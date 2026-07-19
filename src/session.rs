@@ -33,21 +33,15 @@ pub struct JournalEvent {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionHeader {
     pub project_root: PathBuf,
-    pub config_hash: String,
     pub model: String,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
 
 impl SessionHeader {
-    pub fn new(
-        project_root: impl Into<PathBuf>,
-        config_hash: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
+    pub fn new(project_root: impl Into<PathBuf>, model: impl Into<String>) -> Self {
         Self {
             project_root: project_root.into(),
-            config_hash: config_hash.into(),
             model: model.into(),
             extra: Map::new(),
         }
@@ -1066,7 +1060,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn header(root: &Path) -> SessionHeader {
-        SessionHeader::new(root, "config-sha256", "test-model")
+        SessionHeader::new(root, "test-model")
     }
 
     #[test]
@@ -1227,7 +1221,7 @@ mod tests {
                 Some("turn-8"),
                 json!({
                     "call_id": "call-2",
-                    "tool": "plugin/search",
+                    "tool": "shell",
                     "arguments": {"query": "value"},
                     "error_code": "in_doubt"
                 }),
@@ -1240,7 +1234,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].started_seq, 2);
         assert_eq!(pending[0].call_id.as_deref(), Some("call-2"));
-        assert_eq!(pending[0].tool_name.as_deref(), Some("plugin/search"));
+        assert_eq!(pending[0].tool_name.as_deref(), Some("shell"));
 
         recovered
             .append_and_sync(
@@ -1268,14 +1262,14 @@ mod tests {
             .append(
                 "tool.started",
                 Some("turn-9"),
-                json!({"call_id": "call-3", "tool": "plugin/write", "arguments": {}}),
+                json!({"call_id": "call-3", "tool": "write", "arguments": {}}),
             )
             .unwrap();
         journal
             .append_and_sync(
                 "tool.in_doubt",
                 Some("turn-9"),
-                json!({"call_id": "call-3", "tool": "plugin/write", "error_code": "in_doubt"}),
+                json!({"call_id": "call-3", "tool": "write", "error_code": "in_doubt"}),
             )
             .unwrap();
         drop(journal);
@@ -1442,5 +1436,19 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind, "user.message");
         assert!(store.inspect("missing").is_err());
+    }
+
+    #[test]
+    fn old_session_header_with_config_hash_still_deserializes() {
+        let header: SessionHeader = serde_json::from_value(json!({
+            "project_root": "project",
+            "config_hash": "legacy-plugin-snapshot",
+            "model": "test-model",
+            "created_at": "2026-01-01T00:00:00Z",
+            "journal_schema": JOURNAL_SCHEMA,
+        }))
+        .unwrap();
+        assert_eq!(header.project_root, PathBuf::from("project"));
+        assert_eq!(header.model, "test-model");
     }
 }

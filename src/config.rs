@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,28 +23,6 @@ pub struct ProviderConfig {
 #[derive(Clone, Debug)]
 pub struct ProjectContext {
     pub root: PathBuf,
-    pub config_path: Option<PathBuf>,
-    pub config: ProjectConfig,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectConfig {
-    #[serde(default)]
-    pub plugins: Vec<ProjectPlugin>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectPlugin {
-    pub name: String,
-    pub manifest: PathBuf,
-    #[serde(default = "default_activation")]
-    pub activation: String,
-}
-
-fn default_activation() -> String {
-    "on_call".to_owned()
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -153,93 +130,19 @@ impl ContextLimits {
 }
 
 impl ProjectContext {
-    pub fn resolve(cwd: Option<PathBuf>, config_override: Option<PathBuf>) -> Result<Self> {
+    pub fn resolve(cwd: Option<PathBuf>) -> Result<Self> {
         let cwd_was_explicit = cwd.is_some();
         let start = match cwd {
             Some(path) => path,
             None => env::current_dir()?,
         };
         let start = canonical_directory(&start)?;
-
-        let (root, config_path) = if let Some(path) = config_override {
-            let path = absolute_from(&start, &path);
-            let path = path.canonicalize().map_err(|error| {
-                OxidraError::Config(format!("cannot resolve config {}: {error}", path.display()))
-            })?;
-            if path.file_name().and_then(|name| name.to_str()) != Some("config.toml")
-                || path
-                    .parent()
-                    .and_then(Path::file_name)
-                    .and_then(|name| name.to_str())
-                    != Some(".oxidra")
-            {
-                return Err(OxidraError::Config(format!(
-                    "config must be named <project>/.oxidra/config.toml: {}",
-                    path.display()
-                )));
-            }
-            let root = path
-                .parent()
-                .and_then(Path::parent)
-                .ok_or_else(|| {
-                    OxidraError::Config(format!(
-                        "config must be under <project>/.oxidra: {}",
-                        path.display()
-                    ))
-                })?
-                .canonicalize()?;
-            (root, Some(path))
-        } else if cwd_was_explicit {
-            let candidate = start.join(".oxidra").join("config.toml");
-            let config = candidate.is_file().then_some(candidate);
-            (start, config)
+        let root = if cwd_was_explicit {
+            start
         } else {
-            match find_project_config(&start) {
-                Some(path) => {
-                    let root = path
-                        .parent()
-                        .and_then(Path::parent)
-                        .expect("known .oxidra/config.toml shape")
-                        .canonicalize()?;
-                    (root, Some(path))
-                }
-                None => (start, None),
-            }
+            find_git_root(&start).unwrap_or(start)
         };
-
-        let config = match config_path.as_deref() {
-            Some(path) => {
-                let text = fs::read_to_string(path)?;
-                toml::from_str(&text)?
-            }
-            None => ProjectConfig::default(),
-        };
-
-        let mut plugin_names = HashSet::new();
-        for plugin in &config.plugins {
-            if !plugin_names.insert(plugin.name.as_str()) {
-                return Err(OxidraError::Config(format!(
-                    "duplicate plugin name {:?}",
-                    plugin.name
-                )));
-            }
-            if plugin.activation != "on_call" && plugin.activation != "eager" {
-                return Err(OxidraError::Config(format!(
-                    "plugin {} has invalid activation {:?}",
-                    plugin.name, plugin.activation
-                )));
-            }
-        }
-
-        Ok(Self {
-            root,
-            config_path,
-            config,
-        })
-    }
-
-    pub fn resolve_manifest(&self, manifest: &Path) -> PathBuf {
-        absolute_from(&self.root, manifest)
+        Ok(Self { root })
     }
 }
 
@@ -295,24 +198,15 @@ fn canonical_directory(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn find_project_config(start: &Path) -> Option<PathBuf> {
+fn find_git_root(start: &Path) -> Option<PathBuf> {
     let mut current = Some(start);
     while let Some(directory) = current {
-        let candidate = directory.join(".oxidra").join("config.toml");
-        if candidate.is_file() {
-            return Some(candidate);
+        if directory.join(".git").exists() {
+            return Some(directory.to_owned());
         }
         current = directory.parent();
     }
     None
-}
-
-fn absolute_from(base: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_owned()
-    } else {
-        base.join(path)
-    }
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
@@ -345,5 +239,15 @@ mod tests {
         let limits = ContextLimits::default();
         assert_eq!(limits.context_window, Some(DEFAULT_CONTEXT_WINDOW));
         assert_eq!(limits.reserve_tokens, DEFAULT_RESERVE_TOKENS);
+    }
+
+    #[test]
+    fn finds_nearest_git_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let nested = root.join("src").join("deep");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        assert_eq!(find_git_root(&nested), Some(root));
     }
 }

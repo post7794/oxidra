@@ -126,7 +126,7 @@ impl OpenAiResponsesProvider {
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.input_schema,
-                    // Do not force strict mode: existing project/plugin JSON
+                    // Do not force strict mode: existing tool JSON
                     // schemas may contain constructs not accepted by strict
                     // structured outputs.  We validate before dispatch.
                     "strict": false,

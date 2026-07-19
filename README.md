@@ -1,9 +1,8 @@
 # Oxidra
 
-Oxidra is a lightweight, extensible CLI coding agent written in Rust. It uses
-the OpenAI Responses API and keeps an auditable, append-only local session
-journal. External tools use a long-lived MCP stdio JSON-RPC process; built-in
-tools are Rust implementations.
+Oxidra is a lightweight personal CLI coding agent written in Rust. It uses the
+OpenAI Responses API, provides four built-in Rust tools (`read`, `edit`,
+`write`, and `shell`), and keeps an auditable append-only local session journal.
 
 The design and the explicit MVP boundary are documented in
 [docs/oxidra-mvp.md](docs/oxidra-mvp.md).
@@ -81,8 +80,7 @@ Useful options:
 ```text
 -p, --print <PROMPT>       run one non-interactive turn
     --resume <SESSION_ID>  resume a local JSONL session
-    --cwd <DIR>            select the project root
-    --config <FILE>        select <project>/.oxidra/config.toml
+    --cwd <DIR>            select the project root; otherwise discover .git upward
     --model <MODEL>        override the default gpt-5.6-sol model
     --full-auto            skip per-command shell confirmation
     --max-responses <N>    optional per-turn insurance limit
@@ -91,29 +89,6 @@ Useful options:
 
 Session journals and shell artifacts are stored in the platform user-data
 directory, never in the project. A session id is printed on startup.
-
-## Project Plugins
-
-Only plugins explicitly listed in `.oxidra/config.toml` are considered; Oxidra
-does not scan `PATH` for plugins. A minimal project config is:
-
-```toml
-[[plugins]]
-name = "fixture"
-manifest = "plugins/fixture/manifest.json"
-activation = "on_call" # or "eager" for runtime-generated schemas
-```
-
-The manifest declares an MCP stdio executable and static tool schemas. The
-command may be an absolute path, a path relative to the manifest, or a command
-resolved from an absolute `PATH` entry. Oxidra resolves it before launch and
-re-checks the project execution hash before every activation/call. A dynamic
-schema may omit `schemaHash`, but it must use `activation = "eager"`.
-
-The first use of an untrusted project asks for confirmation. Trust is stored
-outside the project and is invalidated when the config, lockfile, manifest,
-declared executable, or manifest-referenced script changes. Trust is not an OS
-sandbox: an accepted plugin runs with the current user's permissions.
 
 ## Verification
 
@@ -131,6 +106,10 @@ change and command result verified by the test in `tests/e2e_cli.rs`.
 
 The integration suite also verifies that interactive text deltas arrive before
 `response.completed`, `--resume` replays complete raw output items, shell
-cancellation returns promptly, and a real Python MCP stdio fixture performs the
-lazy handshake and reuses one long-lived connection. CI runs Rust 1.85 on
-Windows, Linux, and macOS via `.github/workflows/ci.yml`.
+cancellation returns promptly, and project-root boundaries hold across file
+tools. CI runs Rust 1.85 on Windows, Linux, and macOS via
+`.github/workflows/ci.yml`.
+
+External plugin support is intentionally out of scope for the personal-tool
+mainline. The previous implementation remains available at the
+`archive/mcp-mvp` tag and can be reconsidered if a concrete need appears.

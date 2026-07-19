@@ -12,8 +12,6 @@ pub enum OxidraError {
     ResponseAborted(String),
     #[error("tool error ({code}): {message}")]
     Tool { code: String, message: String },
-    #[error("plugin error: {0}")]
-    Plugin(String),
     #[error("session error: {0}")]
     Session(String),
     #[error("approval required: {0}")]

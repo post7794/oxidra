@@ -15,11 +15,10 @@ use uuid::Uuid;
 
 use crate::config::ContextLimits;
 use crate::error::{OxidraError, Result};
-use crate::plugin::{PluginState, PluginSupervisor};
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{JournalEvent, SessionJournal};
-use crate::tools::{BuiltinTools, ToolContext, ToolExecutor};
-use crate::types::{ToolCall, ToolDefinition, ToolResult};
+use crate::tools::{ToolContext, ToolExecutor};
+use crate::types::{ToolCall, ToolResult};
 
 const MAX_PROJECT_INSTRUCTIONS: usize = 32 * 1024;
 
@@ -37,7 +36,7 @@ pub trait AgentObserver: Send {
 }
 
 /// The CLI implements this to keep shell authorization separate from project
-/// trust.  Returning `false` is a normal tool result, not an agent failure.
+/// instructions. Returning `false` is a normal tool result, not an agent failure.
 #[async_trait]
 pub trait ApprovalHandler: Send {
     async fn approve_shell(
@@ -61,134 +60,6 @@ impl ApprovalHandler for DenyApproval {
     }
 }
 
-/// A session-scoped collection of built-in and MCP tools.
-pub struct ToolRegistry {
-    builtins: BuiltinTools,
-    plugins: Vec<Arc<PluginSupervisor>>,
-    definitions: Vec<ToolDefinition>,
-    by_name: HashSet<String>,
-}
-
-impl ToolRegistry {
-    pub fn new(builtins: BuiltinTools, plugins: Vec<Arc<PluginSupervisor>>) -> Result<Self> {
-        let mut definitions = builtins.definitions();
-        let mut by_name = definitions
-            .iter()
-            .map(|definition| definition.name.clone())
-            .collect::<HashSet<_>>();
-        for plugin in &plugins {
-            for definition in plugin.static_tools() {
-                if !by_name.insert(definition.name.clone()) {
-                    return Err(OxidraError::Config(format!(
-                        "duplicate tool name {:?}",
-                        definition.name
-                    )));
-                }
-                definitions.push(definition);
-            }
-        }
-        Ok(Self {
-            builtins,
-            plugins,
-            definitions,
-            by_name,
-        })
-    }
-
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.definitions.clone()
-    }
-
-    pub async fn available_definitions(&self) -> Result<Vec<ToolDefinition>> {
-        let mut definitions = self.builtins.definitions();
-        let mut names = definitions
-            .iter()
-            .map(|definition| definition.name.clone())
-            .collect::<HashSet<_>>();
-        for plugin in &self.plugins {
-            if matches!(
-                plugin.state().await,
-                PluginState::Failed {
-                    recoverable: false,
-                    ..
-                }
-            ) {
-                continue;
-            }
-            for definition in plugin.static_tools() {
-                if !names.insert(definition.name.clone()) {
-                    return Err(OxidraError::Config(format!(
-                        "runtime plugin tool name conflicts with {:?}",
-                        definition.name
-                    )));
-                }
-                definitions.push(definition);
-            }
-        }
-        Ok(definitions)
-    }
-
-    pub fn contains(&self, name: &str) -> bool {
-        self.by_name.contains(name)
-    }
-
-    pub fn builtins(&self) -> &BuiltinTools {
-        &self.builtins
-    }
-
-    pub async fn activate_eager(&self, cancellation: &CancellationToken) -> Result<()> {
-        let mut first_error = None;
-        for plugin in &self.plugins {
-            if let Err(error) = plugin.activate_if_eager(cancellation.clone()).await {
-                if matches!(&error, OxidraError::Interrupted) {
-                    return Err(error);
-                }
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        first_error.map_or(Ok(()), Err)
-    }
-
-    pub async fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolResult {
-        if is_builtin_name(&call.name) {
-            return self.builtins.execute(call, context).await;
-        }
-        if let Some(plugin) = self.plugins.iter().find(|plugin| {
-            plugin
-                .static_tools()
-                .iter()
-                .any(|tool| tool.name == call.name)
-        }) {
-            return plugin
-                .call_tool(call.clone(), context.cancellation.clone())
-                .await;
-        }
-        ToolResult::error(
-            &call.id,
-            "not_found",
-            format!("unknown tool {:?}", call.name),
-        )
-    }
-
-    pub async fn shutdown(&self) -> Result<()> {
-        let mut first_error = None;
-        for plugin in &self.plugins {
-            if let Err(error) = plugin.shutdown().await {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        first_error.map_or(Ok(()), Err)
-    }
-}
-
-fn is_builtin_name(name: &str) -> bool {
-    matches!(name, "read" | "edit" | "write" | "shell")
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct TurnOutcome {
     pub text: String,
@@ -200,7 +71,7 @@ pub struct TurnOutcome {
 pub struct Agent {
     provider: Arc<dyn ResponseProvider>,
     journal: SessionJournal,
-    registry: ToolRegistry,
+    tools: Arc<dyn ToolExecutor>,
     instructions: String,
     context_limits: ContextLimits,
     max_responses: Option<usize>,
@@ -211,7 +82,7 @@ impl Agent {
     pub fn new(
         provider: Arc<dyn ResponseProvider>,
         journal: SessionJournal,
-        registry: ToolRegistry,
+        tools: Arc<dyn ToolExecutor>,
         instructions: impl Into<String>,
         context_limits: ContextLimits,
         max_responses: Option<usize>,
@@ -220,7 +91,7 @@ impl Agent {
         Self {
             provider,
             journal,
-            registry,
+            tools,
             instructions: instructions.into(),
             context_limits,
             max_responses,
@@ -238,18 +109,6 @@ impl Agent {
 
     pub fn journal_mut(&mut self) -> &mut SessionJournal {
         &mut self.journal
-    }
-
-    pub fn registry(&self) -> &ToolRegistry {
-        &self.registry
-    }
-
-    pub async fn activate_eager(&self, cancellation: &CancellationToken) -> Result<()> {
-        self.registry.activate_eager(cancellation).await
-    }
-
-    pub async fn shutdown(&self) -> Result<()> {
-        self.registry.shutdown().await
     }
 
     /// Run one complete user turn.  A successful return means every response
@@ -306,7 +165,7 @@ impl Agent {
             let request = ResponseRequest {
                 instructions: (!self.instructions.is_empty()).then(|| self.instructions.clone()),
                 input,
-                tools: self.registry.available_definitions().await?,
+                tools: self.tools.definitions(),
                 model: None,
             };
             if let Err(error) = self.check_context(&request) {
@@ -467,7 +326,7 @@ impl Agent {
         observer: &mut dyn AgentObserver,
         approval: &mut dyn ApprovalHandler,
     ) -> Result<ToolResult> {
-        let definitions = self.registry.available_definitions().await?;
+        let definitions = self.tools.definitions();
         let definition = definitions
             .iter()
             .find(|definition| definition.name == call.name);
@@ -541,7 +400,7 @@ impl Agent {
         )?;
 
         let context = ToolContext::new(cancellation.clone()).with_shell_approval(shell_approved);
-        let result = self.registry.execute(call, &context).await;
+        let result = self.tools.execute(call, &context).await;
 
         if result.error_code.as_deref() == Some("in_doubt") {
             self.journal.append_and_sync(
@@ -867,8 +726,8 @@ fn canonical_json(value: &Value) -> String {
 }
 
 /// A deliberately bounded JSON-Schema validator for tool arguments.  It
-/// covers the schema vocabulary emitted by the built-ins and common MCP
-/// manifests; unknown annotation keywords and `$ref` are left untouched so a
+/// covers the schema vocabulary emitted by the built-ins; unknown annotation
+/// keywords and `$ref` are left untouched so a
 /// valid remote schema is not rejected merely for using a newer draft.
 pub fn validate_json_schema(schema: &Value, value: &Value) -> std::result::Result<(), String> {
     if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
