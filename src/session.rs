@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+#[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -544,6 +545,7 @@ pub fn user_data_dir() -> Result<PathBuf> {
     ))
 }
 
+#[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
 fn nonempty_env_path(name: &str) -> Option<PathBuf> {
     env::var_os(name)
         .filter(|value| !value.is_empty())
