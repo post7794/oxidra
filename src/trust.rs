@@ -20,6 +20,14 @@ struct TrustDatabase {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TrustRecord {
     execution_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_root: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrustedProject {
+    pub project_root: Option<PathBuf>,
+    pub execution_hash: String,
 }
 
 #[derive(Clone, Debug)]
@@ -47,15 +55,33 @@ impl TrustStore {
     }
 
     pub fn trust(&mut self, root: &Path, execution_hash: String) -> Result<()> {
-        self.database
-            .projects
-            .insert(root_key(root), TrustRecord { execution_hash });
+        self.database.projects.insert(
+            root_key(root),
+            TrustRecord {
+                execution_hash,
+                project_root: Some(root.to_owned()),
+            },
+        );
         self.save()
     }
 
-    pub fn revoke(&mut self, root: &Path) -> Result<()> {
-        self.database.projects.remove(&root_key(root));
-        self.save()
+    pub fn projects(&self) -> Vec<TrustedProject> {
+        self.database
+            .projects
+            .values()
+            .map(|record| TrustedProject {
+                project_root: record.project_root.clone(),
+                execution_hash: record.execution_hash.clone(),
+            })
+            .collect()
+    }
+
+    pub fn revoke(&mut self, root: &Path) -> Result<bool> {
+        let removed = self.database.projects.remove(&root_key(root)).is_some();
+        if removed {
+            self.save()?;
+        }
+        Ok(removed)
     }
 
     fn save(&self) -> Result<()> {
@@ -287,9 +313,21 @@ mod tests {
             root_key(root),
             TrustRecord {
                 execution_hash: "a".to_owned(),
+                project_root: Some(root.to_owned()),
             },
         );
         assert!(store.is_trusted(root, "a"));
         assert!(!store.is_trusted(root, "b"));
+    }
+
+    #[test]
+    fn old_database_without_project_path_still_loads() {
+        let database: TrustDatabase =
+            serde_json::from_str(r#"{"projects":{"key":{"execution_hash":"abc"}}}"#).unwrap();
+        let store = TrustStore {
+            path: PathBuf::from("unused"),
+            database,
+        };
+        assert_eq!(store.projects()[0].project_root, None);
     }
 }

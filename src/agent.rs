@@ -186,7 +186,7 @@ impl ToolRegistry {
 }
 
 fn is_builtin_name(name: &str) -> bool {
-    matches!(name, "read" | "edit" | "shell")
+    matches!(name, "read" | "edit" | "write" | "shell")
 }
 
 #[derive(Clone, Debug, Default)]

@@ -104,6 +104,14 @@ pub struct SessionStore {
     layout: SessionLayout,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub header: SessionHeader,
+    pub event_count: usize,
+    pub last_activity: DateTime<Utc>,
+}
+
 impl SessionStore {
     pub fn new(data_dir: impl Into<PathBuf>) -> Result<Self> {
         let layout = SessionLayout::new(data_dir);
@@ -119,6 +127,59 @@ impl SessionStore {
 
     pub fn layout(&self) -> &SessionLayout {
         &self.layout
+    }
+
+    /// Lists sessions without opening, locking, or recovering them. This keeps
+    /// an administrative read from mutating the append-only journal.
+    pub fn list(&self) -> Result<Vec<SessionSummary>> {
+        let mut summaries = Vec::new();
+        for entry in fs::read_dir(&self.layout.sessions_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            let Some(session_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_session_id(session_id).is_err() {
+                continue;
+            }
+            ensure_journal_size(&path)?;
+            let events = parse_complete_events(&fs::read(&path)?, session_id)?;
+            let Some(first) = events.first() else {
+                continue;
+            };
+            if first.kind != SESSION_STARTED_KIND {
+                return Err(OxidraError::Session(format!(
+                    "session {session_id} has no session.started header"
+                )));
+            }
+            let header = serde_json::from_value(first.data.clone())?;
+            let last_activity = events.last().map(|event| event.ts).unwrap_or(first.ts);
+            summaries.push(SessionSummary {
+                session_id: session_id.to_owned(),
+                header,
+                event_count: events.len(),
+                last_activity,
+            });
+        }
+        summaries.sort_by(|left, right| right.last_activity.cmp(&left.last_activity));
+        Ok(summaries)
+    }
+
+    /// Reads a journal for display without applying crash recovery.
+    pub fn inspect(&self, session_id: &str) -> Result<Vec<JournalEvent>> {
+        validate_session_id(session_id)?;
+        let path = self.layout.journal_path(session_id)?;
+        if !path.is_file() {
+            return Err(OxidraError::Session(format!(
+                "session not found: {session_id}"
+            )));
+        }
+        ensure_journal_size(&path)?;
+        parse_complete_events(&fs::read(path)?, session_id)
     }
 
     pub fn create(&self, header: SessionHeader) -> Result<SessionJournal> {
@@ -1357,5 +1418,27 @@ mod tests {
         let store = SessionStore::new(temp.path()).unwrap();
         assert!(store.open("../escape").is_err());
         assert!(store.open("nested/session").is_err());
+    }
+
+    #[test]
+    fn lists_and_inspects_sessions_without_opening_them() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store.create_with_id("listed", header(temp.path())).unwrap();
+        journal
+            .append_and_sync("user.message", Some("turn"), json!({"text": "hello"}))
+            .unwrap();
+        drop(journal);
+
+        let summaries = store.list().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].session_id, "listed");
+        assert_eq!(summaries[0].event_count, 2);
+        assert_eq!(summaries[0].header.model, "test-model");
+
+        let events = store.inspect("listed").unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].kind, "user.message");
+        assert!(store.inspect("missing").is_err());
     }
 }

@@ -435,6 +435,76 @@ impl BuiltinTools {
         )
     }
 
+    async fn write(&self, call: &ToolCall, context: &ToolContext) -> ToolResult {
+        let args: WriteArgs = match parse_arguments(call) {
+            Ok(args) => args,
+            Err(result) => return result,
+        };
+        if context.cancellation.is_cancelled() {
+            return ToolResult::error(&call.id, "cancelled", "write was cancelled");
+        }
+        if args.content.len() as u64 > MAX_FILE_BYTES {
+            return ToolResult::error(
+                &call.id,
+                "validation_error",
+                format!("content exceeds the {MAX_FILE_BYTES}-byte write limit"),
+            );
+        }
+
+        let path = match self.resolve_new_path(&args.path).await {
+            Ok(path) => path,
+            Err(error) => return error_result(&call.id, error),
+        };
+        let temp_path = temporary_sibling(&path);
+        let mut temp = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .await
+        {
+            Ok(file) => file,
+            Err(error) => return io_result(&call.id, "create temporary write file", error),
+        };
+        if let Err(error) = temp.write_all(args.content.as_bytes()).await {
+            drop(temp);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return io_result(&call.id, "write temporary file", error);
+        }
+        if let Err(error) = temp.sync_all().await {
+            drop(temp);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return io_result(&call.id, "flush temporary write file", error);
+        }
+        drop(temp);
+
+        if context.cancellation.is_cancelled() {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return ToolResult::error(&call.id, "cancelled", "write was cancelled");
+        }
+
+        // A hard link publishes the fully-written sibling atomically and, unlike
+        // rename on Unix, never replaces a destination created by a racing actor.
+        if let Err(error) = tokio::fs::hard_link(&temp_path, &path).await {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            let operation = if error.kind() == io::ErrorKind::AlreadyExists {
+                "create file without overwriting existing target"
+            } else {
+                "atomically publish new file"
+            };
+            return io_result(&call.id, operation, error);
+        }
+        let _ = tokio::fs::remove_file(&temp_path).await;
+
+        ToolResult::success(
+            &call.id,
+            json!({
+                "path": args.path,
+                "bytes": args.content.len(),
+                "sha256": sha256_hex(args.content.as_bytes()),
+            }),
+        )
+    }
+
     async fn shell(&self, call: &ToolCall, context: &ToolContext) -> ToolResult {
         let args: ShellArgs = match parse_arguments(call) {
             Ok(args) => args,
@@ -511,6 +581,69 @@ impl BuiltinTools {
             ));
         }
         Ok(canonical)
+    }
+
+    async fn resolve_new_path(&self, requested: &str) -> Result<PathBuf> {
+        if requested.trim().is_empty() {
+            return Err(OxidraError::tool(
+                "validation_error",
+                "path must not be empty",
+            ));
+        }
+        let requested = Path::new(requested);
+        if requested.is_absolute() {
+            return Err(OxidraError::tool(
+                "permission_denied",
+                "write path must be relative to the project root",
+            ));
+        }
+        if requested.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err(OxidraError::tool(
+                "permission_denied",
+                "write path must not contain '..', root, or prefix components",
+            ));
+        }
+        let file_name = requested
+            .file_name()
+            .ok_or_else(|| OxidraError::tool("validation_error", "write path must name a file"))?;
+        let parent = requested.parent().unwrap_or_else(|| Path::new(""));
+        let parent = tokio::fs::canonicalize(self.root.join(parent))
+            .await
+            .map_err(|error| {
+                OxidraError::tool(
+                    io_error_code(&error),
+                    format!("failed to resolve write parent directory: {error}"),
+                )
+            })?;
+        if !path_is_within(&self.root, &parent) {
+            return Err(OxidraError::tool(
+                "permission_denied",
+                format!("write parent escapes project root: {}", parent.display()),
+            ));
+        }
+        if !tokio::fs::metadata(&parent).await?.is_dir() {
+            return Err(OxidraError::tool(
+                "validation_error",
+                "write parent is not a directory",
+            ));
+        }
+        let destination = parent.join(file_name);
+        match tokio::fs::symlink_metadata(&destination).await {
+            Ok(_) => Err(OxidraError::tool(
+                "already_exists",
+                format!(
+                    "write refuses to overwrite existing path: {}",
+                    destination.display()
+                ),
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(destination),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn run_shell(
@@ -735,6 +868,21 @@ impl BuiltinTools {
                 }),
             },
             ToolDefinition {
+                name: "write".to_owned(),
+                description: format!(
+                    "Create a new UTF-8 file inside the project root without overwriting an existing path. Parent directories must already exist. Content is limited to {MAX_FILE_BYTES} bytes."
+                ),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": { "type": "string", "minLength": 1 },
+                        "content": { "type": "string" },
+                    },
+                    "required": ["path", "content"],
+                }),
+            },
+            ToolDefinition {
                 name: "shell".to_owned(),
                 description: format!(
                     "Run a command from the project root using {}. Output is bounded; full truncated output is saved as an artifact.",
@@ -769,6 +917,7 @@ impl ToolExecutor for BuiltinTools {
         match call.name.as_str() {
             "read" => self.read(call, context).await,
             "edit" => self.edit(call, context).await,
+            "write" => self.write(call, context).await,
             "shell" => self.shell(call, context).await,
             _ => ToolResult::error(
                 &call.id,
@@ -795,6 +944,13 @@ struct EditArgs {
     old_text: String,
     new_text: String,
     expected_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteArgs {
+    path: String,
+    content: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1313,6 +1469,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_creates_utf8_file_and_returns_digest() {
+        let (root, _artifacts, tools) = harness();
+        std::fs::create_dir(root.path().join("nested")).expect("create parent");
+        let content = "hello, 氧化物\n";
+
+        let result = tools
+            .execute(
+                &call(
+                    "write",
+                    json!({ "path": "nested/new.txt", "content": content }),
+                ),
+                &ToolContext::default(),
+            )
+            .await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.output["path"], "nested/new.txt");
+        assert_eq!(result.output["bytes"], content.len());
+        assert_eq!(result.output["sha256"], sha256_hex(content.as_bytes()));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("nested/new.txt")).unwrap(),
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn write_refuses_overwrite_and_path_escape() {
+        let (root, _artifacts, tools) = harness();
+        std::fs::write(root.path().join("existing.txt"), "original").expect("fixture");
+
+        let overwrite = tools
+            .execute(
+                &call(
+                    "write",
+                    json!({ "path": "existing.txt", "content": "changed" }),
+                ),
+                &ToolContext::default(),
+            )
+            .await;
+        assert!(overwrite.is_error);
+        assert_eq!(overwrite.error_code.as_deref(), Some("already_exists"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("existing.txt")).unwrap(),
+            "original"
+        );
+
+        for path in ["../escaped.txt", "sub/../../escaped.txt"] {
+            let escaped = tools
+                .execute(
+                    &call("write", json!({ "path": path, "content": "no" })),
+                    &ToolContext::default(),
+                )
+                .await;
+            assert!(escaped.is_error, "path unexpectedly accepted: {path}");
+            assert_eq!(escaped.error_code.as_deref(), Some("permission_denied"));
+        }
+
+        let absolute = root.path().join("absolute.txt");
+        let escaped = tools
+            .execute(
+                &call("write", json!({ "path": absolute, "content": "no" })),
+                &ToolContext::default(),
+            )
+            .await;
+        assert!(escaped.is_error);
+        assert_eq!(escaped.error_code.as_deref(), Some("permission_denied"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_rejects_symlinked_parent_escape() {
+        use std::os::unix::fs::symlink;
+
+        let (root, _artifacts, tools) = harness();
+        let outside = TempDir::new().expect("outside tempdir");
+        symlink(outside.path(), root.path().join("link")).expect("create symlink");
+
+        let result = tools
+            .execute(
+                &call(
+                    "write",
+                    json!({ "path": "link/escaped.txt", "content": "no" }),
+                ),
+                &ToolContext::default(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(result.error_code.as_deref(), Some("permission_denied"));
+        assert!(!outside.path().join("escaped.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn write_honors_pre_cancelled_context() {
+        let (root, _artifacts, tools) = harness();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = tools
+            .execute(
+                &call("write", json!({ "path": "cancelled.txt", "content": "no" })),
+                &ToolContext::new(cancellation),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(result.error_code.as_deref(), Some("cancelled"));
+        assert!(!root.path().join("cancelled.txt").exists());
+    }
+
+    #[tokio::test]
     async fn read_truncates_at_line_limit_and_returns_full_hash() {
         use std::fmt::Write as _;
 
@@ -1371,7 +1637,7 @@ mod tests {
     fn definitions_have_closed_object_schemas() {
         let (_root, _artifacts, tools) = harness();
         let definitions = tools.definitions();
-        assert_eq!(definitions.len(), 3);
+        assert_eq!(definitions.len(), 4);
         for definition in definitions {
             assert_eq!(definition.input_schema["type"], "object");
             assert_eq!(definition.input_schema["additionalProperties"], false);

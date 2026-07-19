@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Builder;
@@ -26,6 +26,7 @@ use crate::trust::{TrustStore, execution_hash};
 use crate::types::{ToolCall, ToolResult};
 
 const DISPLAY_VALUE_LIMIT: usize = 4 * 1024;
+const DISPLAY_DIFF_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -34,6 +35,9 @@ const DISPLAY_VALUE_LIMIT: usize = 4 * 1024;
     about = "A lightweight, extensible CLI coding agent"
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Run one non-interactive turn and print only the completed assistant text.
     #[arg(short = 'p', long = "print", value_name = "PROMPT")]
     prompt: Option<String>,
@@ -67,6 +71,38 @@ struct Cli {
     max_tools: Option<usize>,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Check local configuration and report actionable problems.
+    Doctor,
+    /// Inspect locally persisted sessions.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+    /// Inspect or revoke project plugin trust.
+    Trust {
+        #[command(subcommand)]
+        command: TrustCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// List sessions, newest first.
+    List,
+    /// Print the canonical journal for a session.
+    Show { session_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum TrustCommand {
+    /// List trusted project plugin configurations.
+    List,
+    /// Revoke all plugin trust for a project path.
+    Revoke { path: PathBuf },
+}
+
 /// Synchronous binary entry point. The CLI owns its Tokio runtime so the core
 /// stays usable by synchronous launchers and tests.
 pub fn main_entry() -> Result<()> {
@@ -77,6 +113,7 @@ pub fn main_entry() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     let Cli {
+        command,
         prompt,
         resume,
         full_auto,
@@ -86,6 +123,9 @@ async fn run(cli: Cli) -> Result<()> {
         max_responses,
         max_tools,
     } = cli;
+    if let Some(command) = command {
+        return run_management_command(command, cwd, config, model);
+    }
     let interactive = prompt.is_none();
     let project = ProjectContext::resolve(cwd, config)?;
     let provider_config = ProviderConfig::resolve(None, None, model)?;
@@ -163,6 +203,137 @@ async fn run(cli: Cli) -> Result<()> {
         (Err(error), Ok(())) => Err(error),
         (Ok(()), Err(error)) => Err(error),
         (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn run_management_command(
+    command: Command,
+    cwd: Option<PathBuf>,
+    config: Option<PathBuf>,
+    model: Option<String>,
+) -> Result<()> {
+    match command {
+        Command::Doctor => run_doctor(cwd, config, model),
+        Command::Session { command } => run_session_command(command),
+        Command::Trust { command } => run_trust_command(command),
+    }
+}
+
+fn run_session_command(command: SessionCommand) -> Result<()> {
+    let store = SessionStore::platform_default()?;
+    match command {
+        SessionCommand::List => {
+            let sessions = store.list()?;
+            if sessions.is_empty() {
+                println!("No sessions.");
+                return Ok(());
+            }
+            for session in sessions {
+                println!(
+                    "{}\t{}\t{}\t{} events\t{}",
+                    session.session_id,
+                    session.last_activity.to_rfc3339(),
+                    session.header.model,
+                    session.event_count,
+                    session.header.project_root.display()
+                );
+            }
+            Ok(())
+        }
+        SessionCommand::Show { session_id } => {
+            let events = store.inspect(&session_id)?;
+            println!("{}", serde_json::to_string_pretty(&events)?);
+            Ok(())
+        }
+    }
+}
+
+fn run_trust_command(command: TrustCommand) -> Result<()> {
+    let mut store = TrustStore::load()?;
+    match command {
+        TrustCommand::List => {
+            let projects = store.projects();
+            if projects.is_empty() {
+                println!("No trusted projects.");
+                return Ok(());
+            }
+            for project in projects {
+                match project.project_root {
+                    Some(root) => println!("{}\t{}", root.display(), project.execution_hash),
+                    None => println!("<legacy path unavailable>\t{}", project.execution_hash),
+                }
+            }
+            Ok(())
+        }
+        TrustCommand::Revoke { path } => {
+            let root = fs::canonicalize(&path).map_err(|error| {
+                OxidraError::Config(format!(
+                    "cannot resolve project path {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if store.revoke(&root)? {
+                println!("Revoked plugin trust for {}", root.display());
+            } else {
+                println!("No plugin trust record for {}", root.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_doctor(cwd: Option<PathBuf>, config: Option<PathBuf>, model: Option<String>) -> Result<()> {
+    let mut failed = false;
+    println!("Oxidra {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "platform: {}-{}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+
+    match SessionStore::platform_default() {
+        Ok(store) => println!("data directory: ok ({})", store.layout().data_dir.display()),
+        Err(error) => {
+            println!("data directory: FAILED ({error})");
+            failed = true;
+        }
+    }
+
+    match ProviderConfig::resolve(None, None, model) {
+        Ok(provider) => {
+            println!("API configuration: ok ({})", provider.api_base_url);
+            println!("model: {}", provider.model);
+        }
+        Err(error) => {
+            println!("API configuration: FAILED ({error})");
+            failed = true;
+        }
+    }
+
+    match ProjectContext::resolve(cwd, config) {
+        Ok(project) => {
+            println!("project: ok ({})", project.root.display());
+            println!("plugins: {} declared", project.config.plugins.len());
+            if let Err(error) = verify_plugin_checksums(&project) {
+                println!("plugin checksums: FAILED ({error})");
+                failed = true;
+            } else {
+                println!("plugin checksums: ok");
+            }
+        }
+        Err(error) => {
+            println!("project: FAILED ({error})");
+            failed = true;
+        }
+    }
+
+    if failed {
+        Err(OxidraError::Config(
+            "doctor found one or more problems".to_owned(),
+        ))
+    } else {
+        println!("status: healthy");
+        Ok(())
     }
 }
 
@@ -555,7 +726,7 @@ fn build_instructions(project: &ProjectContext, journal: &SessionJournal) -> Res
     let shell_kind = if cfg!(windows) { "powershell" } else { "sh" };
     let mut instructions = format!(
         "You are Oxidra, a coding agent operating in the project root {}. \
-Use read and edit for project files and shell for commands. Paths supplied to file tools must remain \
+Use read and edit for existing project files, write for new files, and shell for commands. Never use write to overwrite an existing path. Paths supplied to file tools must remain \
 inside the project root. The shell kind is {shell_kind}. Inspect relevant files before editing, make \
 focused changes, run an appropriate verification, and report only outcomes you actually observed. \
 Never claim that a tool ran when it did not. This session is {}.",
@@ -833,6 +1004,9 @@ impl AgentObserver for CliObserver {
             escape_terminal(&call.name),
             display_value(&call.arguments)
         );
+        if let Some(diff) = render_edit_diff(call) {
+            eprintln!("[edit:diff]\n{diff}");
+        }
         Ok(())
     }
 
@@ -945,6 +1119,50 @@ fn display_value(value: &Value) -> String {
     truncate_for_display(&rendered, DISPLAY_VALUE_LIMIT)
 }
 
+fn render_edit_diff(call: &ToolCall) -> Option<String> {
+    if call.name != "edit" {
+        return None;
+    }
+    let path = call.arguments.get("path")?.as_str()?;
+    let old_text = call.arguments.get("old_text")?.as_str()?;
+    let new_text = call.arguments.get("new_text")?.as_str()?;
+    let mut diff = format!(
+        "--- {}\n+++ {}\n@@ exact replacement @@\n",
+        escape_terminal(path),
+        escape_terminal(path)
+    );
+    append_diff_lines(&mut diff, '-', old_text);
+    append_diff_lines(&mut diff, '+', new_text);
+    Some(truncate_for_display(&diff, DISPLAY_DIFF_LIMIT))
+}
+
+fn append_diff_lines(output: &mut String, marker: char, text: &str) {
+    if text.is_empty() {
+        output.push(marker);
+        output.push('\n');
+        return;
+    }
+    for line in text.split_inclusive('\n') {
+        output.push(marker);
+        for character in line.chars() {
+            match character {
+                '\n' => output.push('\n'),
+                '\r' => output.push_str("\\r"),
+                '\t' => output.push('\t'),
+                '\u{1b}' => output.push_str("\\x1b"),
+                character if character.is_control() => {
+                    use std::fmt::Write as _;
+                    let _ = write!(output, "\\u{{{:04x}}}", character as u32);
+                }
+                character => output.push(character),
+            }
+        }
+        if !line.ends_with('\n') {
+            output.push('\n');
+        }
+    }
+}
+
 fn escape_terminal(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -1014,8 +1232,47 @@ mod tests {
     }
 
     #[test]
+    fn parses_management_commands() {
+        let cli = Cli::try_parse_from(["oxidra", "doctor"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Doctor)));
+
+        let cli = Cli::try_parse_from(["oxidra", "session", "show", "session-1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session {
+                command: SessionCommand::Show { session_id }
+            }) if session_id == "session-1"
+        ));
+
+        let cli = Cli::try_parse_from(["oxidra", "trust", "revoke", "."]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Trust {
+                command: TrustCommand::Revoke { .. }
+            })
+        ));
+    }
+
+    #[test]
     fn display_truncation_keeps_utf8_valid() {
         assert_eq!(truncate_for_display("abcdef", 3), "abc...<truncated>");
         assert_eq!(truncate_for_display("ab中cd", 4), "ab...<truncated>");
+    }
+
+    #[test]
+    fn edit_diff_is_visible_and_escapes_terminal_controls() {
+        let call = ToolCall {
+            id: "call-1".to_owned(),
+            name: "edit".to_owned(),
+            arguments: json!({
+                "path": "src/main.rs",
+                "old_text": "old\n\u{1b}[31m",
+                "new_text": "new\n",
+            }),
+        };
+        let diff = render_edit_diff(&call).expect("render edit diff");
+        assert!(diff.contains("-old\n"));
+        assert!(diff.contains("-\\x1b[31m"));
+        assert!(diff.contains("+new\n"));
     }
 }

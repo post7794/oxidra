@@ -29,6 +29,34 @@ cargo check --offline
 
 ## Quick Start
 
+### Install on Windows
+
+Download and verify the latest release into the current user's application
+directory:
+
+```powershell
+irm https://raw.githubusercontent.com/post7794/oxidra/main/install.ps1 -OutFile $env:TEMP\oxidra-install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File $env:TEMP\oxidra-install.ps1 -AddToPath
+```
+
+Open a new terminal after installation. To install a specific release or use a
+custom directory:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File $env:TEMP\oxidra-install.ps1 `
+  -Version 0.1.0 -InstallDir "$HOME\bin" -AddToPath
+```
+
+The installer downloads the Windows MSVC archive and its release checksum,
+verifies SHA256 before extracting, and installs only `oxidra.exe`. Without
+`-AddToPath`, it prints the directory that must be added to the user `PATH`.
+
+To build from source instead, use `cargo install --path .` from this checkout.
+The raw script and release assets must be anonymously readable for these
+commands, so this installation path is intended for a public GitHub repository.
+
+### Run
+
 Set the API credential in the environment. `API_KEY` is the primary variable;
 `OPENAI_API_KEY` is accepted as a compatibility fallback.
 
