@@ -10,6 +10,8 @@ use url::Url;
 use crate::error::{OxidraError, Result};
 
 pub const DEFAULT_MODEL: &str = "gpt-5.6-sol";
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+pub const DEFAULT_RESERVE_TOKENS: u64 = 16_384;
 pub const DEFAULT_API_BASE_URL: &str = "https://api.openai.com/v1/";
 
 #[derive(Clone, Debug)]
@@ -76,8 +78,8 @@ pub struct ContextLimits {
 impl Default for ContextLimits {
     fn default() -> Self {
         Self {
-            context_window: None,
-            reserve_tokens: 16_384,
+            context_window: Some(DEFAULT_CONTEXT_WINDOW),
+            reserve_tokens: DEFAULT_RESERVE_TOKENS,
         }
     }
 }
@@ -140,11 +142,12 @@ impl ContextLimits {
         Ok(Self {
             context_window: cli_context_window
                 .or_else(|| parse_env_u64("OXIDRA_CONTEXT_WINDOW"))
-                .or(user_context.context_window),
+                .or(user_context.context_window)
+                .or(Some(DEFAULT_CONTEXT_WINDOW)),
             reserve_tokens: cli_reserve_tokens
                 .or_else(|| parse_env_u64("OXIDRA_RESERVE_TOKENS"))
                 .or(user_context.reserve_tokens)
-                .unwrap_or(16_384),
+                .unwrap_or(DEFAULT_RESERVE_TOKENS),
         })
     }
 }
@@ -335,5 +338,12 @@ mod tests {
             config.responses_url().unwrap().as_str(),
             "https://example.test/v1/responses"
         );
+    }
+
+    #[test]
+    fn context_limits_are_bounded_by_default() {
+        let limits = ContextLimits::default();
+        assert_eq!(limits.context_window, Some(DEFAULT_CONTEXT_WINDOW));
+        assert_eq!(limits.reserve_tokens, DEFAULT_RESERVE_TOKENS);
     }
 }

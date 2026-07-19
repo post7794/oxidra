@@ -333,6 +333,7 @@ tool.cancelled           Ctrl+C 后追加取消结果
 - journal 永远保留完整历史。
 - model context 从 journal 派生。
 - MVP 不实现 compaction 算法。
+- 默认按 128,000 token context window、16,384 token reserve 做保守估算；可通过用户配置或 `OXIDRA_CONTEXT_WINDOW` / `OXIDRA_RESERVE_TOKENS` 覆盖。
 - 接近 context_window - reserve_tokens 时停止请求并返回 context_limit，不静默截断。
 - journal 预留 compaction.checkpoint 事件；未来只改变 projection 边界，不删除历史。
 

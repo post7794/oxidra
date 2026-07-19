@@ -806,12 +806,31 @@ fn tool_output_item(data: &Value) -> Option<Value> {
 }
 
 fn error_fingerprint(call: &ToolCall, result: &ToolResult) -> String {
+    let stable_output = stable_error_output(&result.output);
     format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         call.name,
         canonical_json(&call.arguments),
-        canonical_json(&result.output)
+        result.error_code.as_deref().unwrap_or("unknown_error"),
+        canonical_json(&stable_output)
     )
+}
+
+/// Remove observational fields that change between otherwise identical
+/// failures. They remain in the journal and model-visible tool result, but
+/// must not defeat the repeated-error circuit breaker.
+fn stable_error_output(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(stable_error_output).collect()),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .filter(|(key, _)| key.as_str() != "duration_ms")
+                .map(|(key, value)| (key.clone(), stable_error_output(value)))
+                .collect(),
+        ),
+        value => value.clone(),
+    }
 }
 
 fn canonical_json(value: &Value) -> String {
@@ -1156,5 +1175,29 @@ mod tests {
         let a = json!({"b":2,"a":1});
         let b = json!({"a":1,"b":2});
         assert_eq!(canonical_json(&a), canonical_json(&b));
+    }
+
+    #[test]
+    fn error_fingerprint_ignores_shell_duration() {
+        let call = ToolCall {
+            id: "call-1".to_owned(),
+            name: "shell".to_owned(),
+            arguments: json!({"command": "exit 1"}),
+        };
+        let result = |duration_ms| ToolResult {
+            call_id: call.id.clone(),
+            output: json!({
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": "failed",
+                "duration_ms": duration_ms,
+            }),
+            is_error: true,
+            error_code: Some("process_exit".to_owned()),
+        };
+        assert_eq!(
+            error_fingerprint(&call, &result(3)),
+            error_fingerprint(&call, &result(97))
+        );
     }
 }
