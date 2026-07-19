@@ -1,0 +1,6 @@
+/target/
+.claude/
+.idea/
+.vscode/
+*.log
+*.rmeta
