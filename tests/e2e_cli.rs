@@ -321,7 +321,7 @@ fn resume_replays_complete_output_items_across_processes() {
     fs::write(&memory_path, "first memory version").expect("write initial memory");
     fs::write(
         memory_dir.join("00000000-0000-0000-0000-000000000002.md"),
-        "x".repeat(16 * 1024),
+        "x".repeat(16 * 1024 + 1),
     )
     .expect("write memory that cannot fit injection budget");
 
@@ -499,10 +499,13 @@ fn memory_management_is_local_and_needs_no_api_key() {
     let list = run(&["memory", "list"]);
     assert!(list.status.success());
     assert!(String::from_utf8_lossy(&list.stdout).contains(id));
+    assert!(String::from_utf8_lossy(&list.stdout).contains("provenance=unknown"));
 
     let show = run(&["memory", "show", id]);
     assert!(show.status.success());
-    assert_eq!(String::from_utf8_lossy(&show.stdout).trim(), "local memory");
+    let shown = String::from_utf8_lossy(&show.stdout);
+    assert!(shown.contains("provenance: unknown"));
+    assert!(shown.trim_end().ends_with("local memory"));
 
     let forget = run(&["memory", "forget", id]);
     assert!(forget.status.success());

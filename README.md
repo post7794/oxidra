@@ -103,7 +103,10 @@ oxidra memory forget <ID>
 Session journals and shell artifacts are stored in the platform user-data
 directory, never in the project. A session id is printed on startup.
 Persistent memories are stored as plain Markdown under the same user-data
-directory and are injected only after deterministic size packing.
+directory and are injected only after deterministic size packing. Memories
+created by the tool record their source project and creation time in two-field
+frontmatter; this provenance is visible to management commands but is stripped
+before model injection.
 
 ## Verification
 

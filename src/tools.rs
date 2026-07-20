@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{OxidraError, Result};
-use crate::memory::MemoryStore;
+use crate::memory::{MAX_MEMORY_FILE_BYTES, MemoryStore};
 use crate::process::ProcessTree;
 use crate::types::{ToolCall, ToolDefinition, ToolResult};
 
@@ -543,7 +543,7 @@ impl BuiltinTools {
                 "remember requires user confirmation",
             );
         }
-        match self.memory.remember(&args.content) {
+        match self.memory.remember(&args.content, &self.root) {
             Ok(entry) => ToolResult::success(
                 &call.id,
                 json!({
@@ -934,7 +934,9 @@ impl BuiltinTools {
             },
             ToolDefinition {
                 name: "remember".to_owned(),
-                description: "Persist one user-approved memory as a local Markdown file for future Oxidra sessions.".to_owned(),
+                description: format!(
+                    "Persist one user-approved memory as a local Markdown file for future Oxidra sessions. The complete file including provenance frontmatter is limited to {MAX_MEMORY_FILE_BYTES} bytes."
+                ),
                 input_schema: json!({
                     "type": "object",
                     "additionalProperties": false,
@@ -1649,7 +1651,12 @@ mod tests {
         let result = tools.execute(&call, &approved).await;
         assert!(!result.is_error, "{result:?}");
         let id = result.output["id"].as_str().unwrap();
-        assert_eq!(tools.memory.show(id).unwrap(), "prefer focused changes");
+        let stored = tools.memory.show(id).unwrap();
+        assert_eq!(stored.content, "prefer focused changes");
+        assert!(matches!(
+            stored.provenance,
+            crate::memory::MemoryProvenance::Known { .. }
+        ));
     }
 
     #[tokio::test]

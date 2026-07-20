@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{Agent, AgentObserver, ApprovalHandler, TurnOutcome, load_project_instructions};
 use crate::config::{ContextLimits, ProjectContext, ProviderConfig};
 use crate::error::{OxidraError, Result};
-use crate::memory::MemoryStore;
+use crate::memory::{MemoryProvenance, MemoryStore};
 use crate::provider::{OpenAiResponsesProvider, ProviderEvent};
 use crate::render::{
     RenderOptions, display_value, escape_terminal, format_turn_metrics, render_edit_diff,
@@ -239,20 +239,43 @@ fn run_memory_command(command: MemoryCommand) -> Result<()> {
             for entry in entries {
                 let preview = entry.content.lines().next().unwrap_or_default();
                 let preview = preview.chars().take(80).collect::<String>();
+                let provenance = match &entry.provenance {
+                    MemoryProvenance::Known {
+                        project_root,
+                        created,
+                    } => format!(
+                        "project={} created={}",
+                        escape_terminal(project_root),
+                        escape_terminal(created)
+                    ),
+                    MemoryProvenance::Unknown => "provenance=unknown".to_owned(),
+                };
                 println!(
-                    "{}\t{}\t{} bytes\t{}",
+                    "{}\t{}\t{} bytes\t{}\t{}",
                     entry.id,
                     entry.modified.to_rfc3339(),
                     entry.bytes,
+                    provenance,
                     escape_terminal(&preview)
                 );
             }
             Ok(())
         }
         MemoryCommand::Show { memory_id } => {
-            let content = memory.show(&memory_id)?;
-            print!("{content}");
-            if !content.ends_with('\n') {
+            let entry = memory.show(&memory_id)?;
+            match &entry.provenance {
+                MemoryProvenance::Known {
+                    project_root,
+                    created,
+                } => {
+                    println!("project_root: {}", escape_terminal(project_root));
+                    println!("created: {}", escape_terminal(created));
+                }
+                MemoryProvenance::Unknown => println!("provenance: unknown"),
+            }
+            println!("---");
+            print!("{}", entry.content);
+            if !entry.content.ends_with('\n') {
                 println!();
             }
             io::stdout().flush()?;
