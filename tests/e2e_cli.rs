@@ -111,6 +111,15 @@ fn cli_runs_read_edit_shell_and_replays_tool_outputs() {
         stderr.contains("[tool] receiving arguments for call"),
         "streamed tool-call progress was not visible:\n{stderr}"
     );
+    assert!(stderr.contains("[turn]"), "missing turn metrics:\n{stderr}");
+    assert!(
+        stderr.contains("model gpt-5.6-sol") && stderr.contains("tokens in 4, out 4, total 8"),
+        "turn metrics missing model or usage:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("context ") && !stderr.contains('\u{1b}'),
+        "batch output should contain plain context metrics without ANSI:\n{stderr}"
+    );
 
     assert_eq!(
         fs::read_to_string(project.path().join("calc.py")).expect("read edited calc.py"),
@@ -368,6 +377,33 @@ fn resume_replays_complete_output_items_across_processes() {
         .join()
         .expect("resume server panicked")
         .expect("resume server failed");
+
+    let data_dir = if cfg!(windows) {
+        local_data.join("oxidra")
+    } else if cfg!(target_os = "macos") {
+        user_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("oxidra")
+    } else {
+        xdg_state.join("oxidra")
+    };
+    let journal_path = data_dir
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"));
+    let instruction_snapshots = fs::read_to_string(&journal_path)
+        .expect("read resumed journal")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse journal event"))
+        .filter(|event| event["kind"] == "context.instructions")
+        .collect::<Vec<_>>();
+    assert_eq!(instruction_snapshots.len(), 2);
+    assert!(instruction_snapshots.iter().all(|event| {
+        event["data"]["instructions"]
+            .as_str()
+            .is_some_and(|text| text.contains("You are Oxidra"))
+    }));
 
     let captured = captured.lock().expect("lock resume requests");
     assert_eq!(captured.len(), 2);

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,12 +15,12 @@ use crate::agent::{Agent, AgentObserver, ApprovalHandler, TurnOutcome, load_proj
 use crate::config::{ContextLimits, ProjectContext, ProviderConfig};
 use crate::error::{OxidraError, Result};
 use crate::provider::{OpenAiResponsesProvider, ProviderEvent};
+use crate::render::{
+    RenderOptions, display_value, escape_terminal, format_turn_metrics, render_edit_diff,
+};
 use crate::session::{InDoubtTool, SessionHeader, SessionJournal, SessionStore};
 use crate::tools::BuiltinTools;
 use crate::types::{ToolCall, ToolResult};
-
-const DISPLAY_VALUE_LIMIT: usize = 4 * 1024;
-const DISPLAY_DIFF_LIMIT: usize = 16 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -105,10 +105,11 @@ async fn run(cli: Cli) -> Result<()> {
     let interactive = prompt.is_none();
     let project = ProjectContext::resolve(cwd)?;
     let provider_config = ProviderConfig::resolve(None, None, model)?;
+    let model_name = provider_config.model.clone();
     let context_limits = ContextLimits::load(None, None)?;
     let store = SessionStore::platform_default()?;
 
-    let journal = match resume.as_deref() {
+    let mut journal = match resume.as_deref() {
         Some(session_id) => {
             let mut journal = store.open(session_id)?;
             validate_resumed_session(&journal, &project, &provider_config.model)?;
@@ -122,6 +123,11 @@ async fn run(cli: Cli) -> Result<()> {
     };
 
     let instructions = build_instructions(&project, &journal)?;
+    journal.append_and_sync(
+        "context.instructions",
+        None,
+        json!({ "instructions": instructions.clone() }),
+    )?;
     let builtins = BuiltinTools::new(
         &project.root,
         journal.artifact_dir(),
@@ -145,9 +151,15 @@ async fn run(cli: Cli) -> Result<()> {
         project.root.display()
     );
 
+    let render_options = RenderOptions {
+        color: color_enabled(interactive, io::stderr().is_terminal()),
+    };
+
     match prompt.as_deref() {
-        Some(prompt) => run_batch_turn(&mut agent, prompt, full_auto).await,
-        None => run_repl(&mut agent, full_auto).await,
+        Some(prompt) => {
+            run_batch_turn(&mut agent, prompt, full_auto, &model_name, render_options).await
+        }
+        None => run_repl(&mut agent, full_auto, &model_name, render_options).await,
     }
 }
 
@@ -456,14 +468,26 @@ Never claim that a tool ran when it did not. This session is {}.",
     Ok(instructions)
 }
 
-async fn run_batch_turn(agent: &mut Agent, prompt: &str, full_auto: bool) -> Result<()> {
-    let (outcome, observer) = run_one_turn(agent, prompt, false, full_auto, None).await?;
+async fn run_batch_turn(
+    agent: &mut Agent,
+    prompt: &str,
+    full_auto: bool,
+    model: &str,
+    render_options: RenderOptions,
+) -> Result<()> {
+    let (outcome, observer) =
+        run_one_turn(agent, prompt, false, full_auto, None, render_options).await?;
     write_completed_text(&outcome.text)?;
-    print_turn_metrics(&outcome, observer.started_at);
+    print_turn_metrics(&outcome, observer.started_at, model);
     Ok(())
 }
 
-async fn run_repl(agent: &mut Agent, full_auto: bool) -> Result<()> {
+async fn run_repl(
+    agent: &mut Agent,
+    full_auto: bool,
+    model: &str,
+    render_options: RenderOptions,
+) -> Result<()> {
     let mut input = StdinLines::spawn()?;
     loop {
         eprint!("oxidra> ");
@@ -488,9 +512,18 @@ async fn run_repl(agent: &mut Agent, full_auto: bool) -> Result<()> {
             return Ok(());
         }
 
-        match run_one_turn(agent, prompt, true, full_auto, Some(&mut input)).await {
+        match run_one_turn(
+            agent,
+            prompt,
+            true,
+            full_auto,
+            Some(&mut input),
+            render_options,
+        )
+        .await
+        {
             Ok((outcome, observer)) => {
-                print_turn_metrics(&outcome, observer.started_at);
+                print_turn_metrics(&outcome, observer.started_at, model);
             }
             Err(OxidraError::Interrupted) => {
                 eprintln!("^C current turn cancelled");
@@ -516,9 +549,10 @@ async fn run_one_turn(
     stream_text: bool,
     full_auto: bool,
     input: Option<&mut StdinLines>,
+    render_options: RenderOptions,
 ) -> Result<(TurnOutcome, CliObserver)> {
     let cancellation = CancellationToken::new();
-    let mut observer = CliObserver::new(stream_text, cancellation.clone());
+    let mut observer = CliObserver::new(stream_text, cancellation.clone(), render_options);
     let mut approval = CliApproval {
         full_auto,
         interactive: stream_text,
@@ -616,10 +650,15 @@ struct CliObserver {
     cancellation: CancellationToken,
     approval_required: bool,
     started_at: Instant,
+    render_options: RenderOptions,
 }
 
 impl CliObserver {
-    fn new(stream_text: bool, cancellation: CancellationToken) -> Self {
+    fn new(
+        stream_text: bool,
+        cancellation: CancellationToken,
+        render_options: RenderOptions,
+    ) -> Self {
         Self {
             stream_text,
             response_streamed_text: String::new(),
@@ -629,6 +668,7 @@ impl CliObserver {
             cancellation,
             approval_required: false,
             started_at: Instant::now(),
+            render_options,
         }
     }
 
@@ -703,7 +743,7 @@ impl AgentObserver for CliObserver {
             escape_terminal(&call.name),
             display_value(&call.arguments)
         );
-        if let Some(diff) = render_edit_diff(call) {
+        if let Some(diff) = render_edit_diff(call, self.render_options) {
             eprintln!("[edit:diff]\n{diff}");
         }
         Ok(())
@@ -739,15 +779,15 @@ fn write_completed_text(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_turn_metrics(outcome: &TurnOutcome, started_at: Instant) {
-    let stalled = if outcome.stalled { ", stalled" } else { "" };
+fn print_turn_metrics(outcome: &TurnOutcome, started_at: Instant, model: &str) {
     eprintln!(
-        "[turn] {} response(s), {} tool call(s), {:.1}s{}",
-        outcome.responses,
-        outcome.tools,
-        started_at.elapsed().as_secs_f64(),
-        stalled
+        "{}",
+        format_turn_metrics(outcome, started_at.elapsed(), model)
     );
+}
+
+fn color_enabled(interactive: bool, stderr_is_terminal: bool) -> bool {
+    interactive && stderr_is_terminal
 }
 
 fn prompt_yes_no(prompt: &str) -> Result<bool> {
@@ -813,86 +853,6 @@ impl StdinLines {
     }
 }
 
-fn display_value(value: &Value) -> String {
-    let rendered = serde_json::to_string(value).unwrap_or_else(|_| "<invalid JSON>".to_owned());
-    truncate_for_display(&rendered, DISPLAY_VALUE_LIMIT)
-}
-
-fn render_edit_diff(call: &ToolCall) -> Option<String> {
-    if call.name != "edit" {
-        return None;
-    }
-    let path = call.arguments.get("path")?.as_str()?;
-    let old_text = call.arguments.get("old_text")?.as_str()?;
-    let new_text = call.arguments.get("new_text")?.as_str()?;
-    let mut diff = format!(
-        "--- {}\n+++ {}\n@@ exact replacement @@\n",
-        escape_terminal(path),
-        escape_terminal(path)
-    );
-    append_diff_lines(&mut diff, '-', old_text);
-    append_diff_lines(&mut diff, '+', new_text);
-    Some(truncate_for_display(&diff, DISPLAY_DIFF_LIMIT))
-}
-
-fn append_diff_lines(output: &mut String, marker: char, text: &str) {
-    if text.is_empty() {
-        output.push(marker);
-        output.push('\n');
-        return;
-    }
-    for line in text.split_inclusive('\n') {
-        output.push(marker);
-        for character in line.chars() {
-            match character {
-                '\n' => output.push('\n'),
-                '\r' => output.push_str("\\r"),
-                '\t' => output.push('\t'),
-                '\u{1b}' => output.push_str("\\x1b"),
-                character if character.is_control() => {
-                    use std::fmt::Write as _;
-                    let _ = write!(output, "\\u{{{:04x}}}", character as u32);
-                }
-                character => output.push(character),
-            }
-        }
-        if !line.ends_with('\n') {
-            output.push('\n');
-        }
-    }
-}
-
-fn escape_terminal(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '\u{1b}' => escaped.push_str("\\x1b"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            character if character.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(escaped, "\\u{{{:04x}}}", character as u32);
-            }
-            character => escaped.push(character),
-        }
-    }
-    escaped
-}
-
-fn truncate_for_display(value: &str, limit: usize) -> String {
-    if value.len() <= limit {
-        return value.to_owned();
-    }
-    let boundary = value
-        .char_indices()
-        .map(|(index, _)| index)
-        .take_while(|index| *index <= limit)
-        .last()
-        .unwrap_or(0);
-    format!("{}...<truncated>", &value[..boundary])
-}
-
 fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -945,25 +905,10 @@ mod tests {
     }
 
     #[test]
-    fn display_truncation_keeps_utf8_valid() {
-        assert_eq!(truncate_for_display("abcdef", 3), "abc...<truncated>");
-        assert_eq!(truncate_for_display("ab中cd", 4), "ab...<truncated>");
-    }
-
-    #[test]
-    fn edit_diff_is_visible_and_escapes_terminal_controls() {
-        let call = ToolCall {
-            id: "call-1".to_owned(),
-            name: "edit".to_owned(),
-            arguments: json!({
-                "path": "src/main.rs",
-                "old_text": "old\n\u{1b}[31m",
-                "new_text": "new\n",
-            }),
-        };
-        let diff = render_edit_diff(&call).expect("render edit diff");
-        assert!(diff.contains("-old\n"));
-        assert!(diff.contains("-\\x1b[31m"));
-        assert!(diff.contains("+new\n"));
+    fn color_requires_interactive_terminal() {
+        assert!(color_enabled(true, true));
+        assert!(!color_enabled(true, false));
+        assert!(!color_enabled(false, true));
+        assert!(!color_enabled(false, false));
     }
 }

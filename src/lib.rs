@@ -4,6 +4,7 @@ pub mod config;
 pub mod error;
 mod process;
 pub mod provider;
+mod render;
 pub mod session;
 pub mod tools;
 pub mod types;

@@ -75,6 +75,11 @@ Press `Ctrl+C` to cancel the active Responses request or tool process. A
 single shell command requires confirmation unless `--full-auto` is explicitly
 provided for the current process.
 
+At the end of each completed turn, stderr prints the model, accumulated token
+usage, and the estimated context size for the next request. In an interactive
+TTY, edit replacement lines are shown in red/green; `-p` and redirected output
+remain plain text.
+
 Useful options:
 
 ```text

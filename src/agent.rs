@@ -18,7 +18,7 @@ use crate::error::{OxidraError, Result};
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{JournalEvent, SessionJournal};
 use crate::tools::{BuiltinTools, ToolContext};
-use crate::types::{ToolCall, ToolResult};
+use crate::types::{ToolCall, ToolResult, Usage};
 
 const MAX_PROJECT_INSTRUCTIONS: usize = 32 * 1024;
 
@@ -60,12 +60,21 @@ impl ApprovalHandler for DenyApproval {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ContextEstimate {
+    pub estimated_tokens: u64,
+    pub context_window: Option<u64>,
+    pub reserve_tokens: u64,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct TurnOutcome {
     pub text: String,
     pub responses: usize,
     pub tools: usize,
     pub stalled: bool,
+    pub usage: Usage,
+    pub context: Option<ContextEstimate>,
 }
 
 pub struct Agent {
@@ -168,7 +177,9 @@ impl Agent {
                 tools: self.tools.definitions(),
                 model: None,
             };
-            if let Err(error) = self.check_context(&request) {
+            let context = self.estimate_context(&request)?;
+            outcome.context = Some(context.clone());
+            if let Err(error) = self.check_context(&context) {
                 self.journal.append_and_sync(
                     "context.limit_reached",
                     Some(&turn_id),
@@ -217,6 +228,7 @@ impl Agent {
             };
 
             outcome.responses += 1;
+            accumulate_usage(&mut outcome.usage, &turn.usage);
             self.journal.append_and_sync(
                 "response.completed",
                 Some(&turn_id),
@@ -231,6 +243,7 @@ impl Agent {
             )?;
             if turn.tool_calls.is_empty() {
                 outcome.text = turn.text;
+                outcome.context = Some(self.next_context_estimate()?);
                 return Ok(outcome);
             }
 
@@ -299,6 +312,7 @@ impl Agent {
                             }),
                         )?;
                         outcome.stalled = true;
+                        outcome.context = Some(self.next_context_estimate()?);
                         return Ok(outcome);
                     }
                 } else {
@@ -524,10 +538,7 @@ impl Agent {
         Ok(project_events(&events))
     }
 
-    fn check_context(&self, request: &ResponseRequest) -> Result<()> {
-        let Some(window) = self.context_limits.context_window else {
-            return Ok(());
-        };
+    fn estimate_context(&self, request: &ResponseRequest) -> Result<ContextEstimate> {
         let input = serde_json::to_string(&request.input)?;
         let tools = serde_json::to_string(&request.tools)?;
         let instructions = request.instructions.as_deref().unwrap_or_default();
@@ -535,11 +546,48 @@ impl Agent {
             .saturating_add(estimate_tokens(&tools))
             .saturating_add(estimate_tokens(instructions))
             .saturating_add(256);
-        if estimated_tokens.saturating_add(self.context_limits.reserve_tokens) >= window {
+        Ok(ContextEstimate {
+            estimated_tokens,
+            context_window: self.context_limits.context_window,
+            reserve_tokens: self.context_limits.reserve_tokens,
+        })
+    }
+
+    fn check_context(&self, context: &ContextEstimate) -> Result<()> {
+        let Some(window) = context.context_window else {
+            return Ok(());
+        };
+        if context
+            .estimated_tokens
+            .saturating_add(context.reserve_tokens)
+            >= window
+        {
             return Err(OxidraError::ContextLimit);
         }
         Ok(())
     }
+
+    fn next_context_estimate(&self) -> Result<ContextEstimate> {
+        let request = ResponseRequest {
+            instructions: (!self.instructions.is_empty()).then(|| self.instructions.clone()),
+            input: self.project_input()?,
+            tools: self.tools.definitions(),
+            model: None,
+        };
+        self.estimate_context(&request)
+    }
+}
+
+fn accumulate_usage(total: &mut Usage, usage: &Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(usage.cached_input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.output_tokens);
+    total.reasoning_output_tokens = total
+        .reasoning_output_tokens
+        .saturating_add(usage.reasoning_output_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
 }
 
 fn estimate_tokens(text: &str) -> u64 {
@@ -1058,5 +1106,26 @@ mod tests {
             error_fingerprint(&call, &result(3)),
             error_fingerprint(&call, &result(97))
         );
+    }
+
+    #[test]
+    fn usage_accumulation_saturates_all_response_counters() {
+        let mut total = Usage {
+            input_tokens: u64::MAX,
+            ..Usage::default()
+        };
+        let next = Usage {
+            input_tokens: 1,
+            cached_input_tokens: 2,
+            output_tokens: 3,
+            reasoning_output_tokens: 4,
+            total_tokens: 5,
+        };
+        accumulate_usage(&mut total, &next);
+        assert_eq!(total.input_tokens, u64::MAX);
+        assert_eq!(total.cached_input_tokens, 2);
+        assert_eq!(total.output_tokens, 3);
+        assert_eq!(total.reasoning_output_tokens, 4);
+        assert_eq!(total.total_tokens, 5);
     }
 }
