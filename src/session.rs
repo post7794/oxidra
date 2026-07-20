@@ -32,6 +32,9 @@ pub struct JournalEvent {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionHeader {
+    /// Binary version that created this session. Missing in pre-M3 journals.
+    #[serde(default = "legacy_session_version")]
+    pub version: String,
     pub project_root: PathBuf,
     pub model: String,
     #[serde(flatten)]
@@ -41,11 +44,16 @@ pub struct SessionHeader {
 impl SessionHeader {
     pub fn new(project_root: impl Into<PathBuf>, model: impl Into<String>) -> Self {
         Self {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
             project_root: project_root.into(),
             model: model.into(),
             extra: Map::new(),
         }
     }
+}
+
+fn legacy_session_version() -> String {
+    "pre-v0.1".to_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1436,5 +1444,19 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].kind, "user.message");
         assert!(store.inspect("missing").is_err());
+    }
+
+    #[test]
+    fn legacy_session_header_gets_pre_v01_version() {
+        let header: SessionHeader = serde_json::from_value(json!({
+            "project_root": "project",
+            "model": "test-model",
+        }))
+        .unwrap();
+        assert_eq!(header.version, "pre-v0.1");
+        assert_eq!(
+            SessionHeader::new("project", "test-model").version,
+            env!("CARGO_PKG_VERSION")
+        );
     }
 }
