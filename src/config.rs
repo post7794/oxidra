@@ -13,11 +13,22 @@ pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 pub const DEFAULT_RESERVE_TOKENS: u64 = 16_384;
 pub const DEFAULT_API_BASE_URL: &str = "https://api.openai.com/v1/";
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ProviderConfig {
     pub api_key: String,
     pub api_base_url: Url,
     pub model: String,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderConfig")
+            .field("api_key", &"<redacted>")
+            .field("api_base_url", &self.api_base_url)
+            .field("model", &self.model)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +243,18 @@ mod tests {
             config.responses_url().unwrap().as_str(),
             "https://example.test/v1/responses"
         );
+    }
+
+    #[test]
+    fn provider_config_debug_redacts_api_key() {
+        let config = ProviderConfig {
+            api_key: "sk-super-secret".to_owned(),
+            api_base_url: Url::parse("https://example.test/v1/").unwrap(),
+            model: DEFAULT_MODEL.to_owned(),
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("sk-super-secret"));
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]

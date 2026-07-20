@@ -471,6 +471,23 @@ async fn resolve_in_doubt_async(
     resolve_reported_in_doubt(journal, pending)
 }
 
+/// REPL variant: declining resolution keeps the session open. The unresolved
+/// in-doubt calls still block the next turn, so nothing is silently lost.
+async fn resolve_in_doubt_or_stay(
+    journal: &mut SessionJournal,
+    input: &mut StdinLines,
+) -> Result<()> {
+    match resolve_in_doubt_async(journal, input).await {
+        Err(OxidraError::ApprovalRequired(_)) => {
+            eprintln!(
+                "In-doubt calls remain unresolved; the next turn will ask again. Use exit to leave."
+            );
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 fn report_in_doubt(journal: &SessionJournal) -> Result<Vec<InDoubtTool>> {
     let pending = journal.in_doubt()?;
     if pending.is_empty() {
@@ -638,7 +655,7 @@ async fn run_repl(
             Err(OxidraError::Interrupted) => {
                 eprintln!("^C current turn cancelled");
                 if !agent.journal().in_doubt()?.is_empty() {
-                    resolve_in_doubt_async(agent.journal_mut(), &mut input).await?;
+                    resolve_in_doubt_or_stay(agent.journal_mut(), &mut input).await?;
                 }
             }
             Err(OxidraError::ResponseAborted(message)) => {
@@ -646,7 +663,13 @@ async fn run_repl(
             }
             Err(OxidraError::Tool { code, message }) if code == "in_doubt" => {
                 eprintln!("[tool] {message}");
-                resolve_in_doubt_async(agent.journal_mut(), &mut input).await?;
+                resolve_in_doubt_or_stay(agent.journal_mut(), &mut input).await?;
+            }
+            Err(OxidraError::ApprovalRequired(message)) => {
+                eprintln!("[session] {message}");
+                if !agent.journal().in_doubt()?.is_empty() {
+                    resolve_in_doubt_or_stay(agent.journal_mut(), &mut input).await?;
+                }
             }
             Err(error) => return Err(error),
         }

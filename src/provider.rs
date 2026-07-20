@@ -20,6 +20,7 @@ use crate::error::{OxidraError, Result};
 use crate::types::{AssistantTurn, ToolCall, ToolDefinition, Usage};
 
 const MAX_ATTEMPTS: usize = 3;
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_ERROR_BODY: usize = 64 * 1024;
 const MAX_RESPONSE_EVENT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESPONSE_TEXT_BYTES: usize = 4 * 1024 * 1024;
@@ -105,6 +106,10 @@ impl OpenAiResponsesProvider {
     pub fn new(config: ProviderConfig) -> Result<Self> {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(30))
+            // Idle timeout per socket read: streaming deltas and keep-alive
+            // frames reset it, so long responses are unaffected while a hung
+            // server surfaces as a normal transport error.
+            .read_timeout(READ_IDLE_TIMEOUT)
             .build()
             .map_err(|error| {
                 OxidraError::Provider(format!("cannot create HTTP client: {error}"))
