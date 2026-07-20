@@ -304,6 +304,26 @@ fn resume_replays_complete_output_items_across_processes() {
     for directory in [&local_data, &roaming_data, &xdg_config, &xdg_state] {
         fs::create_dir_all(directory).expect("create isolated user directory");
     }
+    let data_dir = if cfg!(windows) {
+        local_data.join("oxidra")
+    } else if cfg!(target_os = "macos") {
+        user_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("oxidra")
+    } else {
+        xdg_state.join("oxidra")
+    };
+    let memory_dir = data_dir.join("memory");
+    fs::create_dir_all(&memory_dir).expect("create memory directory");
+    let memory_path = memory_dir.join("00000000-0000-0000-0000-000000000001.md");
+    fs::write(&memory_path, "first memory version").expect("write initial memory");
+    fs::write(
+        memory_dir.join("00000000-0000-0000-0000-000000000002.md"),
+        "x".repeat(16 * 1024),
+    )
+    .expect("write memory that cannot fit injection budget");
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind resume server");
     let address = listener.local_addr().expect("read resume server address");
@@ -361,12 +381,14 @@ fn resume_replays_complete_output_items_across_processes() {
         String::from_utf8_lossy(&first.stderr)
     );
     let first_stderr = String::from_utf8(first.stderr).expect("first stderr is UTF-8");
+    assert!(first_stderr.contains("1 memory item(s) were not injected."));
     let session_id = first_stderr
         .lines()
         .find_map(|line| line.strip_prefix("Oxidra session "))
         .and_then(|line| line.split_once(" (root:").map(|(id, _)| id.to_owned()))
         .unwrap_or_else(|| panic!("missing session id in stderr:\n{first_stderr}"));
 
+    fs::write(&memory_path, "current memory version").expect("update memory before resume");
     let second = run("second prompt", Some(&session_id));
     assert!(
         second.status.success(),
@@ -378,17 +400,6 @@ fn resume_replays_complete_output_items_across_processes() {
         .expect("resume server panicked")
         .expect("resume server failed");
 
-    let data_dir = if cfg!(windows) {
-        local_data.join("oxidra")
-    } else if cfg!(target_os = "macos") {
-        user_home
-            .path()
-            .join("Library")
-            .join("Application Support")
-            .join("oxidra")
-    } else {
-        xdg_state.join("oxidra")
-    };
     let journal_path = data_dir
         .join("sessions")
         .join(format!("{session_id}.jsonl"));
@@ -399,14 +410,30 @@ fn resume_replays_complete_output_items_across_processes() {
         .filter(|event| event["kind"] == "context.instructions")
         .collect::<Vec<_>>();
     assert_eq!(instruction_snapshots.len(), 2);
-    assert!(instruction_snapshots.iter().all(|event| {
-        event["data"]["instructions"]
-            .as_str()
-            .is_some_and(|text| text.contains("You are Oxidra"))
-    }));
+    let first_snapshot = instruction_snapshots[0]["data"]["instructions"]
+        .as_str()
+        .expect("first instructions snapshot");
+    let second_snapshot = instruction_snapshots[1]["data"]["instructions"]
+        .as_str()
+        .expect("second instructions snapshot");
+    assert!(first_snapshot.contains("first memory version"));
+    assert!(!first_snapshot.contains(&"x".repeat(64)));
+    assert!(!first_snapshot.contains("current memory version"));
+    assert!(second_snapshot.contains("current memory version"));
+    assert!(!second_snapshot.contains("first memory version"));
 
     let captured = captured.lock().expect("lock resume requests");
     assert_eq!(captured.len(), 2);
+    assert!(
+        captured[0].body["instructions"]
+            .as_str()
+            .is_some_and(|text| text.contains("first memory version"))
+    );
+    assert!(
+        captured[1].body["instructions"]
+            .as_str()
+            .is_some_and(|text| text.contains("current memory version"))
+    );
     let input = captured[1].body["input"]
         .as_array()
         .expect("resumed request input is an array");
@@ -424,6 +451,131 @@ fn resume_replays_complete_output_items_across_processes() {
         input
             .iter()
             .any(|item| { item["role"] == "user" && item["content"] == "second prompt" })
+    );
+}
+
+#[test]
+fn memory_management_is_local_and_needs_no_api_key() {
+    let user_home = tempfile::tempdir().expect("create isolated user data directory");
+    let local_data = user_home.path().join("local");
+    let roaming_data = user_home.path().join("roaming");
+    let xdg_config = user_home.path().join("config");
+    let xdg_state = user_home.path().join("state");
+    for directory in [&local_data, &roaming_data, &xdg_config, &xdg_state] {
+        fs::create_dir_all(directory).expect("create isolated user directory");
+    }
+    let data_dir = if cfg!(windows) {
+        local_data.join("oxidra")
+    } else if cfg!(target_os = "macos") {
+        user_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("oxidra")
+    } else {
+        xdg_state.join("oxidra")
+    };
+    let memory_dir = data_dir.join("memory");
+    fs::create_dir_all(&memory_dir).expect("create memory directory");
+    let id = "00000000-0000-0000-0000-000000000001";
+    fs::write(memory_dir.join(format!("{id}.md")), "local memory").expect("write memory");
+
+    let run = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_oxidra"));
+        command
+            .args(args)
+            .env_remove("API_KEY")
+            .env_remove("OPENAI_API_KEY")
+            .env("LOCALAPPDATA", &local_data)
+            .env("APPDATA", &roaming_data)
+            .env("XDG_CONFIG_HOME", &xdg_config)
+            .env("XDG_STATE_HOME", &xdg_state)
+            .env("HOME", user_home.path())
+            .env("USERPROFILE", user_home.path())
+            .output()
+            .expect("run memory management command")
+    };
+
+    let list = run(&["memory", "list"]);
+    assert!(list.status.success());
+    assert!(String::from_utf8_lossy(&list.stdout).contains(id));
+
+    let show = run(&["memory", "show", id]);
+    assert!(show.status.success());
+    assert_eq!(String::from_utf8_lossy(&show.stdout).trim(), "local memory");
+
+    let forget = run(&["memory", "forget", id]);
+    assert!(forget.status.success());
+    assert!(!memory_dir.join(format!("{id}.md")).exists());
+}
+
+#[test]
+fn full_auto_does_not_approve_persistent_memory() {
+    let project = tempfile::tempdir().expect("create temporary project");
+    let user_home = tempfile::tempdir().expect("create isolated user data directory");
+    let local_data = user_home.path().join("local");
+    let roaming_data = user_home.path().join("roaming");
+    let xdg_config = user_home.path().join("config");
+    let xdg_state = user_home.path().join("state");
+    for directory in [&local_data, &roaming_data, &xdg_config, &xdg_state] {
+        fs::create_dir_all(directory).expect("create isolated user directory");
+    }
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind remember server");
+    let address = listener.local_addr().expect("read remember server address");
+    let server = thread::spawn(move || -> Result<(), String> {
+        let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+        let _request = read_http_request(&mut stream)?;
+        let body = tool_call_sse(
+            "resp_remember",
+            "item_remember",
+            "call_remember",
+            "remember",
+            json!({"content": "persist this"}),
+        );
+        write_http_response(&mut stream, "200 OK", "text/event-stream", &body)
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oxidra"))
+        .arg("-p")
+        .arg("remember this")
+        .arg("--full-auto")
+        .arg("--cwd")
+        .arg(project.path())
+        .env("API_KEY", "fake")
+        .env("API_BASE_URL", format!("http://{address}/v1/"))
+        .env("LOCALAPPDATA", &local_data)
+        .env("APPDATA", &roaming_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .expect("run non-interactive remember");
+    server
+        .join()
+        .expect("remember server panicked")
+        .expect("remember server failed");
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("approval required"));
+    let data_dir = if cfg!(windows) {
+        local_data.join("oxidra")
+    } else if cfg!(target_os = "macos") {
+        user_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("oxidra")
+    } else {
+        xdg_state.join("oxidra")
+    };
+    assert!(
+        fs::read_dir(data_dir.join("memory"))
+            .expect("read memory directory")
+            .next()
+            .is_none()
     );
 }
 
@@ -460,6 +612,9 @@ fn serve_responses(
             }
             Err(error) => return Err(format!("accept request: {error}")),
         };
+        stream
+            .set_nonblocking(false)
+            .map_err(|error| format!("set request blocking mode: {error}"))?;
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(|error| format!("set request timeout: {error}"))?;

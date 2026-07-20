@@ -92,8 +92,18 @@ Useful options:
     --max-tools <N>        optional per-turn insurance limit
 ```
 
+Memory management is local and does not require an API key:
+
+```text
+oxidra memory list
+oxidra memory show <ID>
+oxidra memory forget <ID>
+```
+
 Session journals and shell artifacts are stored in the platform user-data
 directory, never in the project. A session id is printed on startup.
+Persistent memories are stored as plain Markdown under the same user-data
+directory and are injected only after deterministic size packing.
 
 ## Verification
 

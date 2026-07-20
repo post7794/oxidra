@@ -44,6 +44,12 @@ pub trait ApprovalHandler: Send {
         command: &str,
         cancellation: &CancellationToken,
     ) -> Result<bool>;
+
+    async fn approve_memory(
+        &mut self,
+        content: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<bool>;
 }
 
 #[derive(Default)]
@@ -54,6 +60,14 @@ impl ApprovalHandler for DenyApproval {
     async fn approve_shell(
         &mut self,
         _command: &str,
+        _cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
+    async fn approve_memory(
+        &mut self,
+        _content: &str,
         _cancellation: &CancellationToken,
     ) -> Result<bool> {
         Ok(false)
@@ -369,11 +383,21 @@ impl Agent {
         } else {
             false
         };
+        let memory_approved = if call.name == "remember" {
+            let content = call
+                .arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            approval.approve_memory(content, &cancellation).await?
+        } else {
+            false
+        };
 
         // Authorization is a decision point, not tool execution.  Record
         // `tool.started` only after approval succeeds so a crash while the
-        // prompt is waiting cannot turn an unexecuted shell command into an
-        // in-doubt side effect.
+        // prompt is waiting cannot turn an unexecuted persistent action into
+        // an in-doubt side effect.
         if cancellation.is_cancelled() {
             let result =
                 ToolResult::error(&call.id, "cancelled", "tool was cancelled before start");
@@ -401,6 +425,15 @@ impl Agent {
             self.commit_tool_completed(turn_id, call, &result, observer)?;
             return Ok(result);
         }
+        if call.name == "remember" && !memory_approved {
+            let result = ToolResult::error(
+                &call.id,
+                "approval_required",
+                "remember requires user confirmation",
+            );
+            self.commit_tool_completed(turn_id, call, &result, observer)?;
+            return Ok(result);
+        }
 
         observer.on_tool_started(call)?;
         self.journal.append_and_sync(
@@ -413,7 +446,9 @@ impl Agent {
             }),
         )?;
 
-        let context = ToolContext::new(cancellation.clone()).with_shell_approval(shell_approved);
+        let context = ToolContext::new(cancellation.clone())
+            .with_shell_approval(shell_approved)
+            .with_memory_approval(memory_approved);
         let result = self.tools.execute(call, &context).await;
 
         if result.error_code.as_deref() == Some("in_doubt") {

@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{OxidraError, Result};
+use crate::memory::MemoryStore;
 use crate::process::ProcessTree;
 use crate::types::{ToolCall, ToolDefinition, ToolResult};
 
@@ -28,6 +29,7 @@ pub const MAX_SHELL_TIMEOUT_SECS: u64 = 3_600;
 pub struct ToolContext {
     pub cancellation: CancellationToken,
     pub shell_approved: bool,
+    pub memory_approved: bool,
 }
 
 impl ToolContext {
@@ -35,11 +37,17 @@ impl ToolContext {
         Self {
             cancellation,
             shell_approved: false,
+            memory_approved: false,
         }
     }
 
     pub fn with_shell_approval(mut self, approved: bool) -> Self {
         self.shell_approved = approved;
+        self
+    }
+
+    pub fn with_memory_approval(mut self, approved: bool) -> Self {
+        self.memory_approved = approved;
         self
     }
 }
@@ -54,6 +62,7 @@ impl Default for ToolContext {
 pub struct BuiltinTools {
     root: PathBuf,
     artifact_dir: PathBuf,
+    memory: MemoryStore,
     full_auto: bool,
     interactive: bool,
 }
@@ -62,6 +71,7 @@ impl BuiltinTools {
     pub fn new(
         root: impl AsRef<Path>,
         artifact_dir: impl AsRef<Path>,
+        memory_dir: impl AsRef<Path>,
         full_auto: bool,
         interactive: bool,
     ) -> Result<Self> {
@@ -90,10 +100,12 @@ impl BuiltinTools {
                 format!("failed to resolve artifact directory: {error}"),
             )
         })?;
+        let memory = MemoryStore::new(memory_dir.as_ref().to_owned())?;
 
         Ok(Self {
             root,
             artifact_dir,
+            memory,
             full_auto,
             interactive,
         })
@@ -108,6 +120,7 @@ impl BuiltinTools {
             "read" => self.read(call, context).await,
             "edit" => self.edit(call, context).await,
             "write" => self.write(call, context).await,
+            "remember" => self.remember(call, context).await,
             "shell" => self.shell(call, context).await,
             _ => ToolResult::error(
                 &call.id,
@@ -515,6 +528,33 @@ impl BuiltinTools {
         )
     }
 
+    async fn remember(&self, call: &ToolCall, context: &ToolContext) -> ToolResult {
+        let args: RememberArgs = match parse_arguments(call) {
+            Ok(args) => args,
+            Err(result) => return result,
+        };
+        if context.cancellation.is_cancelled() {
+            return ToolResult::error(&call.id, "cancelled", "remember was cancelled");
+        }
+        if !context.memory_approved {
+            return ToolResult::error(
+                &call.id,
+                "approval_required",
+                "remember requires user confirmation",
+            );
+        }
+        match self.memory.remember(&args.content) {
+            Ok(entry) => ToolResult::success(
+                &call.id,
+                json!({
+                    "id": entry.id,
+                    "bytes": entry.bytes,
+                }),
+            ),
+            Err(error) => error_result(&call.id, error),
+        }
+    }
+
     async fn shell(&self, call: &ToolCall, context: &ToolContext) -> ToolResult {
         let args: ShellArgs = match parse_arguments(call) {
             Ok(args) => args,
@@ -893,6 +933,22 @@ impl BuiltinTools {
                 }),
             },
             ToolDefinition {
+                name: "remember".to_owned(),
+                description: "Persist one user-approved memory as a local Markdown file for future Oxidra sessions.".to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "The exact memory text to persist."
+                        },
+                    },
+                    "required": ["content"],
+                }),
+            },
+            ToolDefinition {
                 name: "shell".to_owned(),
                 description: format!(
                     "Run a command from the project root using {}. Output is bounded; full truncated output is saved as an artifact.",
@@ -939,6 +995,12 @@ struct EditArgs {
 #[serde(deny_unknown_fields)]
 struct WriteArgs {
     path: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RememberArgs {
     content: String,
 }
 
@@ -1344,8 +1406,14 @@ mod tests {
     fn harness() -> (TempDir, TempDir, BuiltinTools) {
         let root = TempDir::new().expect("root tempdir");
         let artifacts = TempDir::new().expect("artifact tempdir");
-        let tools = BuiltinTools::new(root.path(), artifacts.path(), true, false)
-            .expect("construct built-in tools");
+        let tools = BuiltinTools::new(
+            root.path(),
+            artifacts.path(),
+            artifacts.path().join("memory"),
+            true,
+            false,
+        )
+        .expect("construct built-in tools");
         (root, artifacts, tools)
     }
 
@@ -1568,6 +1636,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remember_requires_approval_and_persists_plain_text() {
+        let (_root, _artifacts, tools) = harness();
+        let call = call("remember", json!({ "content": "prefer focused changes" }));
+
+        let denied = tools.execute(&call, &ToolContext::default()).await;
+        assert!(denied.is_error);
+        assert_eq!(denied.error_code.as_deref(), Some("approval_required"));
+        assert!(tools.memory.list().unwrap().is_empty());
+
+        let approved = ToolContext::default().with_memory_approval(true);
+        let result = tools.execute(&call, &approved).await;
+        assert!(!result.is_error, "{result:?}");
+        let id = result.output["id"].as_str().unwrap();
+        assert_eq!(tools.memory.show(id).unwrap(), "prefer focused changes");
+    }
+
+    #[tokio::test]
     async fn read_truncates_at_line_limit_and_returns_full_hash() {
         use std::fmt::Write as _;
 
@@ -1626,7 +1711,7 @@ mod tests {
     fn definitions_have_closed_object_schemas() {
         let (_root, _artifacts, tools) = harness();
         let definitions = tools.definitions();
-        assert_eq!(definitions.len(), 4);
+        assert_eq!(definitions.len(), 5);
         for definition in definitions {
             assert_eq!(definition.input_schema["type"], "object");
             assert_eq!(definition.input_schema["additionalProperties"], false);

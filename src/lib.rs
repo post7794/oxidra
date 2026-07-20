@@ -2,6 +2,7 @@ pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod error;
+mod memory;
 mod process;
 pub mod provider;
 mod render;
