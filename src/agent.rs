@@ -17,7 +17,7 @@ use crate::config::ContextLimits;
 use crate::error::{OxidraError, Result};
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{JournalEvent, SessionJournal};
-use crate::tools::{ToolContext, ToolExecutor};
+use crate::tools::{BuiltinTools, ToolContext};
 use crate::types::{ToolCall, ToolResult};
 
 const MAX_PROJECT_INSTRUCTIONS: usize = 32 * 1024;
@@ -71,7 +71,7 @@ pub struct TurnOutcome {
 pub struct Agent {
     provider: Arc<dyn ResponseProvider>,
     journal: SessionJournal,
-    tools: Arc<dyn ToolExecutor>,
+    tools: BuiltinTools,
     instructions: String,
     context_limits: ContextLimits,
     max_responses: Option<usize>,
@@ -82,7 +82,7 @@ impl Agent {
     pub fn new(
         provider: Arc<dyn ResponseProvider>,
         journal: SessionJournal,
-        tools: Arc<dyn ToolExecutor>,
+        tools: BuiltinTools,
         instructions: impl Into<String>,
         context_limits: ContextLimits,
         max_responses: Option<usize>,

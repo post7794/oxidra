@@ -128,12 +128,11 @@ async fn run(cli: Cli) -> Result<()> {
         full_auto,
         interactive,
     )?;
-    let tools = Arc::new(builtins);
     let provider = Arc::new(OpenAiResponsesProvider::new(provider_config)?);
     let mut agent = Agent::new(
         provider,
         journal,
-        tools,
+        builtins,
         instructions,
         context_limits,
         max_responses,

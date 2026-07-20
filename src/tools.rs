@@ -4,7 +4,6 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -49,13 +48,6 @@ impl Default for ToolContext {
     fn default() -> Self {
         Self::new(CancellationToken::new())
     }
-}
-
-#[async_trait]
-pub trait ToolExecutor: Send + Sync {
-    fn definitions(&self) -> Vec<ToolDefinition>;
-
-    async fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolResult;
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +97,24 @@ impl BuiltinTools {
             full_auto,
             interactive,
         })
+    }
+
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        Self::tool_definitions()
+    }
+
+    pub async fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolResult {
+        match call.name.as_str() {
+            "read" => self.read(call, context).await,
+            "edit" => self.edit(call, context).await,
+            "write" => self.write(call, context).await,
+            "shell" => self.shell(call, context).await,
+            _ => ToolResult::error(
+                &call.id,
+                "validation_error",
+                format!("unknown built-in tool: {}", call.name),
+            ),
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -904,27 +914,6 @@ impl BuiltinTools {
                 }),
             },
         ]
-    }
-}
-
-#[async_trait]
-impl ToolExecutor for BuiltinTools {
-    fn definitions(&self) -> Vec<ToolDefinition> {
-        Self::tool_definitions()
-    }
-
-    async fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolResult {
-        match call.name.as_str() {
-            "read" => self.read(call, context).await,
-            "edit" => self.edit(call, context).await,
-            "write" => self.write(call, context).await,
-            "shell" => self.shell(call, context).await,
-            _ => ToolResult::error(
-                &call.id,
-                "validation_error",
-                format!("unknown built-in tool: {}", call.name),
-            ),
-        }
     }
 }
 

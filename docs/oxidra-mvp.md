@@ -1,8 +1,8 @@
 # Oxidra 个人 CLI Agent 设计
 
-状态：M1 已实现。Windows、Linux、macOS CI 通过。当前主线定位为个人使用的轻量 coding agent，不维护第三方插件生态。
+状态：M1 已实现。Windows、Linux、macOS CI 通过。当前主线定位为个人使用的轻量 coding agent，不包含扩展系统。
 
-历史 MCP 实验实现保存在 Git tag `archive/mcp-mvp`。它不属于当前产品范围；未来只有出现真实扩展需求时，才按届时正式协议重新评估。
+已删除的协议实验代码仅作为历史源码保存在 Git tag `archive/mcp-mvp`，主线不为其保留兼容层或扩展接口。
 
 ## 1. 产品边界
 
@@ -29,7 +29,7 @@
 
 暂不实现：
 
-- 第三方工具协议、插件安装器和 registry。
+- 扩展系统、插件安装器和 registry。
 - Goal mode、compaction、sub-agent。
 - TUI、steering/follow-up 队列。
 - delete/move 等更多文件工具。
@@ -56,13 +56,13 @@
 CLI
   -> Agent loop
       -> Responses provider
-      -> Builtin ToolExecutor
+      -> BuiltinTools
       -> Approval policy
       -> Session journal
       -> Context projector
 ```
 
-Rust traits 是内部实现契约，不承诺第三方 Rust ABI。外部扩展系统当前不存在。
+Agent 直接持有 `BuiltinTools`，不提供工具注册器、动态工具接口或第三方 ABI。
 
 ## 4. Provider
 

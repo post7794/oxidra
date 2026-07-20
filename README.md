@@ -110,6 +110,5 @@ cancellation returns promptly, and project-root boundaries hold across file
 tools. CI runs Rust 1.85 on Windows, Linux, and macOS via
 `.github/workflows/ci.yml`.
 
-External plugin support is intentionally out of scope for the personal-tool
-mainline. The previous implementation remains available at the
-`archive/mcp-mvp` tag and can be reconsidered if a concrete need appears.
+Oxidra has no extension system. The removed experimental implementation is
+retained only as historical source at the `archive/mcp-mvp` tag.
