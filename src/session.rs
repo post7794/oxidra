@@ -187,12 +187,29 @@ impl SessionStore {
 
     /// Permanently deletes a session journal and its shell artifacts. The
     /// session lock prevents deletion while another process has it open.
+    ///
+    /// The journal is first renamed to a `.jsonl.deleting` tombstone so that a
+    /// partial failure can never leave a discoverable session whose artifacts
+    /// are already gone; a later delete of the same id resumes the cleanup.
     pub fn delete(&self, session_id: &str) -> Result<bool> {
         validate_session_id(session_id)?;
-        let _lock_file = acquire_lock(&self.layout, session_id)?;
         let journal_path = self.layout.journal_path(session_id)?;
-        if !journal_path.is_file() {
+        let tombstone_path = journal_path.with_extension("jsonl.deleting");
+        // Check before locking so a mistyped id does not manufacture a lock file.
+        if !journal_path.is_file() && !tombstone_path.is_file() {
             return Ok(false);
+        }
+        let lock_file = acquire_lock(&self.layout, session_id)?;
+        if !journal_path.is_file() && !tombstone_path.is_file() {
+            release_and_remove_lock(&self.layout, session_id, lock_file);
+            return Ok(false);
+        }
+
+        if journal_path.is_file() {
+            if tombstone_path.is_file() {
+                fs::remove_file(&tombstone_path)?;
+            }
+            fs::rename(&journal_path, &tombstone_path)?;
         }
 
         let artifact_dir = self.layout.artifact_dir(session_id)?;
@@ -207,7 +224,8 @@ impl SessionStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        fs::remove_file(journal_path)?;
+        fs::remove_file(&tombstone_path)?;
+        release_and_remove_lock(&self.layout, session_id, lock_file);
         Ok(true)
     }
 
@@ -609,6 +627,16 @@ fn acquire_lock(layout: &SessionLayout, session_id: &str) -> Result<File> {
         ))
     })?;
     Ok(file)
+}
+
+/// Best-effort removal of a lock file whose session no longer exists. The
+/// lock must be released first or Windows refuses to delete the open file; a
+/// racing writer re-creates the lock file anyway, so failure here is harmless.
+fn release_and_remove_lock(layout: &SessionLayout, session_id: &str, lock_file: File) {
+    drop(lock_file);
+    if let Ok(path) = layout.lock_path(session_id) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 struct JournalScan {
@@ -1151,7 +1179,38 @@ mod tests {
         assert!(store.delete("deletable").unwrap());
         assert!(!journal_path.exists());
         assert!(!artifact_dir.exists());
+        assert!(!store.layout().lock_path("deletable").unwrap().exists());
         assert!(!store.delete("deletable").unwrap());
+    }
+
+    #[test]
+    fn deleting_a_missing_session_leaves_no_lock_file() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        assert!(!store.delete("never-existed").unwrap());
+        assert!(!store.layout().lock_path("never-existed").unwrap().exists());
+    }
+
+    #[test]
+    fn delete_resumes_cleanup_from_a_leftover_tombstone() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let journal = store
+            .create_with_id("half-deleted", header(temp.path()))
+            .unwrap();
+        let journal_path = journal.journal_path().to_owned();
+        let artifact_dir = journal.artifact_dir().to_owned();
+        drop(journal);
+
+        // Simulate a delete that failed after the tombstone rename.
+        let tombstone = journal_path.with_extension("jsonl.deleting");
+        fs::rename(&journal_path, &tombstone).unwrap();
+        assert!(store.list().unwrap().is_empty());
+
+        assert!(store.delete("half-deleted").unwrap());
+        assert!(!tombstone.exists());
+        assert!(!journal_path.exists());
+        assert!(!artifact_dir.exists());
     }
 
     #[test]
