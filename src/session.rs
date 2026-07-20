@@ -191,6 +191,14 @@ impl SessionStore {
     /// The journal is first renamed to a `.jsonl.deleting` tombstone so that a
     /// partial failure can never leave a discoverable session whose artifacts
     /// are already gone; a later delete of the same id resumes the cleanup.
+    ///
+    /// The lock file is deliberately left in place. Journal, artifacts, and
+    /// lock live in three separate paths, so plain file operations cannot
+    /// delete all of them atomically: removing the lock last leaves a crash
+    /// window with an orphan lock nothing will clean up, and unlink-after-drop
+    /// races a concurrent open of the same id into two independent lock
+    /// inodes on Unix. An empty leftover lock file is harmless and is reused
+    /// by any future session with the same id.
     pub fn delete(&self, session_id: &str) -> Result<bool> {
         validate_session_id(session_id)?;
         let journal_path = self.layout.journal_path(session_id)?;
@@ -199,9 +207,8 @@ impl SessionStore {
         if !journal_path.is_file() && !tombstone_path.is_file() {
             return Ok(false);
         }
-        let lock_file = acquire_lock(&self.layout, session_id)?;
+        let _lock_file = acquire_lock(&self.layout, session_id)?;
         if !journal_path.is_file() && !tombstone_path.is_file() {
-            release_and_remove_lock(&self.layout, session_id, lock_file);
             return Ok(false);
         }
 
@@ -225,7 +232,6 @@ impl SessionStore {
             Err(error) => return Err(error.into()),
         }
         fs::remove_file(&tombstone_path)?;
-        release_and_remove_lock(&self.layout, session_id, lock_file);
         Ok(true)
     }
 
@@ -627,16 +633,6 @@ fn acquire_lock(layout: &SessionLayout, session_id: &str) -> Result<File> {
         ))
     })?;
     Ok(file)
-}
-
-/// Best-effort removal of a lock file whose session no longer exists. The
-/// lock must be released first or Windows refuses to delete the open file; a
-/// racing writer re-creates the lock file anyway, so failure here is harmless.
-fn release_and_remove_lock(layout: &SessionLayout, session_id: &str, lock_file: File) {
-    drop(lock_file);
-    if let Ok(path) = layout.lock_path(session_id) {
-        let _ = fs::remove_file(path);
-    }
 }
 
 struct JournalScan {
@@ -1179,8 +1175,12 @@ mod tests {
         assert!(store.delete("deletable").unwrap());
         assert!(!journal_path.exists());
         assert!(!artifact_dir.exists());
-        assert!(!store.layout().lock_path("deletable").unwrap().exists());
         assert!(!store.delete("deletable").unwrap());
+        // The leftover lock file is deliberate and must not block re-creating
+        // a session with the same id.
+        store
+            .create_with_id("deletable", header(temp.path()))
+            .unwrap();
     }
 
     #[test]
