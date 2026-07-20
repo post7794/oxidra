@@ -994,6 +994,12 @@ mod tests {
                 "turn.cancelled",
                 json!({"reason":"cancelled after tool"}),
             ),
+            event(
+                5,
+                "turn-1",
+                "context.instructions",
+                json!({"instructions":"You are Oxidra..."}),
+            ),
         ]);
         assert_eq!(projected.len(), 4);
         assert_eq!(projected[2]["type"], "function_call_output");
