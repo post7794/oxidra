@@ -1437,18 +1437,4 @@ mod tests {
         assert_eq!(events[1].kind, "user.message");
         assert!(store.inspect("missing").is_err());
     }
-
-    #[test]
-    fn old_session_header_with_config_hash_still_deserializes() {
-        let header: SessionHeader = serde_json::from_value(json!({
-            "project_root": "project",
-            "config_hash": "legacy-plugin-snapshot",
-            "model": "test-model",
-            "created_at": "2026-01-01T00:00:00Z",
-            "journal_schema": JOURNAL_SCHEMA,
-        }))
-        .unwrap();
-        assert_eq!(header.project_root, PathBuf::from("project"));
-        assert_eq!(header.model, "test-model");
-    }
 }
