@@ -56,13 +56,28 @@ commands, so this installation path is intended for a public GitHub repository.
 
 ### Run
 
-Set the API credential in the environment. `API_KEY` is the primary variable;
-`OPENAI_API_KEY` is accepted as a compatibility fallback.
+Set the API credential in the environment or in the user config file. `API_KEY`
+is the primary variable; `OPENAI_API_KEY` is accepted as a compatibility
+fallback. Environment variables take precedence over `config.toml`.
 
 ```powershell
 $env:API_KEY = "..."
 cargo run -- -p "修复当前项目的测试并运行验证" --full-auto
 ```
+
+The persistent config file is `%APPDATA%\oxidra\config.toml` on Windows:
+
+```toml
+[provider]
+api_key = "sk-..."
+api_base_url = "https://api.openai.com/v1"
+model = "gpt-5.6-sol"
+```
+
+`api_key` is stored as plain text and should not be committed or shared. The
+environment variables `API_KEY`, `API_BASE_URL`, and `MODEL` override these
+provider values. `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_MODEL` remain
+an all-or-nothing compatibility fallback group.
 
 Interactive mode shows streamed assistant text on stdout and tool/provider
 diagnostics on stderr:

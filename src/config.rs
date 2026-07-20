@@ -36,21 +36,22 @@ pub struct ProjectContext {
     pub root: PathBuf,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserConfig {
     provider: Option<UserProviderConfig>,
     context: Option<UserContextConfig>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserProviderConfig {
+    api_key: Option<String>,
     api_base_url: Option<String>,
     model: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserContextConfig {
     context_window: Option<u64>,
@@ -81,6 +82,10 @@ impl ProviderConfig {
         let user = load_user_config()?;
         let user_provider = user.provider.unwrap_or_default();
 
+        let configured_key = user_provider
+            .api_key
+            .clone()
+            .filter(|value| !value.trim().is_empty());
         let primary_key = cli_api_key.or_else(|| nonempty_env("API_KEY"));
         let (api_key, env_base_url, env_model) = if let Some(key) = primary_key {
             (key, nonempty_env("API_BASE_URL"), nonempty_env("MODEL"))
@@ -90,9 +95,11 @@ impl ProviderConfig {
                 nonempty_env("OPENAI_BASE_URL"),
                 nonempty_env("OPENAI_MODEL"),
             )
+        } else if let Some(key) = configured_key {
+            (key, nonempty_env("API_BASE_URL"), nonempty_env("MODEL"))
         } else {
             return Err(OxidraError::Config(
-                "missing API_KEY (or OPENAI_API_KEY fallback)".to_owned(),
+                "missing API_KEY, OPENAI_API_KEY, or [provider].api_key".to_owned(),
             ));
         };
 
@@ -168,7 +175,17 @@ fn load_user_config() -> Result<UserConfig> {
         return Ok(UserConfig::default());
     }
     let text = fs::read_to_string(&path)?;
-    Ok(toml::from_str(&text)?)
+    parse_user_config(&path, &text)
+}
+
+fn parse_user_config(path: &Path, text: &str) -> Result<UserConfig> {
+    toml::from_str(text).map_err(|error: toml::de::Error| {
+        OxidraError::Config(format!(
+            "invalid user config {}: {}",
+            path.display(),
+            error.message()
+        ))
+    })
 }
 
 fn user_config_dir() -> Result<PathBuf> {
@@ -255,6 +272,40 @@ mod tests {
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("sk-super-secret"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn parses_persistent_provider_credentials() {
+        let config = parse_user_config(
+            Path::new("config.toml"),
+            r#"
+                [provider]
+                api_key = "sk-config"
+                api_base_url = "https://example.test/v1"
+                model = "configured-model"
+            "#,
+        )
+        .unwrap();
+        let provider = config.provider.unwrap();
+        assert_eq!(provider.api_key.as_deref(), Some("sk-config"));
+        assert_eq!(
+            provider.api_base_url.as_deref(),
+            Some("https://example.test/v1")
+        );
+        assert_eq!(provider.model.as_deref(), Some("configured-model"));
+    }
+
+    #[test]
+    fn malformed_provider_key_is_not_echoed_in_parse_errors() {
+        let error = parse_user_config(
+            Path::new("config.toml"),
+            "[provider]\napi_key = sk-secret-without-quotes\n",
+        )
+        .err()
+        .unwrap();
+        let rendered = error.to_string();
+        assert!(rendered.contains("invalid user config"));
+        assert!(!rendered.contains("sk-secret-without-quotes"));
     }
 
     #[test]

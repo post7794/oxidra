@@ -178,6 +178,112 @@ fn cli_runs_read_edit_shell_and_replays_tool_outputs() {
 }
 
 #[test]
+fn provider_credentials_can_be_loaded_from_user_config() {
+    let project = tempfile::tempdir().expect("create temporary project");
+    let user_home = tempfile::tempdir().expect("create isolated user directory");
+    let local_data = user_home.path().join("local");
+    let roaming_data = user_home.path().join("roaming");
+    let xdg_config = user_home.path().join("config");
+    let xdg_state = user_home.path().join("state");
+    for directory in [&local_data, &roaming_data, &xdg_config, &xdg_state] {
+        fs::create_dir_all(directory).expect("create isolated user directory");
+    }
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind config server");
+    let address = listener.local_addr().expect("read config server address");
+    let server = thread::spawn(move || -> Result<CapturedRequest, String> {
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err("timed out waiting for configured provider request".to_owned());
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .map_err(|error| error.to_string())?;
+        let request = read_http_request(&mut stream)?;
+        let body = final_text_sse("resp_config", "configured");
+        write_http_response(&mut stream, "200 OK", "text/event-stream", &body)?;
+        Ok(request)
+    });
+
+    let config_dir = if cfg!(windows) {
+        roaming_data.join("oxidra")
+    } else if cfg!(target_os = "macos") {
+        user_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("oxidra")
+    } else {
+        xdg_config.join("oxidra")
+    };
+    fs::create_dir_all(&config_dir).expect("create config directory");
+    fs::write(
+        config_dir.join("config.toml"),
+        format!(
+            "[provider]\napi_key = \"config-secret\"\napi_base_url = \"http://{address}/v1\"\nmodel = \"config-model\"\n"
+        ),
+    )
+    .expect("write provider config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oxidra"))
+        .arg("-p")
+        .arg("use persistent configuration")
+        .arg("--cwd")
+        .arg(project.path())
+        .env_remove("API_KEY")
+        .env_remove("API_BASE_URL")
+        .env_remove("MODEL")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_MODEL")
+        .env("LOCALAPPDATA", &local_data)
+        .env("APPDATA", &roaming_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .expect("run Oxidra with provider config");
+
+    let request = server
+        .join()
+        .expect("config server panicked")
+        .expect("config server failed");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(
+        output.status.success(),
+        "Oxidra exited with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        stdout,
+        stderr
+    );
+    assert_eq!(stdout.trim(), "configured");
+    assert_eq!(request.target, "/v1/responses");
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer config-secret")
+    );
+    assert_eq!(request.body["model"], "config-model");
+    assert!(!stdout.contains("config-secret"));
+    assert!(!stderr.contains("config-secret"));
+}
+
+#[test]
 fn interactive_text_delta_is_visible_before_response_completed() {
     const STREAMED: &str = "streamed before completion";
 
