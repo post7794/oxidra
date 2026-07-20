@@ -185,6 +185,32 @@ impl SessionStore {
         parse_complete_events(&fs::read(path)?, session_id)
     }
 
+    /// Permanently deletes a session journal and its shell artifacts. The
+    /// session lock prevents deletion while another process has it open.
+    pub fn delete(&self, session_id: &str) -> Result<bool> {
+        validate_session_id(session_id)?;
+        let _lock_file = acquire_lock(&self.layout, session_id)?;
+        let journal_path = self.layout.journal_path(session_id)?;
+        if !journal_path.is_file() {
+            return Ok(false);
+        }
+
+        let artifact_dir = self.layout.artifact_dir(session_id)?;
+        match fs::symlink_metadata(&artifact_dir) {
+            Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(&artifact_dir)?,
+            Ok(_) => {
+                return Err(OxidraError::Session(format!(
+                    "artifact path is not a directory: {}",
+                    artifact_dir.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        fs::remove_file(journal_path)?;
+        Ok(true)
+    }
+
     pub fn create(&self, header: SessionHeader) -> Result<SessionJournal> {
         self.create_with_id(Uuid::now_v7().to_string(), header)
     }
@@ -1108,6 +1134,36 @@ mod tests {
         assert!(error.to_string().contains("already open"));
         drop(journal);
         store.open("locked").unwrap();
+    }
+
+    #[test]
+    fn deletes_session_journal_and_artifacts_after_releasing_lock() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let journal = store
+            .create_with_id("deletable", header(temp.path()))
+            .unwrap();
+        let journal_path = journal.journal_path().to_owned();
+        let artifact_dir = journal.artifact_dir().to_owned();
+        fs::write(artifact_dir.join("output.txt"), "artifact").unwrap();
+        drop(journal);
+
+        assert!(store.delete("deletable").unwrap());
+        assert!(!journal_path.exists());
+        assert!(!artifact_dir.exists());
+        assert!(!store.delete("deletable").unwrap());
+    }
+
+    #[test]
+    fn refuses_to_delete_an_open_session() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let journal = store
+            .create_with_id("open-delete", header(temp.path()))
+            .unwrap();
+        let error = store.delete("open-delete").unwrap_err();
+        assert!(error.to_string().contains("already open"));
+        drop(journal);
     }
 
     #[test]

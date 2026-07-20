@@ -84,6 +84,8 @@ enum SessionCommand {
     List,
     /// Print the canonical journal for a session.
     Show { session_id: String },
+    /// Permanently delete a session and its artifacts.
+    Delete { session_id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -221,6 +223,14 @@ fn run_session_command(command: SessionCommand) -> Result<()> {
         SessionCommand::Show { session_id } => {
             let events = store.inspect(&session_id)?;
             println!("{}", serde_json::to_string_pretty(&events)?);
+            Ok(())
+        }
+        SessionCommand::Delete { session_id } => {
+            if store.delete(&session_id)? {
+                println!("Deleted session {session_id}.");
+            } else {
+                println!("No session {session_id}.");
+            }
             Ok(())
         }
     }
@@ -1033,6 +1043,14 @@ mod tests {
             cli.command,
             Some(Command::Session {
                 command: SessionCommand::Show { session_id }
+            }) if session_id == "session-1"
+        ));
+
+        let cli = Cli::try_parse_from(["oxidra", "session", "delete", "session-1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session {
+                command: SessionCommand::Delete { session_id }
             }) if session_id == "session-1"
         ));
 

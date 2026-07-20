@@ -92,12 +92,13 @@ Useful options:
     --max-tools <N>        optional per-turn insurance limit
 ```
 
-Memory management is local and does not require an API key:
+Local management commands do not require an API key:
 
 ```text
 oxidra memory list
 oxidra memory show <ID>
 oxidra memory forget <ID>
+oxidra session delete <SESSION_ID>
 ```
 
 Session journals and shell artifacts are stored in the platform user-data

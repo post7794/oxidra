@@ -24,7 +24,7 @@
 - Ctrl+C 取消当前 LLM 请求或工具进程。
 - Windows Job Object、Unix process group 的进程树清理。
 - 本地 session journal 与 `--resume`。
-- `doctor`、`session list/show`。
+- `doctor`、`session list/show/delete`。
 - Windows 安装脚本与 Release workflow。
 
 暂不实现：
@@ -217,6 +217,7 @@ oxidra --resume <session-id>
 oxidra doctor
 oxidra session list
 oxidra session show <session-id>
+oxidra session delete <session-id>
 ```
 
 常用参数：
@@ -228,6 +229,8 @@ oxidra session show <session-id>
 --max-responses <N>
 --max-tools <N>
 ```
+
+`session delete` 永久删除对应 journal 与 artifact 目录；删除前获取 session 独占锁，因此不能删除正在使用的 session。目标不存在时返回成功并明确报告。
 
 stdout 只承载 assistant 文本；工具状态、diff、确认、诊断和错误写 stderr。
 
