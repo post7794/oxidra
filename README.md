@@ -56,28 +56,42 @@ commands, so this installation path is intended for a public GitHub repository.
 
 ### Run
 
-Set the API credential in the environment or in the user config file. `API_KEY`
-is the primary variable; `OPENAI_API_KEY` is accepted as a compatibility
-fallback. Environment variables take precedence over `config.toml`.
+Use `API_KEY` for a shell-scoped override, or persist the credential separately
+from normal configuration with `oxidra auth login`. `OPENAI_API_KEY` remains a
+compatibility fallback.
 
 ```powershell
 $env:API_KEY = "..."
 cargo run -- -p "修复当前项目的测试并运行验证" --full-auto
 ```
 
-The persistent config file is `%APPDATA%\oxidra\config.toml` on Windows:
+The persistent config file is `%APPDATA%\oxidra\config.toml` on Windows. It
+contains non-secret provider settings only:
 
 ```toml
 [provider]
-api_key = "sk-..."
 api_base_url = "https://api.openai.com/v1"
 model = "gpt-5.6-sol"
+
+[auth]
+credential_store = "keyring"
 ```
 
-`api_key` is stored as plain text and should not be committed or shared. The
-environment variables `API_KEY`, `API_BASE_URL`, and `MODEL` override these
-provider values. `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_MODEL` remain
-an all-or-nothing compatibility fallback group.
+```powershell
+oxidra auth login
+oxidra auth status
+oxidra auth logout
+```
+
+`keyring` is the default and uses the operating-system credential store. Set
+`credential_store = "file"` only as an explicit fallback; it stores plaintext
+credentials in `auth.json` beside `config.toml`. A stored credential is bound to
+the normalized API base URL and is rejected after the URL changes. Environment
+variables override persistent settings and credentials.
+
+The legacy `[provider].api_key` field is intentionally rejected. Remove it from
+an existing config file, then run `oxidra auth login` to migrate the credential
+into the selected store.
 
 Interactive mode shows streamed assistant text on stdout and tool/provider
 diagnostics on stderr:
@@ -110,6 +124,8 @@ Useful options:
 Local management commands do not require an API key:
 
 ```text
+oxidra auth status
+oxidra auth logout
 oxidra memory list
 oxidra memory show <ID>
 oxidra memory forget <ID>

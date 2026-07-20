@@ -12,7 +12,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentObserver, ApprovalHandler, TurnOutcome, load_project_instructions};
-use crate::config::{ContextLimits, ProjectContext, ProviderConfig};
+use crate::auth::{CredentialStatus, CredentialStore};
+use crate::config::{ContextLimits, ProjectContext, ProviderConfig, load_provider_settings};
 use crate::error::{OxidraError, Result};
 use crate::memory::{MemoryProvenance, MemoryStore};
 use crate::provider::{OpenAiResponsesProvider, ProviderEvent};
@@ -76,6 +77,21 @@ enum Command {
         #[command(subcommand)]
         command: MemoryCommand,
     },
+    /// Manage the persistent API credential.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AuthCommand {
+    /// Read an API key without echo and save it in the configured credential store.
+    Login,
+    /// Report credential sources without revealing secrets.
+    Status,
+    /// Delete the persistent credential.
+    Logout,
 }
 
 #[derive(Debug, Subcommand)]
@@ -196,7 +212,75 @@ fn run_management_command(
         Command::Doctor => run_doctor(cwd, model),
         Command::Session { command } => run_session_command(command),
         Command::Memory { command } => run_memory_command(command),
+        Command::Auth { command } => run_auth_command(command, model),
     }
+}
+
+fn run_auth_command(command: AuthCommand, model: Option<String>) -> Result<()> {
+    let settings = load_provider_settings(None, model)?;
+    let store = CredentialStore::platform_default(settings.credential_store)?;
+    match command {
+        AuthCommand::Login => {
+            let api_key = rpassword::prompt_password("API key: ")?;
+            store.save(&settings.api_base_url, &api_key)?;
+            println!(
+                "Stored credential for {} in {}.",
+                escape_terminal(settings.api_base_url.as_str()),
+                store.kind()
+            );
+            if let Some(source) = credential_env_source() {
+                eprintln!(
+                    "{source} is set and remains the effective credential until it is removed from the environment."
+                );
+            }
+            Ok(())
+        }
+        AuthCommand::Status => {
+            if let Some(source) = credential_env_source() {
+                println!("effective: {source} environment variable");
+            } else {
+                println!("effective: persistent store or none");
+            }
+            match store.status(&settings.api_base_url)? {
+                CredentialStatus::Missing => println!(
+                    "persistent: none in {} for {}",
+                    store.kind(),
+                    escape_terminal(settings.api_base_url.as_str())
+                ),
+                CredentialStatus::Bound => println!(
+                    "persistent: {} credential bound to {}",
+                    store.kind(),
+                    escape_terminal(settings.api_base_url.as_str())
+                ),
+                CredentialStatus::BaseUrlMismatch { stored_base_url } => println!(
+                    "persistent: {} credential is bound to {}, not {}",
+                    store.kind(),
+                    escape_terminal(&stored_base_url),
+                    escape_terminal(settings.api_base_url.as_str())
+                ),
+            }
+            Ok(())
+        }
+        AuthCommand::Logout => {
+            if store.delete()? {
+                println!("Deleted persistent credential from {}.", store.kind());
+            } else {
+                println!("No persistent credential in {}.", store.kind());
+            }
+            if let Some(source) = credential_env_source() {
+                eprintln!(
+                    "{source} is still set; logout cannot remove a parent environment variable."
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+fn credential_env_source() -> Option<&'static str> {
+    ["API_KEY", "OPENAI_API_KEY"]
+        .into_iter()
+        .find(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty()))
 }
 
 fn run_session_command(command: SessionCommand) -> Result<()> {
@@ -1083,6 +1167,14 @@ mod tests {
             Some(Command::Memory {
                 command: MemoryCommand::Forget { memory_id }
             }) if memory_id == "memory-1"
+        ));
+
+        let cli = Cli::try_parse_from(["oxidra", "auth", "login"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Auth {
+                command: AuthCommand::Login
+            })
         ));
     }
 

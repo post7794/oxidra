@@ -145,3 +145,17 @@
 ### Skill 暂不作为当前重点
 
 目前只使用 `grill-me` skill。Skill 扩展可以暂不考虑，优先解决 MCP 接入、长任务上下文管理和可恢复交接问题。
+
+## 延后设计
+
+### 多 Provider 凭据与切换
+
+当前认证只支持一个活动 Provider：`config.toml` 保存 base URL/model，凭据存储保存一个与规范化 base URL 绑定的 API key。这样可以避免把 key 发给后来切换的代理地址，但不提供 Provider 列表、别名、按 Provider 保存多套模型参数或交互式切换。
+
+如果实际使用中出现以下需求，再单独设计 Provider registry：
+
+- 需要在官方 API、个人代理和本地兼容服务之间频繁切换。
+- 同时维护多套 key、base URL、model 和 context 参数。
+- 需要导入/导出、轮换或按 session 固定 Provider。
+
+在出现这些使用证据前，不把单 Provider 认证扩展成新的插件或配置框架。

@@ -232,10 +232,17 @@ fn provider_credentials_can_be_loaded_from_user_config() {
     fs::write(
         config_dir.join("config.toml"),
         format!(
-            "[provider]\napi_key = \"config-secret\"\napi_base_url = \"http://{address}/v1\"\nmodel = \"config-model\"\n"
+            "[provider]\napi_base_url = \"http://{address}/v1\"\nmodel = \"config-model\"\n\n[auth]\ncredential_store = \"file\"\n"
         ),
     )
     .expect("write provider config");
+    fs::write(
+        config_dir.join("auth.json"),
+        format!(
+            "{{\"version\":1,\"api_base_url\":\"http://{address}/v1/\",\"api_key\":\"config-secret\"}}\n"
+        ),
+    )
+    .expect("write credential record");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oxidra"))
         .arg("-p")
@@ -281,6 +288,77 @@ fn provider_credentials_can_be_loaded_from_user_config() {
     assert_eq!(request.body["model"], "config-model");
     assert!(!stdout.contains("config-secret"));
     assert!(!stderr.contains("config-secret"));
+    assert!(
+        !fs::read_to_string(config_dir.join("config.toml"))
+            .unwrap()
+            .contains("config-secret")
+    );
+}
+
+#[test]
+fn auth_management_reports_and_removes_file_credentials_without_revealing_them() {
+    let user_home = tempfile::tempdir().expect("create isolated user directory");
+    let local_data = user_home.path().join("local");
+    let roaming_data = user_home.path().join("roaming");
+    let xdg_config = user_home.path().join("config");
+    let xdg_state = user_home.path().join("state");
+    for directory in [&local_data, &roaming_data, &xdg_config, &xdg_state] {
+        fs::create_dir_all(directory).expect("create isolated user directory");
+    }
+    let config_dir = if cfg!(windows) {
+        roaming_data.join("oxidra")
+    } else if cfg!(target_os = "macos") {
+        user_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("oxidra")
+    } else {
+        xdg_config.join("oxidra")
+    };
+    fs::create_dir_all(&config_dir).expect("create config directory");
+    fs::write(
+        config_dir.join("config.toml"),
+        "[provider]\napi_base_url = \"https://example.test/v1\"\n[auth]\ncredential_store = \"file\"\n",
+    )
+    .expect("write auth config");
+    let credential_path = config_dir.join("auth.json");
+    fs::write(
+        &credential_path,
+        r#"{"version":1,"api_base_url":"https://example.test/v1/","api_key":"hidden-secret"}
+"#,
+    )
+    .expect("write auth record");
+
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_oxidra"))
+            .args(args)
+            .env_remove("API_KEY")
+            .env_remove("API_BASE_URL")
+            .env_remove("MODEL")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_BASE_URL")
+            .env_remove("OPENAI_MODEL")
+            .env("LOCALAPPDATA", &local_data)
+            .env("APPDATA", &roaming_data)
+            .env("XDG_CONFIG_HOME", &xdg_config)
+            .env("XDG_STATE_HOME", &xdg_state)
+            .env("HOME", user_home.path())
+            .env("USERPROFILE", user_home.path())
+            .output()
+            .expect("run auth command")
+    };
+
+    let status = run(&["auth", "status"]);
+    assert!(status.status.success());
+    let status_output = String::from_utf8_lossy(&status.stdout);
+    assert!(status_output.contains("file credential bound"));
+    assert!(!status_output.contains("hidden-secret"));
+
+    let logout = run(&["auth", "logout"]);
+    assert!(logout.status.success());
+    assert!(!credential_path.exists());
+    assert!(!String::from_utf8_lossy(&logout.stdout).contains("hidden-secret"));
 }
 
 #[test]
