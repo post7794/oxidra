@@ -1,18 +1,20 @@
 # Oxidra M4/M5 实施规划
 
-状态：设计基线，尚未实现。
+状态：设计基线。M4 按实际使用数据推迟，M5 前置结构开始实施，自动 compaction 尚未实现。
 
 本文只规划两个后续里程碑：
 
 - M4：每 session 的 token 与执行时间预算。
 - M5：自动 compaction 与可审计 checkpoint。
 
+当前实施顺序不再要求先完成 M4。第 2 节保留为未来预算契约；M5 第一版不得留下未生效的预算检查、deadline 或累计器钩子。
+
 它们的共同目标不是增加 Agent 能力，而是让长任务拥有明确的资源上限和可恢复的上下文。实现必须继续遵守现有契约：本地 journal 是 append-only 真相源，Responses API 使用 `store: false`，已提交的原始事件永不因 projection 或 compaction 被修改、覆盖或删除。
 
 ## 1. 不可破坏的底层契约
 
 1. **journal 与 projection 分离。** journal 保存发生过的完整事实；projection 只决定下一次请求向模型重放哪些内容。
-2. **Provider usage 是 token 记账依据。** `total_tokens` 已包含 input 与 output；cached input 和 reasoning output 是子项，不能重复相加。
+2. **Provider usage 是真实 token 依据。** `input_tokens` 是下一请求上下文占用的校准锚点，cached input 已包含在其中，不得扣除；`total_tokens` 用于未来预算记账，cached input 和 reasoning output 是子项，不能重复相加。
 3. **已知完成后才提交。** 流式 delta 不写 canonical history；未完成的普通 response 或 compaction response 不参与之后的 projection。
 4. **未知工具副作用不自动重试。** 预算超限或 compaction 都不能绕过现有 `in_doubt` 恢复规则。
 5. **不静默丢历史。** compaction 失败、无可压缩前缀或压缩后仍超限时，明确停止并写 journal，绝不按字符或条数偷偷截断。
@@ -208,15 +210,27 @@ min_recent_complete_turns = 2
 
 每次普通 response 发出前：
 
-1. 用当前 instructions、tools 和 projection 估算下一请求大小。
-2. 小于 trigger，正常请求。
-3. 达到 trigger，选择一个完整旧前缀并最多执行一次 compaction。
-4. checkpoint 提交后重新构建 projection 并重新检查。
-5. 仍达到硬上限时返回 `context_limit`，不继续压缩循环，不静默截断。
+1. 优先用最近一次可比较的普通 `response.completed.data.usage.input_tokens` 作为真实锚点，再只估算当前请求相对该锚点请求的变化：
+
+   ```text
+   next_input ~= anchor.input_tokens
+                + estimate(current_request)
+                - estimate(anchor_request)
+   ```
+
+   `estimate(anchor_request)` 必须是在发送该请求时保存的同版本估算值，差值是有符号的，既允许追加也允许删除。锚点只描述上一次实际请求；它不是下一请求的精确 token 计数。
+2. 没有历史 usage，或锚点的 model、provider protocol、估算器版本不可比较时，才从零估算当前完整请求。Provider 未报告 usage 必须视为“没有锚点”，不能把缺失值当成真实的 `0`。
+3. 用校准后的 `next_input` 与 trigger、hard limit 比较。cached input 是上下文的一部分，不得从 `input_tokens` 中扣除。
+4. 小于 trigger，正常请求。
+5. 达到 trigger，选择一个完整旧前缀并最多执行一次 compaction。
+6. checkpoint 提交后重新构建 projection 并重新检查。
+7. 仍达到 hard limit 时返回 `context_limit`，不继续压缩循环，不静默截断。
 
 压缩选择必须至少保留最近两个完整 turn 和当前 turn。若当前 turn 本身过大，或不存在能在完整 turn 边界切开的旧前缀，则明确停止；不能切开 function call 与 function_call_output，也不能只丢大工具输出。
 
-百分比和 summary 上限可进入用户配置，但第一版不增加一组临时 CLI 开关。缺少实际使用证据前，不做按模型、项目或 session 的策略框架。
+`context_window` 允许按精确 model 配置；`context_window` 与 `reserve_tokens` 都必须保留最终生效值和各自来源（CLI、环境变量、model config、全局 config 或内置默认）。第一版不调用 `/models` 自动探测窗口，不引入本地 tokenizer，也不做按项目或 session 的 compaction 策略框架。
+
+每次新建或 resume 都追加独立的 `context.configured`，保存 model、provider protocol、window、reserve、usable、trigger、target、各字段来源和 measurement/estimator version。`response.started` 还要保存本次完整请求估算、请求 digest、使用的锚点 response seq、真实 anchor input、估算差值和最终 `next_input`，使每个触发决定都可复查。
 
 ### 3.3 Compaction 单位与边界
 
@@ -292,17 +306,13 @@ compaction.checkpoint
 compaction.aborted | compaction.failed
 ```
 
-`compaction.started` 在发请求前 sync，保存 compaction model 实际收到的完整 instructions 和 source input。只有收到完整 response、summary 非空且通过大小/边界校验后，才一次性追加 `compaction.checkpoint`，其中保存完整 raw response、usage 和最终注入文本。
+`compaction.started` 在发请求前 sync，保存 compaction model 实际收到的完整 instructions 和 source input，以及本次生效的 window/reserve/source、真实 token 锚点、估算差值、trigger 与 target。只有收到完整 response、summary 非空且通过大小/边界校验后，才一次性追加 `compaction.checkpoint`，其中保存完整 raw response、usage 和最终注入文本。
 
 partial delta 只显示状态，不进入 checkpoint。进程崩溃留下单独的 `compaction.started` 时，resume 追加 `compaction.aborted`；partial summary 不参与 projection。之后若仍超过 trigger，可把下一次压缩作为新 attempt，但同一 turn 内不能无界自动重试。
 
-### 3.6 与 M4 的关系
+### 3.6 M4 推迟后的边界
 
-- compaction 的 `usage.total_tokens` 与 `duration_ms` 计入同一 session 预算。
-- 发 compaction 前先经过 M4 预算检查。
-- 预算不足以容纳估算 input 时，预算耗尽优先，不能为了“省 context”越过费用上限。
-- compaction response 本身导致 token 预算超限时，先提交有效 checkpoint 和实际 usage，然后停止，不再发送普通 response。
-- `--no-session-budget` 只关闭 M4，不关闭 M5 的 context hard limit 或 checkpoint 校验。
+M4 当前按实际使用数据推迟，本节不再是 M5 第一版的实现前置条件。M5 仍把每次 compaction 的完整 usage 与 `duration_ms` 写进 checkpoint 供审计，但不实现 session 预算 reducer、发请求前预算检查、active-time deadline 或 `--no-session-budget` 分支。自动 compaction 因而没有 session 级费用/时间保险丝，这一限制必须在发布说明中明确。
 
 ### 3.7 失败策略
 
@@ -319,7 +329,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 自动触发时只在 stderr 显示简短状态，不污染 assistant stdout：
 
 ```text
-[compaction] context 91,420/111,616; compacting 8 completed turns
+[compaction] context 91,420/111,616; window 128,000 (config), reserve 16,384 (config); compacting 8 completed turns
 [compaction] checkpoint <ID>; context 52,180/111,616
 ```
 
@@ -327,31 +337,35 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 
 ### 3.9 实现顺序
 
-1. 为新 turn 写 `turn.completed`，实现旧 journal 的保守边界识别。
-2. 将现有 `project_events` 拆成“原始事件投影”“按 cutoff 投影”“checkpoint + tail 投影”三个纯函数。
-3. 新建 `compaction.rs`：候选选择、source 规范化/digest、checkpoint reducer 与校验。
-4. 扩展 `ResponseRequest` 支持 compaction 的无工具请求和 summary output 上限。
-5. 在 Agent 的 context preflight 接入单次自动 compaction，再重新估算。
-6. 接入 M4 usage/time、observer stderr 状态和 crash recovery。
-7. 单元测试、合成大 journal 的 CLI E2E、三平台 CI。
+1. 锁定真实 usage 锚点、增量估算、context 配置来源和 journal 审计字段。
+2. 为新 turn 写 `turn.completed`，实现旧 journal 的保守边界识别。
+3. 将现有 `project_events` 拆成“原始事件投影”“按 cutoff 投影”“checkpoint + tail 投影”三个纯函数。
+4. 新建 `compaction.rs`：候选选择、source 规范化/digest、checkpoint reducer 与校验。
+5. 扩展 `ResponseRequest` 支持 compaction 的无工具请求和 summary output 上限。
+6. 在 Agent 的 context preflight 接入单次自动 compaction，再重新估算。
+7. 接入 observer stderr 状态和 crash recovery。
+8. 单元测试、合成大 journal 的 CLI E2E、三平台 CI。
 
 ### 3.10 M5 验收门槛
 
 - 默认在 trigger 自动压缩，不必等到 hard limit。
+- 有可比较 usage 时使用真实 `input_tokens` 锚点和有符号估算差；无锚点时才估算完整请求。
+- cached input 不从上下文占用中扣除；usage 缺失不冒充真实 `0`。
+- journal 可还原每次生效的 window、reserve、来源、锚点和触发计算。
 - 相同 journal 和配置选择相同完整 turn 前缀。
 - function call 与 output 永不被切到 checkpoint 两侧。
 - 最新 projection 为一个 summary 加 cutoff 后的 tail；被覆盖原始 items 不再发送给模型。
 - journal 原始事件逐字保留，`session show` 可看到模型用于摘要的完整 source 和生成结果。
 - resume 选择同一最新有效 checkpoint，并继续形成单链。
 - 单独 `compaction.started` 恢复为 aborted，partial summary 不使用。
-- compaction usage 和时间进入 M4 累计值。
+- compaction usage 和时间完整写入 checkpoint；M4 推迟期间不做累计预算判断。
 - 压缩失败、无候选或压缩后仍过大时明确停止，无静默截断。
 - 当前 instructions 使用当前 `AGENTS.md`/memory；旧 instructions 快照不因 compaction 被重新注入。
 - Windows、Linux、macOS 的 fmt、test、Clippy 全绿。
 
 ## 4. M4/M5 完成后的决策门
 
-M4 与 M5 完成并实际使用一段时间后，才重新评估 sub-agent。进入该工作前必须同时满足：
+M5 完成、M4 后续实现并实际使用一段时间后，才重新评估 sub-agent。进入该工作前必须同时满足：
 
 1. 单 Agent 确实频繁遇到可并行的独立工作，而不是只因框架看起来更完整。
 2. 子 Agent 使用独立 session/journal，父 session 只引用结果，不能破坏单写者锁。
@@ -362,14 +376,13 @@ Goal mode 同样不自动随 M4 出现。未来若实现，它可以消费 M4 �
 
 ## 5. 推荐提交边界
 
-为降低回退成本，按以下边界提交，不把 M4/M5 混成一次大改：
+为降低回退成本，当前 M5 按以下边界提交；M4 保留为未来独立里程碑：
 
-1. `docs: lock M4 and M5 execution contracts`
-2. `feat: persist and enforce session budgets`
-3. `feat: expose session budget diagnostics`
-4. `refactor: make turn boundaries and projection explicit`
-5. `feat: add auditable compaction checkpoints`
-6. `feat: trigger compaction before context exhaustion`
-7. `test: cover budget and compaction recovery end to end`
+1. `docs: lock measured context and compaction contracts`
+2. `refactor: make turn boundaries and projection explicit`
+3. `test: cover turn and projection boundaries`
+4. `feat: add auditable compaction checkpoints`
+5. `feat: trigger compaction before context exhaustion`
+6. `test: cover compaction recovery end to end`
 
 每个功能提交都必须保持现有 read/edit/write/remember/shell、session resume 和 memory 测试通过。M5 未完整通过验收前，不删除原有 `context.limit_reached` 硬停止路径。

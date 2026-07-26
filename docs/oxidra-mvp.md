@@ -286,10 +286,10 @@ stdout 只承载 assistant 文本；工具状态、diff、确认、诊断和错�
 - 本次完整注入文本统一写入 `context.instructions`，不只保存引用、hash 或版本号。
 - journal 保存的是每个启动 epoch 的输入快照；memory 文件仍是当前可编辑的真相源。
 
-### M4 及以后
+### M5 及以后
 
 M4 与 M5 的完整实施契约见 [`m4-m5-roadmap.md`](m4-m5-roadmap.md)。
 
-1. M4：每会话 token/执行时间预算。
-2. M5：自动 compaction 与可审计 checkpoint。
+1. M5：先实现可审计的上下文测量、turn 边界和自动 compaction checkpoint。
+2. M4：每会话 token/执行时间预算按实际使用数据推迟，后续作为独立里程碑。
 3. 只有实际高频需要时才重新评估子 agent；它必须使用独立子会话，并受父级预算约束。
