@@ -5,7 +5,6 @@
 //! are supplied through traits so the core remains usable from tests and a
 //! future TUI.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,9 +14,11 @@ use uuid::Uuid;
 
 use crate::config::ContextLimits;
 use crate::error::{OxidraError, Result};
+pub use crate::projection::project_events;
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
-use crate::session::{JournalEvent, SessionJournal};
+use crate::session::SessionJournal;
 use crate::tools::{BuiltinTools, ToolContext};
+use crate::turn::TURN_BOUNDARY_VERSION;
 use crate::types::{ToolCall, ToolResult, Usage};
 
 const MAX_PROJECT_INSTRUCTIONS: usize = 32 * 1024;
@@ -158,11 +159,15 @@ impl Agent {
             "role": "user",
             "content": prompt,
         });
-        self.journal.append_and_sync(
+        let user_event = self.journal.append_and_sync(
             "user.message",
             Some(&turn_id),
-            json!({ "item": user_item }),
+            json!({
+                "item": user_item,
+                "turn_boundary_version": TURN_BOUNDARY_VERSION,
+            }),
         )?;
+        let turn_start_seq = user_event.seq;
 
         let mut outcome = TurnOutcome::default();
         let mut repeated_error: Option<(String, usize)> = None;
@@ -243,20 +248,43 @@ impl Agent {
 
             outcome.responses += 1;
             accumulate_usage(&mut outcome.usage, &turn.usage);
-            self.journal.append_and_sync(
+            let is_final_response = turn.tool_calls.is_empty();
+            let response_seq = self.journal.next_seq();
+            let mut response_data = json!({
+                "response_attempt_id": response_attempt_id,
+                "raw_response": turn.raw_response,
+                "output_items": turn.output_items,
+                "text": turn.text,
+                "usage": turn.usage,
+                "unknown_stream_events": turn.unknown_stream_events,
+            });
+            if is_final_response {
+                response_data["turn_completion"] = json!({
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                    "covers_from_seq": turn_start_seq,
+                    "final_response_seq": response_seq,
+                    "covers_through_seq": response_seq,
+                });
+            }
+            let response_event = self.journal.append_and_sync(
                 "response.completed",
                 Some(&turn_id),
-                json!({
-                    "response_attempt_id": response_attempt_id,
-                    "raw_response": turn.raw_response,
-                    "output_items": turn.output_items,
-                    "text": turn.text,
-                    "usage": turn.usage,
-                    "unknown_stream_events": turn.unknown_stream_events,
-                }),
+                response_data,
             )?;
-            if turn.tool_calls.is_empty() {
+            debug_assert_eq!(response_event.seq, response_seq);
+            if is_final_response {
                 outcome.text = turn.text;
+                let marker_seq = self.journal.next_seq();
+                self.journal.append_and_sync(
+                    "turn.completed",
+                    Some(&turn_id),
+                    json!({
+                        "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                        "covers_from_seq": turn_start_seq,
+                        "final_response_seq": response_event.seq,
+                        "covers_through_seq": marker_seq,
+                    }),
+                )?;
                 outcome.context = Some(self.next_context_estimate()?);
                 return Ok(outcome);
             }
@@ -648,105 +676,6 @@ impl StreamObserver for ForwardObserver<'_> {
     }
 }
 
-/// Project only committed events into the stateless Responses `input` array.
-/// Partial deltas and aborted responses are intentionally absent.
-pub fn project_events(events: &[JournalEvent]) -> Vec<Value> {
-    let completed_turns = events
-        .iter()
-        .filter(|event| event.kind == "response.completed")
-        .filter_map(|event| event.turn_id.clone())
-        .collect::<HashSet<_>>();
-    let abandoned_turns = events
-        .iter()
-        .filter(|event| matches!(event.kind.as_str(), "response.aborted" | "turn.cancelled"))
-        .filter_map(|event| event.turn_id.clone())
-        .filter(|turn_id| !completed_turns.contains(turn_id))
-        .collect::<HashSet<_>>();
-    let mut projected = Vec::new();
-    let mut marked_cancelled_turns = HashSet::new();
-    for event in events {
-        match event.kind.as_str() {
-            "user.message" => {
-                let abandoned = event
-                    .turn_id
-                    .as_ref()
-                    .is_some_and(|turn_id| abandoned_turns.contains(turn_id));
-                if !abandoned {
-                    if let Some(item) = event.data.get("item") {
-                        projected.push(item.clone());
-                    }
-                }
-            }
-            "response.completed" => {
-                if let Some(items) = event.data.get("output_items").and_then(Value::as_array) {
-                    projected.extend(items.iter().cloned());
-                } else if let Some(items) = event
-                    .data
-                    .get("raw_response")
-                    .and_then(|response| response.get("output"))
-                    .and_then(Value::as_array)
-                {
-                    projected.extend(items.iter().cloned());
-                }
-            }
-            "tool.completed"
-            | "tool.cancelled"
-            | "tool.skipped_due_to_cancel"
-            | "tool.skipped_due_to_in_doubt"
-            | "tool.skipped_due_to_limit"
-            | "tool.skipped_due_to_stalled"
-            | "tool.skipped_due_to_recovery" => {
-                if let Some(item) = tool_output_item(&event.data) {
-                    projected.push(item);
-                }
-            }
-            // A user may explicitly resolve an in-doubt tool as failed.  It
-            // then becomes a normal function output for future replay.
-            "tool.in_doubt_resolved" => {
-                if let Some(item) = tool_output_item(&event.data) {
-                    projected.push(item);
-                }
-            }
-            "response.aborted" | "turn.cancelled" => {
-                if let Some(turn_id) = &event.turn_id {
-                    if completed_turns.contains(turn_id)
-                        && marked_cancelled_turns.insert(turn_id.clone())
-                    {
-                        projected.push(json!({
-                            "role": "user",
-                            "content": "[Oxidra: the previous turn was cancelled. Do not continue unfinished work from it unless the user requests it again.]",
-                        }));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    projected
-}
-
-fn tool_output_item(data: &Value) -> Option<Value> {
-    let call_id = data.get("call_id")?.as_str()?;
-    let output = data.get("output").cloned().unwrap_or_else(|| {
-        json!({
-            "error": {
-                "code": data.get("error_code").and_then(Value::as_str).unwrap_or("cancelled"),
-                "message": "tool did not complete normally",
-            }
-        })
-    });
-    let output = match output {
-        Value::String(output) => output,
-        output => serde_json::to_string(&output)
-            .unwrap_or_else(|_| "{\"error\":{\"code\":\"serialization_error\"}}".to_owned()),
-    };
-    Some(json!({
-        "type": "function_call_output",
-        "call_id": call_id,
-        "output": output,
-    }))
-}
-
 fn error_fingerprint(call: &ToolCall, result: &ToolResult) -> String {
     let stable_output = stable_error_output(&result.output);
     format!(
@@ -992,6 +921,130 @@ pub fn load_project_instructions(root: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{JournalEvent, SessionHeader, SessionStore};
+    use crate::turn::{CompletionEvidence, TurnState, segment_turns};
+    use crate::types::AssistantTurn;
+
+    struct FinalResponseProvider;
+
+    #[async_trait]
+    impl ResponseProvider for FinalResponseProvider {
+        async fn respond(
+            &self,
+            _request: ResponseRequest,
+            _observer: &mut dyn StreamObserver,
+            _cancellation: CancellationToken,
+        ) -> Result<AssistantTurn> {
+            let output_items = vec![json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}],
+            })];
+            Ok(AssistantTurn {
+                raw_response: json!({"output": output_items}),
+                output_items,
+                text: "done".to_owned(),
+                tool_calls: Vec::new(),
+                usage: Usage::default(),
+                unknown_stream_events: Vec::new(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct NoopObserver;
+
+    impl AgentObserver for NoopObserver {
+        fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_message(&mut self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_turn_writes_an_explicit_completion_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let data_dir = temp.path().join("data");
+        let memory_dir = temp.path().join("memory");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(&data_dir).unwrap();
+        let journal = store
+            .create_with_id(
+                "marker-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            &memory_dir,
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            Arc::new(FinalResponseProvider),
+            journal,
+            tools,
+            "",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let outcome = agent
+            .run_turn(
+                "finish this turn",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.text, "done");
+        let events = agent.journal().read_events().unwrap();
+        let user = events
+            .iter()
+            .find(|event| event.kind == "user.message")
+            .unwrap();
+        let response = events
+            .iter()
+            .find(|event| event.kind == "response.completed")
+            .unwrap();
+        let marker = events
+            .iter()
+            .find(|event| event.kind == "turn.completed")
+            .unwrap();
+        assert_eq!(user.data["turn_boundary_version"], TURN_BOUNDARY_VERSION);
+        assert_eq!(
+            response.data["turn_completion"]["covers_from_seq"],
+            user.seq
+        );
+        assert_eq!(
+            response.data["turn_completion"]["final_response_seq"],
+            response.seq
+        );
+        assert_eq!(marker.data["covers_from_seq"], user.seq);
+        assert_eq!(marker.data["final_response_seq"], response.seq);
+        assert_eq!(marker.data["covers_through_seq"], marker.seq);
+        assert_eq!(
+            segment_turns(&events).unwrap()[0].state,
+            TurnState::Complete(CompletionEvidence::ExplicitMarker)
+        );
+    }
 
     #[test]
     fn projects_only_committed_items() {

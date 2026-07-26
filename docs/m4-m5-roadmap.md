@@ -244,7 +244,9 @@ user.message
   -> final response.completed without tool calls
 ```
 
-M5 应新增显式 `turn.completed` 事件，供新 journal 确定边界。兼容旧 session 时，可把“下一个 `user.message` 已出现”视为前一个 turn 已关闭，但绝不能推断 journal 尾部的 turn 已完成。
+M5 应新增显式 `turn.completed` 事件，供新 journal 确定边界。最终无工具调用的 `response.completed` 同时保存同事件内的 completion coverage，随后正常追加 `turn.completed`；如果进程恰好在两次 sync 之间崩溃，完整的 response 事件仍能恢复边界。兼容旧 session 时，可把“下一个 `user.message` 已出现”视为前一个 turn 已关闭，但绝不能推断 journal 尾部的 turn 已完成。
+
+“turn 成功完成”和“journal 前缀可安全切分”是两个概念。`turn.completed` 只表示成功；failed/cancelled/aborted/stalled/limit 或已显式解决的 in-doubt turn 仍可位于后续完整 cutoff 覆盖的前缀中，前提是已出现下一条 `user.message`、provider projection 已确定且没有 pending/in-doubt/配对不明的工具调用。候选 cutoff 自身仍只能落在成功完成的 turn 边界上。这样一次早期失败不会永久禁用之后的 compaction，也不会把失败伪装成成功。
 
 以下 turn 永不进入压缩前缀：
 
