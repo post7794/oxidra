@@ -1,6 +1,7 @@
 pub mod agent;
 mod auth;
 pub mod cli;
+pub mod compaction;
 pub mod config;
 pub mod error;
 mod event_kind;

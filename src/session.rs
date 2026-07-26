@@ -12,8 +12,14 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::compaction::{COMPACTION_ABORTED_KIND, COMPACTION_STARTED_KIND};
+#[cfg(test)]
+use crate::compaction::{COMPACTION_CHECKPOINT_KIND, COMPACTION_FAILED_KIND};
 use crate::error::{OxidraError, Result};
-use crate::event_kind::{is_response_terminal, is_tool_lifecycle, is_tool_terminal};
+use crate::event_kind::{
+    is_compaction_lifecycle, is_compaction_terminal, is_response_terminal, is_tool_lifecycle,
+    is_tool_terminal,
+};
 
 pub const JOURNAL_SCHEMA: u32 = 1;
 pub const SESSION_STARTED_KIND: &str = "session.started";
@@ -315,6 +321,16 @@ impl SessionStore {
             })
             .count();
         let aborted_responses = previously_aborted_responses + unfinished_responses.len();
+        let unfinished_compactions = unfinished_compactions(&scan.events);
+        let previously_aborted_compactions = scan
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == COMPACTION_ABORTED_KIND
+                    && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
+            })
+            .count();
+        let aborted_compactions = previously_aborted_compactions + unfinished_compactions.len();
         let unstarted_tools = unstarted_tool_calls(&scan.events);
         let previously_skipped = scan
             .events
@@ -328,6 +344,7 @@ impl SessionStore {
             &in_doubt,
             skipped_before_start,
             aborted_responses,
+            aborted_compactions,
         );
         let mut recovery = RecoveryInfo {
             truncated_tail: scan.truncated_tail,
@@ -336,6 +353,7 @@ impl SessionStore {
             marker_seq,
             skipped_before_start,
             aborted_responses,
+            aborted_compactions,
         };
 
         let mut journal = SessionJournal {
@@ -358,6 +376,21 @@ impl SessionStore {
                     "response_attempt_id": response.response_attempt_id,
                     "started_seq": response.started_seq,
                     "reason": "process stopped before a terminal response event was committed",
+                    "recovered": true,
+                }),
+            )?;
+        }
+
+        let recovered_unfinished_compaction = !unfinished_compactions.is_empty();
+        for attempt in unfinished_compactions {
+            journal.append_and_sync(
+                COMPACTION_ABORTED_KIND,
+                None,
+                json!({
+                    "attempt_id": attempt.attempt_id,
+                    "started_seq": attempt.started_seq,
+                    "code": "interrupted",
+                    "message": "compaction was interrupted before a terminal event was committed",
                     "recovered": true,
                 }),
             )?;
@@ -388,10 +421,12 @@ impl SessionStore {
 
         if recovery.truncated_tail.is_some()
             || recovered_unfinished_response
+            || recovered_unfinished_compaction
             || recovered_unstarted
             || (!recovery.in_doubt.is_empty() && recovery.marker_seq.is_none())
             || (recovery.skipped_before_start > 0 && recovery.marker_seq.is_none())
             || (recovery.aborted_responses > 0 && recovery.marker_seq.is_none())
+            || (recovery.aborted_compactions > 0 && recovery.marker_seq.is_none())
         {
             let event =
                 journal.append_and_sync(RECOVERY_KIND, None, recovery_marker_data(&recovery))?;
@@ -412,6 +447,8 @@ pub struct RecoveryInfo {
     pub skipped_before_start: usize,
     #[serde(default)]
     pub aborted_responses: usize,
+    #[serde(default)]
+    pub aborted_compactions: usize,
 }
 
 impl RecoveryInfo {
@@ -924,6 +961,12 @@ struct UnfinishedResponse {
     response_attempt_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UnfinishedCompaction {
+    started_seq: u64,
+    attempt_id: String,
+}
+
 fn unfinished_responses(events: &[JournalEvent]) -> Vec<UnfinishedResponse> {
     let mut unfinished = BTreeMap::<String, UnfinishedResponse>::new();
     for event in events {
@@ -953,6 +996,39 @@ fn unfinished_responses(events: &[JournalEvent]) -> Vec<UnfinishedResponse> {
         }
     }
     unfinished.into_values().collect()
+}
+
+fn unfinished_compactions(events: &[JournalEvent]) -> Vec<UnfinishedCompaction> {
+    let mut unfinished = BTreeMap::<String, Vec<UnfinishedCompaction>>::new();
+    for event in events {
+        if !is_compaction_lifecycle(&event.kind) {
+            continue;
+        }
+        if event.kind == COMPACTION_STARTED_KIND {
+            if let Some(attempt_id) = string_field(&event.data, &["attempt_id"]) {
+                unfinished
+                    .entry(attempt_id.clone())
+                    .or_default()
+                    .push(UnfinishedCompaction {
+                        started_seq: event.seq,
+                        attempt_id,
+                    });
+            }
+        } else if is_compaction_terminal(&event.kind) {
+            if let Some(attempt_id) = string_field(&event.data, &["attempt_id"]) {
+                let remove_entry = unfinished.get_mut(&attempt_id).is_some_and(|attempts| {
+                    attempts.pop();
+                    attempts.is_empty()
+                });
+                if remove_entry {
+                    unfinished.remove(&attempt_id);
+                }
+            }
+        }
+    }
+    let mut attempts = unfinished.into_values().flatten().collect::<Vec<_>>();
+    attempts.sort_by_key(|attempt| attempt.started_seq);
+    attempts
 }
 
 fn unstarted_tool_calls(events: &[JournalEvent]) -> Vec<UnstartedTool> {
@@ -1024,8 +1100,13 @@ fn matching_recovery_marker(
     in_doubt: &[InDoubtTool],
     skipped_before_start: usize,
     aborted_responses: usize,
+    aborted_compactions: usize,
 ) -> Option<u64> {
-    if in_doubt.is_empty() && skipped_before_start == 0 && aborted_responses == 0 {
+    if in_doubt.is_empty()
+        && skipped_before_start == 0
+        && aborted_responses == 0
+        && aborted_compactions == 0
+    {
         return None;
     }
 
@@ -1046,9 +1127,15 @@ fn matching_recovery_marker(
                 .get("aborted_responses")
                 .and_then(Value::as_u64)
                 .unwrap_or_default() as usize;
+            let marked_aborted_compactions = event
+                .data
+                .get("aborted_compactions")
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as usize;
             (same_in_doubt_set(&marked, in_doubt)
                 && marked_skipped == skipped_before_start
-                && marked_aborted == aborted_responses)
+                && marked_aborted == aborted_responses
+                && marked_aborted_compactions == aborted_compactions)
                 .then_some(event.seq)
         })
 }
@@ -1085,6 +1172,8 @@ fn recovery_marker_data(recovery: &RecoveryInfo) -> Value {
             "incomplete_tail"
         } else if recovery.aborted_responses > 0 {
             "response_aborted"
+        } else if recovery.aborted_compactions > 0 {
+            "compaction_aborted"
         } else if recovery.skipped_before_start > 0 {
             "tool_not_started"
         } else {
@@ -1094,6 +1183,7 @@ fn recovery_marker_data(recovery: &RecoveryInfo) -> Value {
         "in_doubt": recovery.in_doubt,
         "skipped_before_start": recovery.skipped_before_start,
         "aborted_responses": recovery.aborted_responses,
+        "aborted_compactions": recovery.aborted_compactions,
     })
 }
 
@@ -1427,6 +1517,98 @@ mod tests {
                 .filter(|event| event.kind == "response.aborted")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn recovers_unfinished_compaction_once() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("unfinished-compaction", header(temp.path()))
+            .unwrap();
+        let started = journal
+            .append_and_sync(
+                COMPACTION_STARTED_KIND,
+                None,
+                json!({
+                    "attempt_id": "compact-1",
+                    "parent_checkpoint_id": null,
+                    "covers_through_seq": 0,
+                    "source": [],
+                    "source_digest": "digest",
+                    "instructions": "summarize",
+                    "prompt_version": 1,
+                    "model": "test-model",
+                }),
+            )
+            .unwrap();
+        drop(journal);
+
+        let recovered = store.open("unfinished-compaction").unwrap();
+        assert_eq!(recovered.recovery_info().aborted_compactions, 1);
+        let events = recovered.read_events().unwrap();
+        let aborted = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_ABORTED_KIND)
+            .unwrap();
+        assert_eq!(aborted.data["attempt_id"], "compact-1");
+        assert_eq!(aborted.data["started_seq"], started.seq);
+        assert_eq!(aborted.data["code"], "interrupted");
+        assert_eq!(aborted.data["recovered"], true);
+        drop(recovered);
+
+        let reopened = store.open("unfinished-compaction").unwrap();
+        assert_eq!(reopened.recovery_info().aborted_compactions, 1);
+        assert_eq!(
+            reopened
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == COMPACTION_ABORTED_KIND)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn terminal_compaction_events_settle_attempts() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("terminal-compactions", header(temp.path()))
+            .unwrap();
+        for (index, terminal_kind) in [
+            COMPACTION_CHECKPOINT_KIND,
+            COMPACTION_FAILED_KIND,
+            COMPACTION_ABORTED_KIND,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let attempt_id = format!("compact-{index}");
+            journal
+                .append_and_sync(
+                    COMPACTION_STARTED_KIND,
+                    None,
+                    json!({"attempt_id": attempt_id}),
+                )
+                .unwrap();
+            journal
+                .append_and_sync(terminal_kind, None, json!({"attempt_id": attempt_id}))
+                .unwrap();
+        }
+        drop(journal);
+
+        let reopened = store.open("terminal-compactions").unwrap();
+        assert_eq!(reopened.recovery_info().aborted_compactions, 0);
+        assert!(
+            !reopened
+                .read_events()
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == COMPACTION_ABORTED_KIND
+                    && event.data.get("recovered").and_then(Value::as_bool) == Some(true))
         );
     }
 

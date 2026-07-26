@@ -1,11 +1,18 @@
 use std::env;
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
-use oxidra::session::{SessionHeader, SessionStore};
+use chrono::Utc;
+use oxidra::compaction::{
+    COMPACTION_ABORTED_KIND, COMPACTION_CHECKPOINT_KIND, COMPACTION_PROMPT_VERSION,
+    COMPACTION_STARTED_KIND, CompactionStarted, build_compaction_source, validate_checkpoint_chain,
+};
+use oxidra::session::{JOURNAL_SCHEMA, JournalEvent, SessionHeader, SessionStore};
 use oxidra::turn::{
     CompletePrefix, CompletionEvidence, TURN_BOUNDARY_VERSION, TurnState,
     complete_prefix_candidates, segment_turns,
@@ -14,6 +21,7 @@ use serde_json::json;
 
 const CHILD_MODE_ENV: &str = "OXIDRA_FAULT_INJECTION_CHILD";
 const DATA_DIR_ENV: &str = "OXIDRA_FAULT_INJECTION_DATA_DIR";
+const COMPACTION_SCENARIO_ENV: &str = "OXIDRA_COMPACTION_FAULT_SCENARIO";
 const SESSION_ID: &str = "process-fault-session";
 const TURN_ID: &str = "turn-1";
 const RESPONSE_ATTEMPT_ID: &str = "attempt-1";
@@ -27,6 +35,42 @@ enum SyncPoint {
     ResponseStarted,
     InlineResponseCompleted,
     TurnCompleted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompactionSyncPoint {
+    Started,
+    ProviderCompleted,
+    CheckpointSynced,
+    CheckpointWithoutNewline,
+    CheckpointPartialLine,
+}
+
+impl CompactionSyncPoint {
+    const ALL: [Self; 5] = [
+        Self::Started,
+        Self::ProviderCompleted,
+        Self::CheckpointSynced,
+        Self::CheckpointWithoutNewline,
+        Self::CheckpointPartialLine,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Started => "compaction.started",
+            Self::ProviderCompleted => "compaction.provider-completed",
+            Self::CheckpointSynced => "compaction.checkpoint-synced",
+            Self::CheckpointWithoutNewline => "compaction.checkpoint-no-newline",
+            Self::CheckpointPartialLine => "compaction.checkpoint-partial-line",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|point| point.label() == value)
+            .unwrap_or_else(|| panic!("unknown compaction fault scenario {value:?}"))
+    }
 }
 
 impl SyncPoint {
@@ -102,6 +146,111 @@ fn force_kill_after_each_synced_turn_boundary_is_recoverable() {
         drop(journal);
 
         assert_recovered_state(sync_point, &recovered, recovery.aborted_responses);
+    }
+}
+
+#[test]
+fn force_kill_during_compaction_commits_only_complete_checkpoints() {
+    for sync_point in CompactionSyncPoint::ALL {
+        let temp = tempfile::tempdir().expect("create compaction fault data directory");
+        let child = spawn_compaction_fault_child(temp.path(), sync_point);
+        stop_child_at_label(
+            child,
+            sync_point.label(),
+            &CompactionSyncPoint::ALL.map(CompactionSyncPoint::label),
+        );
+
+        let store = SessionStore::new(temp.path()).expect("open store after compaction crash");
+        if sync_point != CompactionSyncPoint::CheckpointPartialLine {
+            let persisted = store
+                .inspect(SESSION_ID)
+                .expect("inspect complete compaction journal lines");
+            let checkpoint_committed = matches!(
+                sync_point,
+                CompactionSyncPoint::CheckpointSynced
+                    | CompactionSyncPoint::CheckpointWithoutNewline
+            );
+            let expected = if checkpoint_committed {
+                vec![
+                    "session.started",
+                    "user.message",
+                    "response.completed",
+                    "turn.completed",
+                    COMPACTION_STARTED_KIND,
+                    COMPACTION_CHECKPOINT_KIND,
+                ]
+            } else {
+                vec![
+                    "session.started",
+                    "user.message",
+                    "response.completed",
+                    "turn.completed",
+                    COMPACTION_STARTED_KIND,
+                ]
+            };
+            assert_eq!(event_kinds(&persisted), expected, "{}", sync_point.label());
+        }
+
+        let journal = store
+            .open(SESSION_ID)
+            .expect("recover journal after compaction crash");
+        let recovery = journal.recovery_info().clone();
+        let recovered = journal
+            .read_events()
+            .expect("read recovered compaction journal");
+        drop(journal);
+
+        match sync_point {
+            CompactionSyncPoint::Started | CompactionSyncPoint::ProviderCompleted => {
+                assert_eq!(recovery.aborted_compactions, 1);
+                assert_eq!(count_kind(&recovered, COMPACTION_CHECKPOINT_KIND), 0);
+                assert_recovered_compaction_abort(&recovered, 5);
+            }
+            CompactionSyncPoint::CheckpointSynced
+            | CompactionSyncPoint::CheckpointWithoutNewline => {
+                assert_eq!(
+                    recovery.normalized_missing_newline,
+                    sync_point == CompactionSyncPoint::CheckpointWithoutNewline
+                );
+                assert!(recovery.truncated_tail.is_none());
+                assert_eq!(recovery.aborted_compactions, 0);
+                assert_eq!(count_kind(&recovered, COMPACTION_CHECKPOINT_KIND), 1);
+                assert_eq!(count_kind(&recovered, COMPACTION_ABORTED_KIND), 0);
+            }
+            CompactionSyncPoint::CheckpointPartialLine => {
+                assert!(recovery.truncated_tail.is_some());
+                assert_eq!(recovery.aborted_compactions, 1);
+                assert_eq!(count_kind(&recovered, COMPACTION_CHECKPOINT_KIND), 0);
+                assert_recovered_compaction_abort(&recovered, 5);
+            }
+        }
+
+        let chain = validate_checkpoint_chain(&recovered)
+            .expect("recovered compaction journal has a valid checkpoint chain");
+        assert_eq!(
+            chain.len(),
+            usize::from(matches!(
+                sync_point,
+                CompactionSyncPoint::CheckpointSynced
+                    | CompactionSyncPoint::CheckpointWithoutNewline
+            )),
+            "only a complete checkpoint may enter the chain at {}",
+            sync_point.label()
+        );
+
+        let reopened = store
+            .open(SESSION_ID)
+            .expect("reopen recovered compaction journal");
+        assert_eq!(
+            count_kind(&reopened.read_events().unwrap(), COMPACTION_ABORTED_KIND),
+            usize::from(!matches!(
+                sync_point,
+                CompactionSyncPoint::CheckpointSynced
+                    | CompactionSyncPoint::CheckpointWithoutNewline
+            )),
+            "recovery must be idempotent at {}",
+            sync_point.label()
+        );
     }
 }
 
@@ -186,6 +335,137 @@ fn fault_injection_child() {
     sync_barrier(SyncPoint::TurnCompleted);
 }
 
+#[test]
+#[ignore = "launched by force_kill_during_compaction_commits_only_complete_checkpoints"]
+fn compaction_fault_injection_child() {
+    if env::var_os(CHILD_MODE_ENV).is_none() {
+        return;
+    }
+    let scenario = CompactionSyncPoint::parse(
+        &env::var(COMPACTION_SCENARIO_ENV).expect("compaction fault scenario is set"),
+    );
+    let data_dir = env::var_os(DATA_DIR_ENV).expect("fault child data directory is set");
+    let store = SessionStore::new(&data_dir).expect("create child session store");
+    let mut journal = store
+        .create_with_id(
+            SESSION_ID,
+            SessionHeader::new(&data_dir, "fault-injection-model"),
+        )
+        .expect("create child journal");
+    let user = journal
+        .append_and_sync(
+            "user.message",
+            Some(TURN_ID),
+            json!({
+                "item": {"role": "user", "content": "compact this completed turn"},
+                "turn_boundary_version": TURN_BOUNDARY_VERSION,
+            }),
+        )
+        .expect("append compaction fixture user message");
+    let response_seq = journal.next_seq();
+    let response = journal
+        .append_and_sync(
+            "response.completed",
+            Some(TURN_ID),
+            json!({
+                "response_attempt_id": "compaction-fixture-response",
+                "raw_response": {
+                    "id": "compaction-fixture-response",
+                    "output": [{"type": "message", "role": "assistant", "content": "done"}],
+                },
+                "output_items": [
+                    {"type": "message", "role": "assistant", "content": "done"}
+                ],
+                "text": "done",
+                "turn_completion": {
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                    "covers_from_seq": user.seq,
+                    "final_response_seq": response_seq,
+                    "covers_through_seq": response_seq,
+                },
+            }),
+        )
+        .expect("append compaction fixture response");
+    let marker_seq = journal.next_seq();
+    let marker = journal
+        .append_and_sync(
+            "turn.completed",
+            Some(TURN_ID),
+            json!({
+                "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                "covers_from_seq": user.seq,
+                "final_response_seq": response.seq,
+                "covers_through_seq": marker_seq,
+            }),
+        )
+        .expect("append compaction fixture turn marker");
+    let source = build_compaction_source(
+        &journal
+            .read_events()
+            .expect("read compaction fixture events"),
+        None,
+        marker.seq,
+    )
+    .expect("build compaction fixture source");
+    let source_digest = source.digest().expect("digest compaction fixture source");
+    journal
+        .append_and_sync(
+            COMPACTION_STARTED_KIND,
+            None,
+            serde_json::to_value(CompactionStarted {
+                attempt_id: "compaction-attempt-1".to_owned(),
+                parent_checkpoint_id: None,
+                covers_through_seq: marker.seq,
+                source,
+                source_digest: source_digest.clone(),
+                instructions: "fault-injection summary instructions".to_owned(),
+                prompt_version: COMPACTION_PROMPT_VERSION,
+                model: "fault-injection-model".to_owned(),
+                extra: Default::default(),
+            })
+            .expect("encode compaction fixture start"),
+        )
+        .expect("append compaction start");
+
+    match scenario {
+        CompactionSyncPoint::Started => sync_barrier_label(scenario.label()),
+        CompactionSyncPoint::ProviderCompleted => {
+            // The provider result only exists in memory until checkpoint commit.
+            sync_barrier_label(scenario.label());
+        }
+        CompactionSyncPoint::CheckpointSynced => {
+            journal
+                .append_and_sync(
+                    COMPACTION_CHECKPOINT_KIND,
+                    None,
+                    checkpoint_data(marker.seq, &source_digest),
+                )
+                .expect("append and sync compaction checkpoint");
+            sync_barrier_label(scenario.label());
+        }
+        CompactionSyncPoint::CheckpointWithoutNewline => {
+            append_raw_checkpoint(
+                journal.journal_path(),
+                journal.next_seq(),
+                marker.seq,
+                &source_digest,
+                false,
+            );
+            sync_barrier_label(scenario.label());
+        }
+        CompactionSyncPoint::CheckpointPartialLine => {
+            append_raw_checkpoint(
+                journal.journal_path(),
+                journal.next_seq(),
+                marker.seq,
+                &source_digest,
+                true,
+            );
+            sync_barrier_label(scenario.label());
+        }
+    }
+}
+
 fn spawn_fault_child(data_dir: &std::path::Path) -> Child {
     let mut command = Command::new(env::current_exe().expect("locate integration-test binary"));
     command
@@ -204,7 +484,32 @@ fn spawn_fault_child(data_dir: &std::path::Path) -> Child {
     command.spawn().expect("spawn fault-injection child")
 }
 
+fn spawn_compaction_fault_child(data_dir: &Path, scenario: CompactionSyncPoint) -> Child {
+    let mut command = Command::new(env::current_exe().expect("locate integration-test binary"));
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            "compaction_fault_injection_child",
+            "--nocapture",
+        ])
+        .env(CHILD_MODE_ENV, "1")
+        .env(DATA_DIR_ENV, data_dir)
+        .env(COMPACTION_SCENARIO_ENV, scenario.label())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    suppress_windows_console(&mut command);
+    command
+        .spawn()
+        .expect("spawn compaction fault-injection child")
+}
+
 fn stop_child_at(child: Child, target: SyncPoint) {
+    stop_child_at_label(child, target.label(), &SyncPoint::ALL.map(SyncPoint::label));
+}
+
+fn stop_child_at_label(child: Child, target: &str, known_labels: &[&str]) {
     let mut child = ChildGuard::new(child);
     let stdout = child
         .child
@@ -238,7 +543,7 @@ fn stop_child_at(child: Child, target: SyncPoint) {
             }
         }
     });
-    let expected = format!("{SYNC_PREFIX}{}", target.label());
+    let expected = format!("{SYNC_PREFIX}{target}");
     let mut transcript = String::new();
 
     loop {
@@ -271,7 +576,7 @@ fn stop_child_at(child: Child, target: SyncPoint) {
             continue;
         };
         let observed = line[marker + SYNC_PREFIX.len()..].trim();
-        if observed == target.label() {
+        if observed == target {
             let status = child
                 .kill_and_wait()
                 .expect("force-kill and reap fault child");
@@ -280,15 +585,13 @@ fn stop_child_at(child: Child, target: SyncPoint) {
             assert!(
                 !status.success(),
                 "force-killed child unexpectedly exited successfully at {}",
-                target.label()
+                target
             );
             return;
         }
 
         assert!(
-            SyncPoint::ALL
-                .iter()
-                .any(|sync_point| sync_point.label() == observed),
+            known_labels.contains(&observed),
             "fault child reported unknown sync point {observed:?}"
         );
         stdin
@@ -341,7 +644,11 @@ impl Drop for ChildGuard {
 }
 
 fn sync_barrier(sync_point: SyncPoint) {
-    println!("{SYNC_PREFIX}{}", sync_point.label());
+    sync_barrier_label(sync_point.label());
+}
+
+fn sync_barrier_label(label: &str) {
+    println!("{SYNC_PREFIX}{label}");
     std::io::stdout()
         .flush()
         .expect("flush fault child notification");
@@ -350,6 +657,76 @@ fn sync_barrier(sync_point: SyncPoint) {
         .read_line(&mut acknowledgement)
         .expect("read parent acknowledgement");
     assert_eq!(acknowledgement.trim(), "continue");
+}
+
+fn append_raw_checkpoint(
+    path: &Path,
+    seq: u64,
+    covers_through_seq: u64,
+    source_digest: &str,
+    partial: bool,
+) {
+    let event = JournalEvent {
+        schema: JOURNAL_SCHEMA,
+        seq,
+        ts: Utc::now(),
+        kind: COMPACTION_CHECKPOINT_KIND.to_owned(),
+        session_id: SESSION_ID.to_owned(),
+        turn_id: None,
+        data: checkpoint_data(covers_through_seq, source_digest),
+    };
+    let encoded = serde_json::to_vec(&event).expect("encode raw checkpoint event");
+    let bytes = if partial {
+        &encoded[..encoded.len() / 2]
+    } else {
+        encoded.as_slice()
+    };
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .expect("open journal for raw checkpoint append");
+    file.write_all(bytes)
+        .expect("write raw checkpoint fault payload");
+    file.flush().expect("flush raw checkpoint fault payload");
+    file.sync_data().expect("sync raw checkpoint fault payload");
+}
+
+fn checkpoint_data(covers_through_seq: u64, source_digest: &str) -> serde_json::Value {
+    json!({
+        "attempt_id": "compaction-attempt-1",
+        "checkpoint_id": "checkpoint-1",
+        "parent_checkpoint_id": null,
+        "covers_through_seq": covers_through_seq,
+        "source_digest": source_digest,
+        "summary": "complete checkpoint summary",
+        "model": "fault-injection-model",
+        "usage": {
+            "input_tokens": 10,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": 5,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": 15
+        },
+        "duration_ms": 1,
+        "raw_response": {
+            "id": "fault-response",
+            "status": "completed",
+            "usage": {
+                "input_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": 5,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": 15
+            },
+            "output": [{
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "complete checkpoint summary",
+                }],
+            }],
+        },
+    })
 }
 
 fn assert_recovered_state(
@@ -421,6 +798,21 @@ fn assert_recovered_state(
 
 fn event_kinds(events: &[oxidra::session::JournalEvent]) -> Vec<&str> {
     events.iter().map(|event| event.kind.as_str()).collect()
+}
+
+fn count_kind(events: &[JournalEvent], kind: &str) -> usize {
+    events.iter().filter(|event| event.kind == kind).count()
+}
+
+fn assert_recovered_compaction_abort(events: &[JournalEvent], started_seq: u64) {
+    let aborted = events
+        .iter()
+        .find(|event| event.kind == COMPACTION_ABORTED_KIND)
+        .expect("recovery appended compaction.aborted");
+    assert_eq!(aborted.data["attempt_id"], "compaction-attempt-1");
+    assert_eq!(aborted.data["started_seq"], started_seq);
+    assert_eq!(aborted.data["code"], "interrupted");
+    assert_eq!(aborted.data["recovered"], true);
 }
 
 fn read_child_stderr(child: &mut Child) -> String {

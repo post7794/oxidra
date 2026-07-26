@@ -24,7 +24,7 @@ use crate::types::{ToolCall, ToolResult, Usage};
 const MAX_PROJECT_INSTRUCTIONS: usize = 32 * 1024;
 
 /// Events emitted to the UI.  Streaming provider events are forwarded through
-/// [`on_provider_event`]; tool lifecycle events are committed before/after the
+/// [`AgentObserver::on_provider_event`]; tool lifecycle events are committed before/after the
 /// actual operation and therefore remain visible even when a process crashes.
 pub trait AgentObserver: Send {
     fn on_response_started(&mut self) -> Result<()> {
