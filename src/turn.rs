@@ -874,6 +874,28 @@ mod tests {
     }
 
     #[test]
+    fn terminal_failure_does_not_block_a_later_complete_cutoff() {
+        let events = vec![
+            user(1, "failed", true),
+            event(2, "failed", "response.failed", json!({})),
+            user(3, "complete", true),
+            response(4, "complete"),
+            marker(5, "complete", 3, 4),
+        ];
+
+        let turns = segment_turns(&events).expect("valid turns");
+        assert_eq!(turns[0].state, TurnState::Failed);
+        assert!(turns[0].cut_safe);
+        assert_eq!(
+            complete_prefix_candidates(&events).unwrap(),
+            vec![CompletePrefix {
+                turn_count: 1,
+                covers_through_seq: 5,
+            }]
+        );
+    }
+
+    #[test]
     fn unresolved_in_doubt_call_blocks_completion() {
         let events = vec![
             user(1, "t1", true),
@@ -930,6 +952,41 @@ mod tests {
             complete_prefix_candidates(&events)
                 .expect("valid prefixes")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn resolved_in_doubt_turn_does_not_block_a_later_complete_cutoff() {
+        let events = vec![
+            user(1, "uncertain", true),
+            call(2, "uncertain", "c1"),
+            event(3, "uncertain", "tool.started", json!({"call_id": "c1"})),
+            event(
+                4,
+                "uncertain",
+                "tool.in_doubt",
+                json!({"call_id": "c1", "started_seq": 3}),
+            ),
+            event(
+                5,
+                "uncertain",
+                "tool.in_doubt_resolved",
+                json!({"call_id": "c1", "started_seq": 3}),
+            ),
+            user(6, "complete", true),
+            response(7, "complete"),
+            marker(8, "complete", 6, 7),
+        ];
+
+        let turns = segment_turns(&events).unwrap();
+        assert_eq!(turns[0].state, TurnState::Incomplete);
+        assert!(turns[0].cut_safe);
+        assert_eq!(
+            complete_prefix_candidates(&events).unwrap(),
+            vec![CompletePrefix {
+                turn_count: 1,
+                covers_through_seq: 8,
+            }]
         );
     }
 
