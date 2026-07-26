@@ -85,6 +85,14 @@
 
 ## 安全与凭据
 
+### 未签名的 Windows release 曾触发 Defender ML 误报
+
+- 本地 `cargo test --release` 期间，Defender 曾将 `oxidra.exe` 判为 `Trojan:Win32/Bearfoos.A!ml`；源码、锁文件和构建链审计均未发现异常，`DidThreatExecute=False`，属于基于二进制形态与低信誉的启发式命中。
+- 取消 `strip = "symbols"` 后，标准 release 构建、Defender 定点扫描、`--help` 冒烟和完整 release E2E 均通过；该调整只缓解当前产物，不能保证未来编译器或代码布局变化后永不复发。
+- 长期发布需要 Authenticode 签名，并在再次命中时向 Microsoft 提交对应 SHA256 和样本复核；不能把要求用户关闭实时保护或排除整个安装目录作为发布方案。
+
+状态：当前 release profile 已保留符号以规避已观察到的误报；代码签名与误报提交流程待后续发布工程处理。
+
 ### `ProviderConfig` 的 Debug 会明文打印 API key
 
 - `ProviderConfig` derive 了 `Debug` 且 `api_key` 是公开 String，任何 `{:?}` 打印（日志、错误上下文）都会泄漏 key。

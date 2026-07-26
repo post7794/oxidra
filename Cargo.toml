@@ -58,4 +58,5 @@ codegen-units = 1
 lto = "thin"
 opt-level = "z"
 panic = "abort"
-strip = "symbols"
+# A stripped MSVC release was quarantined by Defender's Bearfoos ML heuristic.
+strip = "none"
