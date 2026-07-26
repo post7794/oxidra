@@ -220,19 +220,16 @@ impl ContextLimits {
 
 impl ProjectContext {
     pub fn resolve(cwd: Option<PathBuf>) -> Result<Self> {
-        let cwd_was_explicit = cwd.is_some();
-        let start = match cwd {
-            Some(path) => path,
-            None => env::current_dir()?,
-        };
-        let start = canonical_directory(&start)?;
-        let root = if cwd_was_explicit {
-            start
-        } else {
-            find_git_root(&start).unwrap_or(start)
+        let root = match cwd {
+            Some(path) => canonical_directory(&path)?,
+            None => default_project_root(&env::current_dir()?)?,
         };
         Ok(Self { root })
     }
+}
+
+fn default_project_root(current_dir: &Path) -> Result<PathBuf> {
+    canonical_directory(current_dir)
 }
 
 pub fn project_dirs() -> Result<ProjectDirs> {
@@ -295,17 +292,6 @@ fn canonical_directory(path: &Path) -> Result<PathBuf> {
         )));
     }
     Ok(canonical)
-}
-
-fn find_git_root(start: &Path) -> Option<PathBuf> {
-    let mut current = Some(start);
-    while let Some(directory) = current {
-        if directory.join(".git").exists() {
-            return Some(directory.to_owned());
-        }
-        current = directory.parent();
-    }
-    None
 }
 
 fn nonempty_env(name: &str) -> Option<String> {
@@ -392,12 +378,13 @@ mod tests {
     }
 
     #[test]
-    fn finds_nearest_git_root() {
+    fn project_context_keeps_the_selected_directory_as_root() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         let nested = root.join("src").join("deep");
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::create_dir_all(&nested).unwrap();
-        assert_eq!(find_git_root(&nested), Some(root));
+        let resolved = default_project_root(&nested).unwrap();
+        assert_eq!(resolved, nested.canonicalize().unwrap());
     }
 }

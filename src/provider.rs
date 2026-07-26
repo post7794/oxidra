@@ -402,11 +402,7 @@ impl OpenAiResponsesProvider {
                         payload
                     )));
                 }
-                "response.created"
-                | "response.in_progress"
-                | "response.content_part.added"
-                | "response.content_part.done"
-                | "response.output_text.done" => {}
+                event_type if is_known_progress_event(event_type) => {}
                 _ => {
                     state.unknown_events.push(payload.clone());
                     if let Err(error) = observer.on_event(ProviderEvent::Unknown {
@@ -675,6 +671,21 @@ fn string_field(value: &Value, name: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn is_known_progress_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "response.created"
+            | "response.in_progress"
+            | "response.content_part.added"
+            | "response.content_part.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+            | "response.output_text.done"
+    )
+}
+
 fn extract_event_error(payload: &Value) -> String {
     payload
         .get("error")
@@ -797,6 +808,19 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert_eq!(body["model"], "m");
+    }
+
+    #[test]
+    fn recognizes_reasoning_summary_progress_events() {
+        for event_type in [
+            "response.reasoning_summary_part.added",
+            "response.reasoning_summary_part.done",
+            "response.reasoning_summary_text.delta",
+            "response.reasoning_summary_text.done",
+        ] {
+            assert!(is_known_progress_event(event_type));
+        }
+        assert!(!is_known_progress_event("response.future.event"));
     }
 
     #[test]

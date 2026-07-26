@@ -114,7 +114,7 @@ Useful options:
 ```text
 -p, --print <PROMPT>       run one non-interactive turn
     --resume <SESSION_ID>  resume a local JSONL session
-    --cwd <DIR>            select the project root; otherwise discover .git upward
+    --cwd <DIR>            select the project root; defaults to the current directory
     --model <MODEL>        override the default gpt-5.6-sol model
     --full-auto            skip per-command shell confirmation
     --max-responses <N>    optional per-turn insurance limit

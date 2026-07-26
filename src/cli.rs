@@ -50,7 +50,7 @@ struct Cli {
     #[arg(long, value_name = "MODEL")]
     model: Option<String>,
 
-    /// Use this directory as the project root without searching parents.
+    /// Use this directory as the project root; defaults to the current directory.
     #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
 
