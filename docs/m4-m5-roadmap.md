@@ -281,6 +281,8 @@ M5 应新增显式 `turn.completed` 事件，供新 journal 确定边界。最�
 - `source_digest` 用于证明 summary 对应哪份规范化 source。这里 hash 只是完整 source 和完整 summary 之外的完整性校验，不承担恢复内容的职责。
 - journal 仍保存 checkpoint 覆盖范围内的全部原始事件，因此可审计、可重新实现 projection，也可在未来离线重做摘要。
 
+Checkpoint 接入必须保留清晰的函数边界：`validate_checkpoint_chain` 单独还原并校验 parent 单链、cutoff 与 source digest；`project_checkpoint_and_tail` 只能在链校验成功后投影最新 summary 与 cutoff 后的原始 tail。现有 `project_events` 继续只做原始事件投影，`project_tail` 继续只验证完整 turn cutoff 并投影原始 tail；不得把 checkpoint reducer 或“失败后静默回退全量历史”的行为塞进这两个函数。
+
 下一次普通请求的 input 为：
 
 ```text
@@ -341,12 +343,13 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 
 1. 锁定真实 usage 锚点、增量估算、context 配置来源和 journal 审计字段。
 2. 为新 turn 写 `turn.completed`，实现旧 journal 的保守边界识别。
-3. 将现有 `project_events` 拆成“原始事件投影”“按 cutoff 投影”“checkpoint + tail 投影”三个纯函数。
-4. 新建 `compaction.rs`：候选选择、source 规范化/digest、checkpoint reducer 与校验。
-5. 扩展 `ResponseRequest` 支持 compaction 的无工具请求和 summary output 上限。
-6. 在 Agent 的 context preflight 接入单次自动 compaction，再重新估算。
-7. 接入 observer stderr 状态和 crash recovery。
-8. 单元测试、合成大 journal 的 CLI E2E、三平台 CI。
+3. 保持 `project_events` 为原始事件投影、`project_tail` 为完整 turn cutoff 校验加原始 tail 投影，不给它们增加 checkpoint 语义。
+4. 新建 `compaction.rs`：候选选择、source 规范化/digest、checkpoint reducer，以及独立的 `validate_checkpoint_chain`。
+5. 新增 `project_checkpoint_and_tail`，只消费 `validate_checkpoint_chain` 返回的最新有效 checkpoint；无 checkpoint 时才走明确的原始 projection 分支，链损坏时直接报错。
+6. 扩展 `ResponseRequest` 支持 compaction 的无工具请求和 summary output 上限。
+7. 在 Agent 的 context preflight 接入单次自动 compaction，再重新估算。
+8. 接入 observer stderr 状态和 crash recovery。
+9. 单元测试、合成大 journal 的 CLI E2E、三平台 CI。
 
 ### 3.10 M5 验收门槛
 
@@ -357,9 +360,11 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 - 相同 journal 和配置选择相同完整 turn 前缀。
 - function call 与 output 永不被切到 checkpoint 两侧。
 - 最新 projection 为一个 summary 加 cutoff 后的 tail；被覆盖原始 items 不再发送给模型。
+- checkpoint 链校验与 checkpoint-aware projection 分别通过 `validate_checkpoint_chain`、`project_checkpoint_and_tail` 完成；`project_tail` 不承担 checkpoint reducer 职责。
 - journal 原始事件逐字保留，`session show` 可看到模型用于摘要的完整 source 和生成结果。
 - resume 选择同一最新有效 checkpoint，并继续形成单链。
 - 单独 `compaction.started` 恢复为 aborted，partial summary 不使用。
+- 进程级故障注入必须在 `compaction.started` 与 `compaction.checkpoint` 各自 `append_and_sync` 后强制终止子进程，证明恢复只启用完整 checkpoint，且不会把未提交 summary 投影给模型。
 - compaction usage 和时间完整写入 checkpoint；M4 推迟期间不做累计预算判断。
 - 压缩失败、无候选或压缩后仍过大时明确停止，无静默截断。
 - 当前 instructions 使用当前 `AGENTS.md`/memory；旧 instructions 快照不因 compaction 被重新注入。
