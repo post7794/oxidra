@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::error::{OxidraError, Result};
+use crate::event_kind::{is_response_lifecycle, is_tool_terminal, is_turn_scoped};
 use crate::session::JournalEvent;
 
 pub const TURN_BOUNDARY_VERSION: u64 = 1;
@@ -81,7 +82,7 @@ pub fn segment_turns(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
 
     for (index, event) in events.iter().enumerate() {
         let Some(turn_id) = event.turn_id.as_deref() else {
-            if is_turn_scoped_kind(&event.kind) {
+            if is_turn_scoped(&event.kind) {
                 return Err(OxidraError::Session(format!(
                     "{} at seq {} has no turn_id",
                     event.kind, event.seq
@@ -90,7 +91,7 @@ pub fn segment_turns(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
             continue;
         };
         let Some((start, end)) = ranges.get(turn_id) else {
-            if is_turn_scoped_kind(&event.kind) {
+            if is_turn_scoped(&event.kind) {
                 return Err(OxidraError::Session(format!(
                     "{} at seq {} references unknown turn {turn_id}",
                     event.kind, event.seq
@@ -279,12 +280,7 @@ fn validate_completed_marker(
     let last_response_event_seq = turn_events
         .iter()
         .rev()
-        .find(|event| {
-            matches!(
-                event.kind.as_str(),
-                "response.started" | "response.completed" | "response.failed" | "response.aborted"
-            )
-        })
+        .find(|event| is_response_lifecycle(&event.kind))
         .map(|event| event.seq);
     if last_response_event_seq != Some(final_response_seq) {
         return Err(OxidraError::Session(format!(
@@ -425,12 +421,7 @@ fn last_response_is_final(turn_events: &[&JournalEvent]) -> bool {
         .iter()
         .rev()
         .copied()
-        .find(|event| {
-            matches!(
-                event.kind.as_str(),
-                "response.started" | "response.completed" | "response.failed" | "response.aborted"
-            )
-        })
+        .find(|event| is_response_lifecycle(&event.kind))
         .is_some_and(|event| {
             event.kind == "response.completed" && !response_has_function_call(event)
         })
@@ -440,12 +431,7 @@ fn last_response_event_seq(turn_events: &[&JournalEvent]) -> Option<u64> {
     turn_events
         .iter()
         .rev()
-        .find(|event| {
-            matches!(
-                event.kind.as_str(),
-                "response.started" | "response.completed" | "response.failed" | "response.aborted"
-            )
-        })
+        .find(|event| is_response_lifecycle(&event.kind))
         .map(|event| event.seq)
 }
 
@@ -555,7 +541,7 @@ fn validate_call_outputs(turn_events: &[&JournalEvent]) -> Result<CallValidation
             continue;
         }
 
-        if is_terminal_tool_output(&event.kind) {
+        if is_tool_terminal(&event.kind) {
             let call_id = event_call_id(event);
             let started_seq = event.data.get("started_seq").and_then(Value::as_u64);
             let position = started_seq
@@ -638,46 +624,6 @@ fn response_output_items(event: &JournalEvent) -> Vec<&Value> {
         })
         .map(|items| items.iter().collect())
         .unwrap_or_default()
-}
-
-fn is_terminal_tool_output(kind: &str) -> bool {
-    matches!(
-        kind,
-        "tool.completed"
-            | "tool.cancelled"
-            | "tool.in_doubt_resolved"
-            | "tool.skipped_due_to_cancel"
-            | "tool.skipped_due_to_in_doubt"
-            | "tool.skipped_due_to_limit"
-            | "tool.skipped_due_to_stalled"
-            | "tool.skipped_due_to_recovery"
-    )
-}
-
-fn is_turn_scoped_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "user.message"
-            | "response.started"
-            | "response.completed"
-            | "response.failed"
-            | "response.aborted"
-            | "turn.completed"
-            | "turn.cancelled"
-            | "agent.stalled"
-            | "agent.limit_reached"
-            | "context.limit_reached"
-            | "tool.started"
-            | "tool.completed"
-            | "tool.cancelled"
-            | "tool.in_doubt"
-            | "tool.in_doubt_resolved"
-            | "tool.skipped_due_to_cancel"
-            | "tool.skipped_due_to_in_doubt"
-            | "tool.skipped_due_to_limit"
-            | "tool.skipped_due_to_stalled"
-            | "tool.skipped_due_to_recovery"
-    )
 }
 
 fn required_u64(event: &JournalEvent, field: &str) -> Result<u64> {
@@ -790,6 +736,72 @@ mod tests {
                 "covers_through_seq": seq,
             }),
         )
+    }
+
+    fn remap_sequence_fields(value: &mut Value, mapping: &HashMap<u64, u64>) {
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    remap_sequence_fields(value, mapping);
+                }
+            }
+            Value::Object(fields) => {
+                for (name, value) in fields {
+                    if matches!(
+                        name.as_str(),
+                        "started_seq"
+                            | "covers_from_seq"
+                            | "final_response_seq"
+                            | "covers_through_seq"
+                    ) {
+                        if let Some(remapped) = value.as_u64().and_then(|seq| mapping.get(&seq)) {
+                            *value = json!(remapped);
+                        }
+                    } else {
+                        remap_sequence_fields(value, mapping);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn renumber(events: &mut [JournalEvent], first_seq: u64) {
+        let mapping = events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| (event.seq, first_seq + index as u64))
+            .collect::<HashMap<_, _>>();
+        for event in events {
+            remap_sequence_fields(&mut event.data, &mapping);
+            event.seq = mapping[&event.seq];
+        }
+    }
+
+    fn semantic_turns(events: &[JournalEvent]) -> Vec<(String, TurnState, bool)> {
+        segment_turns(events)
+            .expect("valid turns")
+            .into_iter()
+            .map(|turn| (turn.turn_id, turn.state, turn.cut_safe))
+            .collect()
+    }
+
+    fn semantic_cutoffs(events: &[JournalEvent]) -> Vec<(usize, Option<String>, String)> {
+        complete_prefix_candidates(events)
+            .expect("valid prefixes")
+            .into_iter()
+            .map(|candidate| {
+                let boundary = events
+                    .iter()
+                    .find(|event| event.seq == candidate.covers_through_seq)
+                    .expect("cutoff references a journal event");
+                (
+                    candidate.turn_count,
+                    boundary.turn_id.clone(),
+                    boundary.kind.clone(),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -1143,6 +1155,173 @@ mod tests {
                 covers_through_seq: 4,
             }]
         );
+    }
+
+    #[test]
+    fn inserting_projection_neutral_global_events_preserves_state_and_cutoff_relation() {
+        let base = vec![
+            user(1, "t1", true),
+            call(2, "t1", "c1"),
+            tool_output(3, "t1", "c1"),
+            response(4, "t1"),
+            marker(5, "t1", 1, 4),
+            user(6, "t2", true),
+            response(7, "t2"),
+            marker(8, "t2", 6, 7),
+        ];
+        let expected_turns = semantic_turns(&base);
+        let expected_cutoffs = semantic_cutoffs(&base);
+
+        for kind in ["context.instructions", "render.compact", "session.metadata"] {
+            for insertion_index in 0..=base.len() {
+                let mut enriched = base.clone();
+                let mut global = event(u64::MAX, "unused", kind, json!({}));
+                global.turn_id = None;
+                enriched.insert(insertion_index, global);
+                renumber(&mut enriched, 1);
+
+                assert_eq!(
+                    semantic_turns(&enriched),
+                    expected_turns,
+                    "turn state changed after inserting {kind} at index {insertion_index}"
+                );
+                assert_eq!(
+                    semantic_cutoffs(&enriched),
+                    expected_cutoffs,
+                    "cutoff relation changed after inserting {kind} at index {insertion_index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legal_sequence_translation_preserves_state_and_translates_cutoffs() {
+        let events = vec![
+            user(1, "t1", true),
+            call(2, "t1", "c1"),
+            event(3, "t1", "tool.started", json!({"call_id": "c1"})),
+            tool_output(4, "t1", "c1"),
+            response(5, "t1"),
+            marker(6, "t1", 1, 5),
+            user(7, "t2", true),
+            inline_response(8, "t2", 7),
+        ];
+        let original_turns = segment_turns(&events).expect("valid original turns");
+        let original_cutoffs = complete_prefix_candidates(&events).expect("valid cutoffs");
+        let offset = 10_000;
+        let mut translated = events.clone();
+        renumber(&mut translated, offset + 1);
+
+        let translated_turns = segment_turns(&translated).expect("valid translated turns");
+        assert_eq!(translated_turns.len(), original_turns.len());
+        for (original, translated) in original_turns.iter().zip(&translated_turns) {
+            assert_eq!(translated.turn_id, original.turn_id);
+            assert_eq!(translated.start_index, original.start_index);
+            assert_eq!(translated.end_index_exclusive, original.end_index_exclusive);
+            assert_eq!(translated.state, original.state);
+            assert_eq!(translated.cut_safe, original.cut_safe);
+            assert_eq!(
+                translated.covers_from_seq,
+                original.covers_from_seq + offset
+            );
+            assert_eq!(
+                translated.covers_through_seq,
+                original.covers_through_seq + offset
+            );
+        }
+
+        let translated_cutoffs =
+            complete_prefix_candidates(&translated).expect("valid translated cutoffs");
+        assert_eq!(translated_cutoffs.len(), original_cutoffs.len());
+        for (original, translated) in original_cutoffs.iter().zip(&translated_cutoffs) {
+            assert_eq!(translated.turn_count, original.turn_count);
+            assert_eq!(
+                translated.covers_through_seq,
+                original.covers_through_seq + offset
+            );
+        }
+    }
+
+    #[test]
+    fn pending_call_variants_never_produce_a_prefix_candidate() {
+        let cases = vec![
+            (
+                "declared",
+                vec![
+                    user(1, "pending", false),
+                    call(2, "pending", "c1"),
+                    response(3, "pending"),
+                    user(4, "later", true),
+                    response(5, "later"),
+                    marker(6, "later", 4, 5),
+                ],
+            ),
+            (
+                "started",
+                vec![
+                    user(1, "pending", false),
+                    call(2, "pending", "c1"),
+                    event(3, "pending", "tool.started", json!({"call_id": "c1"})),
+                    response(4, "pending"),
+                    user(5, "later", true),
+                    response(6, "later"),
+                    marker(7, "later", 5, 6),
+                ],
+            ),
+            (
+                "one_of_two_resolved",
+                vec![
+                    user(1, "pending", false),
+                    event(
+                        2,
+                        "pending",
+                        "response.completed",
+                        json!({"output_items": [
+                            {"type": "function_call", "call_id": "c1"},
+                            {"type": "function_call", "call_id": "c2"},
+                        ]}),
+                    ),
+                    tool_output(3, "pending", "c1"),
+                    response(4, "pending"),
+                    user(5, "later", true),
+                    response(6, "later"),
+                    marker(7, "later", 5, 6),
+                ],
+            ),
+            (
+                "in_doubt",
+                vec![
+                    user(1, "pending", false),
+                    call(2, "pending", "c1"),
+                    event(3, "pending", "tool.started", json!({"call_id": "c1"})),
+                    event(
+                        4,
+                        "pending",
+                        "tool.in_doubt",
+                        json!({"call_id": "c1", "started_seq": 3}),
+                    ),
+                    response(5, "pending"),
+                    user(6, "later", true),
+                    response(7, "later"),
+                    marker(8, "later", 6, 7),
+                ],
+            ),
+        ];
+
+        for (name, events) in cases {
+            let turns = segment_turns(&events).expect("valid turns");
+            assert!(!turns[0].cut_safe, "{name} pending call became cut-safe");
+            assert!(
+                matches!(turns[1].state, TurnState::Complete(_)),
+                "{name} fixture must contain a later complete turn"
+            );
+            assert!(
+                complete_prefix_candidates(&events)
+                    .expect("valid prefix reduction")
+                    .is_empty(),
+                "{name} pending call produced a prefix candidate"
+            );
+        }
     }
 
     #[test]

@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::error::{OxidraError, Result};
+use crate::event_kind::{is_response_terminal, is_tool_lifecycle, is_tool_terminal};
 
 pub const JOURNAL_SCHEMA: u32 = 1;
 pub const SESSION_STARTED_KIND: &str = "session.started";
@@ -789,14 +790,7 @@ fn pending_tools(events: &[JournalEvent]) -> Vec<InDoubtTool> {
             "tool.in_doubt" => {
                 record_in_doubt_tool(event, &mut pending, &mut call_ids);
             }
-            "tool.completed"
-            | "tool.cancelled"
-            | "tool.in_doubt_resolved"
-            | "tool.skipped_due_to_cancel"
-            | "tool.skipped_due_to_in_doubt"
-            | "tool.skipped_due_to_limit"
-            | "tool.skipped_due_to_stalled"
-            | "tool.skipped_due_to_recovery" => {
+            kind if is_tool_terminal(kind) => {
                 resolve_tool(&event.data, &mut pending, &mut call_ids);
             }
             _ => {}
@@ -948,7 +942,7 @@ fn unfinished_responses(events: &[JournalEvent]) -> Vec<UnfinishedResponse> {
                     );
                 }
             }
-            "response.completed" | "response.failed" | "response.aborted" => {
+            kind if is_response_terminal(kind) => {
                 if let Some(response_attempt_id) =
                     string_field(&event.data, &["response_attempt_id"])
                 {
@@ -1008,16 +1002,7 @@ fn unstarted_tool_calls(events: &[JournalEvent]) -> Vec<UnstartedTool> {
                     );
                 }
             }
-            "tool.started"
-            | "tool.completed"
-            | "tool.cancelled"
-            | "tool.in_doubt"
-            | "tool.in_doubt_resolved"
-            | "tool.skipped_due_to_cancel"
-            | "tool.skipped_due_to_in_doubt"
-            | "tool.skipped_due_to_limit"
-            | "tool.skipped_due_to_stalled"
-            | "tool.skipped_due_to_recovery" => {
+            kind if is_tool_lifecycle(kind) => {
                 if let Some(call_id) = string_field(&event.data, &["call_id", "id"]) {
                     if let Some(key) = unstarted
                         .iter()

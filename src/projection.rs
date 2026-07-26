@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use serde_json::{Value, json};
 
 use crate::error::{OxidraError, Result};
+use crate::event_kind::is_tool_terminal;
 use crate::session::JournalEvent;
 use crate::turn::complete_prefix_candidates;
 
@@ -52,20 +53,7 @@ pub fn project_events(events: &[JournalEvent]) -> Vec<Value> {
                     projected.extend(items.iter().cloned());
                 }
             }
-            "tool.completed"
-            | "tool.cancelled"
-            | "tool.skipped_due_to_cancel"
-            | "tool.skipped_due_to_in_doubt"
-            | "tool.skipped_due_to_limit"
-            | "tool.skipped_due_to_stalled"
-            | "tool.skipped_due_to_recovery" => {
-                if let Some(item) = tool_output_item(&event.data) {
-                    projected.push(item);
-                }
-            }
-            // A user may explicitly resolve an in-doubt tool as failed. It
-            // then becomes a normal function output for future replay.
-            "tool.in_doubt_resolved" => {
+            kind if is_tool_terminal(kind) => {
                 if let Some(item) = tool_output_item(&event.data) {
                     projected.push(item);
                 }

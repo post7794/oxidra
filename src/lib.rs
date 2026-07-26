@@ -3,6 +3,7 @@ mod auth;
 pub mod cli;
 pub mod config;
 pub mod error;
+mod event_kind;
 mod memory;
 mod process;
 pub mod projection;
