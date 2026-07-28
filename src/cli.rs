@@ -919,10 +919,11 @@ impl CliObserver {
     }
 
     fn finish_text(&mut self) -> Result<()> {
+        let mut stdout = io::stdout().lock();
         if self.stream_text && self.wrote_text && !self.text_ended_with_newline {
-            println!();
+            stdout.write_all(b"\n")?;
         }
-        io::stdout().flush()?;
+        stdout.flush()?;
         self.wrote_text = false;
         self.text_ended_with_newline = true;
         Ok(())
@@ -939,8 +940,9 @@ impl AgentObserver for CliObserver {
         match event {
             ProviderEvent::TextDelta(delta) => {
                 if self.stream_text {
-                    print!("{delta}");
-                    io::stdout().flush()?;
+                    let mut stdout = io::stdout().lock();
+                    stdout.write_all(delta.as_bytes())?;
+                    stdout.flush()?;
                     self.wrote_text = true;
                     self.response_streamed_text.push_str(&delta);
                     self.text_ended_with_newline = delta.ends_with('\n');
@@ -953,10 +955,11 @@ impl AgentObserver for CliObserver {
             } => {
                 let id = call_id.or(item_id).unwrap_or_else(|| "unknown".to_owned());
                 if self.announced_argument_streams.insert(id.clone()) {
-                    eprintln!(
+                    writeln!(
+                        io::stderr().lock(),
                         "[tool] receiving arguments for call {}",
                         escape_terminal(&id)
-                    );
+                    )?;
                 }
             }
             ProviderEvent::Retry {
@@ -964,44 +967,48 @@ impl AgentObserver for CliObserver {
                 delay,
                 reason,
             } => {
-                eprintln!(
+                writeln!(
+                    io::stderr().lock(),
                     "[provider] retry {attempt} in {:.1}s: {}",
                     delay.as_secs_f64(),
                     escape_terminal(&reason)
-                );
+                )?;
             }
             ProviderEvent::Unknown {
                 event_type,
                 payload: _,
             } => {
-                eprintln!(
+                writeln!(
+                    io::stderr().lock(),
                     "[provider] ignored unknown event {}",
                     escape_terminal(&event_type)
-                );
+                )?;
             }
         }
         Ok(())
     }
 
     fn on_tool_started(&mut self, call: &ToolCall) -> Result<()> {
-        eprintln!(
+        writeln!(
+            io::stderr().lock(),
             "[tool:start] {} {}",
             escape_terminal(&call.name),
             display_value(&call.arguments)
-        );
+        )?;
         if let Some(diff) = render_edit_diff(call, self.render_options) {
-            eprintln!("[edit:diff]\n{diff}");
+            writeln!(io::stderr().lock(), "[edit:diff]\n{diff}")?;
         }
         Ok(())
     }
 
     fn on_tool_completed(&mut self, call: &ToolCall, result: &ToolResult) -> Result<()> {
         let status = if result.is_error { "error" } else { "ok" };
-        eprintln!(
+        writeln!(
+            io::stderr().lock(),
             "[tool:{status}] {} {}",
             escape_terminal(&call.name),
             display_value(&result.output)
-        );
+        )?;
         if !self.stream_text && result.error_code.as_deref() == Some("approval_required") {
             self.approval_required = Some(if call.name == "remember" {
                 "remember requires interactive user confirmation".to_owned()
@@ -1014,7 +1021,7 @@ impl AgentObserver for CliObserver {
     }
 
     fn on_message(&mut self, message: &str) -> Result<()> {
-        eprintln!("[agent] {message}");
+        writeln!(io::stderr().lock(), "[agent] {message}")?;
         Ok(())
     }
 }

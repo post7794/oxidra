@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ProviderConfig;
 use crate::error::{OxidraError, Result};
+use crate::projection::validate_response_output_items;
 use crate::types::{AssistantTurn, ToolCall, ToolDefinition, Usage};
 
 const MAX_ATTEMPTS: usize = 3;
@@ -35,6 +36,7 @@ pub struct ResponseRequest {
     pub input: Vec<Value>,
     pub tools: Vec<ToolDefinition>,
     pub model: Option<String>,
+    pub max_output_tokens: Option<u64>,
 }
 
 impl ResponseRequest {
@@ -44,6 +46,7 @@ impl ResponseRequest {
             input,
             tools,
             model: None,
+            max_output_tokens: None,
         }
     }
 }
@@ -72,6 +75,10 @@ pub enum ProviderEvent {
 /// Sink used by a CLI (or a test) to render streaming output.
 pub trait StreamObserver: Send {
     fn on_event(&mut self, event: ProviderEvent) -> Result<()>;
+}
+
+fn notify_observer(observer: &mut dyn StreamObserver, event: ProviderEvent) -> Result<()> {
+    observer.on_event(event).map_err(OxidraError::observer)
 }
 
 /// A provider implementation can be substituted by a fake in integration
@@ -159,6 +166,12 @@ impl OpenAiResponsesProvider {
             body.insert(
                 "instructions".to_owned(),
                 Value::String(instructions.clone()),
+            );
+        }
+        if let Some(max_output_tokens) = request.max_output_tokens {
+            body.insert(
+                "max_output_tokens".to_owned(),
+                Value::Number(max_output_tokens.into()),
             );
         }
         Value::Object(body)
@@ -312,7 +325,7 @@ impl OpenAiResponsesProvider {
                         }
                         state.text.push_str(delta);
                         if let Err(error) =
-                            observer.on_event(ProviderEvent::TextDelta(delta.to_owned()))
+                            notify_observer(observer, ProviderEvent::TextDelta(delta.to_owned()))
                         {
                             return AttemptResult::fatal(error);
                         }
@@ -336,11 +349,14 @@ impl OpenAiResponsesProvider {
                         }
                         arguments.push_str(&delta);
                     }
-                    if let Err(error) = observer.on_event(ProviderEvent::FunctionArgumentsDelta {
-                        item_id,
-                        call_id,
-                        delta,
-                    }) {
+                    if let Err(error) = notify_observer(
+                        observer,
+                        ProviderEvent::FunctionArgumentsDelta {
+                            item_id,
+                            call_id,
+                            delta,
+                        },
+                    ) {
                         return AttemptResult::fatal(error);
                     }
                 }
@@ -405,10 +421,13 @@ impl OpenAiResponsesProvider {
                 event_type if is_known_progress_event(event_type) => {}
                 _ => {
                     state.unknown_events.push(payload.clone());
-                    if let Err(error) = observer.on_event(ProviderEvent::Unknown {
-                        event_type,
-                        payload,
-                    }) {
+                    if let Err(error) = notify_observer(
+                        observer,
+                        ProviderEvent::Unknown {
+                            event_type,
+                            payload,
+                        },
+                    ) {
                         return AttemptResult::fatal(error);
                     }
                 }
@@ -440,11 +459,14 @@ impl ResponseProvider for OpenAiResponsesProvider {
                     }
                     last_retry_reason = Some(reason);
                     let delay = backoff(attempt);
-                    observer.on_event(ProviderEvent::Retry {
-                        attempt,
-                        delay,
-                        reason: last_retry_reason.clone().unwrap_or_default(),
-                    })?;
+                    notify_observer(
+                        observer,
+                        ProviderEvent::Retry {
+                            attempt,
+                            delay,
+                            reason: last_retry_reason.clone().unwrap_or_default(),
+                        },
+                    )?;
                     tokio::select! {
                         _ = cancellation.cancelled() => return Err(OxidraError::Interrupted),
                         _ = tokio::time::sleep(delay) => {},
@@ -459,11 +481,14 @@ impl ResponseProvider for OpenAiResponsesProvider {
                     }
                     last_retry_reason = Some(reason);
                     let delay = retry_after.unwrap_or_else(|| backoff(attempt));
-                    observer.on_event(ProviderEvent::Retry {
-                        attempt,
-                        delay,
-                        reason: last_retry_reason.clone().unwrap_or_default(),
-                    })?;
+                    notify_observer(
+                        observer,
+                        ProviderEvent::Retry {
+                            attempt,
+                            delay,
+                            reason: last_retry_reason.clone().unwrap_or_default(),
+                        },
+                    )?;
                     tokio::select! {
                         _ = cancellation.cancelled() => return Err(OxidraError::Interrupted),
                         _ = tokio::time::sleep(delay) => {},
@@ -611,6 +636,7 @@ fn build_turn(mut response: Value, stream_state: &StreamState) -> Result<Assista
             }
         }
     }
+    validate_response_output_items(&output_items)?;
 
     if text.is_empty() {
         text = stream_state.text.clone();
@@ -748,10 +774,56 @@ mod tests {
 
     struct NoopObserver;
 
+    struct FailingObserver {
+        error: Option<OxidraError>,
+    }
+
     impl StreamObserver for NoopObserver {
         fn on_event(&mut self, _event: ProviderEvent) -> Result<()> {
             Ok(())
         }
+    }
+
+    impl StreamObserver for FailingObserver {
+        fn on_event(&mut self, _event: ProviderEvent) -> Result<()> {
+            Err(self.error.take().expect("observer is called once"))
+        }
+    }
+
+    #[test]
+    fn observer_callback_errors_are_wrapped_at_the_provider_boundary() {
+        for original in [
+            OxidraError::Config("render configuration failed".to_owned()),
+            OxidraError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "stdout closed",
+            )),
+        ] {
+            let mut observer = FailingObserver {
+                error: Some(original),
+            };
+            let error = notify_observer(
+                &mut observer,
+                ProviderEvent::TextDelta("partial".to_owned()),
+            )
+            .expect_err("observer failure must cross an explicit provenance boundary");
+            assert!(matches!(error, OxidraError::Observer(_)));
+        }
+
+        let mut observer = FailingObserver {
+            error: Some(OxidraError::observer(OxidraError::Config(
+                "already wrapped".to_owned(),
+            ))),
+        };
+        let error = notify_observer(
+            &mut observer,
+            ProviderEvent::TextDelta("partial".to_owned()),
+        )
+        .expect_err("an already wrapped observer error remains an observer error");
+        let OxidraError::Observer(source) = error else {
+            panic!("observer provenance was lost")
+        };
+        assert!(matches!(*source, OxidraError::Config(_)));
     }
 
     #[test]
@@ -759,7 +831,7 @@ mod tests {
         let response = json!({
             "usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
             "output": [
-                {"type":"message","content":[{"type":"output_text","text":"ok"}]},
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]},
                 {"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"a\"}"}
             ]
         });
@@ -767,6 +839,26 @@ mod tests {
         assert_eq!(turn.text, "ok");
         assert_eq!(turn.tool_calls[0].id, "call_1");
         assert_eq!(turn.usage.total_tokens, 7);
+    }
+
+    #[test]
+    fn rejects_provider_messages_with_non_assistant_roles() {
+        for role in [None, Some("user"), Some("developer"), Some("system")] {
+            let mut message = json!({
+                "type": "message",
+                "content": [{"type": "output_text", "text": "unsafe"}],
+            });
+            if let Some(role) = role {
+                message["role"] = json!(role);
+            }
+            let error = build_turn(
+                json!({"output": [message], "usage": {}}),
+                &StreamState::default(),
+            )
+            .expect_err("non-assistant output role must be rejected")
+            .to_string();
+            assert!(error.contains("must have role assistant"), "{error}");
+        }
     }
 
     #[test]
@@ -808,6 +900,23 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert_eq!(body["model"], "m");
+        assert!(body.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn request_can_limit_compaction_output_without_tools() {
+        let config = ProviderConfig {
+            api_key: "x".to_owned(),
+            api_base_url: url::Url::parse("https://example.test/v1/").unwrap(),
+            model: "m".to_owned(),
+        };
+        let provider = OpenAiResponsesProvider::new(config).unwrap();
+        let mut request =
+            ResponseRequest::new(vec![json!({"role": "user", "content": "x"})], Vec::new());
+        request.max_output_tokens = Some(8192);
+        let body = provider.request_body(&request);
+        assert_eq!(body["max_output_tokens"], 8192);
+        assert_eq!(body["tools"], json!([]));
     }
 
     #[test]

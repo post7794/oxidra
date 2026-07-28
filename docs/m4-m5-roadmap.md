@@ -1,6 +1,6 @@
 # Oxidra M4/M5 实施规划
 
-状态：设计基线。M4 按实际使用数据推迟，M5 前置结构开始实施，自动 compaction 尚未实现。
+状态：设计与部分实现。M4 按实际使用数据推迟。M5 的显式 turn 边界、原始 projection、checkpoint 数据模型与 reducer、低权限 summary envelope、不可变格式版本注册表、checkpoint + tail projection、真实 Responses Provider `compact_once`、8192 输出上限，以及 Provider 完成到 checkpoint 落盘窗口的生产路径故障注入已经实现。Agent 在存在有效 checkpoint 时会严格投影 summary + tail；受控历史回查、model-aware preflight、用户入口和自动触发尚未实现。自动 compaction 在历史回查闭环和漂移测量完成前必须保持默认关闭。
 
 本文只规划两个后续里程碑：
 
@@ -61,10 +61,10 @@ CLI 覆盖：
 配置优先级：
 
 ```text
-本次 CLI 显式覆盖 > session 已保存预算 > 用户 config.toml > 内置默认值
+本次 CLI 显式覆盖 > 环境变量 > 当前用户 config.toml > 内置默认值
 ```
 
-新 session 在 `session.started` 后追加 `budget.configured`。resume 默认沿用该 session 最近一次保存的预算，不因用户配置文件后来变化而静默改变。resume 时显式传入新上限或 `--no-session-budget`，追加 `budget.reconfigured`。旧 session 没有预算事件时，在第一次 resume 应用当前默认值并追加配置事件。
+新建和每次 resume 都重新解析当前配置，并在 `session.started` 后或新启动 epoch 开始时追加 `budget.configured`。历史 `budget.configured` / `budget.reconfigured` 只回答“当时使用了什么”，不能反向恢复旧配置。当前配置变化会改变 resume 后的运行行为；journal 快照负责让变化可审计，而不是成为配置真相源。
 
 建议事件数据：
 
@@ -171,7 +171,7 @@ session budget: tokens 143,200/1,000,000 (14%), active 8m12s/2h (7%)
 ### 2.8 M4 验收门槛
 
 - 新 session 默认预算实际启用，不能只在测试中手工配置才生效。
-- resume 沿用 session 预算；用户 config 变化不会改变旧 session。
+- resume 使用当前解析出的预算配置，并追加审计事件；旧 session 中的预算快照不能覆盖当前 CLI/env/config。
 - CLI 显式提高预算后，同一 session 可继续。
 - 多个 response 的 `total_tokens` 正确累计，cached/reasoning 不重复计算。
 - 完成 response 导致超限时，其 tool calls 全部被明确 skip。
@@ -188,6 +188,8 @@ session budget: tokens 143,200/1,000,000 (14%), active 8m12s/2h (7%)
 
 M5 解决的是“下一次请求装不下完整历史”，不是删除历史，也不是降低已经产生的 token 费用。完整原始事件仍保留在 journal；checkpoint 只是一个新的、有出处的派生输入。
 
+设计定位是：Codex 的窗口化上下文 + Claude Code 的压缩后状态重载与完整 transcript 保留 + Oxidra 的可审计 checkpoint 和受控历史回查。公开证据不能证明 Claude Code 向模型提供了压缩历史搜索工具；`history_*` 是 Oxidra 自己补全的能力。
+
 M5 不实现：
 
 - 修改、删除或重写旧 journal 行。
@@ -196,41 +198,57 @@ M5 不实现：
 - 后台压缩任务、多个压缩模型、用户可编程摘要 hook。
 - sub-agent。M5 只为以后评估 sub-agent 清除上下文阻塞，不承诺实现它。
 
-### 3.2 自动触发与目标水位
+### 3.2 Context 测量、触发与发布门
 
-M5 默认自动启用，不要求用户等到硬 `context_limit` 后手工补救。基于当前已配置的 `context_window` 与 `reserve_tokens`：
+自动触发实现后先默认关闭，只通过测试或显式实验入口启用。真实 `compact_once`、受控历史回查、崩溃与连续压缩闭环测试、漂移测量基线全部完成后，才能根据数据另行确定默认启用门槛；不能在实现前预设“摘要质量应该足够好”。
+
+基于当前解析出的 `context_window` 与 `reserve_tokens`：
 
 ```text
 usable = context_window - reserve_tokens
+hard_limit = usable
 trigger = usable * 80%
 target = usable * 50%
 max_summary_output = 8192 tokens
 min_recent_complete_turns = 2
 ```
 
-每次普通 response 发出前：
+每次普通 response 发出前，先对 Provider 实际准备发送的完整请求做 preflight。优先使用最近一次可比较的普通 response 作为差分锚点：
 
-1. 优先用最近一次可比较的普通 `response.completed.data.usage.input_tokens` 作为真实锚点，再只估算当前请求相对该锚点请求的变化：
+```text
+next_input ~= anchor.reported_input_tokens
+             + E(current_prepared_request)
+             - E(anchor_prepared_request)
+```
 
-   ```text
-   next_input ~= anchor.input_tokens
-                + estimate(current_request)
-                - estimate(anchor_request)
-   ```
+差值必须使用有符号计算，允许请求变小。`E(current_prepared_request)` 与 `E(anchor_prepared_request)` 必须使用同一版本的确定性估算器和相同的完整请求形状，包括：
 
-   `estimate(anchor_request)` 必须是在发送该请求时保存的同版本估算值，差值是有符号的，既允许追加也允许删除。锚点只描述上一次实际请求；它不是下一请求的精确 token 计数。
-2. 没有历史 usage，或锚点的 model、provider protocol、估算器版本不可比较时，才从零估算当前完整请求。Provider 未报告 usage 必须视为“没有锚点”，不能把缺失值当成真实的 `0`。
-3. 用校准后的 `next_input` 与 trigger、hard limit 比较。cached input 是上下文的一部分，不得从 `input_tokens` 中扣除。
-4. 小于 trigger，正常请求。
-5. 达到 trigger，选择一个完整旧前缀并最多执行一次 compaction。
-6. checkpoint 提交后重新构建 projection 并重新检查。
-7. 仍达到 hard limit 时返回 `context_limit`，不继续压缩循环，不静默截断。
+- 当前 canonical instructions。
+- 全部 input items，包括 checkpoint summary、assistant output、function call 和 tool output。
+- 当前 canonical tools schema。
+- model/protocol 相关固定开销。
 
-压缩选择必须至少保留最近两个完整 turn 和当前 turn。若当前 turn 本身过大，或不存在能在完整 turn 边界切开的旧前缀，则明确停止；不能切开 function call 与 function_call_output，也不能只丢大工具输出。
+`E(anchor_prepared_request)` 必须是在发送锚点请求时保存的同版本估算值，并绑定实际 prepared-request digest。checkpoint、instructions 或 tools 发生变化本身不机械使锚点失效；只要仍能按相同语义构造 current/anchor 两份请求，差分继续有效。只有无法可靠重建 anchor 请求，或 `provider_usage_domain`、request-shape/estimator version 不再可比时，才从零估算完整当前请求。
+
+`provider_usage_domain` 是不含秘密的稳定兼容键，至少绑定 provider 类型、去除凭据/query/fragment 后的规范化 endpoint 或 provider profile，以及 effective model。只比较 protocol + model 不够：两个 OpenAI-compatible 后端即使使用同一模型名，也可能采用不同 token 统计语义。domain 变化时旧 usage 锚点必须失效。
+
+Provider 未报告 `usage.input_tokens` 必须视为“没有锚点”，不能把缺失值当成真实的 `0`。cached input 已包含在 `input_tokens` 中，不得扣除；也不能直接再加上一次 `output_tokens`，因为真正进入当前请求的 assistant/function/tool 内容已经包含在请求差分里。
+
+以下触发流程只在显式实验入口或未来默认开关启用时生效；开关关闭时保留现有 hard-limit 停止路径，不调用 compaction：
+
+1. 小于 trigger，正常发送普通请求。
+2. 达到 trigger，在安全 turn 边界选择一个连续旧前缀；同一个 request boundary 最多执行一次 compaction。
+3. Provider 完成后，先用候选 summary + tail 重建 prepared request；只有估算达到 target 才允许提交 checkpoint。
+4. 仍高于 target 时写 `compaction.failed`，保留上一有效 checkpoint 并终止当前请求；不能把“低于 hard limit”当作放行理由，也不能在同一 boundary 换 cutoff 再试。
+5. checkpoint 提交后再次执行 hard-limit 防御检查；若因状态或测量不一致仍超限，写 `context.limit_reached` 并终止当前请求，不循环 compact，不静默截断。
+
+cutoff 不得进入最近两个完整 turn，当前开放 turn 也永不被覆盖。这是不可侵犯的安全下限，不是“必定能装下”的容量保证。若 checkpoint summary、最近两个完整 turn、当前开放 turn、当前 instructions 和 tools 仍无法达到可发送范围，则不生成不安全 checkpoint，记录明确原因并终止当前请求。不能切开 function call 与 function_call_output，也不能靠静默丢弃大工具输出兜底。
 
 `context_window` 允许按精确 model 配置；`context_window` 与 `reserve_tokens` 都必须保留最终生效值和各自来源（CLI、环境变量、model config、全局 config 或内置默认）。第一版不调用 `/models` 自动探测窗口，不引入本地 tokenizer，也不做按项目或 session 的 compaction 策略框架。
 
-每次新建或 resume 都追加独立的 `context.configured`，保存 model、provider protocol、window、reserve、usable、trigger、target、各字段来源和 measurement/estimator version。`response.started` 还要保存本次完整请求估算、请求 digest、使用的锚点 response seq、真实 anchor input、估算差值和最终 `next_input`，使每个触发决定都可复查。
+每次新建或 resume 都以当前解析出的 provider、model、context、instructions 和 tools 为运行真相；历史快照只供审计，不能复活旧配置。追加独立的 `context.configured`，保存 model、provider protocol、`provider_usage_domain`、window、reserve、usable、trigger、target、各字段来源和 measurement/estimator/request-shape version。
+
+为使 anchor 请求可重建，每次启动和 canonical tool 集合变化时追加 `context.tools`，保存完整 canonical tool schemas 与 digest；`response.started` 引用对应的 instructions/tools epoch，并保存本次完整请求估算与 digest、请求可见的 journal seq、checkpoint/cutoff、使用的锚点 response seq、真实 anchor input、anchor estimate、有符号差值和最终 `next_input`。`context.limit_reached` 也必须保存同一组决策字段，因为 hard stop 可能发生在普通 `response.started` 之前。API key、endpoint 中的凭据/query 等秘密不得写入 journal。
 
 ### 3.3 Compaction 单位与边界
 
@@ -244,7 +262,7 @@ user.message
   -> final response.completed without tool calls
 ```
 
-M5 应新增显式 `turn.completed` 事件，供新 journal 确定边界。最终无工具调用的 `response.completed` 同时保存同事件内的 completion coverage，随后正常追加 `turn.completed`；如果进程恰好在两次 sync 之间崩溃，完整的 response 事件仍能恢复边界。兼容旧 session 时，可把“下一个 `user.message` 已出现”视为前一个 turn 已关闭，但绝不能推断 journal 尾部的 turn 已完成。
+M5 checkpoint 核心已经新增显式 `turn.completed` 事件，供新 journal 确定边界。最终无工具调用的 `response.completed` 同时保存同事件内的 completion coverage，随后正常追加 `turn.completed`；如果进程恰好在两次 sync 之间崩溃，完整的 response 事件仍能恢复边界。兼容旧 session 时，可把“下一个 `user.message` 已出现”视为前一个 turn 已关闭，但绝不能推断 journal 尾部的 turn 已完成。
 
 “turn 成功完成”和“journal 前缀可安全切分”是两个概念。`turn.completed` 只表示成功；failed/cancelled/aborted/stalled/limit 或已显式解决的 in-doubt turn 仍可位于后续完整 cutoff 覆盖的前缀中，前提是已出现下一条 `user.message`、provider projection 已确定且没有 pending/in-doubt/配对不明的工具调用。候选 cutoff 自身仍只能落在成功完成的 turn 边界上。这样一次早期失败不会永久禁用之后的 compaction，也不会把失败伪装成成功。
 
@@ -255,7 +273,7 @@ M5 应新增显式 `turn.completed` 事件，供新 journal 确定边界。最�
 - cancelled/aborted 且恢复投影尚未形成明确结果。
 - 当前正在处理的 turn。
 
-前缀选择算法必须是纯函数：相同事件、checkpoint、context 参数得到相同 `covers_through_seq`。先按 turn 边界从旧到新装入候选，直到用 summary 替换后预计回落至 target；不使用 LLM 相关性评分决定删谁。
+前缀选择算法必须是纯函数：相同事件、checkpoint、context 参数得到相同 `covers_through_seq`。从旧到新只选择连续、安全的 turn 前缀，同时禁止 cutoff 进入最近两个完整 turn；不使用 LLM 相关性评分决定删谁。若所有合法候选都无法使请求达到目标，返回 `TargetUnreachable` 等明确原因，而不是扩大 cutoff 越过安全下限。
 
 ### 3.4 Checkpoint 链
 
@@ -269,6 +287,12 @@ M5 应新增显式 `turn.completed` 事件，供新 journal 确定边界。最�
   "source_digest": "sha256-of-canonical-source-projection",
   "summary": "模型实际生成并将在 projection 中使用的完整文本",
   "model": "gpt-5.6-sol",
+  "prompt_version": 1,
+  "summary_envelope_version": 1,
+  "source_projection_version": 1,
+  "turn_boundary_validator_version": 1,
+  "source_digest_version": 1,
+  "usage_contract_version": 1,
   "usage": {},
   "duration_ms": 1234,
   "raw_response": {}
@@ -283,24 +307,74 @@ M5 应新增显式 `turn.completed` 事件，供新 journal 确定边界。最�
 
 Checkpoint 接入必须保留清晰的函数边界：`validate_checkpoint_chain` 单独还原并校验 parent 单链、cutoff 与 source digest；`project_checkpoint_and_tail` 只能在链校验成功后投影最新 summary 与 cutoff 后的原始 tail。现有 `project_events` 继续只做原始事件投影，`project_tail` 继续只验证完整 turn cutoff 并投影原始 tail；不得把 checkpoint reducer 或“失败后静默回退全量历史”的行为塞进这两个函数。
 
-下一次普通请求的 input 为：
+下一次普通请求的结构为：
 
 ```text
-[latest checkpoint summary as a synthetic developer message]
-+ [journal 中 seq > covers_through_seq 的正常 projection]
+完整 append-only journal
+        │
+        ├── 最新有效 checkpoint summary
+        └── checkpoint cutoff 后的完整 tail
+              ├── 至少两个已完成 turn
+              └── 当前开放 turn
+        │
+        ├── 当前 canonical instructions
+        └── 当前 canonical tools
+                    ↓
+                Provider request
 ```
 
-synthetic message 必须明确标记为“已压缩的旧会话事实，不是新的用户指令”；当前进程构建的 instructions 始终具有更高时效性。历史 `context.instructions` 继续只留在 journal 审计，不进入 compaction source 或普通 projection，避免复活已经变化的 `AGENTS.md`/memory。
+“至少两个完整 turn”是 cutoff 选择时的保留约束，不是 projection 阶段额外读取和拼接的第二份数据源。projection 只能是一个最新 summary 加 `seq > covers_through_seq` 的正常 tail，禁止重复拼接 recent turns。
+
+summary synthetic item 固定使用低权限 `role: "user"`；当前 canonical instructions 继续使用真正的顶层 `instructions` / developer 通道。父 summary 进入下一次 compaction source 时也必须通过其持久化版本的低权限 envelope，不能进入 compaction instructions。
+
+权限边界来自 Provider 的消息 role。固定 notice、标签和内容分隔只帮助模型识别来源，是 defense in depth，不提供权限隔离，也不能承诺模型完全不受历史 prompt injection 影响。这里保证的是旧 user/tool 文本不会被提升为 developer/system；历史 summary 与当前用户消息同属 user level，不能虚构一个 Provider 并不存在的 data role。历史 `context.instructions` 继续只留在 journal 审计，不进入 compaction source 或普通 projection，避免复活已经变化的 `AGENTS.md`/memory。
+
+同一规则必须覆盖 summary 之外的原始 projection：Provider 返回的 `type: "message"` output item 只能是 `role: "assistant"`，`user.message.data.item` 只能是 `role: "user"`。Provider 提交前和 journal 重放时都要校验；缺失 role、伪造 user/developer/system role 或被篡改的 journal 必须 fail closed，不能把结构化高权限 item 原样带进下一请求。
+
+#### 版本演进契约
+
+checkpoint 的可重建性同时依赖六类独立版本：
+
+- `prompt_version`：compaction 顶层 instructions 的逐字内容。
+- `summary_envelope_version`：summary 的 role、notice、分隔符和 JSON shape。
+- `source_projection_version`：原始 journal 事件进入 compaction source 时的选择和 JSON shape。
+- `turn_boundary_validator_version`：哪些完整 turn 边界可作为 cutoff，以及 pending/in-doubt/tool 配对的判定规则。
+- `source_digest_version`：source 的 canonical JSON、hash 算法和字符串编码。
+- `usage_contract_version`：raw usage 的必需字段、计数关系与 compaction 最大输出 token 上限。
+
+`compaction.started` 和 `compaction.checkpoint` 都保存这六个版本，checkpoint 必须与对应 started 完全一致。读取时使用事件记录的版本，不要求它等于当前默认版本：
+
+```rust
+fn compaction_instructions(version: u32) -> Option<&'static str>;
+fn compacted_history_item(version: u32, summary: &str) -> Result<Value>;
+fn project_events_for_compaction(version: u32, events: &[JournalEvent]) -> Result<Vec<Value>>;
+fn complete_prefix_candidates_for_version(version: u32, events: &[JournalEvent]) -> Result<Vec<CompletePrefix>>;
+fn digest_with_version(version: u32, source: &CompactionSource) -> Result<String>;
+fn max_compaction_output_tokens(version: u32) -> Option<u64>;
+fn validate_compaction_usage(version: u32, usage: &Value) -> Result<()>;
+```
+
+规则：
+
+1. 注册表中已经发布的 match arm 与输出字节不可修改；升级只能新增版本，并只把新默认用于新 attempt。
+2. `compaction.started.instructions` 必须与其 `prompt_version` 的注册文本逐字相等。
+3. 普通 projection 使用最新 checkpoint 自己保存的 `summary_envelope_version`。
+4. 构建子 checkpoint source 时，父 summary 使用父 checkpoint 保存的 envelope version；原始事件、cutoff 校验和 digest 分别使用本次 started 保存的 source projection、turn validator 和 digest version。
+5. parent cutoff 已由 checkpoint chain 按 parent 自己的历史版本验证。child validator 只能处理 `seq > parent.covers_through_seq` 的未压缩后缀，不能用新版本重新审判旧 parent cutoff。
+6. reducer 重建历史 source 并校验 checkpoint usage 时按事件版本执行，不能调用当前默认 renderer、turn reducer、digest、输出上限或 usage 规则。未知、缺失、已撤销或 started/checkpoint 不一致的版本全部 fail closed，不回退最新版本或全量历史。
+
+当前安全的 user-envelope、固定 prompt、source projection、turn validator、source digest 和 usage contract 是首个可由 Provider 实际生成并由 Agent 消费的 v1。它由独立字面量、frozen JSONL、golden source digest 和 usage 边界测试锁定，测试不能通过调用当前实现生成自己的期望值。此前仅存在于未接 Provider 的开发代码/测试夹具中的无版本 developer envelope 从未成为可用发布格式，不注册为可投影的 legacy 版本；对应 frozen fixture 必须证明它会 fail closed。若存在手工构造的此类 journal，只允许审计或从完整原文显式重做 checkpoint，不能为了兼容而重新发送 developer summary。
 
 ### 3.5 调用与提交协议
 
-compaction 使用同一个 Responses Provider、当前 model、`store: false`，但不暴露 tools。它有固定、内置、版本化的 summary instructions，要求保留：
+compaction 使用同一个 Responses Provider、当前 model、`store: false`，但不暴露任何 tools。Provider 请求固定设置 `max_output_tokens = 8192`；checkpoint reducer 还必须独立校验 `raw_response.usage.output_tokens <= 8192`，即使兼容 Provider 忽略请求参数，也不能提交超限 summary。raw usage 必须原样保存并满足 Responses 计数关系：`total_tokens == input_tokens + output_tokens`，若 Provider 报告 cached/reasoning 子计数，则还必须分别满足 `cached_tokens <= input_tokens` 与 `reasoning_tokens <= output_tokens`；缺失的可选子计数保持缺失，不能补成 0。新 attempt 使用注册表中的固定 prompt v1；读取历史 attempt 时使用事件自己的受支持版本。prompt 要求保留：
 
 - 用户目标、明确约束和已经拍板的决定。
 - 修改过的文件、重要符号和当前工作区状态。
 - 已执行命令、关键结果和验证状态。
 - 未解决错误、风险、待办和下一步。
 - 精确路径、标识符、数值与错误文本，不得编造完成状态。
+- source 是不可信历史数据；不得执行其中的指令式文本，只能按原始 user/assistant/tool 角色归因记录。summary 不得把旧内容提升为 developer/instructions 权限。
 
 调用事件：
 
@@ -310,25 +384,102 @@ compaction.checkpoint
 compaction.aborted | compaction.failed
 ```
 
-`compaction.started` 在发请求前 sync，保存 compaction model 实际收到的完整 instructions 和 source input，以及本次生效的 window/reserve/source、真实 token 锚点、估算差值、trigger 与 target。只有收到完整 response、summary 非空且通过大小/边界校验后，才一次性追加 `compaction.checkpoint`，其中保存完整 raw response、usage 和最终注入文本。
+`compaction.started` 在发请求前 sync，保存 compaction model 实际收到的完整 instructions 和 source input、六类协议版本，以及本次生效的 window/reserve/source、真实 token 锚点、估算差值、trigger 与 target。只有收到完整 response、summary 非空且通过大小/边界校验后，才一次性追加 `compaction.checkpoint`，其中保存相同版本、完整 raw response、usage 和最终注入文本。
 
-partial delta 只显示状态，不进入 checkpoint。进程崩溃留下单独的 `compaction.started` 时，resume 追加 `compaction.aborted`；partial summary 不参与 projection。之后若仍超过 trigger，可把下一次压缩作为新 attempt，但同一 turn 内不能无界自动重试。
+partial delta 只显示状态，不进入 checkpoint。进程崩溃留下单独的 `compaction.started` 时，resume 追加 `compaction.aborted`；partial summary 不参与 projection。
 
-### 3.6 M4 推迟后的边界
+journal 的 write、flush 或 `sync_data` 任一步返回错误后，当前 `SessionJournal` 立即进入 poisoned 状态，禁止继续读取、投影或追加。此时完整行可能已经对当前进程可见，但持久化状态不确定；调用方不能自行把它解释为已提交。必须关闭句柄并重新打开 session，由统一的尾行修复、事件校验和 attempt 恢复流程决定磁盘内容是否有效。
+
+一个 request boundary 一旦触发 compaction，Provider 失败、取消、空/超限 summary、校验失败、无安全候选或压缩后仍超 hard limit，都必须终止本次普通请求，不得因为旧 projection 尚低于 hard limit 就继续调用普通模型，也不得执行工具。journal 保留上一有效 checkpoint、当前开放 turn 和完整 attempt 状态。之后的显式 retry 或 resume 必须复用同一条开放的 `user.message` 并创建新 attempt，不能重复追加用户消息或在同一 request boundary 自动重试。
+
+当前 `compact_once` 把“summary + tail 是否达到 target”的判定作为提交前必需回调；回调失败会同步写 `compaction.failed`，不会生成 checkpoint。自动 preflight 尚未接入前，没有默认放行的 CLI 路径。
+
+如果 Provider 已完整返回，但因输出超限、usage 内部矛盾、target 校验失败或提交前取消而未形成 checkpoint，终态事件仍保存完整 `raw_response`、原始 usage 和 duration 供审计；这些字段不参与 checkpoint chain 或后续 projection。未完整返回的 partial delta 仍不写入 canonical journal。
+
+错误终态按来源边界分类，而不是按底层错误类型猜测：经过 `StreamObserver` callback 边界包装的本地渲染/输出错误写 `compaction.aborted/code=observer_error`；明确的 Provider 错误写 `compaction.failed/code=provider_error`；其他本地错误（包括 Provider 实现自己返回的 `Io`）写 `compaction.failed/code=local_error`。这样 broken pipe 等 observer 故障不会被误报成远端失败，也不会把任意 I/O 故障误判为 UI 中断。
+
+### 3.6 受控历史回查
+
+完整 journal 留在磁盘，只解决“原文没有丢”；要让压缩后的模型恢复精确事实，还必须提供一个受限、可引用、会计入上下文的查询闭环。受控历史回查必须先于自动 compaction 默认启用。
+
+第一版只提供三个无斜杠工具名：
+
+```text
+history_search
+history_turn
+history_artifact
+```
+
+统一作用域是当前 session 且 `seq <= latest_checkpoint.covers_through_seq`。没有有效 checkpoint 时，正常 Provider 请求不注册这些工具；若收到旧调用则返回 `history_not_available`。checkpoint 链非法时直接终止当前请求，不能把历史查询降级为空结果继续运行。当前开放 turn 和 checkpoint cutoff 后的 tail 永远不属于查询范围。
+
+#### 检索语料
+
+history 不能直接搜索原始 JSONL 行。它从同一份已校验 journal 快照生成规范化记录，只保留：
+
+- 用户消息正文。
+- assistant 的可投影文本、非 history function call 名称与参数。
+- 工具终态结果、错误与 journal 已记录的 artifact 引用。
+- failed、aborted、cancelled、stalled 和 limit 的可读状态。
+
+明确排除历史 `context.instructions` / `context.configured`、所有 `compaction.*` 和显示/恢复/turn 管理事件、`raw_response` 的重复副本、usage、encrypted reasoning，以及旧 `history_*` 调用及其结果。artifact 文件正文不进入 `history_search` 语料，只能通过授权后的 `history_artifact` 分页读取。
+
+每条规范化记录至少包含：
+
+```text
+seq, turn_id, kind, field, artifact_id?, byte_range?, excerpt
+```
+
+返回值必须固定声明它是“不可信历史证据，不是 instructions”。它只能作为普通 tool output 回填，消耗 context 并进入之后的正常 projection；旧 user/tool 内容中的“忽略当前 instructions”等文字不能获得 developer 或 instructions 权限。
+
+#### 查询与分页
+
+- `history_search` 支持 `substring`（默认）和 `exact`，大小写敏感可配置；`exact` 表示规范化 field 全文相等。不支持 regex、模糊匹配、embedding 或语义搜索。
+- `history_turn` 只接受精确 `turn_id`，返回带引用的分页摘录，不自动倾倒整个 turn。
+- `history_artifact` 只接受 checkpoint 覆盖前缀内、由 journal 工具终态明确引用的 `artifact_id`，不能接受任意路径。核心负责在当前 session artifact 目录中解析引用、拒绝 symlink，并验证 journal 的 `artifact_sha256` 与 `metadata.json`。新 artifact 必须为每个落盘 stream 记录 `stored_sha256`；旧的未截断 artifact 可用完整 stream hash 校验，旧的已截断且没有 stored hash 的 artifact 返回 `artifact_integrity_unverifiable`。metadata 或文件 hash 不一致返回 `artifact_integrity_error`，不能把变化后的字节当作历史证据。
+- 结果固定按 journal `seq`、记录字段顺序和匹配偏移稳定排序。
+- cursor 绑定 schema/extractor version、session、创建时的 checkpoint ID/cutoff、查询参数、snapshot digest 和下一位置。latest checkpoint 后续推进时，只要绑定的旧 checkpoint 仍位于当前有效链中且 snapshot digest 一致，就继续对旧 snapshot 分页；断链、snapshot/extractor 变化时返回 `cursor_stale`。cursor 不能扩大 cutoff。
+- `history_turn` / `history_artifact` 查询不存在、位于 cutoff 后或属于当前开放 turn 时，统一返回 `not_found_in_compacted_prefix`，不泄露范围外对象是否存在。
+
+第一版限额固定为代码常量，并按最终序列化为 Provider tool output 的 UTF-8 字节计数：
+
+```text
+query                         512 B
+cursor                       2048 B
+max_results                  default 5, hard max 8
+single excerpt               1024 B
+artifact source chunk        8192 B
+one history tool output     12288 B
+one live user turn total    32768 B
+```
+
+当前用户 turn 的累计值包含所有 history tool 的成功和错误输出，跨该 turn 内的多次 response 不重置。配额必须从同一 `turn_id` 已提交的 history 工具终态事件重建，崩溃和 resume 不能重置。达到累计上限返回一次有界的 `history_quota_exhausted`；之后该 turn 的 prepared request 移除全部 history schemas，不能让模型靠反复查询继续填满 context。artifact chunk 还必须受单次序列化总上限约束。
+
+第一版每个 Provider request boundary 可对 journal 做一次线性扫描并构建不可变 `HistorySnapshot`；一次 history tool call 不能重新打开并扫描 journal。没有性能证据前不增加数据库、embedding 索引或物理分段。
+
+### 3.7 M4 推迟后的边界
 
 M4 当前按实际使用数据推迟，本节不再是 M5 第一版的实现前置条件。M5 仍把每次 compaction 的完整 usage 与 `duration_ms` 写进 checkpoint 供审计，但不实现 session 预算 reducer、发请求前预算检查、active-time deadline 或 `--no-session-budget` 分支。自动 compaction 因而没有 session 级费用/时间保险丝，这一限制必须在发布说明中明确。
 
-### 3.7 失败策略
+### 3.8 失败策略
 
-- Provider 失败、取消、空 summary、summary 超限或校验失败：写 failed/aborted，不启用半成品 checkpoint。
+- Provider 失败、取消、空 summary、summary 超限或校验失败：写 failed/aborted，不启用半成品 checkpoint，并停止当前请求。
 - 最新 checkpoint 的 parent、cutoff 或 digest 不合法：明确报 session 错误，不能静默换回全量投影继续请求。
 - compaction 后仍超过 hard limit：写 `context.limit_reached` 并停止。
-- 无可压缩完整前缀：写明原因并停止。
+- 无可压缩完整前缀，或最近两个完整 turn 与当前开放 turn 本身已无法安全装入：写明原因并停止。
 - 不在同一个 request boundary 连续尝试不同 prompt、不同 cutoff 或不同模型。
+- 停止后保留状态；显式 retry/resume 复用当前开放 turn，不重复写 `user.message`。
 
 compaction 本质上是有损操作。可靠性来自保留原文、保守保留 recent tail、明确 source 范围和让失败可见，不来自假装摘要不会掉信息。
 
-### 3.8 CLI 与可见性
+“保留供重试”必须有可执行协议：
+
+1. reducer 从 journal 识别“已有 `user.message`、当前 response boundary 因 compaction failed/aborted/target-unreachable 或 context limit 停止、尚未被普通 response 完成”的 pending turn，并返回原 `turn_id`、起始 seq 和待发送 boundary。
+2. 交互模式在接受任何新用户消息前，只允许选择 retry 或退出；退出不改变 journal，下一次 resume 仍会提示。
+3. retry 走独立的 `retry_pending_turn` 路径，复用原 `turn_id` 和已提交的 user/tool history，只创建新的 response/compaction attempt，不调用会追加 `user.message` 的 `run_turn` 入口。
+4. 非交互恢复使用显式 `--retry-pending`；`-p --resume` 在存在 pending turn 时拒绝接收一条新 prompt，并返回专用非零错误，不能悄悄把新消息当作重试。
+5. 第一版不提供 abandon 后继续同一 session 的投影分支；用户拒绝 retry 时保持 fail closed 并退出，避免为“放弃”引入隐式删除历史。
+
+### 3.9 CLI 与可见性
 
 自动触发时只在 stderr 显示简短状态，不污染 assistant stdout：
 
@@ -339,36 +490,61 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 
 `session show` 直接展示 compaction request、raw response、summary、usage 与 cutoff。M5 第一版不增加交互式编辑 checkpoint、手工挑 turn 或后台管理命令。
 
-### 3.9 实现顺序
+### 3.10 实现顺序
 
-1. 锁定真实 usage 锚点、增量估算、context 配置来源和 journal 审计字段。
-2. 为新 turn 写 `turn.completed`，实现旧 journal 的保守边界识别。
-3. 保持 `project_events` 为原始事件投影、`project_tail` 为完整 turn cutoff 校验加原始 tail 投影，不给它们增加 checkpoint 语义。
-4. 新建 `compaction.rs`：候选选择、source 规范化/digest、checkpoint reducer，以及独立的 `validate_checkpoint_chain`。
-5. 新增 `project_checkpoint_and_tail`，只消费 `validate_checkpoint_chain` 返回的最新有效 checkpoint；无 checkpoint 时才走明确的原始 projection 分支，链损坏时直接报错。
-6. 扩展 `ResponseRequest` 支持 compaction 的无工具请求和 summary output 上限。
-7. 在 Agent 的 context preflight 接入单次自动 compaction，再重新估算。
-8. 接入 observer stderr 状态和 crash recovery。
-9. 单元测试、合成大 journal 的 CLI E2E、三平台 CI。
+已经完成的 checkpoint 核心：
 
-### 3.10 M5 验收门槛
+1. 显式 `turn.completed`、legacy turn 的保守识别和完整前缀候选。
+2. `project_events`、`project_tail` 与显示层隔离的原始 projection。
+3. `compaction.rs` 的数据模型、source 规范化/digest、严格单链 reducer 和候选选择。
+4. 独立的 `validate_checkpoint_chain` 与 `project_checkpoint_and_tail`。
+5. started/checkpoint 的 journal sync、孤立 attempt 恢复、损坏尾行，以及真实 `compact_once` 在 Provider 完成到 checkpoint 落盘窗口的进程级故障注入测试。
+6. summary envelope v1 使用 `role: "user"`；prompt、envelope 和 source projection 都通过持久化版本与不可变注册表重建。
 
-- 默认在 trigger 自动压缩，不必等到 hard limit。
-- 有可比较 usage 时使用真实 `input_tokens` 锚点和有符号估算差；无锚点时才估算完整请求。
+下一阶段严格按以下顺序推进：
+
+1. 已实现真实 Provider `compact_once` 内核：复用已注册的六类 v1 协议、无 tools、8192 输出上限、完整 raw response/usage 提交，并让 Agent 在有效 checkpoint 存在时实际使用 checkpoint + tail projection。当前没有用户入口，自动触发仍关闭。
+2. 实现当前 session、最新 checkpoint 覆盖前缀内的 `history_search` / `history_turn` / `history_artifact`，完成确定性检索、引用、cursor 和单 turn 配额。
+3. 实现 model-aware context 配置、prepared-request 测量、`context.configured` 审计和自动 preflight；自动触发先保持默认关闭。
+4. 完成真实崩溃恢复、Provider 完成到 checkpoint 落盘窗口、连续多次 compaction、pending-turn retry 和 history 回查闭环 E2E。
+5. 用固定 fixture 测量父摘要连续 3/5/10 次重摘要后的漂移，保存 model、prompt version、原始输出和指标，先建立基线，不预设发布阈值。
+6. 根据测量结果另行锁定默认启用门槛；只有门槛满足后才改变默认值。
+7. 只有线性扫描或 journal 体积出现实际性能证据后，才考虑可重建索引或物理分段。
+
+### 3.11 M5 验收与发布门槛
+
+功能闭环门槛：
+
+- `compact_once` 发出的真实请求无 tools、使用 prompt v1 和 8192 output token 上限；reducer 独立拒绝 Provider 返回的超限 checkpoint。
+- summary 在普通 projection 和下一次 compaction source 中始终由 checkpoint 自身的受支持 envelope 渲染为 `role: "user"`；恶意历史经过摘要、普通 replay 和再次摘要都不会进入 developer/system item。
+- Provider output message 在提交前与 journal replay 时都强制为 `role: "assistant"`，journal user item 强制为 `role: "user"`；伪造或缺失 role 不得进入普通 projection 或 compaction source。
+- prompt、summary envelope、source projection、turn validator、source digest 和 usage contract 的首个可执行 v1 在新增默认版本后仍按原规则重建；字面量/frozen fixture/golden digest/usage 边界必须锁住 v1。此前未发布的 developer-envelope 实验格式必须由负 fixture 证明 fail closed；任一版本缺失、未知或 started/checkpoint 不一致都不能退回当前默认实现。
+- checkpoint usage 与 `raw_response.usage` 逐字一致，并满足 total 等式、cached/input 与 reasoning/output 子计数关系及 8192 输出上限；矛盾 usage 只生成可审计的 failed attempt，不进入 checkpoint chain。
+- 有可比较 usage 时使用真实 `input_tokens` 锚点和完整 prepared-request 的有符号估算差；无锚点时才估算完整请求。
 - cached input 不从上下文占用中扣除；usage 缺失不冒充真实 `0`。
-- journal 可还原每次生效的 window、reserve、来源、锚点和触发计算。
-- 相同 journal 和配置选择相同完整 turn 前缀。
+- journal 可还原每次生效的 window、reserve、provider usage domain、完整 canonical tool schema、request digest、锚点和触发计算。
+- 相同 journal 和配置选择相同完整 turn 前缀；最近两个完整 turn 与当前开放 turn 不会被 cutoff 侵入；无法达到 target 时不提交 checkpoint。
 - function call 与 output 永不被切到 checkpoint 两侧。
-- 最新 projection 为一个 summary 加 cutoff 后的 tail；被覆盖原始 items 不再发送给模型。
+- 最新 projection 为一个 summary 加 cutoff 后的完整 tail；被覆盖原始 items 不再发送，也不会把 recent turns 重复拼接给模型。
 - checkpoint 链校验与 checkpoint-aware projection 分别通过 `validate_checkpoint_chain`、`project_checkpoint_and_tail` 完成；`project_tail` 不承担 checkpoint reducer 职责。
 - journal 原始事件逐字保留，`session show` 可看到模型用于摘要的完整 source 和生成结果。
-- resume 选择同一最新有效 checkpoint，并继续形成单链。
+- resume 使用当前 provider/model/context/instructions/tools，历史快照只供审计；有效 checkpoint 继续形成单链。
 - 单独 `compaction.started` 恢复为 aborted，partial summary 不使用。
-- 进程级故障注入必须在 `compaction.started` 与 `compaction.checkpoint` 各自 `append_and_sync` 后强制终止子进程，证明恢复只启用完整 checkpoint，且不会把未提交 summary 投影给模型。
+- 现有 journal sync/损坏尾行测试继续通过；进程级故障注入覆盖真实 `compact_once` 的 started 已同步、Provider 已完成但 checkpoint 尚未落盘、checkpoint 已同步三个窗口，证明恢复不启用未提交 summary。
 - compaction usage 和时间完整写入 checkpoint；M4 推迟期间不做累计预算判断。
-- 压缩失败、无候选或压缩后仍过大时明确停止，无静默截断。
-- 当前 instructions 使用当前 `AGENTS.md`/memory；旧 instructions 快照不因 compaction 被重新注入。
+- 压缩失败、无候选或压缩后无法达到 target 时终止当前请求；pending reducer、交互 retry 和 `--retry-pending` 都复用原 turn，同一 boundary 不循环 compact。
+- history 三个工具只访问最新 checkpoint 覆盖前缀，使用稳定排序、带引用分页和硬输出配额；无 checkpoint 时不额外暴露历史。
+- history cursor、排序、分页、artifact ID/hash 授权和当前用户 turn 累计配额均有确定性测试；崩溃/resume 不重置配额，耗尽后移除 history schemas。
+- 同一 journal 在不同 render/折叠设置下生成完全相同的 Provider projection 字节。
 - Windows、Linux、macOS 的 fmt、test、Clippy 全绿。
+
+默认启用前的测量门槛：
+
+- 固定事实集经过 3/5/10 次父摘要递归后，分别测量精确数值、否定约束、已完成/未完成状态和关键标识符的保留情况。
+- 故意让摘要遗漏事实，验证模型能通过 `history_search -> history_turn` 或 `history_artifact` 找回并引用原文。
+- 旧 user/tool output 含“忽略当前 instructions”等恶意内容时，summary 和 history 结果都保持不可信数据身份，不能提升权限。
+- 最近两个完整 turn 本身超过 usable budget 时，记录不可压缩原因并停止，不能生成不安全 checkpoint 或循环重试。
+- 第一阶段只建立可复现测量基线，不预先写死通过率。默认启用阈值必须依据这些数据另行决策并记录。
 
 ## 4. M4/M5 完成后的决策门
 
@@ -383,13 +559,17 @@ Goal mode 同样不自动随 M4 出现。未来若实现，它可以消费 M4 �
 
 ## 5. 推荐提交边界
 
-为降低回退成本，当前 M5 按以下边界提交；M4 保留为未来独立里程碑：
+为降低回退成本，当前 M5 按以下边界提交；前四项 checkpoint 基础已经完成，M4 保留为未来独立里程碑：
 
 1. `docs: lock measured context and compaction contracts`
 2. `refactor: make turn boundaries and projection explicit`
 3. `test: cover turn and projection boundaries`
 4. `feat: add auditable compaction checkpoints`
-5. `feat: trigger compaction before context exhaustion`
-6. `test: cover compaction recovery end to end`
+5. `feat: compact sessions through the provider`
+6. `feat: add controlled compacted history lookup`
+7. `feat: add opt-in model-aware compaction preflight`
+8. `test: cover compaction and history recovery end to end`
+9. `docs: record recursive compaction measurements`
+10. `feat: enable automatic compaction by default`，仅在测量门槛另行锁定并满足后存在。
 
 每个功能提交都必须保持现有 read/edit/write/remember/shell、session resume 和 memory 测试通过。M5 未完整通过验收前，不删除原有 `context.limit_reached` 硬停止路径。

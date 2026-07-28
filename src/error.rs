@@ -10,6 +10,8 @@ pub enum OxidraError {
     Provider(String),
     #[error("response aborted: {0}")]
     ResponseAborted(String),
+    #[error("stream observer error: {0}")]
+    Observer(#[source] Box<OxidraError>),
     #[error("tool error ({code}): {message}")]
     Tool { code: String, message: String },
     #[error("session error: {0}")]
@@ -38,8 +40,16 @@ impl OxidraError {
             Self::Config(_) | Self::Toml(_) | Self::Url(_) => 2,
             Self::ApprovalRequired(_) => 3,
             Self::ContextLimit => 4,
+            Self::Observer(error) => error.exit_code(),
             Self::Interrupted => 130,
             _ => 1,
+        }
+    }
+
+    pub fn observer(error: Self) -> Self {
+        match error {
+            existing @ Self::Observer(_) => existing,
+            other => Self::Observer(Box::new(other)),
         }
     }
 

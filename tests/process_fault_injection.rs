@@ -7,17 +7,25 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use chrono::Utc;
 use oxidra::compaction::{
     COMPACTION_ABORTED_KIND, COMPACTION_CHECKPOINT_KIND, COMPACTION_PROMPT_VERSION,
-    COMPACTION_STARTED_KIND, CompactionStarted, build_compaction_source, validate_checkpoint_chain,
+    COMPACTION_STARTED_KIND, CompactionCandidate, CompactionStarted, MAX_COMPACTION_OUTPUT_TOKENS,
+    SOURCE_DIGEST_VERSION, SUMMARY_ENVELOPE_VERSION, USAGE_CONTRACT_VERSION,
+    build_compaction_source, compact_once, compaction_instructions, validate_checkpoint_chain,
 };
-use oxidra::session::{JOURNAL_SCHEMA, JournalEvent, SessionHeader, SessionStore};
+use oxidra::error::Result;
+use oxidra::projection::SOURCE_PROJECTION_VERSION;
+use oxidra::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
+use oxidra::session::{JOURNAL_SCHEMA, JournalEvent, SessionHeader, SessionJournal, SessionStore};
 use oxidra::turn::{
-    CompletePrefix, CompletionEvidence, TURN_BOUNDARY_VERSION, TurnState,
-    complete_prefix_candidates, segment_turns,
+    CompletePrefix, CompletionEvidence, TURN_BOUNDARY_VALIDATOR_VERSION, TURN_BOUNDARY_VERSION,
+    TurnState, complete_prefix_candidates, segment_turns,
 };
+use oxidra::types::{AssistantTurn, Usage};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 const CHILD_MODE_ENV: &str = "OXIDRA_FAULT_INJECTION_CHILD";
 const DATA_DIR_ENV: &str = "OXIDRA_FAULT_INJECTION_DATA_DIR";
@@ -170,24 +178,20 @@ fn force_kill_during_compaction_commits_only_complete_checkpoints() {
                 CompactionSyncPoint::CheckpointSynced
                     | CompactionSyncPoint::CheckpointWithoutNewline
             );
-            let expected = if checkpoint_committed {
-                vec![
-                    "session.started",
-                    "user.message",
-                    "response.completed",
-                    "turn.completed",
-                    COMPACTION_STARTED_KIND,
-                    COMPACTION_CHECKPOINT_KIND,
-                ]
-            } else {
-                vec![
-                    "session.started",
-                    "user.message",
-                    "response.completed",
-                    "turn.completed",
-                    COMPACTION_STARTED_KIND,
-                ]
-            };
+            let production_path = matches!(
+                sync_point,
+                CompactionSyncPoint::Started
+                    | CompactionSyncPoint::ProviderCompleted
+                    | CompactionSyncPoint::CheckpointSynced
+            );
+            let mut expected = vec!["session.started"];
+            for _ in 0..if production_path { 3 } else { 1 } {
+                expected.extend(["user.message", "response.completed", "turn.completed"]);
+            }
+            expected.push(COMPACTION_STARTED_KIND);
+            if checkpoint_committed {
+                expected.push(COMPACTION_CHECKPOINT_KIND);
+            }
             assert_eq!(event_kinds(&persisted), expected, "{}", sync_point.label());
         }
 
@@ -204,7 +208,7 @@ fn force_kill_during_compaction_commits_only_complete_checkpoints() {
             CompactionSyncPoint::Started | CompactionSyncPoint::ProviderCompleted => {
                 assert_eq!(recovery.aborted_compactions, 1);
                 assert_eq!(count_kind(&recovered, COMPACTION_CHECKPOINT_KIND), 0);
-                assert_recovered_compaction_abort(&recovered, 5);
+                assert_recovered_compaction_abort(&recovered);
             }
             CompactionSyncPoint::CheckpointSynced
             | CompactionSyncPoint::CheckpointWithoutNewline => {
@@ -221,7 +225,7 @@ fn force_kill_during_compaction_commits_only_complete_checkpoints() {
                 assert!(recovery.truncated_tail.is_some());
                 assert_eq!(recovery.aborted_compactions, 1);
                 assert_eq!(count_kind(&recovered, COMPACTION_CHECKPOINT_KIND), 0);
-                assert_recovered_compaction_abort(&recovered, 5);
+                assert_recovered_compaction_abort(&recovered);
             }
         }
 
@@ -335,6 +339,64 @@ fn fault_injection_child() {
     sync_barrier(SyncPoint::TurnCompleted);
 }
 
+struct FaultCompactionProvider {
+    scenario: CompactionSyncPoint,
+}
+
+#[async_trait]
+impl ResponseProvider for FaultCompactionProvider {
+    async fn respond(
+        &self,
+        request: ResponseRequest,
+        _observer: &mut dyn StreamObserver,
+        _cancellation: CancellationToken,
+    ) -> Result<AssistantTurn> {
+        assert!(request.tools.is_empty());
+        assert_eq!(
+            request.max_output_tokens,
+            Some(MAX_COMPACTION_OUTPUT_TOKENS)
+        );
+        if self.scenario == CompactionSyncPoint::Started {
+            sync_barrier_label(self.scenario.label());
+        }
+        let output_items = vec![json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "fault-injection summary"}],
+        })];
+        Ok(AssistantTurn {
+            raw_response: json!({
+                "id": "fault-injection-compaction-response",
+                "status": "completed",
+                "output": output_items,
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 20,
+                    "total_tokens": 120,
+                },
+            }),
+            output_items,
+            text: "fault-injection summary".to_owned(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                input_tokens: 100,
+                output_tokens: 20,
+                total_tokens: 120,
+                ..Usage::default()
+            },
+            unknown_stream_events: Vec::new(),
+        })
+    }
+}
+
+struct NoopStreamObserver;
+
+impl StreamObserver for NoopStreamObserver {
+    fn on_event(&mut self, _event: ProviderEvent) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 #[ignore = "launched by force_kill_during_compaction_commits_only_complete_checkpoints"]
 fn compaction_fault_injection_child() {
@@ -352,53 +414,17 @@ fn compaction_fault_injection_child() {
             SessionHeader::new(&data_dir, "fault-injection-model"),
         )
         .expect("create child journal");
-    let user = journal
-        .append_and_sync(
-            "user.message",
-            Some(TURN_ID),
-            json!({
-                "item": {"role": "user", "content": "compact this completed turn"},
-                "turn_boundary_version": TURN_BOUNDARY_VERSION,
-            }),
-        )
-        .expect("append compaction fixture user message");
-    let response_seq = journal.next_seq();
-    let response = journal
-        .append_and_sync(
-            "response.completed",
-            Some(TURN_ID),
-            json!({
-                "response_attempt_id": "compaction-fixture-response",
-                "raw_response": {
-                    "id": "compaction-fixture-response",
-                    "output": [{"type": "message", "role": "assistant", "content": "done"}],
-                },
-                "output_items": [
-                    {"type": "message", "role": "assistant", "content": "done"}
-                ],
-                "text": "done",
-                "turn_completion": {
-                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
-                    "covers_from_seq": user.seq,
-                    "final_response_seq": response_seq,
-                    "covers_through_seq": response_seq,
-                },
-            }),
-        )
-        .expect("append compaction fixture response");
-    let marker_seq = journal.next_seq();
-    let marker = journal
-        .append_and_sync(
-            "turn.completed",
-            Some(TURN_ID),
-            json!({
-                "turn_boundary_version": TURN_BOUNDARY_VERSION,
-                "covers_from_seq": user.seq,
-                "final_response_seq": response.seq,
-                "covers_through_seq": marker_seq,
-            }),
-        )
-        .expect("append compaction fixture turn marker");
+    let marker = append_completed_compaction_turn(&mut journal, TURN_ID, 1);
+    let production_path = matches!(
+        scenario,
+        CompactionSyncPoint::Started
+            | CompactionSyncPoint::ProviderCompleted
+            | CompactionSyncPoint::CheckpointSynced
+    );
+    if production_path {
+        append_completed_compaction_turn(&mut journal, "turn-2", 2);
+        append_completed_compaction_turn(&mut journal, "turn-3", 3);
+    }
     let source = build_compaction_source(
         &journal
             .read_events()
@@ -408,6 +434,51 @@ fn compaction_fault_injection_child() {
     )
     .expect("build compaction fixture source");
     let source_digest = source.digest().expect("digest compaction fixture source");
+
+    if production_path {
+        let candidate = CompactionCandidate {
+            parent_checkpoint_id: None,
+            covers_through_seq: marker.seq,
+            newly_compacted_complete_turns: 1,
+            estimated_input_tokens_after: 40,
+            prompt_version: COMPACTION_PROMPT_VERSION,
+            summary_envelope_version: SUMMARY_ENVELOPE_VERSION,
+            source_projection_version: SOURCE_PROJECTION_VERSION,
+            turn_boundary_validator_version: TURN_BOUNDARY_VALIDATOR_VERSION,
+            source_digest_version: SOURCE_DIGEST_VERSION,
+            usage_contract_version: USAGE_CONTRACT_VERSION,
+            source,
+            source_digest,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("create compaction fault runtime");
+        let provider = FaultCompactionProvider { scenario };
+        let checkpoint = runtime
+            .block_on(compact_once(
+                &provider,
+                &mut journal,
+                &candidate,
+                "fault-injection-model",
+                &mut NoopStreamObserver,
+                CancellationToken::new(),
+                |summary| {
+                    assert_eq!(summary, "fault-injection summary");
+                    if scenario == CompactionSyncPoint::ProviderCompleted {
+                        sync_barrier_label(scenario.label());
+                    }
+                    Ok(())
+                },
+            ))
+            .expect("complete production compaction attempt");
+        assert_eq!(checkpoint.covers_through_seq, marker.seq);
+        if scenario == CompactionSyncPoint::CheckpointSynced {
+            sync_barrier_label(scenario.label());
+        }
+        return;
+    }
+
     journal
         .append_and_sync(
             COMPACTION_STARTED_KIND,
@@ -418,8 +489,15 @@ fn compaction_fault_injection_child() {
                 covers_through_seq: marker.seq,
                 source,
                 source_digest: source_digest.clone(),
-                instructions: "fault-injection summary instructions".to_owned(),
+                instructions: compaction_instructions(COMPACTION_PROMPT_VERSION)
+                    .expect("current prompt is registered")
+                    .to_owned(),
                 prompt_version: COMPACTION_PROMPT_VERSION,
+                summary_envelope_version: SUMMARY_ENVELOPE_VERSION,
+                source_projection_version: SOURCE_PROJECTION_VERSION,
+                turn_boundary_validator_version: TURN_BOUNDARY_VALIDATOR_VERSION,
+                source_digest_version: SOURCE_DIGEST_VERSION,
+                usage_contract_version: USAGE_CONTRACT_VERSION,
                 model: "fault-injection-model".to_owned(),
                 extra: Default::default(),
             })
@@ -428,21 +506,6 @@ fn compaction_fault_injection_child() {
         .expect("append compaction start");
 
     match scenario {
-        CompactionSyncPoint::Started => sync_barrier_label(scenario.label()),
-        CompactionSyncPoint::ProviderCompleted => {
-            // The provider result only exists in memory until checkpoint commit.
-            sync_barrier_label(scenario.label());
-        }
-        CompactionSyncPoint::CheckpointSynced => {
-            journal
-                .append_and_sync(
-                    COMPACTION_CHECKPOINT_KIND,
-                    None,
-                    checkpoint_data(marker.seq, &source_digest),
-                )
-                .expect("append and sync compaction checkpoint");
-            sync_barrier_label(scenario.label());
-        }
         CompactionSyncPoint::CheckpointWithoutNewline => {
             append_raw_checkpoint(
                 journal.journal_path(),
@@ -463,7 +526,70 @@ fn compaction_fault_injection_child() {
             );
             sync_barrier_label(scenario.label());
         }
+        CompactionSyncPoint::Started
+        | CompactionSyncPoint::ProviderCompleted
+        | CompactionSyncPoint::CheckpointSynced => unreachable!("production path returned above"),
     }
+}
+
+fn append_completed_compaction_turn(
+    journal: &mut SessionJournal,
+    turn_id: &str,
+    index: usize,
+) -> JournalEvent {
+    let user = journal
+        .append_and_sync(
+            "user.message",
+            Some(turn_id),
+            json!({
+                "item": {"role": "user", "content": format!("compact turn {index}")},
+                "turn_boundary_version": TURN_BOUNDARY_VERSION,
+            }),
+        )
+        .expect("append compaction fixture user message");
+    let response_seq = journal.next_seq();
+    let response = journal
+        .append_and_sync(
+            "response.completed",
+            Some(turn_id),
+            json!({
+                "response_attempt_id": format!("compaction-fixture-response-{index}"),
+                "raw_response": {
+                    "id": format!("compaction-fixture-response-{index}"),
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }],
+                },
+                "output_items": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                }],
+                "text": "done",
+                "turn_completion": {
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                    "covers_from_seq": user.seq,
+                    "final_response_seq": response_seq,
+                    "covers_through_seq": response_seq,
+                },
+            }),
+        )
+        .expect("append compaction fixture response");
+    let marker_seq = journal.next_seq();
+    journal
+        .append_and_sync(
+            "turn.completed",
+            Some(turn_id),
+            json!({
+                "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                "covers_from_seq": user.seq,
+                "final_response_seq": response.seq,
+                "covers_through_seq": marker_seq,
+            }),
+        )
+        .expect("append compaction fixture turn marker")
 }
 
 fn spawn_fault_child(data_dir: &std::path::Path) -> Child {
@@ -700,6 +826,12 @@ fn checkpoint_data(covers_through_seq: u64, source_digest: &str) -> serde_json::
         "source_digest": source_digest,
         "summary": "complete checkpoint summary",
         "model": "fault-injection-model",
+        "prompt_version": COMPACTION_PROMPT_VERSION,
+        "summary_envelope_version": SUMMARY_ENVELOPE_VERSION,
+        "source_projection_version": SOURCE_PROJECTION_VERSION,
+        "turn_boundary_validator_version": TURN_BOUNDARY_VALIDATOR_VERSION,
+        "source_digest_version": SOURCE_DIGEST_VERSION,
+        "usage_contract_version": USAGE_CONTRACT_VERSION,
         "usage": {
             "input_tokens": 10,
             "input_tokens_details": {"cached_tokens": 0},
@@ -720,6 +852,7 @@ fn checkpoint_data(covers_through_seq: u64, source_digest: &str) -> serde_json::
             },
             "output": [{
                 "type": "message",
+                "role": "assistant",
                 "content": [{
                     "type": "output_text",
                     "text": "complete checkpoint summary",
@@ -804,13 +937,17 @@ fn count_kind(events: &[JournalEvent], kind: &str) -> usize {
     events.iter().filter(|event| event.kind == kind).count()
 }
 
-fn assert_recovered_compaction_abort(events: &[JournalEvent], started_seq: u64) {
+fn assert_recovered_compaction_abort(events: &[JournalEvent]) {
+    let started = events
+        .iter()
+        .find(|event| event.kind == COMPACTION_STARTED_KIND)
+        .expect("journal contains compaction.started");
     let aborted = events
         .iter()
         .find(|event| event.kind == COMPACTION_ABORTED_KIND)
         .expect("recovery appended compaction.aborted");
-    assert_eq!(aborted.data["attempt_id"], "compaction-attempt-1");
-    assert_eq!(aborted.data["started_seq"], started_seq);
+    assert_eq!(aborted.data["attempt_id"], started.data["attempt_id"]);
+    assert_eq!(aborted.data["started_seq"], started.seq);
     assert_eq!(aborted.data["code"], "interrupted");
     assert_eq!(aborted.data["recovered"], true);
 }

@@ -33,11 +33,6 @@ pub(crate) fn is_response_terminal(kind: &str) -> bool {
     )
 }
 
-/// Whether an event participates in a response attempt's lifecycle.
-pub(crate) fn is_response_lifecycle(kind: &str) -> bool {
-    kind == "response.started" || is_response_terminal(kind)
-}
-
 /// Whether a compaction attempt has reached a terminal state.
 pub(crate) fn is_compaction_terminal(kind: &str) -> bool {
     matches!(
@@ -49,20 +44,6 @@ pub(crate) fn is_compaction_terminal(kind: &str) -> bool {
 /// Whether an event participates in a compaction attempt's lifecycle.
 pub(crate) fn is_compaction_lifecycle(kind: &str) -> bool {
     kind == COMPACTION_STARTED_KIND || is_compaction_terminal(kind)
-}
-
-/// Whether a known event kind must belong to exactly one user turn.
-pub(crate) fn is_turn_scoped(kind: &str) -> bool {
-    matches!(
-        kind,
-        "user.message"
-            | "turn.completed"
-            | "turn.cancelled"
-            | "agent.stalled"
-            | "agent.limit_reached"
-            | "context.limit_reached"
-    ) || is_response_lifecycle(kind)
-        || is_tool_lifecycle(kind)
 }
 
 #[cfg(test)]
@@ -83,23 +64,17 @@ mod tests {
         ] {
             assert!(is_tool_terminal(kind), "{kind}");
             assert!(is_tool_lifecycle(kind), "{kind}");
-            assert!(is_turn_scoped(kind), "{kind}");
         }
 
         for kind in ["response.completed", "response.failed", "response.aborted"] {
             assert!(is_response_terminal(kind), "{kind}");
-            assert!(is_response_lifecycle(kind), "{kind}");
-            assert!(is_turn_scoped(kind), "{kind}");
         }
 
         for kind in ["tool.started", "tool.in_doubt"] {
             assert!(!is_tool_terminal(kind), "{kind}");
             assert!(is_tool_lifecycle(kind), "{kind}");
-            assert!(is_turn_scoped(kind), "{kind}");
         }
         assert!(!is_response_terminal("response.started"));
-        assert!(is_response_lifecycle("response.started"));
-        assert!(is_turn_scoped("response.started"));
 
         for kind in [
             COMPACTION_CHECKPOINT_KIND,
@@ -108,22 +83,9 @@ mod tests {
         ] {
             assert!(is_compaction_terminal(kind), "{kind}");
             assert!(is_compaction_lifecycle(kind), "{kind}");
-            assert!(!is_turn_scoped(kind), "{kind}");
         }
         assert!(!is_compaction_terminal(COMPACTION_STARTED_KIND));
         assert!(is_compaction_lifecycle(COMPACTION_STARTED_KIND));
-        assert!(!is_turn_scoped(COMPACTION_STARTED_KIND));
-
-        for kind in [
-            "user.message",
-            "turn.completed",
-            "turn.cancelled",
-            "agent.stalled",
-            "agent.limit_reached",
-            "context.limit_reached",
-        ] {
-            assert!(is_turn_scoped(kind), "{kind}");
-        }
 
         for kind in [
             "context.instructions",
@@ -131,9 +93,7 @@ mod tests {
             "vendor.future_event",
         ] {
             assert!(!is_tool_lifecycle(kind), "{kind}");
-            assert!(!is_response_lifecycle(kind), "{kind}");
             assert!(!is_compaction_lifecycle(kind), "{kind}");
-            assert!(!is_turn_scoped(kind), "{kind}");
         }
     }
 }

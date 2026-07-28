@@ -279,6 +279,7 @@ impl SessionStore {
             _lock_file: lock_file,
             next_seq: 1,
             recovery: RecoveryInfo::default(),
+            poisoned: false,
         };
         journal.append_and_sync(SESSION_STARTED_KIND, None, serde_json::to_value(header)?)?;
         Ok(journal)
@@ -364,6 +365,7 @@ impl SessionStore {
             _lock_file: lock_file,
             next_seq,
             recovery: RecoveryInfo::default(),
+            poisoned: false,
         };
         fs::create_dir_all(&journal.artifact_dir)?;
 
@@ -481,6 +483,7 @@ pub struct SessionJournal {
     _lock_file: File,
     next_seq: u64,
     recovery: RecoveryInfo,
+    poisoned: bool,
 }
 
 impl SessionJournal {
@@ -518,6 +521,7 @@ impl SessionJournal {
         turn_id: Option<&str>,
         data: Value,
     ) -> Result<JournalEvent> {
+        self.ensure_healthy()?;
         let kind = kind.into();
         if kind.trim().is_empty() {
             return Err(OxidraError::Session(
@@ -539,7 +543,8 @@ impl SessionJournal {
             data,
         };
         let encoded = serde_json::to_vec(&event)?;
-        let current_size = self.file.metadata()?.len();
+        let metadata_result = self.file.metadata();
+        let current_size = self.finish_io(metadata_result)?.len();
         if current_size
             .saturating_add(encoded.len() as u64)
             .saturating_add(1)
@@ -552,9 +557,12 @@ impl SessionJournal {
         // Recovered journals need a read/write handle so Windows permits
         // truncating an incomplete tail. The session lock guarantees a single
         // writer; seeking here preserves append-only writes for that handle.
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&encoded)?;
-        self.file.write_all(b"\n")?;
+        let seek_result = self.file.seek(SeekFrom::End(0));
+        self.finish_io(seek_result)?;
+        let write_result = self.file.write_all(&encoded);
+        self.finish_io(write_result)?;
+        let newline_result = self.file.write_all(b"\n");
+        self.finish_io(newline_result)?;
         self.next_seq = next_seq;
         Ok(event)
     }
@@ -571,23 +579,26 @@ impl SessionJournal {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.file.flush()?;
-        Ok(())
+        self.ensure_healthy()?;
+        let flush_result = self.file.flush();
+        self.finish_io(flush_result)
     }
 
     pub fn sync(&mut self) -> Result<()> {
         self.flush()?;
-        self.file.sync_data()?;
-        Ok(())
+        let sync_result = self.file.sync_data();
+        self.finish_io(sync_result)
     }
 
     pub fn read_events(&self) -> Result<Vec<JournalEvent>> {
+        self.ensure_healthy()?;
         ensure_journal_size(&self.journal_path)?;
         let bytes = fs::read(&self.journal_path)?;
         parse_complete_events(&bytes, &self.session_id)
     }
 
     pub fn read_raw_events(&self) -> Result<Vec<Value>> {
+        self.ensure_healthy()?;
         ensure_journal_size(&self.journal_path)?;
         let bytes = fs::read(&self.journal_path)?;
         parse_json_lines(&bytes)
@@ -595,6 +606,30 @@ impl SessionJournal {
 
     pub fn in_doubt(&self) -> Result<Vec<InDoubtTool>> {
         Ok(pending_tools(&self.read_events()?))
+    }
+
+    fn ensure_healthy(&self) -> Result<()> {
+        if self.poisoned {
+            return Err(OxidraError::Session(
+                "journal write state is indeterminate after an I/O error; close and reopen the session"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_io<T>(&mut self, result: std::io::Result<T>) -> Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // A write may have reached the page cache even when flush or
+                // fsync reports failure. Do not let this process decide that
+                // the visible bytes are a committed event; recovery owns that
+                // decision after this handle is closed.
+                self.poisoned = true;
+                Err(error.into())
+            }
+        }
     }
 }
 
@@ -1222,6 +1257,50 @@ mod tests {
         assert_eq!(raw[1]["data"]["raw"]["future_field"], json!([1, 2, 3]));
         assert_eq!(journal.header().unwrap().unwrap().model, "test-model");
         assert!(journal.artifact_dir().is_dir());
+    }
+
+    #[test]
+    fn write_failure_poison_prevents_same_process_from_using_visible_bytes() {
+        let temp = TempDir::new().unwrap();
+        let journal_path = temp.path().join("poisoned.jsonl");
+        fs::write(&journal_path, b"").unwrap();
+        let file = OpenOptions::new().read(true).open(&journal_path).unwrap();
+        let lock_path = temp.path().join("poisoned.lock");
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        let mut journal = SessionJournal {
+            session_id: "poisoned".to_owned(),
+            journal_path,
+            artifact_dir: temp.path().join("artifacts"),
+            file,
+            _lock_file: lock_file,
+            next_seq: 1,
+            recovery: RecoveryInfo::default(),
+            poisoned: false,
+        };
+
+        let first_error = journal
+            .append_and_sync("test.event", None, json!({"value": 1}))
+            .expect_err("a read-only journal handle must reject writes");
+        assert!(matches!(first_error, OxidraError::Io(_)));
+
+        for error in [
+            journal.read_events().unwrap_err(),
+            journal
+                .append("test.event", None, json!({"value": 2}))
+                .unwrap_err(),
+            journal.sync().unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("write state is indeterminate"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

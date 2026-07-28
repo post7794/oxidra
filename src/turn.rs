@@ -5,10 +5,10 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 
 use crate::error::{OxidraError, Result};
-use crate::event_kind::{is_response_lifecycle, is_tool_terminal, is_turn_scoped};
 use crate::session::JournalEvent;
 
-pub const TURN_BOUNDARY_VERSION: u64 = 1;
+pub const TURN_BOUNDARY_VALIDATOR_VERSION: u32 = 1;
+pub const TURN_BOUNDARY_VERSION: u64 = TURN_BOUNDARY_VALIDATOR_VERSION as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionEvidence {
@@ -51,6 +51,24 @@ pub struct CompletePrefix {
 
 /// Segment user turns without changing or projecting any journal content.
 pub fn segment_turns(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
+    segment_turns_for_version(TURN_BOUNDARY_VALIDATOR_VERSION, events)
+}
+
+/// Rebuild turn boundaries using an immutable historical reducer.
+/// Published match arms must not be changed; add a new version instead.
+pub(crate) fn segment_turns_for_version(
+    version: u32,
+    events: &[JournalEvent],
+) -> Result<Vec<TurnSpan>> {
+    match version {
+        1 => segment_turns_v1(events),
+        _ => Err(OxidraError::Session(format!(
+            "unsupported turn boundary reducer version {version}"
+        ))),
+    }
+}
+
+fn segment_turns_v1(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
     let mut starts = Vec::new();
     let mut seen_turn_ids = HashSet::new();
     for (index, event) in events.iter().enumerate() {
@@ -82,7 +100,7 @@ pub fn segment_turns(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
 
     for (index, event) in events.iter().enumerate() {
         let Some(turn_id) = event.turn_id.as_deref() else {
-            if is_turn_scoped(&event.kind) {
+            if is_turn_scoped_v1(&event.kind) {
                 return Err(OxidraError::Session(format!(
                     "{} at seq {} has no turn_id",
                     event.kind, event.seq
@@ -91,7 +109,7 @@ pub fn segment_turns(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
             continue;
         };
         let Some((start, end)) = ranges.get(turn_id) else {
-            if is_turn_scoped(&event.kind) {
+            if is_turn_scoped_v1(&event.kind) {
                 return Err(OxidraError::Session(format!(
                     "{} at seq {} references unknown turn {turn_id}",
                     event.kind, event.seq
@@ -201,9 +219,17 @@ pub fn segment_turns(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
 
 /// Return complete cutoffs in the contiguous cut-safe prefix.
 pub fn complete_prefix_candidates(events: &[JournalEvent]) -> Result<Vec<CompletePrefix>> {
+    complete_prefix_candidates_for_version(TURN_BOUNDARY_VALIDATOR_VERSION, events)
+}
+
+/// Rebuild complete-prefix cutoffs using an immutable historical reducer.
+pub(crate) fn complete_prefix_candidates_for_version(
+    version: u32,
+    events: &[JournalEvent],
+) -> Result<Vec<CompletePrefix>> {
     let mut candidates = Vec::new();
     let mut complete_turns = 0;
-    for turn in segment_turns(events)? {
+    for turn in segment_turns_for_version(version, events)? {
         if !turn.cut_safe {
             break;
         }
@@ -218,6 +244,44 @@ pub fn complete_prefix_candidates(events: &[JournalEvent]) -> Result<Vec<Complet
     Ok(candidates)
 }
 
+// These classifications are part of turn reducer v1. Keep them local so a new
+// journal event added to the current reducer cannot change historical cutoffs.
+fn is_tool_terminal_v1(kind: &str) -> bool {
+    matches!(
+        kind,
+        "tool.completed"
+            | "tool.cancelled"
+            | "tool.in_doubt_resolved"
+            | "tool.skipped_due_to_cancel"
+            | "tool.skipped_due_to_in_doubt"
+            | "tool.skipped_due_to_limit"
+            | "tool.skipped_due_to_stalled"
+            | "tool.skipped_due_to_recovery"
+    )
+}
+
+fn is_response_lifecycle_v1(kind: &str) -> bool {
+    matches!(
+        kind,
+        "response.started" | "response.completed" | "response.failed" | "response.aborted"
+    )
+}
+
+fn is_turn_scoped_v1(kind: &str) -> bool {
+    matches!(
+        kind,
+        "user.message"
+            | "turn.completed"
+            | "turn.cancelled"
+            | "agent.stalled"
+            | "agent.limit_reached"
+            | "context.limit_reached"
+            | "tool.started"
+            | "tool.in_doubt"
+    ) || is_response_lifecycle_v1(kind)
+        || is_tool_terminal_v1(kind)
+}
+
 fn boundary_version(event: &JournalEvent) -> Result<Option<u64>> {
     let Some(value) = event.data.get("turn_boundary_version") else {
         return Ok(None);
@@ -228,7 +292,7 @@ fn boundary_version(event: &JournalEvent) -> Result<Option<u64>> {
             event.seq
         ))
     })?;
-    if version != TURN_BOUNDARY_VERSION {
+    if version != 1 {
         return Err(OxidraError::Session(format!(
             "unsupported turn boundary version {version} at seq {}",
             event.seq
@@ -243,7 +307,7 @@ fn validate_completed_marker(
     turn_events: &[&JournalEvent],
     calls: &CallValidation,
 ) -> Result<()> {
-    if boundary_version(marker)? != Some(TURN_BOUNDARY_VERSION) {
+    if boundary_version(marker)? != Some(1) {
         return Err(OxidraError::Session(format!(
             "turn.completed at seq {} has no boundary version",
             marker.seq
@@ -280,7 +344,7 @@ fn validate_completed_marker(
     let last_response_event_seq = turn_events
         .iter()
         .rev()
-        .find(|event| is_response_lifecycle(&event.kind))
+        .find(|event| is_response_lifecycle_v1(&event.kind))
         .map(|event| event.seq);
     if last_response_event_seq != Some(final_response_seq) {
         return Err(OxidraError::Session(format!(
@@ -331,7 +395,7 @@ fn validate_inline_completion(
                 response.seq
             ))
         })?;
-    if version != TURN_BOUNDARY_VERSION {
+    if version != 1 {
         return Err(OxidraError::Session(format!(
             "unsupported turn boundary version {version} at seq {}",
             response.seq
@@ -421,7 +485,7 @@ fn last_response_is_final(turn_events: &[&JournalEvent]) -> bool {
         .iter()
         .rev()
         .copied()
-        .find(|event| is_response_lifecycle(&event.kind))
+        .find(|event| is_response_lifecycle_v1(&event.kind))
         .is_some_and(|event| {
             event.kind == "response.completed" && !response_has_function_call(event)
         })
@@ -431,7 +495,7 @@ fn last_response_event_seq(turn_events: &[&JournalEvent]) -> Option<u64> {
     turn_events
         .iter()
         .rev()
-        .find(|event| is_response_lifecycle(&event.kind))
+        .find(|event| is_response_lifecycle_v1(&event.kind))
         .map(|event| event.seq)
 }
 
@@ -541,7 +605,7 @@ fn validate_call_outputs(turn_events: &[&JournalEvent]) -> Result<CallValidation
             continue;
         }
 
-        if is_tool_terminal(&event.kind) {
+        if is_tool_terminal_v1(&event.kind) {
             let call_id = event_call_id(event);
             let started_seq = event.data.get("started_seq").and_then(Value::as_u64);
             let position = started_seq
@@ -828,6 +892,67 @@ mod tests {
                 covers_through_seq: 3,
             }]
         );
+    }
+
+    #[test]
+    fn historical_turn_boundary_v1_is_addressable_by_literal_version() {
+        let events = vec![
+            event(
+                1,
+                "t1",
+                "user.message",
+                json!({
+                    "turn_boundary_version": 1,
+                    "item": {"role": "user", "content": "question"},
+                }),
+            ),
+            response(2, "t1"),
+            event(
+                3,
+                "t1",
+                "turn.completed",
+                json!({
+                    "turn_boundary_version": 1,
+                    "covers_from_seq": 1,
+                    "final_response_seq": 2,
+                    "covers_through_seq": 3,
+                }),
+            ),
+            event(
+                4,
+                "t2",
+                "user.message",
+                json!({
+                    "turn_boundary_version": 1,
+                    "item": {"role": "user", "content": "pending question"},
+                }),
+            ),
+            call(5, "t2", "pending-call"),
+            event(6, "t2", "tool.started", json!({"call_id": "pending-call"})),
+            event(
+                7,
+                "t2",
+                "tool.in_doubt",
+                json!({"call_id": "pending-call", "started_seq": 6}),
+            ),
+        ];
+
+        let turns = segment_turns_for_version(1, &events).expect("v1 remains registered");
+        assert_eq!(
+            turns.iter().map(|turn| turn.state).collect::<Vec<_>>(),
+            vec![
+                TurnState::Complete(CompletionEvidence::ExplicitMarker),
+                TurnState::InDoubt,
+            ]
+        );
+        assert_eq!(
+            complete_prefix_candidates_for_version(1, &events).expect("v1 remains registered"),
+            vec![CompletePrefix {
+                turn_count: 1,
+                covers_through_seq: 3,
+            }]
+        );
+        assert!(complete_prefix_candidates_for_version(999, &events).is_err());
     }
 
     #[test]
