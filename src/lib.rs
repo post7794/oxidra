@@ -5,6 +5,8 @@ pub mod compaction;
 pub mod config;
 pub mod error;
 mod event_kind;
+pub mod history;
+mod history_artifact;
 mod memory;
 mod process;
 pub mod projection;

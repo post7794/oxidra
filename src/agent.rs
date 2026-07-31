@@ -5,6 +5,7 @@
 //! are supplied through traits so the core remains usable from tests and a
 //! future TUI.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,16 +13,24 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::compaction::{COMPACTION_CHECKPOINT_KIND, validate_checkpoint_chain};
+use crate::compaction::validate_checkpoint_chain;
 use crate::config::ContextLimits;
 use crate::error::{OxidraError, Result};
+use crate::history::{
+    HISTORY_ARTIFACT_TOOL, HISTORY_CONTROL_OUTPUT_RESERVE_BYTES, HISTORY_SEARCH_TOOL,
+    HISTORY_TURN_TOOL, HistoryQuota, HistorySearchRequest, HistorySnapshot, HistoryTurnRequest,
+    MAX_HISTORY_CALLS_PER_RESPONSE, MAX_HISTORY_TOOL_OUTPUT_BYTES, MAX_HISTORY_TURN_OUTPUT_BYTES,
+    history_tool_definitions, is_history_tool_name, rebuild_history_quota,
+    serialized_history_tool_output_bytes,
+};
+use crate::history_artifact::{HistoryArtifactReader, HistoryArtifactRequest};
 pub use crate::projection::project_events;
 use crate::projection::{project_checkpoint_and_tail, validate_response_output_items};
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::SessionJournal;
 use crate::tools::{BuiltinTools, ToolContext};
 use crate::turn::TURN_BOUNDARY_VERSION;
-use crate::types::{ToolCall, ToolResult, Usage};
+use crate::types::{ToolCall, ToolDefinition, ToolResult, Usage};
 
 const MAX_PROJECT_INSTRUCTIONS: usize = 32 * 1024;
 
@@ -102,6 +111,20 @@ pub struct Agent {
     context_limits: ContextLimits,
     max_responses: Option<usize>,
     max_tools: Option<usize>,
+}
+
+struct PreparedToolSet {
+    definitions: Vec<ToolDefinition>,
+    history: HistorySnapshot,
+    history_quota: HistoryQuota,
+    history_exposed: bool,
+}
+
+struct ToolDispatchContext<'a> {
+    observer: &'a mut dyn AgentObserver,
+    approval: &'a mut dyn ApprovalHandler,
+    prepared: &'a mut PreparedToolSet,
+    remaining_history_calls: usize,
 }
 
 impl Agent {
@@ -191,14 +214,7 @@ impl Agent {
                 return Err(OxidraError::Limit("max responses reached".to_owned()));
             }
 
-            let input = self.project_input()?;
-            let request = ResponseRequest {
-                instructions: (!self.instructions.is_empty()).then(|| self.instructions.clone()),
-                input,
-                tools: self.tools.definitions(),
-                model: None,
-                max_output_tokens: None,
-            };
+            let (request, mut prepared_tools) = self.prepare_request(Some(&turn_id))?;
             let context = self.estimate_context(&request)?;
             outcome.context = Some(context.clone());
             if let Err(error) = self.check_context(&context) {
@@ -272,6 +288,19 @@ impl Agent {
                 )?;
                 return Err(error);
             }
+            if let Err(error) =
+                validate_history_calls_for_response(&turn.tool_calls, &prepared_tools)
+            {
+                self.journal.append_and_sync(
+                    "response.failed",
+                    Some(&turn_id),
+                    json!({
+                        "response_attempt_id": response_attempt_id,
+                        "error": error.to_string(),
+                    }),
+                )?;
+                return Err(error);
+            }
 
             outcome.responses += 1;
             accumulate_usage(&mut outcome.usage, &turn.usage);
@@ -333,7 +362,20 @@ impl Agent {
                 }
 
                 let result = self
-                    .execute_call(&turn_id, call, cancellation.clone(), observer, approval)
+                    .execute_call(
+                        &turn_id,
+                        call,
+                        cancellation.clone(),
+                        ToolDispatchContext {
+                            observer,
+                            approval,
+                            prepared: &mut prepared_tools,
+                            remaining_history_calls: turn.tool_calls[index..]
+                                .iter()
+                                .filter(|call| is_history_tool_name(&call.name))
+                                .count(),
+                        },
+                    )
                     .await?;
                 outcome.tools += 1;
 
@@ -406,11 +448,29 @@ impl Agent {
         turn_id: &str,
         call: &ToolCall,
         cancellation: CancellationToken,
-        observer: &mut dyn AgentObserver,
-        approval: &mut dyn ApprovalHandler,
+        dispatch: ToolDispatchContext<'_>,
     ) -> Result<ToolResult> {
-        let definitions = self.tools.definitions();
-        let definition = definitions
+        let ToolDispatchContext {
+            observer,
+            approval,
+            prepared,
+            remaining_history_calls,
+        } = dispatch;
+        if is_history_tool_name(&call.name) {
+            return self
+                .execute_history_call(
+                    turn_id,
+                    call,
+                    cancellation,
+                    observer,
+                    prepared,
+                    remaining_history_calls,
+                )
+                .await;
+        }
+
+        let definition = prepared
+            .definitions
             .iter()
             .find(|definition| definition.name == call.name);
         let Some(definition) = definition else {
@@ -541,6 +601,167 @@ impl Agent {
         Ok(result)
     }
 
+    async fn execute_history_call(
+        &mut self,
+        turn_id: &str,
+        call: &ToolCall,
+        cancellation: CancellationToken,
+        observer: &mut dyn AgentObserver,
+        prepared: &mut PreparedToolSet,
+        remaining_history_calls: usize,
+    ) -> Result<ToolResult> {
+        let future_reserve = remaining_history_calls
+            .saturating_sub(1)
+            .saturating_mul(HISTORY_CONTROL_OUTPUT_RESERVE_BYTES);
+        let output_budget = prepared
+            .history_quota
+            .remaining_bytes
+            .saturating_sub(future_reserve)
+            .min(MAX_HISTORY_TOOL_OUTPUT_BYTES);
+
+        let definition = prepared
+            .definitions
+            .iter()
+            .find(|definition| definition.name == call.name);
+        let mut started = false;
+        let mut result = if !prepared.history_exposed || definition.is_none() {
+            if prepared.history.is_available() {
+                ToolResult::error(
+                    &call.id,
+                    "history_quota_exhausted",
+                    "history tools are unavailable because this turn's history quota is exhausted",
+                )
+            } else {
+                ToolResult::error(
+                    &call.id,
+                    "history_not_available",
+                    "no valid compaction checkpoint is available",
+                )
+            }
+        } else if let Err(message) = validate_json_schema(
+            &definition.expect("definition was checked").input_schema,
+            &call.arguments,
+        ) {
+            ToolResult::error(
+                &call.id,
+                "validation_error",
+                format!("invalid arguments for {}: {message}", call.name),
+            )
+        } else if cancellation.is_cancelled() {
+            ToolResult::error(&call.id, "cancelled", "history lookup was cancelled")
+        } else {
+            observer.on_tool_started(call)?;
+            self.journal.append_and_sync(
+                "tool.started",
+                Some(turn_id),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "arguments": call.arguments,
+                }),
+            )?;
+            started = true;
+            match self
+                .run_history_tool(call, &prepared.history, output_budget, &cancellation)
+                .await
+            {
+                Ok(output) => ToolResult::success(&call.id, output),
+                Err(OxidraError::Tool { code, message }) => {
+                    ToolResult::error(&call.id, code, message)
+                }
+                Err(OxidraError::Interrupted) => {
+                    ToolResult::error(&call.id, "cancelled", "history lookup was cancelled")
+                }
+                // history_* is read-only. Once started is durable, every
+                // local parsing/IO failure is a known failure rather than an
+                // unknown side effect, so always close it with a terminal.
+                Err(error) => ToolResult::error(&call.id, "history_error", error.to_string()),
+            }
+        };
+
+        if serialized_history_tool_output_bytes(&call.id, &result.output)? > output_budget {
+            result = ToolResult::error(
+                &call.id,
+                "history_quota_exhausted",
+                "remaining history quota cannot fit this result",
+            );
+        }
+        let output_bytes = serialized_history_tool_output_bytes(&call.id, &result.output)?;
+        if output_bytes > output_budget {
+            return Err(OxidraError::Session(
+                "reserved history control output does not fit the remaining quota".to_owned(),
+            ));
+        }
+        prepared.history_quota.used_bytes = prepared
+            .history_quota
+            .used_bytes
+            .saturating_add(output_bytes);
+        prepared.history_quota.remaining_bytes =
+            MAX_HISTORY_TURN_OUTPUT_BYTES.saturating_sub(prepared.history_quota.used_bytes);
+        prepared.history_quota.exhausted =
+            prepared.history_quota.used_bytes >= MAX_HISTORY_TURN_OUTPUT_BYTES;
+        if result.error_code.as_deref() == Some("cancelled") {
+            self.journal.append_and_sync(
+                "tool.cancelled",
+                Some(turn_id),
+                json!({
+                    "call_id": result.call_id,
+                    "tool": call.name,
+                    "output": result.output,
+                    "is_error": true,
+                    "error_code": "cancelled",
+                    "before_start": !started,
+                }),
+            )?;
+            observer.on_tool_completed(call, &result)?;
+        } else {
+            self.commit_tool_completed(turn_id, call, &result, observer)?;
+        }
+        Ok(result)
+    }
+
+    async fn run_history_tool(
+        &self,
+        call: &ToolCall,
+        snapshot: &HistorySnapshot,
+        output_budget: usize,
+        cancellation: &CancellationToken,
+    ) -> Result<Value> {
+        let output = match call.name.as_str() {
+            HISTORY_SEARCH_TOOL => {
+                let request =
+                    serde_json::from_value::<HistorySearchRequest>(call.arguments.clone())
+                        .map_err(|error| {
+                            OxidraError::tool("validation_error", error.to_string())
+                        })?;
+                serde_json::to_value(snapshot.search(&request)?)?
+            }
+            HISTORY_TURN_TOOL => {
+                let request = serde_json::from_value::<HistoryTurnRequest>(call.arguments.clone())
+                    .map_err(|error| OxidraError::tool("validation_error", error.to_string()))?;
+                serde_json::to_value(snapshot.turn(&request)?)?
+            }
+            HISTORY_ARTIFACT_TOOL => {
+                let request =
+                    serde_json::from_value::<HistoryArtifactRequest>(call.arguments.clone())
+                        .map_err(|error| {
+                            OxidraError::tool("validation_error", error.to_string())
+                        })?;
+                return HistoryArtifactReader::new(self.tools.artifact_dir())?
+                    .read(snapshot, &request, &call.id, output_budget, cancellation)
+                    .await;
+            }
+            _ => unreachable!("history tool name was validated"),
+        };
+        if serialized_history_tool_output_bytes(&call.id, &output)? > output_budget {
+            return Err(OxidraError::tool(
+                "history_quota_exhausted",
+                "remaining history quota cannot fit this history page",
+            ));
+        }
+        Ok(output)
+    }
+
     fn commit_tool_completed(
         &mut self,
         turn_id: &str,
@@ -623,17 +844,47 @@ impl Agent {
         Ok(())
     }
 
-    fn project_input(&self) -> Result<Vec<Value>> {
+    fn prepare_request(&self, turn_id: Option<&str>) -> Result<(ResponseRequest, PreparedToolSet)> {
         let events = self.journal.read_events()?;
-        if events
-            .iter()
-            .any(|event| event.kind == COMPACTION_CHECKPOINT_KIND)
-        {
-            let chain = validate_checkpoint_chain(&events)?;
-            project_checkpoint_and_tail(&events, &chain)
+        let chain = validate_checkpoint_chain(&events)?;
+        let input = if chain.latest().is_some() {
+            project_checkpoint_and_tail(&events, &chain)?
         } else {
-            project_events(&events)
+            project_events(&events)?
+        };
+        let history = HistorySnapshot::build(&events, &chain)?;
+        let history_quota = match turn_id {
+            Some(turn_id) => rebuild_history_quota(&events, turn_id)?,
+            None => HistoryQuota {
+                used_bytes: 0,
+                remaining_bytes: MAX_HISTORY_TURN_OUTPUT_BYTES,
+                exhausted: false,
+            },
+        };
+        let history_exposed = history.is_available()
+            && history_quota.remaining_bytes
+                >= MAX_HISTORY_CALLS_PER_RESPONSE
+                    .saturating_mul(HISTORY_CONTROL_OUTPUT_RESERVE_BYTES);
+        let mut definitions = self.tools.definitions();
+        if history_exposed {
+            definitions.extend(history_tool_definitions());
         }
+        let request = ResponseRequest {
+            instructions: (!self.instructions.is_empty()).then(|| self.instructions.clone()),
+            input,
+            tools: definitions.clone(),
+            model: None,
+            max_output_tokens: None,
+        };
+        Ok((
+            request,
+            PreparedToolSet {
+                definitions,
+                history,
+                history_quota,
+                history_exposed,
+            },
+        ))
     }
 
     fn estimate_context(&self, request: &ResponseRequest) -> Result<ContextEstimate> {
@@ -666,15 +917,47 @@ impl Agent {
     }
 
     fn next_context_estimate(&self) -> Result<ContextEstimate> {
-        let request = ResponseRequest {
-            instructions: (!self.instructions.is_empty()).then(|| self.instructions.clone()),
-            input: self.project_input()?,
-            tools: self.tools.definitions(),
-            model: None,
-            max_output_tokens: None,
-        };
+        let (request, _) = self.prepare_request(None)?;
         self.estimate_context(&request)
     }
+}
+
+fn validate_history_calls_for_response(
+    calls: &[ToolCall],
+    prepared: &PreparedToolSet,
+) -> Result<()> {
+    let history_calls = calls
+        .iter()
+        .filter(|call| is_history_tool_name(&call.name))
+        .collect::<Vec<_>>();
+    if history_calls.len() > MAX_HISTORY_CALLS_PER_RESPONSE {
+        return Err(OxidraError::Limit(format!(
+            "a response may contain at most {MAX_HISTORY_CALLS_PER_RESPONSE} history calls"
+        )));
+    }
+    let required_reserve = history_calls
+        .len()
+        .saturating_mul(HISTORY_CONTROL_OUTPUT_RESERVE_BYTES);
+    if prepared.history_quota.remaining_bytes < required_reserve {
+        return Err(OxidraError::Limit(
+            "remaining history quota cannot pair every history call in this response".to_owned(),
+        ));
+    }
+    let mut call_ids = HashSet::new();
+    for call in history_calls {
+        if call.id.is_empty() || call.id.len() > 128 {
+            return Err(OxidraError::Provider(
+                "history call_id must contain between 1 and 128 UTF-8 bytes".to_owned(),
+            ));
+        }
+        if !call_ids.insert(call.id.as_str()) {
+            return Err(OxidraError::Provider(format!(
+                "duplicate history call_id {:?} in one response",
+                call.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn accumulate_usage(total: &mut Usage, usage: &Usage) {
@@ -958,7 +1241,15 @@ pub fn load_project_instructions(root: &std::path::Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::compaction::{
+        CandidateEstimate, CompactionContext, CompactionSelection, compact_once,
+        select_compaction_candidate,
+    };
+    use crate::history::UNTRUSTED_HISTORY_NOTICE;
     use crate::session::{JournalEvent, SessionHeader, SessionStore};
     use crate::turn::{CompletionEvidence, TurnState, segment_turns};
     use crate::types::AssistantTurn;
@@ -968,6 +1259,32 @@ mod tests {
     struct ForgedRoleProvider;
 
     struct ObserverEventProvider;
+
+    struct RecordingProvider {
+        responses: Mutex<VecDeque<AssistantTurn>>,
+        requests: Mutex<Vec<ResponseRequest>>,
+    }
+
+    impl RecordingProvider {
+        fn new(responses: impl IntoIterator<Item = AssistantTurn>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ResponseRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    struct NoopStreamObserver;
+
+    impl StreamObserver for NoopStreamObserver {
+        fn on_event(&mut self, _event: ProviderEvent) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[async_trait]
     impl ResponseProvider for FinalResponseProvider {
@@ -1028,6 +1345,278 @@ mod tests {
             observer.on_event(ProviderEvent::TextDelta("partial".to_owned()))?;
             panic!("failing observer should stop the Provider")
         }
+    }
+
+    #[async_trait]
+    impl ResponseProvider for RecordingProvider {
+        async fn respond(
+            &self,
+            request: ResponseRequest,
+            _observer: &mut dyn StreamObserver,
+            _cancellation: CancellationToken,
+        ) -> Result<AssistantTurn> {
+            self.requests.lock().unwrap().push(request);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| OxidraError::Provider("test response queue is empty".to_owned()))
+        }
+    }
+
+    fn final_turn(text: &str) -> AssistantTurn {
+        let output_items = vec![json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        })];
+        AssistantTurn {
+            raw_response: json!({"output": output_items}),
+            output_items,
+            text: text.to_owned(),
+            tool_calls: Vec::new(),
+            usage: Usage::default(),
+            unknown_stream_events: Vec::new(),
+        }
+    }
+
+    fn tool_turn(calls: Vec<ToolCall>) -> AssistantTurn {
+        let output_items = calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "type":"function_call",
+                    "call_id":call.id,
+                    "name":call.name,
+                    "arguments":serde_json::to_string(&call.arguments).unwrap(),
+                })
+            })
+            .collect::<Vec<_>>();
+        AssistantTurn {
+            raw_response: json!({"output": output_items}),
+            output_items,
+            text: String::new(),
+            tool_calls: calls,
+            usage: Usage::default(),
+            unknown_stream_events: Vec::new(),
+        }
+    }
+
+    fn compaction_summary_turn() -> AssistantTurn {
+        let output_items = vec![json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"checkpoint summary"}],
+        })];
+        let usage = Usage {
+            input_tokens: 100,
+            cached_input_tokens: 10,
+            output_tokens: 20,
+            reasoning_output_tokens: 5,
+            total_tokens: 120,
+        };
+        AssistantTurn {
+            raw_response: json!({
+                "id":"compaction-test-response",
+                "status":"completed",
+                "output":output_items,
+                "usage":{
+                    "input_tokens":100,
+                    "input_tokens_details":{"cached_tokens":10},
+                    "output_tokens":20,
+                    "output_tokens_details":{"reasoning_tokens":5},
+                    "total_tokens":120,
+                }
+            }),
+            output_items,
+            text: "checkpoint summary".to_owned(),
+            tool_calls: Vec::new(),
+            usage,
+            unknown_stream_events: Vec::new(),
+        }
+    }
+
+    fn append_complete_turn(
+        journal: &mut SessionJournal,
+        turn_id: &str,
+        question: &str,
+        answer: &str,
+    ) -> u64 {
+        let user = journal
+            .append_and_sync(
+                "user.message",
+                Some(turn_id),
+                json!({
+                    "item":{"role":"user","content":question},
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let response_seq = journal.next_seq();
+        let output_items = vec![json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":answer}],
+        })];
+        journal
+            .append_and_sync(
+                "response.completed",
+                Some(turn_id),
+                json!({
+                    "raw_response":{"output":output_items},
+                    "output_items":output_items,
+                    "text":answer,
+                    "usage":Usage::default(),
+                    "turn_completion":{
+                        "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                        "covers_from_seq":user.seq,
+                        "final_response_seq":response_seq,
+                        "covers_through_seq":response_seq,
+                    }
+                }),
+            )
+            .unwrap();
+        let marker_seq = journal.next_seq();
+        journal
+            .append_and_sync(
+                "turn.completed",
+                Some(turn_id),
+                json!({
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                    "covers_from_seq":user.seq,
+                    "final_response_seq":response_seq,
+                    "covers_through_seq":marker_seq,
+                }),
+            )
+            .unwrap();
+        marker_seq
+    }
+
+    async fn commit_checkpoint(journal: &mut SessionJournal, cutoff: u64) {
+        let events = journal.read_events().unwrap();
+        let chain = validate_checkpoint_chain(&events).unwrap();
+        let candidate = match select_compaction_candidate(
+            &events,
+            &chain,
+            &CompactionContext {
+                current_input_tokens: 100,
+                target_input_tokens: 10,
+                min_recent_complete_turns: 2,
+                estimates: vec![CandidateEstimate {
+                    covers_through_seq: cutoff,
+                    estimated_input_tokens_after: 5,
+                }],
+            },
+        )
+        .unwrap()
+        {
+            CompactionSelection::Selected(candidate) => candidate,
+            other => panic!("expected compaction candidate, got {other:?}"),
+        };
+        let provider = RecordingProvider::new([compaction_summary_turn()]);
+        compact_once(
+            &provider,
+            journal,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn seed_checkpoint(journal: &mut SessionJournal) {
+        let cutoff = append_complete_turn(
+            journal,
+            "old-turn-1",
+            "historical needle",
+            "historical answer",
+        );
+        append_complete_turn(journal, "old-turn-2", "second question", "second answer");
+        append_complete_turn(journal, "old-turn-3", "third question", "third answer");
+        commit_checkpoint(journal, cutoff).await;
+    }
+
+    async fn seed_artifact_checkpoint(journal: &mut SessionJournal) {
+        let turn_id = "old-artifact-turn";
+        let user = journal
+            .append_and_sync(
+                "user.message",
+                Some(turn_id),
+                json!({
+                    "item":{"role":"user","content":"produce old output"},
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let call_item = json!({
+            "type":"function_call",
+            "call_id":"old-shell-call",
+            "name":"shell",
+            "arguments":"{\"command\":\"echo old\"}",
+        });
+        journal
+            .append_and_sync(
+                "response.completed",
+                Some(turn_id),
+                json!({"raw_response":{"output":[call_item.clone()]},"output_items":[call_item]}),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "tool.completed",
+                Some(turn_id),
+                json!({
+                    "call_id":"old-shell-call",
+                    "tool":"shell",
+                    "output":{
+                        "artifact_id":"artifact-old",
+                        "artifact_sha256":"a".repeat(64),
+                    },
+                    "is_error":false,
+                }),
+            )
+            .unwrap();
+        let response_seq = journal.next_seq();
+        let final_item = json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"saved"}],
+        });
+        journal
+            .append_and_sync(
+                "response.completed",
+                Some(turn_id),
+                json!({
+                    "raw_response":{"output":[final_item.clone()]},
+                    "output_items":[final_item],
+                    "turn_completion":{
+                        "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                        "covers_from_seq":user.seq,
+                        "final_response_seq":response_seq,
+                        "covers_through_seq":response_seq,
+                    }
+                }),
+            )
+            .unwrap();
+        let cutoff = journal.next_seq();
+        journal
+            .append_and_sync(
+                "turn.completed",
+                Some(turn_id),
+                json!({
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                    "covers_from_seq":user.seq,
+                    "final_response_seq":response_seq,
+                    "covers_through_seq":cutoff,
+                }),
+            )
+            .unwrap();
+        append_complete_turn(journal, "old-turn-2", "second question", "second answer");
+        append_complete_turn(journal, "old-turn-3", "third question", "third answer");
+        commit_checkpoint(journal, cutoff).await;
     }
 
     #[derive(Default)]
@@ -1098,6 +1687,447 @@ mod tests {
         fn on_message(&mut self, _message: &str) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn history_tools_are_hidden_without_a_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let journal = store
+            .create_with_id(
+                "history-hidden-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("done")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        agent
+            .run_turn(
+                "new session",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .all(|tool| !is_history_tool_name(&tool.name))
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_exposes_history_and_projects_lookup_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "history-loop-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        seed_checkpoint(&mut journal).await;
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([
+            tool_turn(vec![ToolCall {
+                id: "history-call".to_owned(),
+                name: HISTORY_SEARCH_TOOL.to_owned(),
+                arguments: json!({"query":"historical needle"}),
+            }]),
+            final_turn("recovered"),
+        ]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let outcome = agent
+            .run_turn(
+                "find the old fact",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "recovered");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let history_names = requests[0]
+            .tools
+            .iter()
+            .filter(|tool| is_history_tool_name(&tool.name))
+            .map(|tool| tool.name.as_str())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            history_names,
+            HashSet::from([
+                HISTORY_SEARCH_TOOL,
+                HISTORY_TURN_TOOL,
+                HISTORY_ARTIFACT_TOOL,
+            ])
+        );
+        let replayed = requests[1]
+            .input
+            .iter()
+            .find(|item| {
+                item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                    && item.get("call_id").and_then(Value::as_str) == Some("history-call")
+            })
+            .expect("history output must enter the next request");
+        let output: Value = serde_json::from_str(replayed["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output["notice"], UNTRUSTED_HISTORY_NOTICE);
+        assert!(
+            output["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|result| result["excerpt"] == "historical needle")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_checkpoint_chain_fails_before_provider_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "invalid-history-chain-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        journal
+            .append_and_sync("compaction.checkpoint", None, json!({}))
+            .unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("must not run")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let error = agent
+            .run_turn(
+                "do not dispatch",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::Session(_)));
+        assert!(provider.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn exhausted_turn_quota_removes_history_schemas() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "history-quota-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        seed_checkpoint(&mut journal).await;
+        journal
+            .append_and_sync(
+                "user.message",
+                Some("quota-turn"),
+                json!({"item":{"role":"user","content":"query repeatedly"}}),
+            )
+            .unwrap();
+        for index in 0..3 {
+            let call_id = format!("history-{index}");
+            let item = json!({
+                "type":"function_call",
+                "call_id":call_id,
+                "name":HISTORY_TURN_TOOL,
+                "arguments":"{\"turn_id\":\"old-turn-1\"}",
+            });
+            journal
+                .append_and_sync(
+                    "response.completed",
+                    Some("quota-turn"),
+                    json!({"raw_response":{"output":[item.clone()]},"output_items":[item]}),
+                )
+                .unwrap();
+            journal
+                .append_and_sync(
+                    "tool.completed",
+                    Some("quota-turn"),
+                    json!({
+                        "call_id":call_id,
+                        "tool":HISTORY_TURN_TOOL,
+                        "output":{"notice":UNTRUSTED_HISTORY_NOTICE,"results":[{"excerpt":"x".repeat(11_000)}]},
+                    }),
+                )
+                .unwrap();
+        }
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let agent = Agent::new(
+            Arc::new(FinalResponseProvider),
+            journal,
+            tools,
+            "",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let (request, prepared) = agent.prepare_request(Some("quota-turn")).unwrap();
+        assert!(prepared.history_quota.exhausted);
+        assert!(!prepared.history_exposed);
+        assert!(
+            request
+                .tools
+                .iter()
+                .all(|tool| !is_history_tool_name(&tool.name))
+        );
+    }
+
+    #[tokio::test]
+    async fn too_many_history_calls_fail_before_response_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "history-call-limit-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        seed_checkpoint(&mut journal).await;
+        let completed_before = journal
+            .read_events()
+            .unwrap()
+            .iter()
+            .filter(|event| event.kind == "response.completed")
+            .count();
+        let calls = (0..=MAX_HISTORY_CALLS_PER_RESPONSE)
+            .map(|index| ToolCall {
+                id: format!("history-{index}"),
+                name: HISTORY_SEARCH_TOOL.to_owned(),
+                arguments: json!({"query":"historical"}),
+            })
+            .collect::<Vec<_>>();
+        let provider = Arc::new(RecordingProvider::new([tool_turn(calls)]));
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let error = agent
+            .run_turn(
+                "make too many calls",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::Limit(_)));
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "response.completed")
+                .count(),
+            completed_before
+        );
+        assert!(events.iter().any(|event| event.kind == "response.failed"));
+        assert_eq!(provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn history_cancellation_and_local_io_errors_have_known_terminals() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "history-terminal-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        seed_artifact_checkpoint(&mut journal).await;
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            Arc::new(FinalResponseProvider),
+            journal,
+            tools,
+            "",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        agent
+            .journal_mut()
+            .append_and_sync(
+                "user.message",
+                Some("current-turn"),
+                json!({"item":{"role":"user","content":"inspect old history"}}),
+            )
+            .unwrap();
+        let cancelled_call = ToolCall {
+            id: "cancelled-history".to_owned(),
+            name: HISTORY_SEARCH_TOOL.to_owned(),
+            arguments: json!({"query":"old"}),
+        };
+        let artifact_call = ToolCall {
+            id: "missing-artifact".to_owned(),
+            name: HISTORY_ARTIFACT_TOOL.to_owned(),
+            arguments: json!({"artifact_id":"artifact-old","stream":"stdout"}),
+        };
+        let (_, mut prepared) = agent.prepare_request(Some("current-turn")).unwrap();
+        let response_items = [&cancelled_call, &artifact_call]
+            .into_iter()
+            .map(|call| {
+                json!({
+                    "type":"function_call",
+                    "call_id":call.id,
+                    "name":call.name,
+                    "arguments":serde_json::to_string(&call.arguments).unwrap(),
+                })
+            })
+            .collect::<Vec<_>>();
+        agent
+            .journal_mut()
+            .append_and_sync(
+                "response.completed",
+                Some("current-turn"),
+                json!({
+                    "raw_response":{"output":response_items},
+                    "output_items":response_items,
+                }),
+            )
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let cancelled = agent
+            .execute_history_call(
+                "current-turn",
+                &cancelled_call,
+                cancellation,
+                &mut NoopObserver,
+                &mut prepared,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cancelled.error_code.as_deref(), Some("cancelled"));
+
+        let failed = agent
+            .execute_history_call(
+                "current-turn",
+                &artifact_call,
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut prepared,
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.error_code.as_deref(), Some("history_error"));
+
+        let events = agent.journal().read_events().unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "tool.cancelled" && event.data["call_id"] == "cancelled-history"
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == "tool.started" && event.data["call_id"] == "missing-artifact"
+        }));
+        assert!(events.iter().any(|event| {
+            event.kind == "tool.completed"
+                && event.data["call_id"] == "missing-artifact"
+                && event.data["error_code"] == "history_error"
+        }));
+        assert!(agent.journal().in_doubt().unwrap().is_empty());
     }
 
     #[tokio::test]

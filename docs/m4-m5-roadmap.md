@@ -1,6 +1,6 @@
 # Oxidra M4/M5 实施规划
 
-状态：设计与部分实现。M4 按实际使用数据推迟。M5 的显式 turn 边界、原始 projection、checkpoint 数据模型与 reducer、低权限 summary envelope、不可变格式版本注册表、checkpoint + tail projection、真实 Responses Provider `compact_once`、8192 输出上限，以及 Provider 完成到 checkpoint 落盘窗口的生产路径故障注入已经实现。Agent 在存在有效 checkpoint 时会严格投影 summary + tail；受控历史回查、model-aware preflight、用户入口和自动触发尚未实现。自动 compaction 在历史回查闭环和漂移测量完成前必须保持默认关闭。
+状态：设计与部分实现。M4 按实际使用数据推迟。M5 的显式 turn 边界、原始 projection、checkpoint 数据模型与 reducer、低权限 summary envelope、不可变格式版本注册表、checkpoint + tail projection、真实 Responses Provider `compact_once`、8192 输出上限、Provider 完成到 checkpoint 落盘窗口的生产路径故障注入，以及 checkpoint 覆盖前缀内的三个受控历史回查工具已经实现。Agent 在存在有效 checkpoint 时会严格投影 summary + tail，并在同一个 prepared-request 快照上暴露和执行 history tools；model-aware preflight、用户入口和自动触发尚未实现。自动 compaction 在漂移测量完成前必须保持默认关闭。
 
 本文只规划两个后续里程碑：
 
@@ -435,7 +435,7 @@ seq, turn_id, kind, field, artifact_id?, byte_range?, excerpt
 
 - `history_search` 支持 `substring`（默认）和 `exact`，大小写敏感可配置；`exact` 表示规范化 field 全文相等。不支持 regex、模糊匹配、embedding 或语义搜索。
 - `history_turn` 只接受精确 `turn_id`，返回带引用的分页摘录，不自动倾倒整个 turn。
-- `history_artifact` 只接受 checkpoint 覆盖前缀内、由 journal 工具终态明确引用的 `artifact_id`，不能接受任意路径。核心负责在当前 session artifact 目录中解析引用、拒绝 symlink，并验证 journal 的 `artifact_sha256` 与 `metadata.json`。新 artifact 必须为每个落盘 stream 记录 `stored_sha256`；旧的未截断 artifact 可用完整 stream hash 校验，旧的已截断且没有 stored hash 的 artifact 返回 `artifact_integrity_unverifiable`。metadata 或文件 hash 不一致返回 `artifact_integrity_error`，不能把变化后的字节当作历史证据。
+- `history_artifact` 只接受 checkpoint 覆盖前缀内、由 journal 工具终态明确引用的 `artifact_id`，不能接受任意路径。核心负责在当前 session artifact 目录中解析引用、拒绝 symlink，并验证 journal 的 `artifact_sha256` 与 `metadata.json`。新 artifact metadata 使用 schema v2，为每个落盘 stream 记录 `stored_sha256`；旧的未截断 schema v1 artifact 可用完整 stream hash 校验，旧的已截断且没有 stored hash 的 artifact 返回 `artifact_integrity_unverifiable`。metadata 或文件 hash 不一致返回 `artifact_integrity_error`，不能把变化后的字节当作历史证据。artifact 正文按二进制读取并以 base64 返回，不假设它是 UTF-8。
 - 结果固定按 journal `seq`、记录字段顺序和匹配偏移稳定排序。
 - cursor 绑定 schema/extractor version、session、创建时的 checkpoint ID/cutoff、查询参数、snapshot digest 和下一位置。latest checkpoint 后续推进时，只要绑定的旧 checkpoint 仍位于当前有效链中且 snapshot digest 一致，就继续对旧 snapshot 分页；断链、snapshot/extractor 变化时返回 `cursor_stale`。cursor 不能扩大 cutoff。
 - `history_turn` / `history_artifact` 查询不存在、位于 cutoff 后或属于当前开放 turn 时，统一返回 `not_found_in_compacted_prefix`，不泄露范围外对象是否存在。
@@ -450,9 +450,11 @@ single excerpt               1024 B
 artifact source chunk        8192 B
 one history tool output     12288 B
 one live user turn total    32768 B
+history calls per response       8
+reserved control output/call   512 B
 ```
 
-当前用户 turn 的累计值包含所有 history tool 的成功和错误输出，跨该 turn 内的多次 response 不重置。配额必须从同一 `turn_id` 已提交的 history 工具终态事件重建，崩溃和 resume 不能重置。达到累计上限返回一次有界的 `history_quota_exhausted`；之后该 turn 的 prepared request 移除全部 history schemas，不能让模型靠反复查询继续填满 context。artifact chunk 还必须受单次序列化总上限约束。
+当前用户 turn 的累计值包含所有 history tool 的成功和错误输出，跨该 turn 内的多次 response 不重置。配额必须从同一 `turn_id` 已提交的 history 工具终态事件重建，崩溃和 resume 不能重置。每次提交 Provider response 前先验证 history call 不超过 8 个，并为这一批每个尚未执行的 call 预留 512 B，使每个 function call 都能得到确定终态而不会突破 32768 B 硬上限。prepared request 的剩余配额不足以容纳最大一批 8 个控制结果时就提前移除全部 history schemas；不能让模型靠反复查询继续填满 context。artifact chunk 还必须受单次序列化总上限约束，并按最终 base64/JSON 输出大小动态缩小。
 
 第一版每个 Provider request boundary 可对 journal 做一次线性扫描并构建不可变 `HistorySnapshot`；一次 history tool call 不能重新打开并扫描 journal。没有性能证据前不增加数据库、embedding 索引或物理分段。
 
@@ -504,7 +506,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 下一阶段严格按以下顺序推进：
 
 1. 已实现真实 Provider `compact_once` 内核：复用已注册的六类 v1 协议、无 tools、8192 输出上限、完整 raw response/usage 提交，并让 Agent 在有效 checkpoint 存在时实际使用 checkpoint + tail projection。当前没有用户入口，自动触发仍关闭。
-2. 实现当前 session、最新 checkpoint 覆盖前缀内的 `history_search` / `history_turn` / `history_artifact`，完成确定性检索、引用、cursor 和单 turn 配额。
+2. 已实现当前 session、最新 checkpoint 覆盖前缀内的 `history_search` / `history_turn` / `history_artifact`：同一 request boundary 只读一次 journal，schema 和执行器绑定同一不可变 snapshot；确定性检索、引用、cursor、artifact schema v1/v2 校验和单 turn 配额已经接入 Agent 主循环。
 3. 实现 model-aware context 配置、prepared-request 测量、`context.configured` 审计和自动 preflight；自动触发先保持默认关闭。
 4. 完成真实崩溃恢复、Provider 完成到 checkpoint 落盘窗口、连续多次 compaction、pending-turn retry 和 history 回查闭环 E2E。
 5. 用固定 fixture 测量父摘要连续 3/5/10 次重摘要后的漂移，保存 model、prompt version、原始输出和指标，先建立基线，不预设发布阈值。

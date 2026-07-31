@@ -854,7 +854,7 @@ impl BuiltinTools {
         }
 
         let metadata = json!({
-            "schema": 1,
+            "schema": 2,
             "kind": "shell_output",
             "command": command,
             "completion": completion.label(),
@@ -865,6 +865,7 @@ impl BuiltinTools {
                 "stored_bytes": stdout.stored_bytes,
                 "artifact_truncated": stdout.artifact_truncated,
                 "sha256": stdout.sha256,
+                "stored_sha256": stdout.stored_sha256,
             },
             "stderr": {
                 "file": "stderr.bin",
@@ -872,12 +873,18 @@ impl BuiltinTools {
                 "stored_bytes": stderr.stored_bytes,
                 "artifact_truncated": stderr.artifact_truncated,
                 "sha256": stderr.sha256,
+                "stored_sha256": stderr.stored_sha256,
             },
         });
         let metadata_bytes = serde_json::to_vec_pretty(&metadata)?;
         let metadata_path = directory.join("metadata.json");
-        tokio::fs::write(&metadata_path, &metadata_bytes).await?;
-        let metadata_file = tokio::fs::File::open(&metadata_path).await?;
+        let mut metadata_file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&metadata_path)
+            .await?;
+        metadata_file.write_all(&metadata_bytes).await?;
+        metadata_file.flush().await?;
         metadata_file.sync_data().await?;
         Ok(ArtifactReference {
             id: id.to_owned(),
@@ -1153,6 +1160,7 @@ struct StreamCapture {
     prefix: Vec<u8>,
     total_bytes: u64,
     sha256: String,
+    stored_sha256: String,
     spool_path: PathBuf,
     stored_bytes: u64,
     artifact_truncated: bool,
@@ -1168,6 +1176,7 @@ where
     let mut stored_bytes = 0u64;
     let mut artifact_truncated = false;
     let mut hasher = Sha256::new();
+    let mut stored_hasher = Sha256::new();
     let mut buffer = [0u8; 8 * 1_024];
     loop {
         let read = reader.read(&mut buffer).await?;
@@ -1179,6 +1188,7 @@ where
         if remaining > 0 {
             let stored = (read as u64).min(remaining) as usize;
             spool.write_all(&chunk[..stored]).await?;
+            stored_hasher.update(&chunk[..stored]);
             stored_bytes = stored_bytes.saturating_add(stored as u64);
             if stored < read {
                 artifact_truncated = true;
@@ -1197,6 +1207,7 @@ where
         prefix,
         total_bytes,
         sha256: hex::encode(hasher.finalize()),
+        stored_sha256: hex::encode(stored_hasher.finalize()),
         spool_path,
         stored_bytes,
         artifact_truncated,
@@ -1685,6 +1696,50 @@ mod tests {
             sha256_hex(contents.as_bytes())
         );
         assert!(result.output["text"].as_str().unwrap().len() <= MAX_TOOL_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn shell_artifact_v2_records_the_stored_stream_hashes() {
+        let (_root, artifacts, tools) = harness();
+        let stdout_bytes = b"stored stdout";
+        let stderr_bytes = b"stored stderr";
+        let stdout = capture_stream(
+            &stdout_bytes[..],
+            artifacts.path().join("stdout-test.spool"),
+        )
+        .await
+        .unwrap();
+        let stderr = capture_stream(
+            &stderr_bytes[..],
+            artifacts.path().join("stderr-test.spool"),
+        )
+        .await
+        .unwrap();
+
+        let reference = tools
+            .commit_shell_artifact(
+                "artifact-v2",
+                "test command",
+                &ShellCompletion::Exited(Some(0)),
+                &stdout,
+                &stderr,
+            )
+            .await
+            .unwrap();
+        let metadata_bytes =
+            std::fs::read(artifacts.path().join("artifact-v2").join("metadata.json")).unwrap();
+        let metadata: Value = serde_json::from_slice(&metadata_bytes).unwrap();
+
+        assert_eq!(metadata["schema"], 2);
+        assert_eq!(
+            metadata["stdout"]["stored_sha256"],
+            sha256_hex(stdout_bytes)
+        );
+        assert_eq!(
+            metadata["stderr"]["stored_sha256"],
+            sha256_hex(stderr_bytes)
+        );
+        assert_eq!(reference.sha256, sha256_hex(&metadata_bytes));
     }
 
     #[tokio::test]
