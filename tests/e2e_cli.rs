@@ -454,15 +454,22 @@ fn context_limited_session_blocks_new_prompts_and_can_retry_explicitly() {
             .iter()
             .filter(|event| event["kind"] == "user.message")
             .count(),
-        2,
+        1,
         "the blocked replacement must not be persisted"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "turn.retry_started")
+            .count(),
+        1
     );
     assert_eq!(
         events
             .iter()
             .filter(|event| event["kind"] == "turn.abandoned")
             .count(),
-        1
+        0
     );
 }
 

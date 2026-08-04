@@ -31,6 +31,7 @@ const CHILD_MODE_ENV: &str = "OXIDRA_FAULT_INJECTION_CHILD";
 const DATA_DIR_ENV: &str = "OXIDRA_FAULT_INJECTION_DATA_DIR";
 const COMPACTION_SCENARIO_ENV: &str = "OXIDRA_COMPACTION_FAULT_SCENARIO";
 const SESSION_ID: &str = "process-fault-session";
+const RETRY_SESSION_ID: &str = "retry-fault-session";
 const TURN_ID: &str = "turn-1";
 const RESPONSE_ATTEMPT_ID: &str = "attempt-1";
 const SYNC_PREFIX: &str = "OXIDRA_FAULT_SYNC:";
@@ -42,6 +43,13 @@ enum SyncPoint {
     UserMessage,
     ResponseStarted,
     InlineResponseCompleted,
+    TurnCompleted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetrySyncPoint {
+    IntentSynced,
+    ResponseStarted,
     TurnCompleted,
 }
 
@@ -118,6 +126,22 @@ impl SyncPoint {
                 "response.completed",
                 "turn.completed",
             ],
+        }
+    }
+}
+
+impl RetrySyncPoint {
+    const ALL: [Self; 3] = [
+        Self::IntentSynced,
+        Self::ResponseStarted,
+        Self::TurnCompleted,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::IntentSynced => "turn.retry_started",
+            Self::ResponseStarted => "turn.retry-response-started",
+            Self::TurnCompleted => "turn.retry-completed",
         }
     }
 }
@@ -258,6 +282,58 @@ fn force_kill_during_compaction_commits_only_complete_checkpoints() {
     }
 }
 
+#[test]
+fn force_kill_during_retry_preserves_the_original_prompt_and_intent() {
+    for sync_point in RetrySyncPoint::ALL {
+        let temp = tempfile::tempdir().expect("create retry fault data directory");
+        let child = spawn_retry_fault_child(temp.path());
+        stop_child_at_label(
+            child,
+            sync_point.label(),
+            &RetrySyncPoint::ALL.map(RetrySyncPoint::label),
+        );
+
+        let store = SessionStore::new(temp.path()).expect("open retry fault store");
+        let persisted = store
+            .inspect(RETRY_SESSION_ID)
+            .expect("inspect retry journal before recovery");
+        assert_eq!(count_kind(&persisted, "user.message"), 1);
+        assert_eq!(count_kind(&persisted, "turn.retry_started"), 1);
+        assert_eq!(count_kind(&persisted, "turn.abandoned"), 0);
+
+        let journal = store
+            .open(RETRY_SESSION_ID)
+            .expect("recover retry journal after forced exit");
+        let recovery = journal.recovery_info().clone();
+        let recovered = journal.read_events().expect("read recovered retry journal");
+        drop(journal);
+
+        match sync_point {
+            RetrySyncPoint::IntentSynced => {
+                assert_eq!(recovery.aborted_responses, 0);
+                assert_eq!(count_kind(&recovered, "response.started"), 0);
+                assert_eq!(count_kind(&recovered, "turn.completed"), 0);
+            }
+            RetrySyncPoint::ResponseStarted => {
+                assert_eq!(recovery.aborted_responses, 1);
+                assert_eq!(count_kind(&recovered, "response.aborted"), 1);
+                assert_eq!(count_kind(&recovered, "turn.completed"), 0);
+            }
+            RetrySyncPoint::TurnCompleted => {
+                assert_eq!(recovery.aborted_responses, 0);
+                assert_eq!(count_kind(&recovered, "turn.completed"), 1);
+                assert!(matches!(
+                    segment_turns(&recovered)
+                        .expect("segment completed retry")
+                        .last()
+                        .map(|turn| turn.state),
+                    Some(TurnState::Complete(_))
+                ));
+            }
+        }
+    }
+}
+
 // This ignored test is a helper process, not a standalone test. The parent
 // launches this same integration-test binary and kills it while a synced
 // journal writer is deliberately blocked on stdin.
@@ -337,6 +413,109 @@ fn fault_injection_child() {
         )
         .expect("append turn completion marker");
     sync_barrier(SyncPoint::TurnCompleted);
+}
+
+// 该 helper 由父测试启动，并在 retry 的已同步边界上被强制终止。
+#[test]
+#[ignore = "launched by force_kill_during_retry_preserves_the_original_prompt_and_intent"]
+fn retry_fault_injection_child() {
+    if env::var_os(CHILD_MODE_ENV).is_none() {
+        return;
+    }
+    let data_dir = env::var_os(DATA_DIR_ENV).expect("retry fault child data directory is set");
+    let store = SessionStore::new(&data_dir).expect("create retry child session store");
+    let mut journal = store
+        .create_with_id(
+            RETRY_SESSION_ID,
+            SessionHeader::new(&data_dir, "fault-injection-model"),
+        )
+        .expect("create retry child journal");
+    let user = journal
+        .append_and_sync(
+            "user.message",
+            Some(TURN_ID),
+            json!({
+                "item":{"role":"user","content":"retry after context limit"},
+                "turn_boundary_version":TURN_BOUNDARY_VERSION,
+            }),
+        )
+        .expect("append retry user message");
+    journal
+        .append_and_sync(
+            "response.failed",
+            Some(TURN_ID),
+            json!({
+                "response_attempt_id":"initial-context-limit",
+                "error":"context_length_exceeded",
+            }),
+        )
+        .expect("append initial context failure");
+    let limit = journal
+        .append_and_sync(
+            "context.limit_reached",
+            Some(TURN_ID),
+            json!({"error":"context_length_exceeded"}),
+        )
+        .expect("append initial context limit");
+    journal
+        .append_and_sync(
+            "turn.retry_started",
+            Some(TURN_ID),
+            json!({
+                "retry_version":1,
+                "retry_id":"fault-retry",
+                "user_message_seq":user.seq,
+                "context_limit_seq":limit.seq,
+            }),
+        )
+        .expect("append retry intent");
+    sync_barrier_label(RetrySyncPoint::IntentSynced.label());
+
+    journal
+        .append_and_sync(
+            "response.started",
+            Some(TURN_ID),
+            json!({
+                "response_attempt_id":"retry-attempt",
+                "response_index":1,
+            }),
+        )
+        .expect("append retry response start");
+    sync_barrier_label(RetrySyncPoint::ResponseStarted.label());
+
+    let response_seq = journal.next_seq();
+    let response = journal
+        .append_and_sync(
+            "response.completed",
+            Some(TURN_ID),
+            json!({
+                "response_attempt_id":"retry-attempt",
+                "raw_response":{"id":"retry-response","output":[]},
+                "output_items":[],
+                "text":"done",
+                "turn_completion":{
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                    "covers_from_seq":user.seq,
+                    "final_response_seq":response_seq,
+                    "covers_through_seq":response_seq,
+                },
+            }),
+        )
+        .expect("append retry response completion");
+    let marker_seq = journal.next_seq();
+    journal
+        .append_and_sync(
+            "turn.completed",
+            Some(TURN_ID),
+            json!({
+                "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                "covers_from_seq":user.seq,
+                "final_response_seq":response.seq,
+                "covers_through_seq":marker_seq,
+            }),
+        )
+        .expect("append retry completion marker");
+    sync_barrier_label(RetrySyncPoint::TurnCompleted.label());
 }
 
 struct FaultCompactionProvider {
@@ -608,6 +787,24 @@ fn spawn_fault_child(data_dir: &std::path::Path) -> Child {
         .stderr(Stdio::piped());
     suppress_windows_console(&mut command);
     command.spawn().expect("spawn fault-injection child")
+}
+
+fn spawn_retry_fault_child(data_dir: &Path) -> Child {
+    let mut command = Command::new(env::current_exe().expect("locate integration-test binary"));
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            "retry_fault_injection_child",
+            "--nocapture",
+        ])
+        .env(CHILD_MODE_ENV, "1")
+        .env(DATA_DIR_ENV, data_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    suppress_windows_console(&mut command);
+    command.spawn().expect("spawn retry fault-injection child")
 }
 
 fn spawn_compaction_fault_child(data_dir: &Path, scenario: CompactionSyncPoint) -> Child {

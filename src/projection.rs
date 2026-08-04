@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::compaction::{COMPACTION_CHECKPOINT_KIND, CheckpointChain, compacted_history_item};
 use crate::error::{OxidraError, Result};
 use crate::session::JournalEvent;
-use crate::turn::complete_prefix_candidates;
+use crate::turn::{complete_prefix_candidates, validate_turn_recovery};
 
 /// Current immutable event-to-item format used when building compaction input.
 pub const SOURCE_PROJECTION_VERSION: u32 = 2;
@@ -58,10 +58,9 @@ fn project_events_impl(
         .filter(|turn_id| !completed_turns.contains(turn_id))
         .collect::<HashSet<_>>();
     let explicitly_abandoned_turns = if supports_explicit_abandon {
-        events
-            .iter()
-            .filter(|event| event.kind == "turn.abandoned")
-            .filter_map(|event| event.turn_id.clone())
+        validate_turn_recovery(events)?
+            .abandons
+            .into_keys()
             .collect::<HashSet<_>>()
     } else {
         HashSet::new()
@@ -551,7 +550,10 @@ mod tests {
                 5,
                 Some("abandoned"),
                 "turn.abandoned",
-                json!({"reason":"user abandoned pending turn"}),
+                json!({
+                    "user_message_seq": 1,
+                    "reason":"user abandoned pending turn"
+                }),
             ),
         ];
 
@@ -566,6 +568,38 @@ mod tests {
                 .is_empty()
         );
         assert!(project_events(&events).unwrap().is_empty());
+    }
+
+    #[test]
+    fn forged_abandon_cannot_delete_a_completed_turn() {
+        let events = vec![
+            user(1, "completed"),
+            event(
+                2,
+                Some("completed"),
+                "response.completed",
+                json!({"output_items":[{
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"done"}]
+                }]}),
+            ),
+            event(
+                3,
+                Some("completed"),
+                "turn.completed",
+                json!({"turn_boundary_version":2}),
+            ),
+            event(
+                4,
+                Some("completed"),
+                "turn.abandoned",
+                json!({"user_message_seq":1,"reason":"forged"}),
+            ),
+        ];
+
+        let error = project_events(&events).expect_err("forged abandon must fail closed");
+        assert!(error.to_string().contains("cannot be abandoned"));
     }
 
     #[test]

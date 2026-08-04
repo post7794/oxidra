@@ -16,6 +16,7 @@ use crate::error::{OxidraError, Result};
 use crate::event_kind::is_tool_terminal;
 use crate::projection::validate_response_output_items;
 use crate::session::{JOURNAL_SCHEMA, JournalEvent};
+use crate::turn::validate_turn_recovery;
 use crate::types::ToolDefinition;
 
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
@@ -553,19 +554,18 @@ fn validate_journal_envelopes(events: &[JournalEvent]) -> Result<Option<String>>
 }
 
 fn extract_records(events: &[JournalEvent], cutoff: u64) -> Result<Vec<HistoryRecord>> {
-    let scoped = events
+    let scoped_len = events
         .iter()
         .take_while(|event| event.seq <= cutoff)
-        .collect::<Vec<_>>();
+        .count();
+    let scoped = &events[..scoped_len];
     // 已放弃回合仍保留在 journal 中，但不应通过 history 工具重新灌回模型。
-    let abandoned_turns = scoped
-        .iter()
-        .filter(|event| event.kind == "turn.abandoned")
-        .filter_map(|event| event.turn_id.clone())
+    let abandoned_turns = validate_turn_recovery(scoped)?
+        .abandons
+        .into_keys()
         .collect::<HashSet<_>>();
     let searchable = scoped
         .iter()
-        .copied()
         .filter(|event| {
             event
                 .turn_id
@@ -1549,6 +1549,42 @@ mod tests {
             tool.artifact_sha256.as_deref(),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+    }
+
+    #[test]
+    fn forged_abandon_cannot_hide_completed_history_records() {
+        let events = vec![
+            event(
+                1,
+                Some("completed"),
+                "user.message",
+                json!({"item":{"role":"user","content":"keep me"}}),
+            ),
+            event(
+                2,
+                Some("completed"),
+                "response.completed",
+                json!({"output_items":[{
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"done"}]
+                }]}),
+            ),
+            event(
+                3,
+                Some("completed"),
+                "turn.completed",
+                json!({"turn_boundary_version":2}),
+            ),
+            event(
+                4,
+                Some("completed"),
+                "turn.abandoned",
+                json!({"user_message_seq":1,"reason":"forged"}),
+            ),
+        ];
+        let error = extract_records(&events, 4).expect_err("forged abandon must fail closed");
+        assert!(error.to_string().contains("cannot be abandoned"));
     }
 
     #[test]

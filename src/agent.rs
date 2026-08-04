@@ -32,7 +32,7 @@ use crate::projection::{project_checkpoint_and_tail, validate_response_output_it
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::SessionJournal;
 use crate::tools::{BuiltinTools, ToolContext};
-use crate::turn::TURN_BOUNDARY_VERSION;
+use crate::turn::{TURN_BOUNDARY_VERSION, validate_turn_recovery};
 use crate::types::{ToolCall, ToolDefinition, ToolResult, Usage};
 
 const MAX_PROJECT_INSTRUCTIONS: usize = 32 * 1024;
@@ -110,6 +110,7 @@ pub struct TurnOutcome {
 pub struct PendingContextTurn {
     pub turn_id: String,
     pub user_message_seq: u64,
+    pub context_limit_seq: u64,
     pub prompt: String,
 }
 
@@ -234,12 +235,25 @@ impl Agent {
         )?;
         let turn_start_seq = user_event.seq;
 
+        self.run_existing_turn(&turn_id, turn_start_seq, cancellation, observer, approval)
+            .await
+    }
+
+    /// 从已同步的 user.message 继续执行；retry 恢复使用它避免重复追加 prompt。
+    async fn run_existing_turn(
+        &mut self,
+        turn_id: &str,
+        turn_start_seq: u64,
+        cancellation: CancellationToken,
+        observer: &mut dyn AgentObserver,
+        approval: &mut dyn ApprovalHandler,
+    ) -> Result<TurnOutcome> {
         let mut outcome = TurnOutcome::default();
         let mut repeated_error: Option<(String, usize)> = None;
 
         loop {
             if cancellation.is_cancelled() {
-                self.append_turn_cancelled(&turn_id, "cancelled before response started")?;
+                self.append_turn_cancelled(turn_id, "cancelled before response started")?;
                 return Err(OxidraError::Interrupted);
             }
             if self
@@ -248,19 +262,19 @@ impl Agent {
             {
                 self.journal.append_and_sync(
                     "agent.limit_reached",
-                    Some(&turn_id),
+                    Some(turn_id),
                     json!({ "kind": "responses", "limit": self.max_responses }),
                 )?;
                 return Err(OxidraError::Limit("max responses reached".to_owned()));
             }
 
-            let (request, mut prepared_tools) = self.prepare_request(Some(&turn_id))?;
+            let (request, mut prepared_tools) = self.prepare_request(Some(turn_id))?;
             let context = self.context_estimate(&prepared_tools.context);
             outcome.context = Some(context.clone());
             let response_attempt_id = Uuid::now_v7().to_string();
             self.journal.append_and_sync(
                 "response.started",
-                Some(&turn_id),
+                Some(turn_id),
                 json!({
                     "response_attempt_id": response_attempt_id,
                     "response_index": outcome.responses + 1,
@@ -269,7 +283,7 @@ impl Agent {
             )?;
             if let Err(error) = observer.on_response_started() {
                 let error = OxidraError::observer(error);
-                self.append_response_aborted(&turn_id, &response_attempt_id, &error.to_string())?;
+                self.append_response_aborted(turn_id, &response_attempt_id, &error.to_string())?;
                 return Err(error);
             }
             let response = {
@@ -282,16 +296,16 @@ impl Agent {
             let turn = match response {
                 Ok(turn) => turn,
                 Err(OxidraError::Interrupted) => {
-                    self.append_response_aborted(&turn_id, &response_attempt_id, "cancelled")?;
+                    self.append_response_aborted(turn_id, &response_attempt_id, "cancelled")?;
                     return Err(OxidraError::Interrupted);
                 }
                 Err(OxidraError::ResponseAborted(reason)) => {
-                    self.append_response_aborted(&turn_id, &response_attempt_id, &reason)?;
+                    self.append_response_aborted(turn_id, &response_attempt_id, &reason)?;
                     return Err(OxidraError::ResponseAborted(reason));
                 }
                 Err(error @ OxidraError::Observer(_)) => {
                     self.append_response_aborted(
-                        &turn_id,
+                        turn_id,
                         &response_attempt_id,
                         &error.to_string(),
                     )?;
@@ -300,7 +314,7 @@ impl Agent {
                 Err(OxidraError::ProviderContextLimit(reason)) => {
                     self.journal.append_and_sync(
                         "response.failed",
-                        Some(&turn_id),
+                        Some(turn_id),
                         json!({
                             "response_attempt_id": response_attempt_id,
                             "error": &reason,
@@ -309,7 +323,7 @@ impl Agent {
                     )?;
                     self.journal.append_and_sync(
                         "context.limit_reached",
-                        Some(&turn_id),
+                        Some(turn_id),
                         json!({
                             "error": &reason,
                             "source": "provider",
@@ -322,7 +336,7 @@ impl Agent {
                 Err(error) => {
                     self.journal.append_and_sync(
                         "response.failed",
-                        Some(&turn_id),
+                        Some(turn_id),
                         json!({
                             "response_attempt_id": response_attempt_id,
                             "error": error.to_string(),
@@ -335,7 +349,7 @@ impl Agent {
             if let Err(error) = validate_response_output_items(&turn.output_items) {
                 self.journal.append_and_sync(
                     "response.failed",
-                    Some(&turn_id),
+                    Some(turn_id),
                     json!({
                         "response_attempt_id": response_attempt_id,
                         "error": error.to_string(),
@@ -348,7 +362,7 @@ impl Agent {
             {
                 self.journal.append_and_sync(
                     "response.failed",
-                    Some(&turn_id),
+                    Some(turn_id),
                     json!({
                         "response_attempt_id": response_attempt_id,
                         "error": error.to_string(),
@@ -377,18 +391,16 @@ impl Agent {
                     "covers_through_seq": response_seq,
                 });
             }
-            let response_event = self.journal.append_and_sync(
-                "response.completed",
-                Some(&turn_id),
-                response_data,
-            )?;
+            let response_event =
+                self.journal
+                    .append_and_sync("response.completed", Some(turn_id), response_data)?;
             debug_assert_eq!(response_event.seq, response_seq);
             if is_final_response {
                 outcome.text = turn.text;
                 let marker_seq = self.journal.next_seq();
                 self.journal.append_and_sync(
                     "turn.completed",
-                    Some(&turn_id),
+                    Some(turn_id),
                     json!({
                         "turn_boundary_version": TURN_BOUNDARY_VERSION,
                         "covers_from_seq": turn_start_seq,
@@ -402,23 +414,23 @@ impl Agent {
 
             for (index, call) in turn.tool_calls.iter().enumerate() {
                 if self.max_tools.is_some_and(|limit| outcome.tools >= limit) {
-                    self.mark_remaining_skipped(&turn_id, &turn.tool_calls[index..], "tool limit")?;
+                    self.mark_remaining_skipped(turn_id, &turn.tool_calls[index..], "tool limit")?;
                     self.journal.append_and_sync(
                         "agent.limit_reached",
-                        Some(&turn_id),
+                        Some(turn_id),
                         json!({ "kind": "tools", "limit": self.max_tools }),
                     )?;
                     return Err(OxidraError::Limit("max tools reached".to_owned()));
                 }
                 if cancellation.is_cancelled() {
-                    self.mark_remaining_skipped(&turn_id, &turn.tool_calls[index..], "cancelled")?;
-                    self.append_turn_cancelled(&turn_id, "cancelled before tool dispatch")?;
+                    self.mark_remaining_skipped(turn_id, &turn.tool_calls[index..], "cancelled")?;
+                    self.append_turn_cancelled(turn_id, "cancelled before tool dispatch")?;
                     return Err(OxidraError::Interrupted);
                 }
 
                 let result = self
                     .execute_call(
-                        &turn_id,
+                        turn_id,
                         call,
                         cancellation.clone(),
                         ToolDispatchContext {
@@ -436,7 +448,7 @@ impl Agent {
 
                 if result.error_code.as_deref() == Some("in_doubt") {
                     self.mark_remaining_skipped(
-                        &turn_id,
+                        turn_id,
                         &turn.tool_calls[index + 1..],
                         "in_doubt",
                     )?;
@@ -463,14 +475,14 @@ impl Agent {
                     };
                     if count >= 3 {
                         self.mark_remaining_skipped(
-                            &turn_id,
+                            turn_id,
                             &turn.tool_calls[index + 1..],
                             "stalled",
                         )?;
                         observer.on_message("相同工具调用连续失败 3 次，已暂停以避免无效循环")?;
                         self.journal.append_and_sync(
                             "agent.stalled",
-                            Some(&turn_id),
+                            Some(turn_id),
                             json!({
                                 "call_id": call.id,
                                 "tool": call.name,
@@ -487,11 +499,11 @@ impl Agent {
 
                 if cancellation.is_cancelled() {
                     self.mark_remaining_skipped(
-                        &turn_id,
+                        turn_id,
                         &turn.tool_calls[index + 1..],
                         "cancelled",
                     )?;
-                    self.append_turn_cancelled(&turn_id, "cancelled during tool execution")?;
+                    self.append_turn_cancelled(turn_id, "cancelled during tool execution")?;
                     return Err(OxidraError::Interrupted);
                 }
             }
@@ -519,21 +531,65 @@ impl Agent {
         Ok(pending.len())
     }
 
-    /// 放弃旧 pending 回合，并把最新 prompt 作为新的可审计回合重放。
+    /// 持久化 retry intent 后在原 turn 上继续，崩溃恢复不会重复追加 prompt。
     pub async fn retry_pending_context_turn(
         &mut self,
         cancellation: CancellationToken,
         observer: &mut dyn AgentObserver,
         approval: &mut dyn ApprovalHandler,
     ) -> Result<TurnOutcome> {
-        let pending = self.pending_context_turns()?;
+        let events = self.journal.read_events()?;
+        let pending = pending_context_turns(&events)?;
         let retry = pending.last().ok_or_else(|| {
             OxidraError::Config("session has no pending context-limited turn".to_owned())
         })?;
-        let prompt = retry.prompt.clone();
-        self.abandon_pending_context_turns("superseded by explicit retry")?;
-        self.run_turn(&prompt, cancellation, observer, approval)
-            .await
+        if pending.len() != 1 {
+            return Err(OxidraError::ApprovalRequired(format!(
+                "session has {} pending context-limited turns; abandon the legacy backlog before retrying",
+                pending.len()
+            )));
+        }
+        let recovery = validate_turn_recovery(&events)?;
+        let has_current_intent = recovery
+            .retries
+            .iter()
+            .rev()
+            .find(|intent| {
+                intent.turn_id == retry.turn_id && intent.limit_seq == retry.context_limit_seq
+            })
+            .is_some_and(|intent| {
+                !events.iter().any(|event| {
+                    event.turn_id.as_deref() == Some(retry.turn_id.as_str())
+                        && event.seq > intent.retry_seq
+                        && matches!(
+                            event.kind.as_str(),
+                            "response.started"
+                                | "response.completed"
+                                | "response.failed"
+                                | "response.aborted"
+                        )
+                })
+            });
+        if !has_current_intent {
+            self.journal.append_and_sync(
+                "turn.retry_started",
+                Some(&retry.turn_id),
+                json!({
+                    "retry_version": 1,
+                    "retry_id": Uuid::now_v7().to_string(),
+                    "user_message_seq": retry.user_message_seq,
+                    "context_limit_seq": retry.context_limit_seq,
+                }),
+            )?;
+        }
+        self.run_existing_turn(
+            &retry.turn_id,
+            retry.user_message_seq,
+            cancellation,
+            observer,
+            approval,
+        )
+        .await
     }
 
     async fn execute_call(
@@ -1047,12 +1103,33 @@ fn pending_context_turns(
     let limited_turns = events
         .iter()
         .filter(|event| event.kind == "context.limit_reached")
-        .filter_map(|event| event.turn_id.clone())
-        .collect::<HashSet<_>>();
+        .try_fold(
+            std::collections::HashMap::<String, u64>::new(),
+            |mut limits, event| {
+                let turn_id = event.turn_id.clone().ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "context.limit_reached at seq {} has no turn_id",
+                        event.seq
+                    ))
+                })?;
+                limits
+                    .entry(turn_id)
+                    .and_modify(|seq| *seq = (*seq).max(event.seq))
+                    .or_insert(event.seq);
+                Ok::<_, OxidraError>(limits)
+            },
+        )?;
+    let recovery = validate_turn_recovery(events)?;
     let resolved_turns = events
         .iter()
-        .filter(|event| matches!(event.kind.as_str(), "turn.completed" | "turn.abandoned"))
+        .filter(|event| {
+            event.kind == "turn.completed" || event.data.get("turn_completion").is_some()
+        })
         .filter_map(|event| event.turn_id.clone())
+        .collect::<HashSet<_>>();
+    let resolved_turns = resolved_turns
+        .into_iter()
+        .chain(recovery.abandons.into_keys())
         .collect::<HashSet<_>>();
     let mut pending = Vec::new();
     for user in events.iter().filter(|event| event.kind == "user.message") {
@@ -1062,7 +1139,10 @@ fn pending_context_turns(
                 user.seq
             )));
         };
-        if !limited_turns.contains(turn_id) || resolved_turns.contains(turn_id) {
+        let Some(context_limit_seq) = limited_turns.get(turn_id).copied() else {
+            continue;
+        };
+        if resolved_turns.contains(turn_id) {
             continue;
         }
         let prompt = user
@@ -1079,6 +1159,7 @@ fn pending_context_turns(
         pending.push(PendingContextTurn {
             turn_id: turn_id.to_owned(),
             user_message_seq: user.seq,
+            context_limit_seq,
             prompt: prompt.to_owned(),
         });
     }
@@ -2104,7 +2185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_retry_abandons_every_limited_turn_and_restores_the_session() {
+    async fn explicit_retry_reuses_the_original_turn_without_deleting_history() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -2115,28 +2196,23 @@ mod tests {
                 SessionHeader::new(&project_root, "test-model"),
             )
             .unwrap();
-        for (turn_id, prompt) in [
-            ("old-limit-1", "first oversized prompt"),
-            ("old-limit-2", "second oversized prompt"),
-        ] {
-            journal
-                .append_and_sync(
-                    "user.message",
-                    Some(turn_id),
-                    json!({
-                        "item":{"role":"user","content":prompt},
-                        "turn_boundary_version":TURN_BOUNDARY_VERSION,
-                    }),
-                )
-                .unwrap();
-            journal
-                .append_and_sync(
-                    "context.limit_reached",
-                    Some(turn_id),
-                    json!({"error":"context window limit reached"}),
-                )
-                .unwrap();
-        }
+        journal
+            .append_and_sync(
+                "user.message",
+                Some("limited-turn"),
+                json!({
+                    "item":{"role":"user","content":"oversized prompt"},
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "context.limit_reached",
+                Some("limited-turn"),
+                json!({"error":"context window limit reached"}),
+            )
+            .unwrap();
         drop(journal);
 
         let journal = store.open("context-retry-test").unwrap();
@@ -2168,8 +2244,8 @@ mod tests {
         );
 
         let pending = agent.pending_context_turns().unwrap();
-        assert_eq!(pending.len(), 2);
-        assert_eq!(pending.last().unwrap().prompt, "second oversized prompt");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].prompt, "oversized prompt");
 
         let outcome = agent
             .retry_pending_context_turn(
@@ -2186,9 +2262,23 @@ mod tests {
         assert_eq!(
             events
                 .iter()
+                .filter(|event| event.kind == "turn.retry_started")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
                 .filter(|event| event.kind == "turn.abandoned")
                 .count(),
-            2
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "user.message")
+                .count(),
+            1
         );
         let projected = project_events(&events).unwrap();
         let projected_user_text = projected
@@ -2196,7 +2286,7 @@ mod tests {
             .filter(|item| item.get("role").and_then(Value::as_str) == Some("user"))
             .filter_map(|item| item.get("content").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(projected_user_text, vec!["second oversized prompt"]);
+        assert_eq!(projected_user_text, vec!["oversized prompt"]);
         assert_eq!(provider.requests().len(), 1);
 
         let follow_up = agent
@@ -2210,6 +2300,190 @@ mod tests {
             .unwrap();
         assert_eq!(follow_up.text, "follow-up");
         assert_eq!(provider.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn synced_retry_intent_survives_reopen_without_duplication() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "context-retry-recovery-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let user = journal
+            .append_and_sync(
+                "user.message",
+                Some("limited-turn"),
+                json!({
+                    "item":{"role":"user","content":"retry me"},
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let limit = journal
+            .append_and_sync(
+                "context.limit_reached",
+                Some("limited-turn"),
+                json!({"error":"context window limit reached"}),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "turn.retry_started",
+                Some("limited-turn"),
+                json!({
+                    "retry_version":1,
+                    "retry_id":"persisted-retry",
+                    "user_message_seq":user.seq,
+                    "context_limit_seq":limit.seq,
+                }),
+            )
+            .unwrap();
+        drop(journal);
+
+        let journal = store.open("context-retry-recovery-test").unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("recovered")]));
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+        let outcome = agent
+            .retry_pending_context_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "recovered");
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "turn.retry_started")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "user.message")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_retry_attempt_gets_a_new_intent_without_a_new_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "context-retry-attempt-recovery-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let user = journal
+            .append_and_sync(
+                "user.message",
+                Some("limited-turn"),
+                json!({
+                    "item":{"role":"user","content":"retry after crash"},
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let limit = journal
+            .append_and_sync(
+                "context.limit_reached",
+                Some("limited-turn"),
+                json!({"error":"context window limit reached"}),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "turn.retry_started",
+                Some("limited-turn"),
+                json!({
+                    "retry_version":1,
+                    "retry_id":"first-retry",
+                    "user_message_seq":user.seq,
+                    "context_limit_seq":limit.seq,
+                }),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "response.started",
+                Some("limited-turn"),
+                json!({"response_attempt_id":"crashed-attempt","response_index":1}),
+            )
+            .unwrap();
+        drop(journal);
+
+        let journal = store.open("context-retry-attempt-recovery-test").unwrap();
+        assert_eq!(journal.recovery_info().aborted_responses, 1);
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("recovered")]));
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+        let outcome = agent
+            .retry_pending_context_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "recovered");
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "turn.retry_started")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "user.message")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

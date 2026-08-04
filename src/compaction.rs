@@ -2384,7 +2384,10 @@ mod tests {
                 .iter_mut()
                 .find(|event| event.kind == COMPACTION_CHECKPOINT_KIND)
                 .unwrap()
-                .data[field] = json!(if field == "source_projection_version" {
+                .data[field] = json!(if matches!(
+                field,
+                "source_projection_version" | "turn_boundary_validator_version"
+            ) {
                 1
             } else {
                 2

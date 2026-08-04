@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::error::{OxidraError, Result};
 use crate::session::JournalEvent;
 
-pub const TURN_BOUNDARY_VALIDATOR_VERSION: u32 = 1;
+pub const TURN_BOUNDARY_VALIDATOR_VERSION: u32 = 2;
 pub const TURN_BOUNDARY_VERSION: u64 = TURN_BOUNDARY_VALIDATOR_VERSION as u64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,6 +49,299 @@ pub struct CompletePrefix {
     pub covers_through_seq: u64,
 }
 
+/// 已通过验证的显式放弃事件；调用方只能使用该 reducer 的结果改变 projection。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedAbandon {
+    pub turn_id: String,
+    pub user_message_seq: u64,
+    pub limit_seq: u64,
+    pub abandon_seq: u64,
+}
+
+/// 已通过验证的持久化 retry 意图。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedRetry {
+    pub retry_id: String,
+    pub turn_id: String,
+    pub user_message_seq: u64,
+    pub limit_seq: u64,
+    pub retry_seq: u64,
+}
+
+/// turn recovery 控制事件的唯一共享 reducer 输出。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ValidatedTurnRecovery {
+    pub abandons: HashMap<String, ValidatedAbandon>,
+    pub retries: Vec<ValidatedRetry>,
+}
+
+/// 校验并归约 turn recovery 控制事件，防止任意 journal 行获得历史删除或
+/// 重试状态迁移语义。
+///
+/// 放弃只适用于尚未完成、确实经历过 context-limit 的 turn；引用、顺序和
+/// 重复事件任一不成立时都 fail closed。
+pub(crate) fn validate_turn_recovery(events: &[JournalEvent]) -> Result<ValidatedTurnRecovery> {
+    let mut users = HashMap::new();
+    let mut limits: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut completion_seqs: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut response_terminal_seqs: HashMap<String, Vec<u64>> = HashMap::new();
+
+    for event in events {
+        match event.kind.as_str() {
+            "user.message" => {
+                let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "user.message at seq {} has no turn_id",
+                        event.seq
+                    ))
+                })?;
+                if users.insert(turn_id.to_owned(), event.seq).is_some() {
+                    return Err(OxidraError::Session(format!(
+                        "turn {turn_id} has more than one user.message"
+                    )));
+                }
+            }
+            "context.limit_reached" => {
+                let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "context.limit_reached at seq {} has no turn_id",
+                        event.seq
+                    ))
+                })?;
+                limits
+                    .entry(turn_id.to_owned())
+                    .or_default()
+                    .push(event.seq);
+            }
+            "turn.completed" => {
+                let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "turn.completed at seq {} has no turn_id",
+                        event.seq
+                    ))
+                })?;
+                completion_seqs
+                    .entry(turn_id.to_owned())
+                    .or_default()
+                    .push(event.seq);
+            }
+            _ => {}
+        }
+        if matches!(
+            event.kind.as_str(),
+            "response.completed" | "response.failed" | "response.aborted"
+        ) {
+            let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "{} at seq {} has no turn_id",
+                    event.kind, event.seq
+                ))
+            })?;
+            response_terminal_seqs
+                .entry(turn_id.to_owned())
+                .or_default()
+                .push(event.seq);
+        }
+        if event.data.get("turn_completion").is_some() {
+            let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "inline turn completion at seq {} has no turn_id",
+                    event.seq
+                ))
+            })?;
+            completion_seqs
+                .entry(turn_id.to_owned())
+                .or_default()
+                .push(event.seq);
+        }
+    }
+
+    let mut abandons = HashMap::new();
+    for event in events.iter().filter(|event| event.kind == "turn.abandoned") {
+        let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "turn.abandoned at seq {} has no turn_id",
+                event.seq
+            ))
+        })?;
+        if abandons.contains_key(turn_id) {
+            return Err(OxidraError::Session(format!(
+                "turn {turn_id} has duplicate turn.abandoned events"
+            )));
+        }
+        let user_message_seq = event
+            .data
+            .get("user_message_seq")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "turn.abandoned at seq {} has no user_message_seq",
+                    event.seq
+                ))
+            })?;
+        if users.get(turn_id) != Some(&user_message_seq) {
+            return Err(OxidraError::Session(format!(
+                "turn.abandoned at seq {} does not reference turn {turn_id}'s user.message",
+                event.seq
+            )));
+        }
+        if completion_seqs.contains_key(turn_id) {
+            return Err(OxidraError::Session(format!(
+                "completed turn {turn_id} cannot be abandoned"
+            )));
+        }
+        let limit_seq = limits
+            .get(turn_id)
+            .and_then(|seqs| seqs.iter().copied().filter(|seq| *seq < event.seq).max())
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "turn.abandoned at seq {} is not preceded by context.limit_reached",
+                    event.seq
+                ))
+            })?;
+        if event.seq <= user_message_seq {
+            return Err(OxidraError::Session(format!(
+                "turn.abandoned at seq {} precedes its user.message",
+                event.seq
+            )));
+        }
+        abandons.insert(
+            turn_id.to_owned(),
+            ValidatedAbandon {
+                turn_id: turn_id.to_owned(),
+                user_message_seq,
+                limit_seq,
+                abandon_seq: event.seq,
+            },
+        );
+    }
+
+    let mut retries = Vec::new();
+    let mut retry_ids = HashSet::new();
+    let mut previous_retry_seq: HashMap<String, u64> = HashMap::new();
+    for event in events
+        .iter()
+        .filter(|event| event.kind == "turn.retry_started")
+    {
+        let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "turn.retry_started at seq {} has no turn_id",
+                event.seq
+            ))
+        })?;
+        let version = event
+            .data
+            .get("retry_version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "turn.retry_started at seq {} has no retry_version",
+                    event.seq
+                ))
+            })?;
+        if version != 1 {
+            return Err(OxidraError::Session(format!(
+                "unsupported turn retry version {version} at seq {}",
+                event.seq
+            )));
+        }
+        let retry_id = event
+            .data
+            .get("retry_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "turn.retry_started at seq {} has no retry_id",
+                    event.seq
+                ))
+            })?;
+        if !retry_ids.insert(retry_id.to_owned()) {
+            return Err(OxidraError::Session(format!(
+                "duplicate turn retry id {retry_id}"
+            )));
+        }
+        let user_message_seq = event
+            .data
+            .get("user_message_seq")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "turn.retry_started at seq {} has no user_message_seq",
+                    event.seq
+                ))
+            })?;
+        if users.get(turn_id) != Some(&user_message_seq) {
+            return Err(OxidraError::Session(format!(
+                "turn.retry_started at seq {} does not reference turn {turn_id}'s user.message",
+                event.seq
+            )));
+        }
+        if completion_seqs
+            .get(turn_id)
+            .is_some_and(|seqs| seqs.iter().any(|seq| *seq < event.seq))
+        {
+            return Err(OxidraError::Session(format!(
+                "completed turn {turn_id} cannot be retried"
+            )));
+        }
+        if abandons
+            .get(turn_id)
+            .is_some_and(|abandon| abandon.abandon_seq < event.seq)
+        {
+            return Err(OxidraError::Session(format!(
+                "abandoned turn {turn_id} cannot be retried"
+            )));
+        }
+        let limit_seq = event
+            .data
+            .get("context_limit_seq")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "turn.retry_started at seq {} has no context_limit_seq",
+                    event.seq
+                ))
+            })?;
+        let latest_limit = limits
+            .get(turn_id)
+            .and_then(|seqs| seqs.iter().copied().filter(|seq| *seq < event.seq).max())
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "turn.retry_started at seq {} is not preceded by context.limit_reached",
+                    event.seq
+                ))
+            })?;
+        if limit_seq != latest_limit {
+            return Err(OxidraError::Session(format!(
+                "turn.retry_started at seq {} does not reference the latest context limit",
+                event.seq
+            )));
+        }
+        if let Some(previous) = previous_retry_seq.get(turn_id) {
+            let previous_was_settled = response_terminal_seqs
+                .get(turn_id)
+                .is_some_and(|seqs| seqs.iter().any(|seq| *seq > *previous && *seq < event.seq));
+            if limit_seq <= *previous && !previous_was_settled {
+                return Err(OxidraError::Session(format!(
+                    "turn.retry_started at seq {} duplicates an undispatched retry intent",
+                    event.seq
+                )));
+            }
+        }
+        previous_retry_seq.insert(turn_id.to_owned(), event.seq);
+        retries.push(ValidatedRetry {
+            retry_id: retry_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            user_message_seq,
+            limit_seq,
+            retry_seq: event.seq,
+        });
+    }
+
+    Ok(ValidatedTurnRecovery { abandons, retries })
+}
+
 /// Segment user turns without changing or projecting any journal content.
 pub fn segment_turns(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
     segment_turns_for_version(TURN_BOUNDARY_VALIDATOR_VERSION, events)
@@ -62,10 +355,84 @@ pub(crate) fn segment_turns_for_version(
 ) -> Result<Vec<TurnSpan>> {
     match version {
         1 => segment_turns_v1(events),
+        2 => segment_turns_v2(events),
         _ => Err(OxidraError::Session(format!(
             "unsupported turn boundary reducer version {version}"
         ))),
     }
+}
+
+fn segment_turns_v2(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
+    let recovery = validate_turn_recovery(events)?;
+    let latest_retry_by_turn =
+        recovery
+            .retries
+            .iter()
+            .fold(HashMap::<String, u64>::new(), |mut latest, retry| {
+                latest
+                    .entry(retry.turn_id.clone())
+                    .and_modify(|seq| *seq = (*seq).max(retry.retry_seq))
+                    .or_insert(retry.retry_seq);
+                latest
+            });
+    let mut normalized = events.to_vec();
+    for event in &mut normalized {
+        normalize_boundary_version_for_v1(event)?;
+        if event
+            .turn_id
+            .as_ref()
+            .and_then(|turn_id| latest_retry_by_turn.get(turn_id))
+            .is_some_and(|retry_seq| {
+                event.seq < *retry_seq
+                    && matches!(
+                        event.kind.as_str(),
+                        "response.failed" | "response.aborted" | "context.limit_reached"
+                    )
+            })
+        {
+            event.kind = "turn.retry_superseded".to_owned();
+        }
+    }
+    segment_turns_v1(&normalized)
+}
+
+fn normalize_boundary_version_for_v1(event: &mut JournalEvent) -> Result<()> {
+    if let Some(version) = event.data.get_mut("turn_boundary_version") {
+        let value = version.as_u64().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "turn boundary version at seq {} is not an unsigned integer",
+                event.seq
+            ))
+        })?;
+        if !matches!(value, 1 | 2) {
+            return Err(OxidraError::Session(format!(
+                "unsupported turn boundary version {value} at seq {}",
+                event.seq
+            )));
+        }
+        *version = Value::from(1);
+    }
+    if let Some(version) = event
+        .data
+        .get_mut("turn_completion")
+        .and_then(Value::as_object_mut)
+        .and_then(|completion| completion.get_mut("turn_boundary_version"))
+    {
+        let value = version.as_u64().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "inline turn boundary version at seq {} is not an unsigned integer",
+                event.seq
+            ))
+        })?;
+        if !matches!(value, 1 | 2) {
+            return Err(OxidraError::Session(format!(
+                "unsupported inline turn boundary version {value} at seq {}",
+                event.seq
+            )));
+        }
+        *version = Value::from(1);
+    }
+    Ok(())
 }
 
 fn segment_turns_v1(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
@@ -1192,6 +1559,186 @@ mod tests {
         let turns = segment_turns(&events).expect("valid turns");
         assert_eq!(turns[0].state, TurnState::LimitReached);
         assert!(complete_prefix_candidates(&events).unwrap().is_empty());
+    }
+
+    #[test]
+    fn validates_abandon_only_for_the_matching_pending_context_turn() {
+        let events = vec![
+            user(1, "limited", true),
+            event(2, "limited", "context.limit_reached", json!({})),
+            event(
+                3,
+                "limited",
+                "turn.abandoned",
+                json!({"user_message_seq":1,"reason":"retry"}),
+            ),
+        ];
+        let validated = validate_turn_recovery(&events).expect("valid abandon");
+        let abandon = validated.abandons.get("limited").expect("validated turn");
+        assert_eq!(abandon.user_message_seq, 1);
+        assert_eq!(abandon.limit_seq, 2);
+        assert_eq!(abandon.abandon_seq, 3);
+    }
+
+    #[test]
+    fn forged_abandon_events_fail_closed() {
+        let completed = vec![
+            user(1, "done", true),
+            inline_response(2, "done", 1),
+            event(
+                3,
+                "done",
+                "turn.abandoned",
+                json!({"user_message_seq":1,"reason":"forged"}),
+            ),
+        ];
+        assert!(validate_turn_recovery(&completed).is_err());
+
+        let no_limit = vec![
+            user(1, "done", true),
+            event(
+                2,
+                "done",
+                "turn.abandoned",
+                json!({"user_message_seq":1,"reason":"forged"}),
+            ),
+        ];
+        assert!(validate_turn_recovery(&no_limit).is_err());
+
+        let out_of_order = vec![
+            user(1, "limited", true),
+            event(
+                2,
+                "limited",
+                "turn.abandoned",
+                json!({"user_message_seq":1,"reason":"forged"}),
+            ),
+            event(3, "limited", "context.limit_reached", json!({})),
+        ];
+        assert!(validate_turn_recovery(&out_of_order).is_err());
+    }
+
+    #[test]
+    fn duplicate_abandon_events_fail_closed() {
+        let events = vec![
+            user(1, "limited", true),
+            event(2, "limited", "context.limit_reached", json!({})),
+            event(
+                3,
+                "limited",
+                "turn.abandoned",
+                json!({"user_message_seq":1,"reason":"retry"}),
+            ),
+            event(
+                4,
+                "limited",
+                "turn.abandoned",
+                json!({"user_message_seq":1,"reason":"retry again"}),
+            ),
+        ];
+        assert!(validate_turn_recovery(&events).is_err());
+    }
+
+    #[test]
+    fn retry_intent_is_versioned_and_references_the_latest_limit() {
+        let events = vec![
+            user(1, "limited", true),
+            event(2, "limited", "response.failed", json!({})),
+            event(3, "limited", "context.limit_reached", json!({})),
+            event(
+                4,
+                "limited",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-1",
+                    "user_message_seq":1,
+                    "context_limit_seq":3,
+                }),
+            ),
+        ];
+        let recovery = validate_turn_recovery(&events).expect("valid retry intent");
+        assert_eq!(recovery.retries.len(), 1);
+        assert_eq!(recovery.retries[0].retry_id, "retry-1");
+        assert_eq!(recovery.retries[0].limit_seq, 3);
+    }
+
+    #[test]
+    fn retry_without_a_new_limit_or_after_completion_fails_closed() {
+        let duplicate = vec![
+            user(1, "limited", true),
+            event(2, "limited", "context.limit_reached", json!({})),
+            event(
+                3,
+                "limited",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-1",
+                    "user_message_seq":1,
+                    "context_limit_seq":2,
+                }),
+            ),
+            event(
+                4,
+                "limited",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-2",
+                    "user_message_seq":1,
+                    "context_limit_seq":2,
+                }),
+            ),
+        ];
+        assert!(validate_turn_recovery(&duplicate).is_err());
+
+        let completed = vec![
+            user(1, "done", true),
+            inline_response(2, "done", 1),
+            marker(3, "done", 1, 2),
+            event(4, "done", "context.limit_reached", json!({})),
+            event(
+                5,
+                "done",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-forged",
+                    "user_message_seq":1,
+                    "context_limit_seq":4,
+                }),
+            ),
+        ];
+        assert!(validate_turn_recovery(&completed).is_err());
+    }
+
+    #[test]
+    fn boundary_v2_allows_a_successful_response_after_a_persisted_retry() {
+        let events = vec![
+            user(1, "limited", true),
+            event(2, "limited", "response.failed", json!({})),
+            event(3, "limited", "context.limit_reached", json!({})),
+            event(
+                4,
+                "limited",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-1",
+                    "user_message_seq":1,
+                    "context_limit_seq":3,
+                }),
+            ),
+            inline_response(5, "limited", 1),
+            marker(6, "limited", 1, 5),
+        ];
+        let turns = segment_turns(&events).expect("retry should restore completion semantics");
+        assert_eq!(
+            turns[0].state,
+            TurnState::Complete(CompletionEvidence::ExplicitMarker)
+        );
+        assert_eq!(complete_prefix_candidates(&events).unwrap().len(), 1);
     }
 
     #[test]
