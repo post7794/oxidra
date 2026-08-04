@@ -203,6 +203,16 @@ fn normalize_record_base_url(value: &str) -> Result<String> {
     let mut url = Url::parse(value).map_err(|_| {
         OxidraError::Config("stored credential has an invalid API base URL".to_owned())
     })?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(OxidraError::Config(
+            "stored credential uses an unsupported secret-bearing API base URL; log in again"
+                .to_owned(),
+        ));
+    }
     if !url.path().ends_with('/') {
         let path = format!("{}/", url.path());
         url.set_path(&path);
@@ -298,5 +308,24 @@ mod tests {
             .err()
             .unwrap();
         assert!(!error.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn legacy_secret_bearing_stored_url_is_rejected_without_echoing_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"api_base_url":"https://user:password@example.test/v1/?signature=secret","api_key":"api-secret"}"#,
+        )
+        .unwrap();
+        let store = CredentialStore::new(CredentialStoreKind::File, path);
+        let error = match store.lookup(&Url::parse("https://example.test/v1/").unwrap()) {
+            Ok(_) => panic!("secret-bearing stored URL must be rejected"),
+            Err(error) => error.to_string(),
+        };
+        for secret in ["user", "password", "signature", "api-secret"] {
+            assert!(!error.contains(secret));
+        }
     }
 }

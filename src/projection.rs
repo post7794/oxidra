@@ -13,12 +13,12 @@ use crate::session::JournalEvent;
 use crate::turn::complete_prefix_candidates;
 
 /// Current immutable event-to-item format used when building compaction input.
-pub const SOURCE_PROJECTION_VERSION: u32 = 1;
+pub const SOURCE_PROJECTION_VERSION: u32 = 2;
 
 /// Project only committed events into the stateless Responses `input` array.
 /// Partial deltas and aborted responses are intentionally absent.
 pub fn project_events(events: &[JournalEvent]) -> Result<Vec<Value>> {
-    project_events_v1(events)
+    project_events_v2(events)
 }
 
 /// Rebuild the exact event projection recorded by a compaction attempt.
@@ -26,6 +26,7 @@ pub fn project_events(events: &[JournalEvent]) -> Result<Vec<Value>> {
 pub fn project_events_for_compaction(version: u32, events: &[JournalEvent]) -> Result<Vec<Value>> {
     match version {
         1 => project_events_v1(events),
+        2 => project_events_v2(events),
         _ => Err(OxidraError::Session(format!(
             "unsupported compaction source projection version {version}"
         ))),
@@ -33,6 +34,18 @@ pub fn project_events_for_compaction(version: u32, events: &[JournalEvent]) -> R
 }
 
 fn project_events_v1(events: &[JournalEvent]) -> Result<Vec<Value>> {
+    project_events_impl(events, false)
+}
+
+fn project_events_v2(events: &[JournalEvent]) -> Result<Vec<Value>> {
+    // v2 新增显式 abandon 语义；v1 必须保持历史 checkpoint 的原始字节行为。
+    project_events_impl(events, true)
+}
+
+fn project_events_impl(
+    events: &[JournalEvent],
+    supports_explicit_abandon: bool,
+) -> Result<Vec<Value>> {
     let completed_turns = events
         .iter()
         .filter(|event| event.kind == "response.completed")
@@ -44,6 +57,15 @@ fn project_events_v1(events: &[JournalEvent]) -> Result<Vec<Value>> {
         .filter_map(|event| event.turn_id.clone())
         .filter(|turn_id| !completed_turns.contains(turn_id))
         .collect::<HashSet<_>>();
+    let explicitly_abandoned_turns = if supports_explicit_abandon {
+        events
+            .iter()
+            .filter(|event| event.kind == "turn.abandoned")
+            .filter_map(|event| event.turn_id.clone())
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     let mut projected = Vec::new();
     let mut marked_cancelled_turns = HashSet::new();
     for event in events {
@@ -56,27 +78,42 @@ fn project_events_v1(events: &[JournalEvent]) -> Result<Vec<Value>> {
                     ))
                 })?;
                 validate_user_input_item(item, event.seq)?;
-                let abandoned = event
-                    .turn_id
-                    .as_ref()
-                    .is_some_and(|turn_id| abandoned_turns.contains(turn_id));
+                let abandoned = event.turn_id.as_ref().is_some_and(|turn_id| {
+                    abandoned_turns.contains(turn_id)
+                        || explicitly_abandoned_turns.contains(turn_id)
+                });
                 if !abandoned {
                     projected.push(item.clone());
                 }
             }
             "response.completed" => {
+                if event
+                    .turn_id
+                    .as_ref()
+                    .is_some_and(|turn_id| explicitly_abandoned_turns.contains(turn_id))
+                {
+                    continue;
+                }
                 let items = response_output_items(event)?;
                 validate_response_output_items(items)?;
                 projected.extend(items.iter().cloned());
             }
             kind if is_tool_terminal_v1(kind) => {
+                if event
+                    .turn_id
+                    .as_ref()
+                    .is_some_and(|turn_id| explicitly_abandoned_turns.contains(turn_id))
+                {
+                    continue;
+                }
                 if let Some(item) = tool_output_item_v1(&event.data) {
                     projected.push(item);
                 }
             }
             "response.aborted" | "turn.cancelled" => {
                 if let Some(turn_id) = &event.turn_id {
-                    if completed_turns.contains(turn_id)
+                    if !explicitly_abandoned_turns.contains(turn_id)
+                        && completed_turns.contains(turn_id)
                         && marked_cancelled_turns.insert(turn_id.clone())
                     {
                         projected.push(json!({
@@ -481,6 +518,54 @@ mod tests {
         )
         .expect("serialize projection");
         assert_eq!(enriched_bytes, base_bytes);
+    }
+
+    #[test]
+    fn projection_v2_drops_every_item_from_an_explicitly_abandoned_turn() {
+        let events = vec![
+            user(1, "abandoned"),
+            event(
+                2,
+                Some("abandoned"),
+                "response.completed",
+                json!({"output_items":[{
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"read",
+                    "arguments":"{}"
+                }]}),
+            ),
+            event(
+                3,
+                Some("abandoned"),
+                "tool.completed",
+                json!({"call_id":"call-1","output":{"text":"large partial result"}}),
+            ),
+            event(
+                4,
+                Some("abandoned"),
+                "context.limit_reached",
+                json!({"error":"limit"}),
+            ),
+            event(
+                5,
+                Some("abandoned"),
+                "turn.abandoned",
+                json!({"reason":"user abandoned pending turn"}),
+            ),
+        ];
+
+        assert!(
+            !project_events_for_compaction(1, &events)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            project_events_for_compaction(2, &events)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(project_events(&events).unwrap().is_empty());
     }
 
     #[test]

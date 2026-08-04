@@ -10,7 +10,7 @@ use crate::provider::{ResponseRequest, prepared_request_body};
 use crate::session::JournalEvent;
 use crate::types::ToolDefinition;
 
-pub const CONTEXT_MEASUREMENT_VERSION: u32 = 1;
+pub const CONTEXT_MEASUREMENT_VERSION: u32 = 2;
 pub const CONTEXT_ESTIMATOR_VERSION: u32 = 1;
 pub const REQUEST_SHAPE_VERSION: u32 = 1;
 pub const TOOL_SNAPSHOT_VERSION: u32 = 1;
@@ -73,6 +73,9 @@ pub struct PreparedRequestMeasurement {
     pub request_shape_version: u32,
     pub request_digest: String,
     pub estimated_input_tokens: u64,
+    /// 完整 Provider JSON 的 UTF-8 字节数，仅用于审计估算密度，不作为 token 上限。
+    #[serde(default)]
+    pub serialized_request_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -99,6 +102,7 @@ pub struct ContextDecision {
     pub anchor_reported_input_tokens: Option<u64>,
     pub anchor_estimated_input_tokens: Option<u64>,
     pub estimate_delta_tokens: Option<i64>,
+    pub anchor_rejection_reason: Option<String>,
     pub estimated_next_input_tokens: u64,
     pub context_window: Option<u64>,
     pub reserve_tokens: u64,
@@ -145,6 +149,7 @@ pub fn measure_prepared_request(
         request_shape_version: REQUEST_SHAPE_VERSION,
         request_digest: digest_bytes(b"oxidra.prepared-request.v1\0", &bytes),
         estimated_input_tokens: estimate_json_tokens(&body)?,
+        serialized_request_bytes: bytes.len() as u64,
     })
 }
 
@@ -177,6 +182,7 @@ pub fn decide_context(
         anchor_reported_input_tokens,
         anchor_estimated_input_tokens,
         estimate_delta_tokens,
+        anchor_rejection_reason,
         estimated_next_input_tokens,
     ) = match anchor {
         Some(anchor) => {
@@ -185,20 +191,48 @@ pub fn decide_context(
             let delta_i64 = i64::try_from(delta).map_err(|_| {
                 OxidraError::Session("prepared request estimate delta exceeds i64".to_owned())
             })?;
-            let next = (i128::from(anchor.reported_input_tokens) + delta)
-                .clamp(0, i128::from(u64::MAX)) as u64;
-            (
-                ContextEstimateMethod::UsageAnchor,
-                Some(anchor.response_seq),
-                Some(anchor.response_attempt_id),
-                Some(anchor.reported_input_tokens),
-                Some(anchor.estimated_input_tokens),
-                Some(delta_i64),
-                next,
-            )
+            let anchor_error = anchor
+                .reported_input_tokens
+                .abs_diff(anchor.estimated_input_tokens);
+            let allowed_error = anchor.estimated_input_tokens.max(1_024).saturating_mul(4);
+            let candidate = i128::from(anchor.reported_input_tokens) + delta;
+            let rejection = if anchor_error > allowed_error {
+                Some(format!(
+                    "anchor estimator error {anchor_error} exceeds tolerance {allowed_error}"
+                ))
+            } else if candidate <= 0 {
+                Some("anchor delta produced a non-positive estimate".to_owned())
+            } else {
+                None
+            };
+            if let Some(reason) = rejection {
+                (
+                    ContextEstimateMethod::FullRequest,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(reason),
+                    measurement.estimated_input_tokens,
+                )
+            } else {
+                let next = u64::try_from(candidate).unwrap_or(u64::MAX);
+                (
+                    ContextEstimateMethod::UsageAnchor,
+                    Some(anchor.response_seq),
+                    Some(anchor.response_attempt_id),
+                    Some(anchor.reported_input_tokens),
+                    Some(anchor.estimated_input_tokens),
+                    Some(delta_i64),
+                    None,
+                    next,
+                )
+            }
         }
         None => (
             ContextEstimateMethod::FullRequest,
+            None,
             None,
             None,
             None,
@@ -216,6 +250,7 @@ pub fn decide_context(
         anchor_reported_input_tokens,
         anchor_estimated_input_tokens,
         estimate_delta_tokens,
+        anchor_rejection_reason,
         estimated_next_input_tokens,
         context_window: runtime.limits.context_window,
         reserve_tokens: runtime.limits.reserve_tokens,
@@ -391,6 +426,10 @@ mod tests {
                 &serde_json::to_vec(&body).unwrap()
             )
         );
+        assert_eq!(
+            measurement.serialized_request_bytes,
+            serde_json::to_vec(&body).unwrap().len() as u64
+        );
         assert!(body["include"].as_array().is_some());
     }
 
@@ -402,6 +441,7 @@ mod tests {
             request_shape_version: REQUEST_SHAPE_VERSION,
             request_digest: "anchor".to_owned(),
             estimated_input_tokens: 1_000,
+            serialized_request_bytes: 5_000,
         };
         let events = vec![
             event(
@@ -430,6 +470,7 @@ mod tests {
             request_shape_version: REQUEST_SHAPE_VERSION,
             request_digest: "current".to_owned(),
             estimated_input_tokens: 900,
+            serialized_request_bytes: 5_000,
         };
         let decision = decide_context(
             &events,
@@ -446,6 +487,63 @@ mod tests {
         assert_eq!(decision.method, ContextEstimateMethod::UsageAnchor);
         assert_eq!(decision.estimate_delta_tokens, Some(-100));
         assert_eq!(decision.estimated_next_input_tokens, 1_400);
+        assert!(decision.anchor_rejection_reason.is_none());
+    }
+
+    #[test]
+    fn non_positive_or_wild_anchor_delta_falls_back_instead_of_clamping_to_zero() {
+        let anchor_measurement = PreparedRequestMeasurement {
+            measurement_version: CONTEXT_MEASUREMENT_VERSION,
+            estimator_version: CONTEXT_ESTIMATOR_VERSION,
+            request_shape_version: REQUEST_SHAPE_VERSION,
+            request_digest: "anchor".to_owned(),
+            estimated_input_tokens: 10_000,
+            serialized_request_bytes: 20_000,
+        };
+        let events = vec![
+            event(
+                1,
+                "response.started",
+                json!({
+                    "response_attempt_id":"attempt",
+                    "context":{
+                        "measurement":anchor_measurement,
+                        "provider_usage_domain":"domain"
+                    }
+                }),
+            ),
+            event(
+                2,
+                "response.completed",
+                json!({
+                    "response_attempt_id":"attempt",
+                    "raw_response":{"usage":{"input_tokens":1}}
+                }),
+            ),
+        ];
+        let current = PreparedRequestMeasurement {
+            measurement_version: CONTEXT_MEASUREMENT_VERSION,
+            estimator_version: CONTEXT_ESTIMATOR_VERSION,
+            request_shape_version: REQUEST_SHAPE_VERSION,
+            request_digest: "current".to_owned(),
+            estimated_input_tokens: 1,
+            serialized_request_bytes: 4_200,
+        };
+        let decision = decide_context(
+            &events,
+            &runtime("domain"),
+            current,
+            Some(2),
+            None,
+            None,
+            None,
+            None,
+            3,
+        )
+        .unwrap();
+        assert_eq!(decision.method, ContextEstimateMethod::FullRequest);
+        assert_eq!(decision.estimated_next_input_tokens, 1);
+        assert!(decision.anchor_rejection_reason.is_some());
     }
 
     #[test]
@@ -458,7 +556,7 @@ mod tests {
                     "response_attempt_id":"attempt",
                     "context":{
                         "measurement":{
-                            "measurement_version":1,
+                            "measurement_version":2,
                             "estimator_version":1,
                             "request_shape_version":1,
                             "request_digest":"anchor",
@@ -475,11 +573,12 @@ mod tests {
             ),
         ];
         let current = PreparedRequestMeasurement {
-            measurement_version: 1,
+            measurement_version: 2,
             estimator_version: 1,
             request_shape_version: 1,
             request_digest: "current".to_owned(),
             estimated_input_tokens: 900,
+            serialized_request_bytes: 5_000,
         };
         let decision = decide_context(
             &events,

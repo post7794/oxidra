@@ -64,13 +64,13 @@ pub(crate) fn format_turn_metrics(outcome: &TurnOutcome, elapsed: Duration, mode
     let context = match &outcome.context {
         Some(context) => match context.context_window {
             Some(0) => format!(
-                "context {}/0 (invalid)",
+                "context approx {}/0 (invalid)",
                 format_number(context.estimated_tokens)
             ),
             Some(window) => {
                 let percent = context.estimated_tokens.saturating_mul(100) / window;
                 format!(
-                    "context {}/{} ({}%, {} reserved)",
+                    "context approx {}/{} ({}%, {} reserved)",
                     format_number(context.estimated_tokens),
                     format_number(window),
                     percent,
@@ -78,7 +78,7 @@ pub(crate) fn format_turn_metrics(outcome: &TurnOutcome, elapsed: Duration, mode
                 )
             }
             None => format!(
-                "context {}/unlimited",
+                "context approx {}/unlimited",
                 format_number(context.estimated_tokens)
             ),
         },
@@ -255,6 +255,6 @@ mod tests {
         assert!(
             rendered.contains("tokens in 1,200, cached 200, out 300, reasoning 50, total 1,500")
         );
-        assert!(rendered.contains("context 45,000/128,000 (35%, 16,384 reserved)"));
+        assert!(rendered.contains("context approx 45,000/128,000 (35%, 16,384 reserved)"));
     }
 }

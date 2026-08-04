@@ -8,6 +8,8 @@ pub enum OxidraError {
     Config(String),
     #[error("provider error: {0}")]
     Provider(String),
+    #[error("provider context window limit reached: {0}")]
+    ProviderContextLimit(String),
     #[error("response aborted: {0}")]
     ResponseAborted(String),
     #[error("stream observer error: {0}")]
@@ -39,7 +41,7 @@ impl OxidraError {
         match self {
             Self::Config(_) | Self::Toml(_) | Self::Url(_) => 2,
             Self::ApprovalRequired(_) => 3,
-            Self::ContextLimit => 4,
+            Self::ContextLimit | Self::ProviderContextLimit(_) => 4,
             Self::Observer(error) => error.exit_code(),
             Self::Interrupted => 130,
             _ => 1,

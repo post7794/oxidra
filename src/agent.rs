@@ -106,6 +106,13 @@ pub struct TurnOutcome {
     pub context: Option<ContextEstimate>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingContextTurn {
+    pub turn_id: String,
+    pub user_message_seq: u64,
+    pub prompt: String,
+}
+
 pub struct Agent {
     provider: Arc<dyn ResponseProvider>,
     journal: SessionJournal,
@@ -205,6 +212,13 @@ impl Agent {
                 in_doubt.len()
             )));
         }
+        let pending = self.pending_context_turns()?;
+        if !pending.is_empty() {
+            return Err(OxidraError::ApprovalRequired(format!(
+                "session contains {} context-limited turn(s); retry or abandon them before adding a new prompt",
+                pending.len()
+            )));
+        }
         let turn_id = Uuid::now_v7().to_string();
         let user_item = json!({
             "role": "user",
@@ -243,17 +257,6 @@ impl Agent {
             let (request, mut prepared_tools) = self.prepare_request(Some(&turn_id))?;
             let context = self.context_estimate(&prepared_tools.context);
             outcome.context = Some(context.clone());
-            if let Err(error) = self.check_context(&context) {
-                self.journal.append_and_sync(
-                    "context.limit_reached",
-                    Some(&turn_id),
-                    json!({
-                        "error": error.to_string(),
-                        "context": prepared_tools.context.audit_value()?,
-                    }),
-                )?;
-                return Err(error);
-            }
             let response_attempt_id = Uuid::now_v7().to_string();
             self.journal.append_and_sync(
                 "response.started",
@@ -293,6 +296,28 @@ impl Agent {
                         &error.to_string(),
                     )?;
                     return Err(error);
+                }
+                Err(OxidraError::ProviderContextLimit(reason)) => {
+                    self.journal.append_and_sync(
+                        "response.failed",
+                        Some(&turn_id),
+                        json!({
+                            "response_attempt_id": response_attempt_id,
+                            "error": &reason,
+                            "error_code": "provider_context_limit",
+                        }),
+                    )?;
+                    self.journal.append_and_sync(
+                        "context.limit_reached",
+                        Some(&turn_id),
+                        json!({
+                            "error": &reason,
+                            "source": "provider",
+                            "response_attempt_id": response_attempt_id,
+                            "context": prepared_tools.context.audit_value()?,
+                        }),
+                    )?;
+                    return Err(OxidraError::ProviderContextLimit(reason));
                 }
                 Err(error) => {
                     self.journal.append_and_sync(
@@ -471,6 +496,44 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// 返回尚未被显式完成或放弃的 Provider context 超限回合。
+    pub fn pending_context_turns(&self) -> Result<Vec<PendingContextTurn>> {
+        pending_context_turns(&self.journal.read_events()?)
+    }
+
+    /// 以 append-only 事件放弃全部 pending 回合，不删除原始 journal 内容。
+    pub fn abandon_pending_context_turns(&mut self, reason: &str) -> Result<usize> {
+        let pending = self.pending_context_turns()?;
+        for turn in &pending {
+            self.journal.append_and_sync(
+                "turn.abandoned",
+                Some(&turn.turn_id),
+                json!({
+                    "user_message_seq": turn.user_message_seq,
+                    "reason": reason,
+                }),
+            )?;
+        }
+        Ok(pending.len())
+    }
+
+    /// 放弃旧 pending 回合，并把最新 prompt 作为新的可审计回合重放。
+    pub async fn retry_pending_context_turn(
+        &mut self,
+        cancellation: CancellationToken,
+        observer: &mut dyn AgentObserver,
+        approval: &mut dyn ApprovalHandler,
+    ) -> Result<TurnOutcome> {
+        let pending = self.pending_context_turns()?;
+        let retry = pending.last().ok_or_else(|| {
+            OxidraError::Config("session has no pending context-limited turn".to_owned())
+        })?;
+        let prompt = retry.prompt.clone();
+        self.abandon_pending_context_turns("superseded by explicit retry")?;
+        self.run_turn(&prompt, cancellation, observer, approval)
+            .await
     }
 
     async fn execute_call(
@@ -970,24 +1033,56 @@ impl Agent {
         }
     }
 
-    fn check_context(&self, context: &ContextEstimate) -> Result<()> {
-        let Some(window) = context.context_window else {
-            return Ok(());
-        };
-        if context
-            .estimated_tokens
-            .saturating_add(context.reserve_tokens)
-            >= window
-        {
-            return Err(OxidraError::ContextLimit);
-        }
-        Ok(())
-    }
-
     fn next_context_estimate(&mut self) -> Result<ContextEstimate> {
         let (_, prepared) = self.prepare_request(None)?;
         Ok(self.context_estimate(&prepared.context))
     }
+}
+
+fn pending_context_turns(
+    events: &[crate::session::JournalEvent],
+) -> Result<Vec<PendingContextTurn>> {
+    // resolution 可能在更晚的回合之后追加，因此必须按 turn_id 全局归约，
+    // 不能只扫描两个 user.message 之间的物理区间。
+    let limited_turns = events
+        .iter()
+        .filter(|event| event.kind == "context.limit_reached")
+        .filter_map(|event| event.turn_id.clone())
+        .collect::<HashSet<_>>();
+    let resolved_turns = events
+        .iter()
+        .filter(|event| matches!(event.kind.as_str(), "turn.completed" | "turn.abandoned"))
+        .filter_map(|event| event.turn_id.clone())
+        .collect::<HashSet<_>>();
+    let mut pending = Vec::new();
+    for user in events.iter().filter(|event| event.kind == "user.message") {
+        let Some(turn_id) = user.turn_id.as_deref() else {
+            return Err(OxidraError::Session(format!(
+                "user.message at seq {} has no turn_id",
+                user.seq
+            )));
+        };
+        if !limited_turns.contains(turn_id) || resolved_turns.contains(turn_id) {
+            continue;
+        }
+        let prompt = user
+            .data
+            .get("item")
+            .and_then(|item| item.get("content"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "pending user.message at seq {} has no string content",
+                    user.seq
+                ))
+            })?;
+        pending.push(PendingContextTurn {
+            turn_id: turn_id.to_owned(),
+            user_message_seq: user.seq,
+            prompt: prompt.to_owned(),
+        });
+    }
+    Ok(pending)
 }
 
 fn validate_history_calls_for_response(
@@ -1321,6 +1416,11 @@ mod tests {
         requests: Mutex<Vec<ResponseRequest>>,
     }
 
+    #[derive(Default)]
+    struct ContextLimitProvider {
+        requests: Mutex<Vec<ResponseRequest>>,
+    }
+
     impl RecordingProvider {
         fn new(responses: impl IntoIterator<Item = AssistantTurn>) -> Self {
             Self {
@@ -1329,6 +1429,12 @@ mod tests {
             }
         }
 
+        fn requests(&self) -> Vec<ResponseRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl ContextLimitProvider {
         fn requests(&self) -> Vec<ResponseRequest> {
             self.requests.lock().unwrap().clone()
         }
@@ -1417,6 +1523,21 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| OxidraError::Provider("test response queue is empty".to_owned()))
+        }
+    }
+
+    #[async_trait]
+    impl ResponseProvider for ContextLimitProvider {
+        async fn respond(
+            &self,
+            request: ResponseRequest,
+            _observer: &mut dyn StreamObserver,
+            _cancellation: CancellationToken,
+        ) -> Result<AssistantTurn> {
+            self.requests.lock().unwrap().push(request);
+            Err(OxidraError::ProviderContextLimit(
+                "context_length_exceeded".to_owned(),
+            ))
         }
     }
 
@@ -1901,7 +2022,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hard_limit_records_the_full_preflight_without_provider_dispatch() {
+    async fn provider_context_limit_records_a_recoverable_pending_turn() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -1920,7 +2041,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let provider = Arc::new(RecordingProvider::new([final_turn("must not run")]));
+        let provider = Arc::new(ContextLimitProvider::default());
         let mut agent = Agent::new(
             provider.clone(),
             journal,
@@ -1945,8 +2066,8 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, OxidraError::ContextLimit));
-        assert!(provider.requests().is_empty());
+        assert!(matches!(error, OxidraError::ProviderContextLimit(_)));
+        assert_eq!(provider.requests().len(), 1);
         let event = agent
             .journal()
             .read_events()
@@ -1957,6 +2078,138 @@ mod tests {
         assert!(event.data["context"]["measurement"]["request_digest"].is_string());
         assert!(event.data["context"]["estimated_next_input_tokens"].is_u64());
         assert!(event.data["context"]["tools_event_seq"].is_u64());
+        assert_eq!(event.data["source"], "provider");
+
+        let retry_error = agent
+            .run_turn(
+                "small replacement prompt",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(retry_error, OxidraError::ApprovalRequired(_)));
+        assert_eq!(
+            agent
+                .journal()
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "user.message")
+                .count(),
+            1,
+            "a blocked resume must not append another user message"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_retry_abandons_every_limited_turn_and_restores_the_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "context-retry-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        for (turn_id, prompt) in [
+            ("old-limit-1", "first oversized prompt"),
+            ("old-limit-2", "second oversized prompt"),
+        ] {
+            journal
+                .append_and_sync(
+                    "user.message",
+                    Some(turn_id),
+                    json!({
+                        "item":{"role":"user","content":prompt},
+                        "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                    }),
+                )
+                .unwrap();
+            journal
+                .append_and_sync(
+                    "context.limit_reached",
+                    Some(turn_id),
+                    json!({"error":"context window limit reached"}),
+                )
+                .unwrap();
+        }
+        drop(journal);
+
+        let journal = store.open("context-retry-test").unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([
+            final_turn("retried"),
+            final_turn("follow-up"),
+        ]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits {
+                context_window: Some(1_000_000),
+                reserve_tokens: 16_000,
+                context_window_source: ContextValueSource::Cli,
+                reserve_tokens_source: ContextValueSource::Cli,
+            },
+            None,
+            None,
+        );
+
+        let pending = agent.pending_context_turns().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.last().unwrap().prompt, "second oversized prompt");
+
+        let outcome = agent
+            .retry_pending_context_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "retried");
+        assert!(agent.pending_context_turns().unwrap().is_empty());
+
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "turn.abandoned")
+                .count(),
+            2
+        );
+        let projected = project_events(&events).unwrap();
+        let projected_user_text = projected
+            .iter()
+            .filter(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+            .filter_map(|item| item.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(projected_user_text, vec!["second oversized prompt"]);
+        assert_eq!(provider.requests().len(), 1);
+
+        let follow_up = agent
+            .run_turn(
+                "continue after retry",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(follow_up.text, "follow-up");
+        assert_eq!(provider.requests().len(), 2);
     }
 
     #[tokio::test]

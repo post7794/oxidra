@@ -787,7 +787,9 @@ where
                 OxidraError::Interrupted => (COMPACTION_ABORTED_KIND, "cancelled"),
                 OxidraError::ResponseAborted(_) => (COMPACTION_ABORTED_KIND, "response_aborted"),
                 OxidraError::Observer(_) => (COMPACTION_ABORTED_KIND, "observer_error"),
-                OxidraError::Provider(_) => (COMPACTION_FAILED_KIND, "provider_error"),
+                OxidraError::Provider(_) | OxidraError::ProviderContextLimit(_) => {
+                    (COMPACTION_FAILED_KIND, "provider_error")
+                }
                 _ => (COMPACTION_FAILED_KIND, "local_error"),
             };
             append_compaction_terminal(
@@ -2382,7 +2384,11 @@ mod tests {
                 .iter_mut()
                 .find(|event| event.kind == COMPACTION_CHECKPOINT_KIND)
                 .unwrap()
-                .data[field] = json!(2);
+                .data[field] = json!(if field == "source_projection_version" {
+                1
+            } else {
+                2
+            });
             let error = validate_checkpoint_chain(&mismatch)
                 .unwrap_err()
                 .to_string();

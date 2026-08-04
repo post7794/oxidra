@@ -15,7 +15,7 @@ use reqwest::{Client, StatusCode};
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::ProviderConfig;
+use crate::config::{ProviderConfig, display_safe_url};
 use crate::error::{OxidraError, Result};
 use crate::projection::validate_response_output_items;
 use crate::types::{AssistantTurn, ToolCall, ToolDefinition, Usage};
@@ -103,7 +103,7 @@ impl std::fmt::Debug for OpenAiResponsesProvider {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("OpenAiResponsesProvider")
-            .field("api_base_url", &self.config.api_base_url)
+            .field("api_base_url", &display_safe_url(&self.config.api_base_url))
             .field("model", &self.config.model)
             .finish_non_exhaustive()
     }
@@ -198,7 +198,9 @@ impl OpenAiResponsesProvider {
                 body.push_str("...<transport error while reading error body>");
             }
             let message = format_http_error(status, &body);
-            return if retryable_status(status) {
+            return if is_context_limit_error_body(&body) {
+                AttemptResult::fatal(OxidraError::ProviderContextLimit(message))
+            } else if retryable_status(status) {
                 AttemptResult::retryable(message, retry_after)
             } else {
                 AttemptResult::fatal(OxidraError::Provider(message))
@@ -361,9 +363,13 @@ impl OpenAiResponsesProvider {
                     };
                 }
                 "response.failed" | "error" => {
-                    return AttemptResult::fatal(OxidraError::Provider(extract_event_error(
-                        &payload,
-                    )));
+                    let message = extract_event_error(&payload);
+                    let error = if is_context_limit_error_payload(&payload) {
+                        OxidraError::ProviderContextLimit(message)
+                    } else {
+                        OxidraError::Provider(message)
+                    };
+                    return AttemptResult::fatal(error);
                 }
                 // A response can finish with an explicit incomplete event in
                 // newer API versions.  It is terminal but not replayable.
@@ -734,6 +740,35 @@ fn extract_event_error(payload: &Value) -> String {
         .unwrap_or_else(|| payload.to_string())
 }
 
+fn is_context_limit_error_body(body: &str) -> bool {
+    // 只接受结构化错误码，避免把普通错误消息中的关键词误判为 context 超限。
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .is_some_and(|payload| is_context_limit_error_payload(&payload))
+}
+
+fn is_context_limit_error_payload(payload: &Value) -> bool {
+    const CONTEXT_LIMIT_CODES: &[&str] = &[
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "input_too_long",
+        "max_context_length_exceeded",
+        "prompt_too_long",
+    ];
+    [
+        payload.pointer("/error/code"),
+        payload.pointer("/error/type"),
+        payload.pointer("/response/error/code"),
+        payload.pointer("/response/error/type"),
+        payload.get("code"),
+        payload.get("type"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .any(|code| CONTEXT_LIMIT_CODES.contains(&code))
+}
+
 fn retryable_status(status: StatusCode) -> bool {
     status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
@@ -790,6 +825,56 @@ mod tests {
         fn on_event(&mut self, _event: ProviderEvent) -> Result<()> {
             Err(self.error.take().expect("observer is called once"))
         }
+    }
+
+    #[test]
+    fn provider_debug_never_echoes_secret_bearing_url_components() {
+        let provider = OpenAiResponsesProvider::new(ProviderConfig {
+            api_key: "api-secret".to_owned(),
+            api_base_url: url::Url::parse(
+                "https://secret-user:secret-password@example.test/v1/?signature=secret#fragment",
+            )
+            .unwrap(),
+            model: "model".to_owned(),
+        })
+        .unwrap();
+        let rendered = format!("{provider:?}");
+        for secret in [
+            "api-secret",
+            "secret-user",
+            "secret-password",
+            "signature",
+            "fragment",
+        ] {
+            assert!(!rendered.contains(secret));
+        }
+    }
+
+    #[test]
+    fn context_limit_classification_requires_a_known_structured_code() {
+        for code in [
+            "context_length_exceeded",
+            "context_window_exceeded",
+            "input_too_long",
+            "max_context_length_exceeded",
+            "prompt_too_long",
+        ] {
+            assert!(is_context_limit_error_payload(&json!({
+                "error":{"code":code,"message":"too large"}
+            })));
+            assert!(is_context_limit_error_payload(&json!({
+                "error":{"type":code,"message":"too large"}
+            })));
+        }
+        assert!(!is_context_limit_error_payload(&json!({
+            "error":{
+                "code":"invalid_request_error",
+                "message":"the words context length appear only in prose"
+            }
+        })));
+        assert!(!is_context_limit_error_body(
+            "not json: context_length_exceeded"
+        ));
     }
 
     #[test]

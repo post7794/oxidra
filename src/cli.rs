@@ -13,7 +13,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::{Agent, AgentObserver, ApprovalHandler, TurnOutcome, load_project_instructions};
 use crate::auth::{CredentialStatus, CredentialStore};
-use crate::config::{ContextLimits, ProjectContext, ProviderConfig, load_provider_settings};
+use crate::config::{
+    ContextLimits, ProjectContext, ProviderConfig, display_safe_url, load_provider_settings,
+};
 use crate::context::ContextRuntime;
 use crate::error::{OxidraError, Result};
 use crate::memory::{MemoryProvenance, MemoryStore};
@@ -70,6 +72,18 @@ struct Cli {
     /// Override tokens reserved outside the Provider input context.
     #[arg(long, value_name = "TOKENS")]
     reserve_tokens: Option<u64>,
+
+    /// Retry the newest context-limited prompt after abandoning all pending limit turns.
+    #[arg(
+        long,
+        requires = "resume",
+        conflicts_with_all = ["abandon_pending", "prompt"]
+    )]
+    retry_pending: bool,
+
+    /// Abandon context-limited turns before accepting a new prompt.
+    #[arg(long, requires = "resume", conflicts_with = "retry_pending")]
+    abandon_pending: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -143,6 +157,8 @@ async fn run(cli: Cli) -> Result<()> {
         max_tools,
         context_window,
         reserve_tokens,
+        retry_pending,
+        abandon_pending,
     } = cli;
     if let Some(command) = command {
         return run_management_command(command, cwd, model, context_window, reserve_tokens);
@@ -212,6 +228,19 @@ async fn run(cli: Cli) -> Result<()> {
         color: color_enabled(interactive, io::stderr().is_terminal()),
     };
 
+    if abandon_pending {
+        let count = agent.abandon_pending_context_turns("abandoned by explicit CLI request")?;
+        eprintln!("[session] abandoned {count} context-limited turn(s)");
+    }
+    if retry_pending {
+        if prompt.is_some() {
+            return Err(OxidraError::Config(
+                "--retry-pending cannot be combined with --print".to_owned(),
+            ));
+        }
+        return run_batch_retry_pending(&mut agent, full_auto, &model_name, render_options).await;
+    }
+
     match prompt.as_deref() {
         Some(prompt) => {
             run_batch_turn(&mut agent, prompt, full_auto, &model_name, render_options).await
@@ -244,7 +273,7 @@ fn run_auth_command(command: AuthCommand, model: Option<String>) -> Result<()> {
             store.save(&settings.api_base_url, &api_key)?;
             println!(
                 "Stored credential for {} in {}.",
-                escape_terminal(settings.api_base_url.as_str()),
+                escape_terminal(&display_safe_url(&settings.api_base_url)),
                 store.kind()
             );
             if let Some(source) = credential_env_source() {
@@ -264,18 +293,18 @@ fn run_auth_command(command: AuthCommand, model: Option<String>) -> Result<()> {
                 CredentialStatus::Missing => println!(
                     "persistent: none in {} for {}",
                     store.kind(),
-                    escape_terminal(settings.api_base_url.as_str())
+                    escape_terminal(&display_safe_url(&settings.api_base_url))
                 ),
                 CredentialStatus::Bound => println!(
                     "persistent: {} credential bound to {}",
                     store.kind(),
-                    escape_terminal(settings.api_base_url.as_str())
+                    escape_terminal(&display_safe_url(&settings.api_base_url))
                 ),
                 CredentialStatus::BaseUrlMismatch { stored_base_url } => println!(
                     "persistent: {} credential is bound to {}, not {}",
                     store.kind(),
                     escape_terminal(&stored_base_url),
-                    escape_terminal(settings.api_base_url.as_str())
+                    escape_terminal(&display_safe_url(&settings.api_base_url))
                 ),
             }
             Ok(())
@@ -429,7 +458,10 @@ fn run_doctor(
 
     match ProviderConfig::resolve(None, None, model) {
         Ok(provider) => {
-            println!("API configuration: ok ({})", provider.api_base_url);
+            println!(
+                "API configuration: ok ({})",
+                display_safe_url(&provider.api_base_url)
+            );
             println!("model: {}", provider.model);
             match ContextLimits::load(&provider.model, context_window, reserve_tokens) {
                 Ok(context) => println!(
@@ -742,6 +774,40 @@ async fn run_batch_turn(
     Ok(())
 }
 
+async fn run_batch_retry_pending(
+    agent: &mut Agent,
+    full_auto: bool,
+    model: &str,
+    render_options: RenderOptions,
+) -> Result<()> {
+    let cancellation = CancellationToken::new();
+    let mut observer = CliObserver::new(false, cancellation.clone(), render_options);
+    let mut approval = CliApproval {
+        full_auto,
+        interactive: false,
+        input: None,
+    };
+    let result = {
+        let turn =
+            agent.retry_pending_context_turn(cancellation.clone(), &mut observer, &mut approval);
+        tokio::pin!(turn);
+        tokio::select! {
+            result = &mut turn => result,
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                cancellation.cancel();
+                let _ = turn.await;
+                Err(OxidraError::Interrupted)
+            }
+        }
+    };
+    observer.finish_text()?;
+    let outcome = result?;
+    write_completed_text(&outcome.text)?;
+    print_turn_metrics(&outcome, observer.started_at, model);
+    Ok(())
+}
+
 async fn run_repl(
     agent: &mut Agent,
     full_auto: bool,
@@ -802,6 +868,10 @@ async fn run_repl(
                 eprintln!("[session] {message}");
                 if !agent.journal().in_doubt()?.is_empty() {
                     resolve_in_doubt_or_stay(agent.journal_mut(), &mut input).await?;
+                } else if !agent.pending_context_turns()?.is_empty() {
+                    eprintln!(
+                        "[session] restart with --retry-pending, or use --abandon-pending before a replacement prompt"
+                    );
                 }
             }
             Err(error) => return Err(error),
@@ -1201,6 +1271,20 @@ mod tests {
     fn rejects_zero_limits() {
         assert!(Cli::try_parse_from(["oxidra", "--max-tools", "0"]).is_err());
         assert!(Cli::try_parse_from(["oxidra", "--context-window", "0"]).is_err());
+        assert!(Cli::try_parse_from(["oxidra", "--retry-pending", "--abandon-pending"]).is_err());
+        assert!(Cli::try_parse_from(["oxidra", "--retry-pending"]).is_err());
+        assert!(Cli::try_parse_from(["oxidra", "--abandon-pending"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "oxidra",
+                "--resume",
+                "session-1",
+                "--retry-pending",
+                "-p",
+                "replacement",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

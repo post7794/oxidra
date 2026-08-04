@@ -296,6 +296,177 @@ fn provider_credentials_can_be_loaded_from_user_config() {
 }
 
 #[test]
+fn context_limited_session_blocks_new_prompts_and_can_retry_explicitly() {
+    let project = tempfile::tempdir().expect("create temporary project");
+    let user_home = tempfile::tempdir().expect("create isolated user directory");
+    let local_data = user_home.path().join("local");
+    let roaming_data = user_home.path().join("roaming");
+    let xdg_config = user_home.path().join("config");
+    let xdg_state = user_home.path().join("state");
+    for directory in [&local_data, &roaming_data, &xdg_config, &xdg_state] {
+        fs::create_dir_all(directory).expect("create isolated user directory");
+    }
+
+    let command = || {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_oxidra"));
+        command
+            .arg("--cwd")
+            .arg(project.path())
+            .env("API_KEY", "fake")
+            .env_remove("MODEL")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_BASE_URL")
+            .env_remove("OPENAI_MODEL")
+            .env("LOCALAPPDATA", &local_data)
+            .env("APPDATA", &roaming_data)
+            .env("XDG_CONFIG_HOME", &xdg_config)
+            .env("XDG_STATE_HOME", &xdg_state)
+            .env("HOME", user_home.path())
+            .env("USERPROFILE", user_home.path())
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost");
+        command
+    };
+
+    let oversized = "x".repeat(20_000);
+    let first_listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind limit server");
+    let first_address = first_listener
+        .local_addr()
+        .expect("read limit server address");
+    let first_server = thread::spawn(move || -> Result<(), String> {
+        let (mut stream, _) = first_listener.accept().map_err(|error| error.to_string())?;
+        let _request = read_http_request(&mut stream)?;
+        let body = json!({
+            "error": {
+                "message": "request exceeds the model context window",
+                "type": "invalid_request_error",
+                "code": "context_length_exceeded"
+            }
+        })
+        .to_string();
+        write_http_response(&mut stream, "400 Bad Request", "application/json", &body)
+    });
+    let first = command()
+        .arg("-p")
+        .arg(&oversized)
+        .arg("--context-window")
+        .arg("300")
+        .arg("--reserve-tokens")
+        .arg("100")
+        .env("API_BASE_URL", format!("http://{first_address}/v1/"))
+        .output()
+        .expect("run context-limited turn");
+    first_server
+        .join()
+        .expect("limit server panicked")
+        .expect("limit server failed");
+    assert_eq!(first.status.code(), Some(4));
+    let first_stderr = String::from_utf8(first.stderr).expect("stderr is UTF-8");
+    let session_id = first_stderr
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Oxidra session ")
+                .and_then(|rest| rest.split_once(" (root:").map(|(id, _)| id.to_owned()))
+        })
+        .expect("context-limited run prints its session id");
+
+    let blocked = command()
+        .arg("-p")
+        .arg("small replacement")
+        .arg("--resume")
+        .arg(&session_id)
+        .arg("--context-window")
+        .arg("1000000")
+        .arg("--reserve-tokens")
+        .arg("16000")
+        .env("API_BASE_URL", "http://127.0.0.1:9/v1/")
+        .output()
+        .expect("run blocked replacement turn");
+    assert_eq!(blocked.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("context-limited turn"),
+        "blocked resume should explain the pending turn"
+    );
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind retry server");
+    let address = listener.local_addr().expect("read retry server address");
+    let server = thread::spawn(move || -> Result<CapturedRequest, String> {
+        let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+        let request = read_http_request(&mut stream)?;
+        let body = final_text_sse("resp_context_retry", "retried");
+        write_http_response(&mut stream, "200 OK", "text/event-stream", &body)?;
+        Ok(request)
+    });
+
+    let retried = command()
+        .arg("--resume")
+        .arg(&session_id)
+        .arg("--retry-pending")
+        .arg("--context-window")
+        .arg("1000000")
+        .arg("--reserve-tokens")
+        .arg("16000")
+        .env("API_BASE_URL", format!("http://{address}/v1/"))
+        .output()
+        .expect("retry pending turn");
+    let request = server
+        .join()
+        .expect("retry server panicked")
+        .expect("retry server failed");
+    assert!(
+        retried.status.success(),
+        "retry failed: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&retried.stdout).trim(), "retried");
+    let projected_prompts = request.body["input"]
+        .as_array()
+        .expect("request input is an array")
+        .iter()
+        .filter(|item| item["role"] == "user")
+        .filter_map(|item| item["content"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(projected_prompts, vec![oversized.as_str()]);
+
+    let data_dir = if cfg!(windows) {
+        local_data.join("oxidra")
+    } else if cfg!(target_os = "macos") {
+        user_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("oxidra")
+    } else {
+        xdg_state.join("oxidra")
+    };
+    let journal = fs::read_to_string(
+        data_dir
+            .join("sessions")
+            .join(format!("{session_id}.jsonl")),
+    )
+    .expect("read retried journal");
+    let events = journal
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("valid journal event"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "user.message")
+            .count(),
+        2,
+        "the blocked replacement must not be persisted"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["kind"] == "turn.abandoned")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn auth_management_reports_and_removes_file_credentials_without_revealing_them() {
     let user_home = tempfile::tempdir().expect("create isolated user directory");
     let local_data = user_home.path().join("local");
@@ -359,6 +530,58 @@ fn auth_management_reports_and_removes_file_credentials_without_revealing_them()
     assert!(logout.status.success());
     assert!(!credential_path.exists());
     assert!(!String::from_utf8_lossy(&logout.stdout).contains("hidden-secret"));
+}
+
+#[test]
+fn doctor_rejects_secret_bearing_base_urls_without_echoing_them() {
+    let project = tempfile::tempdir().expect("create temporary project");
+    let user_home = tempfile::tempdir().expect("create isolated user directory");
+    let local_data = user_home.path().join("local");
+    let roaming_data = user_home.path().join("roaming");
+    let xdg_config = user_home.path().join("config");
+    let xdg_state = user_home.path().join("state");
+    for directory in [&local_data, &roaming_data, &xdg_config, &xdg_state] {
+        fs::create_dir_all(directory).expect("create isolated user directory");
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oxidra"))
+        .arg("--cwd")
+        .arg(project.path())
+        .arg("doctor")
+        .env("API_KEY", "api-secret")
+        .env(
+            "API_BASE_URL",
+            "https://secret-user:secret-password@example.test/v1/?signature=secret#fragment",
+        )
+        .env_remove("MODEL")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_MODEL")
+        .env("LOCALAPPDATA", &local_data)
+        .env("APPDATA", &roaming_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .output()
+        .expect("run doctor");
+
+    assert_eq!(output.status.code(), Some(2));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("API configuration: FAILED"));
+    for secret in [
+        "api-secret",
+        "secret-user",
+        "secret-password",
+        "signature=secret",
+        "fragment",
+    ] {
+        assert!(!combined.contains(secret));
+    }
 }
 
 #[test]

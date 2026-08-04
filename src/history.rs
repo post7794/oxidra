@@ -5,7 +5,7 @@
 //! reopen the journal, and cursors identify a checkpoint instead of carrying a
 //! caller-controlled cutoff.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,7 +19,7 @@ use crate::session::{JOURNAL_SCHEMA, JournalEvent};
 use crate::types::ToolDefinition;
 
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
-pub const HISTORY_EXTRACTOR_VERSION: u32 = 1;
+pub const HISTORY_EXTRACTOR_VERSION: u32 = 2;
 pub const HISTORY_CURSOR_VERSION: u32 = 1;
 pub const MAX_HISTORY_QUERY_BYTES: usize = 512;
 pub const MAX_HISTORY_CURSOR_BYTES: usize = 2_048;
@@ -557,10 +557,26 @@ fn extract_records(events: &[JournalEvent], cutoff: u64) -> Result<Vec<HistoryRe
         .iter()
         .take_while(|event| event.seq <= cutoff)
         .collect::<Vec<_>>();
-    let calls = collect_function_calls(scoped.iter().copied())?;
+    // 已放弃回合仍保留在 journal 中，但不应通过 history 工具重新灌回模型。
+    let abandoned_turns = scoped
+        .iter()
+        .filter(|event| event.kind == "turn.abandoned")
+        .filter_map(|event| event.turn_id.clone())
+        .collect::<HashSet<_>>();
+    let searchable = scoped
+        .iter()
+        .copied()
+        .filter(|event| {
+            event
+                .turn_id
+                .as_ref()
+                .is_none_or(|turn_id| !abandoned_turns.contains(turn_id))
+        })
+        .collect::<Vec<_>>();
+    let calls = collect_function_calls(searchable.iter().copied())?;
     let mut records = Vec::new();
 
-    for event in scoped {
+    for event in searchable {
         match event.kind.as_str() {
             "user.message" => extract_user(event, &mut records)?,
             "response.completed" => extract_response(event, &mut records)?,

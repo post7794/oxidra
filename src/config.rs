@@ -34,7 +34,7 @@ impl std::fmt::Debug for ProviderConfig {
         formatter
             .debug_struct("ProviderConfig")
             .field("api_key", &"<redacted>")
-            .field("api_base_url", &self.api_base_url)
+            .field("api_base_url", &display_safe_url(&self.api_base_url))
             .field("model", &self.model)
             .finish()
     }
@@ -230,11 +230,37 @@ fn resolve_settings(
 
 fn normalize_base_url(base_url: &str) -> Result<Url> {
     let mut api_base_url = Url::parse(base_url)?;
+    validate_public_base_url(&api_base_url)?;
     if !api_base_url.path().ends_with('/') {
         let path = format!("{}/", api_base_url.path());
         api_base_url.set_path(&path);
     }
     Ok(api_base_url)
+}
+
+fn validate_public_base_url(url: &Url) -> Result<()> {
+    // Provider URL 会出现在诊断与审计域中，配置边界直接禁止携带秘密。
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(OxidraError::Config(
+            "API base URL must not contain username or password information".to_owned(),
+        ));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(OxidraError::Config(
+            "API base URL must not contain query parameters or a fragment".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn display_safe_url(url: &Url) -> String {
+    // 即使调用方绕过正常配置构造 ProviderConfig，显示层也必须二次脱敏。
+    let mut safe = url.clone();
+    let _ = safe.set_username("");
+    let _ = safe.set_password(None);
+    safe.set_query(None);
+    safe.set_fragment(None);
+    safe.to_string()
 }
 
 impl ContextLimits {
@@ -444,12 +470,34 @@ mod tests {
     fn provider_config_debug_redacts_api_key() {
         let config = ProviderConfig {
             api_key: "sk-super-secret".to_owned(),
-            api_base_url: Url::parse("https://example.test/v1/").unwrap(),
+            api_base_url: Url::parse(
+                "https://url-user:url-password@example.test/v1/?signature=secret#fragment",
+            )
+            .unwrap(),
             model: DEFAULT_MODEL.to_owned(),
         };
         let rendered = format!("{config:?}");
         assert!(!rendered.contains("sk-super-secret"));
+        assert!(!rendered.contains("url-user"));
+        assert!(!rendered.contains("url-password"));
+        assert!(!rendered.contains("signature"));
+        assert!(!rendered.contains("fragment"));
         assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn provider_base_url_rejects_secret_bearing_components_without_echoing_them() {
+        for value in [
+            "https://secret-user:secret-password@example.test/v1/",
+            "https://example.test/v1/?signature=super-secret",
+            "https://example.test/v1/#private-fragment",
+        ] {
+            let error = normalize_base_url(value).unwrap_err().to_string();
+            assert!(!error.contains("secret-user"));
+            assert!(!error.contains("secret-password"));
+            assert!(!error.contains("super-secret"));
+            assert!(!error.contains("private-fragment"));
+        }
     }
 
     #[test]
