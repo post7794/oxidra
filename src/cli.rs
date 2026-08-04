@@ -163,7 +163,7 @@ async fn run(cli: Cli) -> Result<()> {
     if let Some(command) = command {
         return run_management_command(command, cwd, model, context_window, reserve_tokens);
     }
-    let interactive = prompt.is_none();
+    let interactive = prompt.is_none() && !retry_pending;
     let project = ProjectContext::resolve(cwd)?;
     let provider_config = ProviderConfig::resolve(None, None, model)?;
     let model_name = provider_config.model.clone();
@@ -767,8 +767,15 @@ async fn run_batch_turn(
     model: &str,
     render_options: RenderOptions,
 ) -> Result<()> {
-    let (outcome, observer) =
-        run_one_turn(agent, prompt, false, full_auto, None, render_options).await?;
+    let (outcome, observer) = run_one_turn(
+        agent,
+        TurnInvocation::Prompt(prompt),
+        false,
+        full_auto,
+        None,
+        render_options,
+    )
+    .await?;
     write_completed_text(&outcome.text)?;
     print_turn_metrics(&outcome, observer.started_at, model);
     Ok(())
@@ -780,29 +787,15 @@ async fn run_batch_retry_pending(
     model: &str,
     render_options: RenderOptions,
 ) -> Result<()> {
-    let cancellation = CancellationToken::new();
-    let mut observer = CliObserver::new(false, cancellation.clone(), render_options);
-    let mut approval = CliApproval {
+    let (outcome, observer) = run_one_turn(
+        agent,
+        TurnInvocation::RetryPending,
+        false,
         full_auto,
-        interactive: false,
-        input: None,
-    };
-    let result = {
-        let turn =
-            agent.retry_pending_context_turn(cancellation.clone(), &mut observer, &mut approval);
-        tokio::pin!(turn);
-        tokio::select! {
-            result = &mut turn => result,
-            signal = tokio::signal::ctrl_c() => {
-                signal?;
-                cancellation.cancel();
-                let _ = turn.await;
-                Err(OxidraError::Interrupted)
-            }
-        }
-    };
-    observer.finish_text()?;
-    let outcome = result?;
+        None,
+        render_options,
+    )
+    .await?;
     write_completed_text(&outcome.text)?;
     print_turn_metrics(&outcome, observer.started_at, model);
     Ok(())
@@ -840,7 +833,7 @@ async fn run_repl(
 
         match run_one_turn(
             agent,
-            prompt,
+            TurnInvocation::Prompt(prompt),
             true,
             full_auto,
             Some(&mut input),
@@ -879,9 +872,15 @@ async fn run_repl(
     }
 }
 
+#[derive(Clone, Copy)]
+enum TurnInvocation<'a> {
+    Prompt(&'a str),
+    RetryPending,
+}
+
 async fn run_one_turn(
     agent: &mut Agent,
-    prompt: &str,
+    invocation: TurnInvocation<'_>,
     stream_text: bool,
     full_auto: bool,
     input: Option<&mut StdinLines>,
@@ -896,7 +895,24 @@ async fn run_one_turn(
     };
 
     let result = {
-        let turn = agent.run_turn(prompt, cancellation.clone(), &mut observer, &mut approval);
+        let turn = async {
+            match invocation {
+                TurnInvocation::Prompt(prompt) => {
+                    agent
+                        .run_turn(prompt, cancellation.clone(), &mut observer, &mut approval)
+                        .await
+                }
+                TurnInvocation::RetryPending => {
+                    agent
+                        .retry_pending_context_turn(
+                            cancellation.clone(),
+                            &mut observer,
+                            &mut approval,
+                        )
+                        .await
+                }
+            }
+        };
         tokio::pin!(turn);
         tokio::select! {
             result = &mut turn => result,

@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use oxidra::session::{SessionHeader, SessionStore};
+use oxidra::turn::TURN_BOUNDARY_VERSION;
+
 const INITIAL_CALC: &str = "def add(a, b):\n    return a - b\n\nprint(add(3, 5))\n";
 const FIXED_CALC: &str = "def add(a, b):\n    return a + b\n\nprint(add(3, 5))\n";
 const FINAL_TEXT: &str = "Fixed calc.py; 3 + 5 now outputs 8.";
@@ -471,6 +474,130 @@ fn context_limited_session_blocks_new_prompts_and_can_retry_explicitly() {
             .count(),
         0
     );
+}
+
+#[test]
+fn retry_pending_reports_shell_approval_as_exit_three() {
+    let project = tempfile::tempdir().expect("create temporary project");
+    let user_home = tempfile::tempdir().expect("create isolated user directory");
+    let local_data = user_home.path().join("local");
+    let roaming_data = user_home.path().join("roaming");
+    let xdg_config = user_home.path().join("config");
+    let xdg_state = user_home.path().join("state");
+    for directory in [&local_data, &roaming_data, &xdg_config, &xdg_state] {
+        fs::create_dir_all(directory).expect("create isolated user directory");
+    }
+    let data_dir = if cfg!(windows) {
+        local_data.join("oxidra")
+    } else if cfg!(target_os = "macos") {
+        user_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("oxidra")
+    } else {
+        xdg_state.join("oxidra")
+    };
+    let store = SessionStore::new(&data_dir).expect("create isolated session store");
+    let project_root = project
+        .path()
+        .canonicalize()
+        .expect("canonical project root");
+    let mut journal = store
+        .create_with_id(
+            "retry-approval-session",
+            SessionHeader::new(&project_root, "gpt-5.6-sol"),
+        )
+        .expect("create pending session");
+    journal
+        .append_and_sync(
+            "user.message",
+            Some("limited-turn"),
+            json!({
+                "item":{"role":"user","content":"run a shell command"},
+                "turn_boundary_version":TURN_BOUNDARY_VERSION,
+            }),
+        )
+        .expect("append pending prompt");
+    journal
+        .append_and_sync(
+            "context.limit_reached",
+            Some("limited-turn"),
+            json!({"error":"context window limit reached"}),
+        )
+        .expect("append context limit");
+    drop(journal);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind approval server");
+    let address = listener.local_addr().expect("read approval server address");
+    let server = thread::spawn(move || -> Result<(), String> {
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err("timed out waiting for retry approval request".to_owned());
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        };
+        stream
+            .set_nonblocking(false)
+            .map_err(|error| error.to_string())?;
+        let _request = read_http_request(&mut stream)?;
+        let body = tool_call_sse(
+            "resp_retry_shell",
+            "item_retry_shell",
+            "call_retry_shell",
+            "shell",
+            json!({"command":"echo should-not-run"}),
+        );
+        write_http_response(&mut stream, "200 OK", "text/event-stream", &body)
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oxidra"))
+        .arg("--cwd")
+        .arg(project.path())
+        .arg("--resume")
+        .arg("retry-approval-session")
+        .arg("--retry-pending")
+        .env("API_KEY", "fake")
+        .env("API_BASE_URL", format!("http://{address}/v1/"))
+        .env_remove("MODEL")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_MODEL")
+        .env("LOCALAPPDATA", &local_data)
+        .env("APPDATA", &roaming_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .expect("retry pending shell turn");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let server_result = server.join().expect("approval server panicked");
+    assert!(
+        server_result.is_ok(),
+        "approval server failed: {server_result:?}; status={}\nstdout:\n{}\nstderr:\n{stderr}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+    );
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(
+        stderr.contains("shell command requires --full-auto in non-interactive mode"),
+        "missing non-interactive approval guidance:\n{stderr}"
+    );
+    assert!(!stderr.contains("operation interrupted"));
 }
 
 #[test]
