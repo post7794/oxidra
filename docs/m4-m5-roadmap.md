@@ -478,11 +478,12 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 
 “保留供重试”必须有可执行协议：
 
-1. 当前 reducer 识别带 `context.limit_reached`、且尚无 `turn.completed` / `turn.abandoned` 的 turn，返回原 `turn_id`、`user.message` seq 和 prompt。Provider context limit 是第一版已接通的 pending 来源；compaction failure 的更细 boundary 恢复随自动触发一起实现。
+1. 唯一共享的 turn-recovery reducer 校验 `turn.abandoned` 与 `turn.retry_started`。abandon 必须引用对应 `user.message`、发生在真实 context limit 之后、不能指向已完成 turn、不能重复；retry intent 必须带固定版本、唯一 ID，并引用当前最新 limit。Agent pending、projection 和 history 都只能消费这个 reducer 的验证结果，伪造控制事件一律 fail closed。
 2. `run_turn` 在追加新 `user.message` 前检查 pending；存在 pending 时返回明确错误，因此 `-p --resume` 不会继续叠加新消息，也不会再次毒化 session。
-3. `--retry-pending --resume <ID>` 对所有 pending turn 追加 `turn.abandoned`，然后把最新 pending prompt 作为一个新的 turn 重新提交。原始 prompt 和放弃事件都留在 journal；source projection v2 只向 Provider 投影新的副本，从而不需要篡改已发布的 turn-boundary v1。
-4. `--abandon-pending --resume <ID>` 只追加 `turn.abandoned`；之后可以在同一次进程中用 `-p` 提交替代 prompt，或进入 REPL。`turn.abandoned` 是显式投影决定，不是删除 journal 原文。
-5. source projection v1 保持历史字节语义；v2 才识别 `turn.abandoned`。history extractor v2 同样排除已放弃 turn，避免未来 checkpoint 回查把废弃的大 prompt重新引入 context。
+3. `--retry-pending --resume <ID>` 先同步写入 `turn.retry_started`，再在原 `turn_id` 和原 `user.message` 上继续，不重复追加 prompt，也不需要用 abandon 模拟 retry。崩溃若发生在 intent sync 后、Provider dispatch 前，resume 复用同一 intent；若 response attempt 已开始后崩溃，统一恢复为 `response.aborted`，下一次显式 retry 写入新的 intent 后继续。
+4. `--abandon-pending --resume <ID>` 只追加经 reducer 校验的 `turn.abandoned`；之后可以在同一次进程中用 `-p` 提交替代 prompt，或进入 REPL。该事件只改变 projection/history，不删除 journal 原文。
+5. turn-boundary validator v1 保持历史语义；v2 允许成功 retry 在同一 turn 内覆盖 retry intent 之前的 `response.failed` / `response.aborted` / `context.limit_reached` 终态，但不会隐藏 retry 之后的新失败。source projection v2 和 history extractor v2 只排除 reducer 已验证的 abandon。
+6. `--retry-pending` 明确是非交互 batch；它与普通 `-p` 共用取消、流收尾和 `approval_required` 转换。shell 未带 `--full-auto` 时返回 exit 3，而不是把审批拒绝误报成 Ctrl+C/130。
 
 ### 3.9 CLI 与可见性
 
@@ -537,7 +538,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 - 单独 `compaction.started` 恢复为 aborted，partial summary 不使用。
 - 现有 journal sync/损坏尾行测试继续通过；进程级故障注入覆盖真实 `compact_once` 的 started 已同步、Provider 已完成但 checkpoint 尚未落盘、checkpoint 已同步三个窗口，证明恢复不启用未提交 summary。
 - compaction usage 和时间完整写入 checkpoint；M4 推迟期间不做累计预算判断。
-- 压缩失败、无候选或压缩后无法达到 target 时终止当前请求；同一 boundary 不循环 compact。当前 Provider context-limit 恢复通过 `turn.abandoned` + 新 turn 重放最新 prompt；未来 compaction failure 的 pending boundary 必须另行锁定，不能被这条现状描述假定为已经完成。
+- 压缩失败、无候选或压缩后无法达到 target 时终止当前请求；同一 boundary 不循环 compact。当前 Provider context-limit retry 使用持久化 intent 并继续原 turn；显式 abandon 是另一条独立且严格校验的状态迁移。未来 compaction failure 的 pending boundary 必须另行锁定，不能被这条现状描述假定为已经完成。
 - history 三个工具只访问最新 checkpoint 覆盖前缀，使用稳定排序、带引用分页和硬输出配额；无 checkpoint 时不额外暴露历史。
 - history cursor、排序、分页、artifact ID/hash 授权和当前用户 turn 累计配额均有确定性测试；崩溃/resume 不重置配额，耗尽后移除 history schemas。
 - 同一 journal 在不同 render/折叠设置下生成完全相同的 Provider projection 字节。

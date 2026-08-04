@@ -145,9 +145,10 @@ Useful options:
     --abandon-pending      abandon context-limited turns before a replacement prompt
 ```
 
-Both pending-turn options require `--resume`. `--retry-pending` replays the
-latest pending prompt as a new auditable turn; `--abandon-pending` can be
-combined with `-p` to submit a replacement prompt.
+Both pending-turn options require `--resume`. `--retry-pending` first syncs a
+versioned retry intent and then continues the original turn without appending a
+second user message; `--abandon-pending` can be combined with `-p` to submit a
+replacement prompt.
 
 Local management commands do not require an API key:
 
