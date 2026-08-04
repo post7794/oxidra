@@ -367,6 +367,14 @@ impl BuiltinTools {
             );
         }
         let replacement = original_text.replacen(&args.old_text, &args.new_text, 1);
+        // 在创建临时文件前校验最终结果，避免工具写出自己随后无法读取的文件。
+        if replacement.len() as u64 > MAX_FILE_BYTES {
+            return ToolResult::error(
+                &call.id,
+                "validation_error",
+                format!("edited file would exceed the {MAX_FILE_BYTES}-byte limit"),
+            );
+        }
         let new_hash = sha256_hex(replacement.as_bytes());
         if !metadata.is_file() {
             return ToolResult::error(
@@ -1508,6 +1516,39 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
             "alpha delta gamma\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_cannot_publish_a_file_larger_than_its_own_limit() {
+        let (root, _artifacts, tools) = harness();
+        let path = root.path().join("limit.txt");
+        let mut original = String::with_capacity(MAX_FILE_BYTES as usize);
+        original.push('x');
+        original.push_str(&"a".repeat(MAX_FILE_BYTES as usize - 1));
+        std::fs::write(&path, &original).expect("write max-size fixture");
+
+        let result = tools
+            .execute(
+                &call(
+                    "edit",
+                    json!({
+                        "path":"limit.txt",
+                        "old_text":"x",
+                        "new_text":"xx",
+                        "expected_sha256":sha256_hex(original.as_bytes()),
+                    }),
+                ),
+                &ToolContext::default(),
+            )
+            .await;
+
+        assert!(result.is_error);
+        assert_eq!(result.error_code.as_deref(), Some("validation_error"));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), MAX_FILE_BYTES);
+        assert_eq!(
+            sha256_hex(&std::fs::read(path).unwrap()),
+            sha256_hex(original.as_bytes())
         );
     }
 
