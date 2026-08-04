@@ -1,8 +1,9 @@
 # Oxidra
 
 Oxidra is a lightweight personal CLI coding agent written in Rust. It uses the
-OpenAI Responses API, provides four built-in Rust tools (`read`, `edit`,
-`write`, and `shell`), and keeps an auditable append-only local session journal.
+OpenAI Responses API, provides five built-in Rust tools (`read`, `edit`,
+`write`, `shell`, and `remember`), and keeps an auditable append-only local
+session journal.
 
 The design and the explicit MVP boundary are documented in
 [docs/oxidra-mvp.md](docs/oxidra-mvp.md).
@@ -49,6 +50,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $env:TEMP\oxidra-install.ps1
 The installer downloads the Windows MSVC archive and its release checksum,
 verifies SHA256 before extracting, and installs only `oxidra.exe`. Without
 `-AddToPath`, it prints the directory that must be added to the user `PATH`.
+The release workflow pins third-party Actions to full commit SHAs and publishes
+a GitHub build-provenance attestation for the archive. The checksum protects
+transport integrity; the provenance record is the separate build-origin
+evidence.
 
 To build from source instead, use `cargo install --path .` from this checkout.
 The raw script and release assets must be anonymously readable for these
@@ -118,9 +123,11 @@ single shell command requires confirmation unless `--full-auto` is explicitly
 provided for the current process.
 
 At the end of each completed turn, stderr prints the model, accumulated token
-usage, and the estimated context size for the next request. In an interactive
-TTY, edit replacement lines are shown in red/green; `-p` and redirected output
-remain plain text.
+usage, and the approximate context size for the next request. The estimate is
+telemetry, not a tokenizer-backed hard limit. A structured Provider context
+limit becomes a recoverable pending turn. In an interactive TTY, edit
+replacement lines are shown in red/green; `-p` and redirected output remain
+plain text.
 
 Useful options:
 
@@ -134,7 +141,13 @@ Useful options:
     --max-tools <N>        optional per-turn insurance limit
     --context-window <N>   override the effective model context window
     --reserve-tokens <N>   override the reserved token allowance
+    --retry-pending        retry the newest context-limited prompt on resume
+    --abandon-pending      abandon context-limited turns before a replacement prompt
 ```
+
+Both pending-turn options require `--resume`. `--retry-pending` replays the
+latest pending prompt as a new auditable turn; `--abandon-pending` can be
+combined with `-p` to submit a replacement prompt.
 
 Local management commands do not require an API key:
 
