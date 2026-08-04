@@ -598,6 +598,86 @@ fn retry_pending_reports_shell_approval_as_exit_three() {
         "missing non-interactive approval guidance:\n{stderr}"
     );
     assert!(!stderr.contains("operation interrupted"));
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind successful retry server");
+    let address = listener
+        .local_addr()
+        .expect("read successful retry server address");
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let server = {
+        let captured = Arc::clone(&captured);
+        thread::spawn(move || -> Result<(), String> {
+            for index in 0..2 {
+                let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+                let request = read_http_request(&mut stream)?;
+                captured
+                    .lock()
+                    .map_err(|_| "successful retry request lock poisoned".to_owned())?
+                    .push(request);
+                let body = if index == 0 {
+                    tool_call_sse(
+                        "resp_retry_shell_full_auto",
+                        "item_retry_shell_full_auto",
+                        "call_retry_shell_full_auto",
+                        "shell",
+                        json!({"command":"echo retried"}),
+                    )
+                } else {
+                    final_text_sse("resp_retry_shell_done", "retry succeeded")
+                };
+                write_http_response(&mut stream, "200 OK", "text/event-stream", &body)?;
+            }
+            Ok(())
+        })
+    };
+    let output = Command::new(env!("CARGO_BIN_EXE_oxidra"))
+        .arg("--cwd")
+        .arg(project.path())
+        .arg("--resume")
+        .arg("retry-approval-session")
+        .arg("--retry-pending")
+        .arg("--full-auto")
+        .env("API_KEY", "fake")
+        .env("API_BASE_URL", format!("http://{address}/v1/"))
+        .env_remove("MODEL")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_MODEL")
+        .env("LOCALAPPDATA", &local_data)
+        .env("APPDATA", &roaming_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .expect("retry pending shell turn with full auto");
+    server
+        .join()
+        .expect("successful retry server panicked")
+        .expect("successful retry server failed");
+    assert!(
+        output.status.success(),
+        "second retry failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "retry succeeded"
+    );
+    let requests = captured.lock().expect("lock successful retry requests");
+    assert_eq!(requests.len(), 2);
+    assert!(
+        !requests[0].body["input"]
+            .as_array()
+            .expect("retry request input array")
+            .iter()
+            .any(|item| item
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("previous turn was cancelled")))
+    );
 }
 
 #[test]
