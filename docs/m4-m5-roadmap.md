@@ -478,12 +478,13 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 
 “保留供重试”必须有可执行协议：
 
-1. 唯一共享的 turn-recovery reducer 校验 `turn.abandoned` 与 `turn.retry_started`。abandon 必须引用对应 `user.message`、发生在真实 context limit 之后、不能指向已完成 turn、不能重复；retry intent 必须带固定版本、唯一 ID，并引用当前最新 limit。Agent pending、projection 和 history 都只能消费这个 reducer 的验证结果，伪造控制事件一律 fail closed。
+1. 唯一共享的 turn-recovery reducer 校验 `turn.abandoned` 与 `turn.retry_started`。两者必须满足 `user.message < context.limit_reached < control event`，引用对应 user seq，不能指向已完成 turn，不能重复；retry intent 还必须带固定版本、唯一 ID，并引用当前最新 limit。Provider 来源的 limit 必须用 `response_attempt_id` 绑定同 turn、更早的 `response.failed`。Agent pending、projection 和 history 都只能消费这个 reducer 的验证结果，伪造控制事件一律 fail closed。
 2. `run_turn` 在追加新 `user.message` 前检查 pending；存在 pending 时返回明确错误，因此 `-p --resume` 不会继续叠加新消息，也不会再次毒化 session。
 3. `--retry-pending --resume <ID>` 先同步写入 `turn.retry_started`，再在原 `turn_id` 和原 `user.message` 上继续，不重复追加 prompt，也不需要用 abandon 模拟 retry。崩溃若发生在 intent sync 后、Provider dispatch 前，resume 复用同一 intent；若 response attempt 已开始后崩溃，统一恢复为 `response.aborted`，下一次显式 retry 写入新的 intent 后继续。
 4. `--abandon-pending --resume <ID>` 只追加经 reducer 校验的 `turn.abandoned`；之后可以在同一次进程中用 `-p` 提交替代 prompt，或进入 REPL。该事件只改变 projection/history，不删除 journal 原文。
-5. turn-boundary validator v1 保持历史语义；v2 允许成功 retry 在同一 turn 内覆盖 retry intent 之前的 `response.failed` / `response.aborted` / `context.limit_reached` 终态，但不会隐藏 retry 之后的新失败。source projection v2 和 history extractor v2 只排除 reducer 已验证的 abandon。
+5. turn-boundary validator v1 保持历史语义；v2 按 latest retry 划分 attempt epoch。成功 retry 会 supersede 较早 epoch 的 `response.failed`、`response.aborted`、`turn.cancelled`、`agent.stalled`、`agent.limit_reached` 和 `context.limit_reached`，但不会隐藏 latest retry 之后的新终态。source projection v3 同样不再因被后续 retry 覆盖的 cancellation 删除原 prompt或注入取消提示；历史 projection v1/v2 保持原字节语义。history extractor v2 仍保留这些 attempt 状态作为可审计历史证据，只排除 reducer 已验证的 abandon。
 6. `--retry-pending` 明确是非交互 batch；它与普通 `-p` 共用取消、流收尾和 `approval_required` 转换。shell 未带 `--full-auto` 时返回 exit 3，而不是把审批拒绝误报成 Ctrl+C/130。
+7. 回归测试覆盖审批拒绝后带 `--full-auto` 再次成功、retry 取消后再次成功、stalled 后再次成功，以及 tool/response limit 后再次成功；较早 attempt 的终态不得污染最终 turn completion。
 
 ### 3.9 CLI 与可见性
 

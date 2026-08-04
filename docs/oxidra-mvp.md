@@ -218,7 +218,7 @@ reserve_tokens = 16384
 
 每次启动追加 `context.configured`，记录实际 model、Provider usage domain、window/reserve/usable/trigger/target、字段来源和测量协议版本。每个启动 epoch 与 tools schema 变化时追加 `context.tools`；每次 `response.started` 保存完整 prepared-request digest、序列化请求字节数、确定性估算、journal/checkpoint/instructions/tools 引用和 usage anchor 差分。存在可比较的上一普通 response 时，下一次输入估算使用真实 `input_tokens + E(current) - E(anchor)`；cached tokens 不扣除。无可比较 usage 时才从零估算完整请求。anchor 产生非正值或异常漂移时回退完整请求估算，不 clamp 为 `0`。
 
-当前没有 model tokenizer 或 Provider 计数接口，因此估算只用于显示、审计和未来 compaction trigger，不能作为 token hard limit。普通请求仍交给 Provider；Provider 返回受识别的结构化 context-limit 错误时，Oxidra 写入 `response.failed` + `context.limit_reached`，禁止继续追加新 prompt。`--retry-pending --resume <ID>` 先同步版本化 `turn.retry_started`，再在原 turn 上继续，不写第二条 user message；`--abandon-pending --resume <ID>` 允许用户放弃后提交替代 prompt。唯一共享 reducer 严格校验 abandon/retry 的引用、顺序、状态和唯一性，projection/history 只排除验证通过的 abandon。
+当前没有 model tokenizer 或 Provider 计数接口，因此估算只用于显示、审计和未来 compaction trigger，不能作为 token hard limit。普通请求仍交给 Provider；Provider 返回受识别的结构化 context-limit 错误时，Oxidra 写入 `response.failed` + `context.limit_reached`，禁止继续追加新 prompt。`--retry-pending --resume <ID>` 先同步版本化 `turn.retry_started`，再在原 turn 上继续，不写第二条 user message；`--abandon-pending --resume <ID>` 允许用户放弃后提交替代 prompt。唯一共享 reducer 严格校验 `user < limit < control`、response attempt 绑定、状态和唯一性；turn validator v2 与 source projection v3 只 supersede latest retry 之前的 attempt 终态，不能让较早取消、stalled 或限额污染之后成功的 retry。
 
 每次新建或 resume 都以当前解析出的 provider/model/context、当前 `AGENTS.md`/memory 和当前内置 tools 为运行真相；journal 中历史配置与 instructions 快照只供审计，不反向恢复旧配置。API key 等秘密不写 journal。
 
