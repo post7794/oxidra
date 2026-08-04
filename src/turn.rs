@@ -1297,7 +1297,13 @@ mod tests {
         let expected_turns = semantic_turns(&base);
         let expected_cutoffs = semantic_cutoffs(&base);
 
-        for kind in ["context.instructions", "render.compact", "session.metadata"] {
+        for kind in [
+            "context.instructions",
+            "context.configured",
+            "context.tools",
+            "render.compact",
+            "session.metadata",
+        ] {
             for insertion_index in 0..=base.len() {
                 let mut enriched = base.clone();
                 let mut global = event(u64::MAX, "unused", kind, json!({}));

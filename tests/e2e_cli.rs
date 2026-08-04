@@ -587,10 +587,13 @@ fn resume_replays_complete_output_items_across_processes() {
     let journal_path = data_dir
         .join("sessions")
         .join(format!("{session_id}.jsonl"));
-    let instruction_snapshots = fs::read_to_string(&journal_path)
+    let journal_events = fs::read_to_string(&journal_path)
         .expect("read resumed journal")
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("parse journal event"))
+        .collect::<Vec<_>>();
+    let instruction_snapshots = journal_events
+        .iter()
         .filter(|event| event["kind"] == "context.instructions")
         .collect::<Vec<_>>();
     assert_eq!(instruction_snapshots.len(), 2);
@@ -605,6 +608,63 @@ fn resume_replays_complete_output_items_across_processes() {
     assert!(!first_snapshot.contains("current memory version"));
     assert!(second_snapshot.contains("current memory version"));
     assert!(!second_snapshot.contains("first memory version"));
+
+    let configured = journal_events
+        .iter()
+        .filter(|event| event["kind"] == "context.configured")
+        .collect::<Vec<_>>();
+    assert_eq!(configured.len(), 2);
+    for event in &configured {
+        assert_eq!(event["data"]["model"], "gpt-5.6-sol");
+        assert_eq!(event["data"]["provider_protocol"], "openai_responses");
+        assert_eq!(event["data"]["context_window"], 128_000);
+        assert_eq!(event["data"]["reserve_tokens"], 16_384);
+        assert_eq!(event["data"]["context_window_source"], "builtin_default");
+        assert_eq!(
+            event["data"]["provider_usage_domain"]
+                .as_str()
+                .expect("provider usage domain")
+                .len(),
+            64
+        );
+    }
+    assert_eq!(
+        journal_events
+            .iter()
+            .filter(|event| event["kind"] == "context.tools")
+            .count(),
+        2,
+        "each process epoch must snapshot its canonical tools"
+    );
+    let response_starts = journal_events
+        .iter()
+        .filter(|event| event["kind"] == "response.started")
+        .collect::<Vec<_>>();
+    assert_eq!(response_starts.len(), 2);
+    assert_eq!(
+        response_starts[0]["data"]["context"]["method"],
+        "full_request"
+    );
+    assert_eq!(
+        response_starts[1]["data"]["context"]["method"],
+        "usage_anchor"
+    );
+    assert_eq!(
+        response_starts[1]["data"]["context"]["anchor_reported_input_tokens"],
+        1
+    );
+    assert_eq!(
+        response_starts[0]["data"]["context"]["configured_event_seq"],
+        configured[0]["seq"]
+    );
+    assert_eq!(
+        response_starts[1]["data"]["context"]["configured_event_seq"],
+        configured[1]["seq"]
+    );
+    assert_eq!(
+        response_starts[1]["data"]["context"]["usable_tokens"],
+        111_616
+    );
 
     let captured = captured.lock().expect("lock resume requests");
     assert_eq!(captured.len(), 2);

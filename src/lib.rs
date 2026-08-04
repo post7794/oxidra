@@ -3,6 +3,7 @@ mod auth;
 pub mod cli;
 pub mod compaction;
 pub mod config;
+pub mod context;
 pub mod error;
 mod event_kind;
 pub mod history;

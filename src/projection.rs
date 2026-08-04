@@ -467,9 +467,11 @@ mod tests {
                 "context.instructions",
                 json!({"instructions": "diagnostic snapshot only"}),
             ),
-            event(3, None, "render.compact", json!({"depth": "compact"})),
-            response(4, "t1"),
-            marker(5, "t1", 1, 4),
+            event(3, None, "context.configured", json!({"model":"model"})),
+            event(4, None, "context.tools", json!({"digest":"tools"})),
+            event(5, None, "render.compact", json!({"depth": "compact"})),
+            response(6, "t1"),
+            marker(7, "t1", 1, 6),
         ];
 
         let base_bytes = serde_json::to_vec(&project_events(&base).expect("valid base projection"))

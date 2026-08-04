@@ -1,6 +1,6 @@
 # Oxidra 个人 CLI Agent 设计
 
-状态：M1-M3 已实现；M5 checkpoint 协议、低权限版本化 summary envelope、真实 Provider `compact_once` 和 checkpoint-aware Agent projection 已实现。Windows、Linux、macOS CI 通过。当前主线定位为个人使用的轻量 coding agent，不包含扩展系统。受控历史回查、model-aware preflight、用户入口和自动触发尚未实现，因此终端用户当前还不能主动触发 compaction。
+状态：M1-M3 已实现；M5 checkpoint 协议、低权限版本化 summary envelope、真实 Provider `compact_once`、checkpoint-aware Agent projection、受控历史回查，以及 model-aware context 配置和 prepared-request 测量/审计已经实现。Windows、Linux、macOS CI 通过。当前主线定位为个人使用的轻量 coding agent，不包含扩展系统。compaction 用户入口、pending-turn retry 和自动触发尚未实现，因此终端用户当前还不能主动触发 compaction。
 
 已删除的协议实验代码仅作为历史源码保存在 Git tag `archive/mcp-mvp`，主线不为其保留兼容层或扩展接口。
 
@@ -205,7 +205,7 @@ Oxidra 采用完整输入契约：journal 必须记录模型实际看到的所�
 
 ## 9. Context
 
-当前发布行为仍不提供可用 compaction：达到限制时干净停止。M5 已实现 turn 边界、checkpoint reducer、低权限 `role: "user"` summary envelope，以及 prompt/envelope/source projection/turn validator/source digest/usage contract 六类不可变版本注册表、checkpoint + tail projection、真实 Provider `compact_once` 内核和故障恢复基础，但尚未接入历史回查、用户入口或自动触发。
+当前发布行为仍不提供可用 compaction：达到限制时干净停止。M5 已实现 turn 边界、checkpoint reducer、低权限 `role: "user"` summary envelope、六类不可变版本注册表、checkpoint + tail projection、真实 Provider `compact_once`、受控历史回查和 model-aware preflight 测量基础，但尚未接入 pending-turn retry、用户入口或自动触发。
 
 默认：
 
@@ -214,7 +214,9 @@ context_window = 128000
 reserve_tokens = 16384
 ```
 
-可通过用户配置或 `OXIDRA_CONTEXT_WINDOW`、`OXIDRA_RESERVE_TOKENS` 覆盖。估算接近 `context_window - reserve_tokens` 时返回 `context_limit` 并记录事件，不静默截断。
+可通过 CLI、环境变量、精确 model 配置或全局用户配置覆盖，优先级依次为 CLI > 环境变量 > `[context.models."<exact-model>"]` > `[context]` > 内置默认。`OXIDRA_CONTEXT_WINDOW`、`OXIDRA_RESERVE_TOKENS` 是环境变量入口；CLI 对应 `--context-window`、`--reserve-tokens`。reserve 必须小于 window。
+
+每次启动追加 `context.configured`，记录实际 model、Provider usage domain、window/reserve/usable/trigger/target、字段来源和测量协议版本。每个启动 epoch 与 tools schema 变化时追加 `context.tools`；每次 `response.started` 保存完整 prepared-request digest、确定性估算、journal/checkpoint/instructions/tools 引用和 usage anchor 差分。存在可比较的上一普通 response 时，下一次输入估算使用真实 `input_tokens + E(current) - E(anchor)`；cached tokens 不扣除。无可比较 usage 时才从零估算完整请求。达到 hard limit 时同一审计数据进入 `context.limit_reached`，Provider 不被调用。
 
 每次新建或 resume 都以当前解析出的 provider/model/context、当前 `AGENTS.md`/memory 和当前内置 tools 为运行真相；journal 中历史配置与 instructions 快照只供审计，不反向恢复旧配置。API key 等秘密不写 journal。
 
@@ -297,7 +299,7 @@ stdout 只承载 assistant 文本；工具状态、diff、确认、诊断和错�
 
 M4 与 M5 的完整实施契约见 [`m4-m5-roadmap.md`](m4-m5-roadmap.md)。
 
-1. M5 checkpoint 核心与真实 Provider `compact_once` 已实现；下一步依次接入当前 session 压缩前缀的受控历史回查、默认关闭的 model-aware 自动 preflight。
+1. M5 checkpoint 核心、真实 Provider `compact_once`、受控历史回查、model-aware 配置和 prepared-request usage-anchor 测量已经实现；下一步先实现 pending-turn retry，再接默认关闭的 compaction 实验入口。
 2. 完成崩溃/连续压缩/history 闭环后，先测量 3/5/10 次递归摘要漂移；只有数据支持时才默认启用自动 compaction。
 3. M4：每会话 token/执行时间预算按实际使用数据推迟，后续作为独立里程碑。
 4. 只有实际高频需要时才重新评估子 agent；它必须使用独立子会话，并受父级预算约束。

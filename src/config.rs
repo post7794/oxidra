@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::auth::{CredentialLookup, CredentialStore, CredentialStoreKind};
@@ -70,12 +71,45 @@ struct UserAuthConfig {
 struct UserContextConfig {
     context_window: Option<u64>,
     reserve_tokens: Option<u64>,
+    #[serde(default)]
+    models: HashMap<String, UserModelContextConfig>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserModelContextConfig {
+    context_window: Option<u64>,
+    reserve_tokens: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextValueSource {
+    Cli,
+    Environment,
+    ModelConfig,
+    GlobalConfig,
+    BuiltinDefault,
+}
+
+impl ContextValueSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cli => "cli",
+            Self::Environment => "environment",
+            Self::ModelConfig => "model_config",
+            Self::GlobalConfig => "global_config",
+            Self::BuiltinDefault => "builtin_default",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct ContextLimits {
     pub context_window: Option<u64>,
     pub reserve_tokens: u64,
+    pub context_window_source: ContextValueSource,
+    pub reserve_tokens_source: ContextValueSource,
 }
 
 impl Default for ContextLimits {
@@ -83,6 +117,8 @@ impl Default for ContextLimits {
         Self {
             context_window: Some(DEFAULT_CONTEXT_WINDOW),
             reserve_tokens: DEFAULT_RESERVE_TOKENS,
+            context_window_source: ContextValueSource::BuiltinDefault,
+            reserve_tokens_source: ContextValueSource::BuiltinDefault,
         }
     }
 }
@@ -202,19 +238,98 @@ fn normalize_base_url(base_url: &str) -> Result<Url> {
 }
 
 impl ContextLimits {
-    pub fn load(cli_context_window: Option<u64>, cli_reserve_tokens: Option<u64>) -> Result<Self> {
+    pub fn load(
+        model: &str,
+        cli_context_window: Option<u64>,
+        cli_reserve_tokens: Option<u64>,
+    ) -> Result<Self> {
         let user = load_user_config()?;
         let user_context = user.context.unwrap_or_default();
-        Ok(Self {
-            context_window: cli_context_window
-                .or_else(|| parse_env_u64("OXIDRA_CONTEXT_WINDOW"))
-                .or(user_context.context_window)
-                .or(Some(DEFAULT_CONTEXT_WINDOW)),
-            reserve_tokens: cli_reserve_tokens
-                .or_else(|| parse_env_u64("OXIDRA_RESERVE_TOKENS"))
-                .or(user_context.reserve_tokens)
-                .unwrap_or(DEFAULT_RESERVE_TOKENS),
-        })
+        let env_window = parse_env_u64("OXIDRA_CONTEXT_WINDOW")?;
+        let env_reserve = parse_env_u64("OXIDRA_RESERVE_TOKENS")?;
+        resolve_context_limits(
+            &user_context,
+            model,
+            cli_context_window,
+            cli_reserve_tokens,
+            env_window,
+            env_reserve,
+        )
+    }
+
+    pub fn usable_tokens(&self) -> Option<u64> {
+        self.context_window
+            .map(|window| window.saturating_sub(self.reserve_tokens))
+    }
+
+    pub fn trigger_tokens(&self) -> Option<u64> {
+        self.usable_tokens()
+            .map(|usable| ((u128::from(usable) * 80) / 100) as u64)
+    }
+
+    pub fn target_tokens(&self) -> Option<u64> {
+        self.usable_tokens().map(|usable| usable / 2)
+    }
+}
+
+fn resolve_context_limits(
+    user_context: &UserContextConfig,
+    model: &str,
+    cli_context_window: Option<u64>,
+    cli_reserve_tokens: Option<u64>,
+    env_window: Option<u64>,
+    env_reserve: Option<u64>,
+) -> Result<ContextLimits> {
+    let model_context = user_context.models.get(model);
+    let (context_window, context_window_source) = first_context_value(
+        cli_context_window,
+        env_window,
+        model_context.and_then(|context| context.context_window),
+        user_context.context_window,
+        DEFAULT_CONTEXT_WINDOW,
+    );
+    let (reserve_tokens, reserve_tokens_source) = first_context_value(
+        cli_reserve_tokens,
+        env_reserve,
+        model_context.and_then(|context| context.reserve_tokens),
+        user_context.reserve_tokens,
+        DEFAULT_RESERVE_TOKENS,
+    );
+    if context_window == 0 {
+        return Err(OxidraError::Config(
+            "context_window must be greater than zero".to_owned(),
+        ));
+    }
+    if reserve_tokens >= context_window {
+        return Err(OxidraError::Config(format!(
+            "reserve_tokens ({reserve_tokens}) must be smaller than context_window ({context_window})"
+        )));
+    }
+    Ok(ContextLimits {
+        context_window: Some(context_window),
+        reserve_tokens,
+        context_window_source,
+        reserve_tokens_source,
+    })
+}
+
+fn first_context_value(
+    cli: Option<u64>,
+    environment: Option<u64>,
+    model: Option<u64>,
+    global: Option<u64>,
+    builtin: u64,
+) -> (u64, ContextValueSource) {
+    if let Some(value) = cli {
+        (value, ContextValueSource::Cli)
+    } else if let Some(value) = environment {
+        (value, ContextValueSource::Environment)
+    } else if let Some(value) = model {
+        (value, ContextValueSource::ModelConfig)
+    } else if let Some(value) = global {
+        (value, ContextValueSource::GlobalConfig)
+    } else {
+        (builtin, ContextValueSource::BuiltinDefault)
     }
 }
 
@@ -298,8 +413,14 @@ fn nonempty_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|value| !value.trim().is_empty())
 }
 
-fn parse_env_u64(name: &str) -> Option<u64> {
-    nonempty_env(name).and_then(|value| value.parse().ok())
+fn parse_env_u64(name: &str) -> Result<Option<u64>> {
+    nonempty_env(name)
+        .map(|value| {
+            value
+                .parse::<u64>()
+                .map_err(|_| OxidraError::Config(format!("{name} must be an unsigned integer")))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
@@ -375,6 +496,76 @@ mod tests {
         let limits = ContextLimits::default();
         assert_eq!(limits.context_window, Some(DEFAULT_CONTEXT_WINDOW));
         assert_eq!(limits.reserve_tokens, DEFAULT_RESERVE_TOKENS);
+        assert_eq!(
+            limits.context_window_source,
+            ContextValueSource::BuiltinDefault
+        );
+        assert_eq!(limits.usable_tokens(), Some(111_616));
+        assert_eq!(limits.trigger_tokens(), Some(89_292));
+        assert_eq!(limits.target_tokens(), Some(55_808));
+    }
+
+    #[test]
+    fn model_context_overrides_global_but_not_environment_or_cli() {
+        let config = parse_user_config(
+            Path::new("config.toml"),
+            r#"
+                [context]
+                context_window = 128000
+                reserve_tokens = 16000
+
+                [context.models."grok-4.5"]
+                context_window = 256000
+                reserve_tokens = 32000
+            "#,
+        )
+        .unwrap();
+        let context = config.context.unwrap();
+        let model = resolve_context_limits(&context, "grok-4.5", None, None, None, None).unwrap();
+        assert_eq!(model.context_window, Some(256_000));
+        assert_eq!(model.reserve_tokens, 32_000);
+        assert_eq!(model.context_window_source, ContextValueSource::ModelConfig);
+
+        let environment = resolve_context_limits(
+            &context,
+            "grok-4.5",
+            None,
+            None,
+            Some(512_000),
+            Some(48_000),
+        )
+        .unwrap();
+        assert_eq!(environment.context_window, Some(512_000));
+        assert_eq!(
+            environment.context_window_source,
+            ContextValueSource::Environment
+        );
+
+        let cli = resolve_context_limits(
+            &context,
+            "grok-4.5",
+            Some(1_000_000),
+            Some(64_000),
+            Some(512_000),
+            Some(48_000),
+        )
+        .unwrap();
+        assert_eq!(cli.context_window, Some(1_000_000));
+        assert_eq!(cli.context_window_source, ContextValueSource::Cli);
+    }
+
+    #[test]
+    fn context_rejects_reserve_that_consumes_the_window() {
+        let error = resolve_context_limits(
+            &UserContextConfig::default(),
+            "model",
+            Some(10_000),
+            Some(10_000),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be smaller"));
     }
 
     #[test]

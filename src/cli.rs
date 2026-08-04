@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::{Agent, AgentObserver, ApprovalHandler, TurnOutcome, load_project_instructions};
 use crate::auth::{CredentialStatus, CredentialStore};
 use crate::config::{ContextLimits, ProjectContext, ProviderConfig, load_provider_settings};
+use crate::context::ContextRuntime;
 use crate::error::{OxidraError, Result};
 use crate::memory::{MemoryProvenance, MemoryStore};
 use crate::provider::{OpenAiResponsesProvider, ProviderEvent};
@@ -61,6 +62,14 @@ struct Cli {
     /// Stop a turn after this many tool calls.
     #[arg(long, value_name = "COUNT", value_parser = parse_positive_usize)]
     max_tools: Option<usize>,
+
+    /// Override the effective context window for this process.
+    #[arg(long, value_name = "TOKENS", value_parser = parse_positive_u64)]
+    context_window: Option<u64>,
+
+    /// Override tokens reserved outside the Provider input context.
+    #[arg(long, value_name = "TOKENS")]
+    reserve_tokens: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -132,15 +141,18 @@ async fn run(cli: Cli) -> Result<()> {
         cwd,
         max_responses,
         max_tools,
+        context_window,
+        reserve_tokens,
     } = cli;
     if let Some(command) = command {
-        return run_management_command(command, cwd, model);
+        return run_management_command(command, cwd, model, context_window, reserve_tokens);
     }
     let interactive = prompt.is_none();
     let project = ProjectContext::resolve(cwd)?;
     let provider_config = ProviderConfig::resolve(None, None, model)?;
     let model_name = provider_config.model.clone();
-    let context_limits = ContextLimits::load(None, None)?;
+    let context_limits = ContextLimits::load(&model_name, context_window, reserve_tokens)?;
+    let context_runtime = ContextRuntime::from_provider(&provider_config, context_limits)?;
     let store = SessionStore::platform_default()?;
     let memory_dir = store.layout().data_dir.join("memory");
     let memory_store = MemoryStore::new(&memory_dir)?;
@@ -163,6 +175,11 @@ async fn run(cli: Cli) -> Result<()> {
         eprintln!("{omitted_memories} memory item(s) were not injected.");
     }
     journal.append_and_sync(
+        "context.configured",
+        None,
+        context_runtime.configured_event_data(),
+    )?;
+    journal.append_and_sync(
         "context.instructions",
         None,
         json!({ "instructions": instructions.clone() }),
@@ -175,12 +192,12 @@ async fn run(cli: Cli) -> Result<()> {
         interactive,
     )?;
     let provider = Arc::new(OpenAiResponsesProvider::new(provider_config)?);
-    let mut agent = Agent::new(
+    let mut agent = Agent::new_with_runtime(
         provider,
         journal,
         builtins,
         instructions,
-        context_limits,
+        context_runtime,
         max_responses,
         max_tools,
     );
@@ -207,9 +224,11 @@ fn run_management_command(
     command: Command,
     cwd: Option<PathBuf>,
     model: Option<String>,
+    context_window: Option<u64>,
+    reserve_tokens: Option<u64>,
 ) -> Result<()> {
     match command {
-        Command::Doctor => run_doctor(cwd, model),
+        Command::Doctor => run_doctor(cwd, model, context_window, reserve_tokens),
         Command::Session { command } => run_session_command(command),
         Command::Memory { command } => run_memory_command(command),
         Command::Auth { command } => run_auth_command(command, model),
@@ -386,7 +405,12 @@ fn run_memory_command(command: MemoryCommand) -> Result<()> {
     }
 }
 
-fn run_doctor(cwd: Option<PathBuf>, model: Option<String>) -> Result<()> {
+fn run_doctor(
+    cwd: Option<PathBuf>,
+    model: Option<String>,
+    context_window: Option<u64>,
+    reserve_tokens: Option<u64>,
+) -> Result<()> {
     let mut failed = false;
     println!("Oxidra {}", env!("CARGO_PKG_VERSION"));
     println!(
@@ -407,6 +431,21 @@ fn run_doctor(cwd: Option<PathBuf>, model: Option<String>) -> Result<()> {
         Ok(provider) => {
             println!("API configuration: ok ({})", provider.api_base_url);
             println!("model: {}", provider.model);
+            match ContextLimits::load(&provider.model, context_window, reserve_tokens) {
+                Ok(context) => println!(
+                    "context: {}/{} usable (window {}, {}, reserve {}, {})",
+                    context.usable_tokens().unwrap_or_default(),
+                    context.context_window.unwrap_or_default(),
+                    context.context_window.unwrap_or_default(),
+                    context.context_window_source.as_str(),
+                    context.reserve_tokens,
+                    context.reserve_tokens_source.as_str(),
+                ),
+                Err(error) => {
+                    println!("context: FAILED ({error})");
+                    failed = true;
+                }
+            }
         }
         Err(error) => {
             println!("API configuration: FAILED ({error})");
@@ -432,6 +471,16 @@ fn run_doctor(cwd: Option<PathBuf>, model: Option<String>) -> Result<()> {
         println!("status: healthy");
         Ok(())
     }
+}
+
+fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|_| "expected a positive integer".to_owned())?;
+    if value == 0 {
+        return Err("expected a positive integer".to_owned());
+    }
+    Ok(value)
 }
 
 fn validate_resumed_session(
@@ -1135,16 +1184,23 @@ mod tests {
             "4",
             "--max-tools",
             "8",
+            "--context-window",
+            "1000000",
+            "--reserve-tokens",
+            "64000",
         ])
         .unwrap();
         assert_eq!(cli.prompt.as_deref(), Some("fix it"));
         assert_eq!(cli.max_responses, Some(4));
         assert_eq!(cli.max_tools, Some(8));
+        assert_eq!(cli.context_window, Some(1_000_000));
+        assert_eq!(cli.reserve_tokens, Some(64_000));
     }
 
     #[test]
     fn rejects_zero_limits() {
         assert!(Cli::try_parse_from(["oxidra", "--max-tools", "0"]).is_err());
+        assert!(Cli::try_parse_from(["oxidra", "--context-window", "0"]).is_err());
     }
 
     #[test]

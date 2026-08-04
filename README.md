@@ -75,6 +75,14 @@ model = "gpt-5.6-sol"
 
 [auth]
 credential_store = "keyring"
+
+[context]
+context_window = 128000
+reserve_tokens = 16384
+
+[context.models."gpt-5.6-sol"]
+context_window = 1000000
+reserve_tokens = 65536
 ```
 
 ```powershell
@@ -88,6 +96,11 @@ oxidra auth logout
 credentials in `auth.json` beside `config.toml`. A stored credential is bound to
 the normalized API base URL and is rejected after the URL changes. Environment
 variables override persistent settings and credentials.
+
+Context values resolve independently in this order: CLI override, environment
+variable, exact model entry, global `[context]`, then the built-in default.
+`OXIDRA_CONTEXT_WINDOW` and `OXIDRA_RESERVE_TOKENS` are the environment
+overrides. The reserve must be smaller than the selected window.
 
 The legacy `[provider].api_key` field is intentionally rejected. Remove it from
 an existing config file, then run `oxidra auth login` to migrate the credential
@@ -119,6 +132,8 @@ Useful options:
     --full-auto            skip per-command shell confirmation
     --max-responses <N>    optional per-turn insurance limit
     --max-tools <N>        optional per-turn insurance limit
+    --context-window <N>   override the effective model context window
+    --reserve-tokens <N>   override the reserved token allowance
 ```
 
 Local management commands do not require an API key:

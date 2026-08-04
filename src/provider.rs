@@ -129,52 +129,7 @@ impl OpenAiResponsesProvider {
     }
 
     fn request_body(&self, request: &ResponseRequest) -> Value {
-        let tools: Vec<Value> = request
-            .tools
-            .iter()
-            .map(|tool| {
-                json!({
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.input_schema,
-                    // Do not force strict mode: existing tool JSON
-                    // schemas may contain constructs not accepted by strict
-                    // structured outputs.  We validate before dispatch.
-                    "strict": false,
-                })
-            })
-            .collect();
-
-        let mut body = Map::new();
-        body.insert(
-            "model".to_owned(),
-            Value::String(
-                request
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| self.config.model.clone()),
-            ),
-        );
-        body.insert("input".to_owned(), Value::Array(request.input.clone()));
-        body.insert("tools".to_owned(), Value::Array(tools));
-        body.insert("stream".to_owned(), Value::Bool(true));
-        body.insert("store".to_owned(), Value::Bool(false));
-        // Required for stateless replay when reasoning output is present.
-        body.insert("include".to_owned(), json!(["reasoning.encrypted_content"]));
-        if let Some(instructions) = &request.instructions {
-            body.insert(
-                "instructions".to_owned(),
-                Value::String(instructions.clone()),
-            );
-        }
-        if let Some(max_output_tokens) = request.max_output_tokens {
-            body.insert(
-                "max_output_tokens".to_owned(),
-                Value::Number(max_output_tokens.into()),
-            );
-        }
-        Value::Object(body)
+        prepared_request_body(request, &self.config.model)
     }
 
     async fn attempt(
@@ -500,6 +455,53 @@ impl ResponseProvider for OpenAiResponsesProvider {
             last_retry_reason.unwrap_or_else(|| "provider failed".to_owned()),
         ))
     }
+}
+
+/// Exact secret-free JSON body sent to a Responses-compatible Provider.
+/// Context measurement uses the same builder so request-shape drift cannot
+/// silently invalidate usage-anchor deltas.
+pub(crate) fn prepared_request_body(request: &ResponseRequest, effective_model: &str) -> Value {
+    let tools = request
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.input_schema,
+                "strict": false,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut body = Map::new();
+    body.insert(
+        "model".to_owned(),
+        Value::String(
+            request
+                .model
+                .clone()
+                .unwrap_or_else(|| effective_model.to_owned()),
+        ),
+    );
+    body.insert("input".to_owned(), Value::Array(request.input.clone()));
+    body.insert("tools".to_owned(), Value::Array(tools));
+    body.insert("stream".to_owned(), Value::Bool(true));
+    body.insert("store".to_owned(), Value::Bool(false));
+    body.insert("include".to_owned(), json!(["reasoning.encrypted_content"]));
+    if let Some(instructions) = &request.instructions {
+        body.insert(
+            "instructions".to_owned(),
+            Value::String(instructions.clone()),
+        );
+    }
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        body.insert(
+            "max_output_tokens".to_owned(),
+            Value::Number(max_output_tokens.into()),
+        );
+    }
+    Value::Object(body)
 }
 
 enum AttemptResult {

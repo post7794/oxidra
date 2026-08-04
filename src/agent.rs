@@ -15,6 +15,9 @@ use uuid::Uuid;
 
 use crate::compaction::validate_checkpoint_chain;
 use crate::config::ContextLimits;
+use crate::context::{
+    ContextDecision, ContextRuntime, decide_context, measure_prepared_request, snapshot_tools,
+};
 use crate::error::{OxidraError, Result};
 use crate::history::{
     HISTORY_ARTIFACT_TOOL, HISTORY_CONTROL_OUTPUT_RESERVE_BYTES, HISTORY_SEARCH_TOOL,
@@ -108,7 +111,8 @@ pub struct Agent {
     journal: SessionJournal,
     tools: BuiltinTools,
     instructions: String,
-    context_limits: ContextLimits,
+    context_runtime: ContextRuntime,
+    tools_epoch: Option<(String, u64)>,
     max_responses: Option<usize>,
     max_tools: Option<usize>,
 }
@@ -118,6 +122,7 @@ struct PreparedToolSet {
     history: HistorySnapshot,
     history_quota: HistoryQuota,
     history_exposed: bool,
+    context: ContextDecision,
 }
 
 struct ToolDispatchContext<'a> {
@@ -137,12 +142,33 @@ impl Agent {
         max_responses: Option<usize>,
         max_tools: Option<usize>,
     ) -> Self {
+        Self::new_with_runtime(
+            provider,
+            journal,
+            tools,
+            instructions,
+            ContextRuntime::for_tests("unspecified", context_limits),
+            max_responses,
+            max_tools,
+        )
+    }
+
+    pub fn new_with_runtime(
+        provider: Arc<dyn ResponseProvider>,
+        journal: SessionJournal,
+        tools: BuiltinTools,
+        instructions: impl Into<String>,
+        context_runtime: ContextRuntime,
+        max_responses: Option<usize>,
+        max_tools: Option<usize>,
+    ) -> Self {
         Self {
             provider,
             journal,
             tools,
             instructions: instructions.into(),
-            context_limits,
+            context_runtime,
+            tools_epoch: None,
             max_responses,
             max_tools,
         }
@@ -215,13 +241,16 @@ impl Agent {
             }
 
             let (request, mut prepared_tools) = self.prepare_request(Some(&turn_id))?;
-            let context = self.estimate_context(&request)?;
+            let context = self.context_estimate(&prepared_tools.context);
             outcome.context = Some(context.clone());
             if let Err(error) = self.check_context(&context) {
                 self.journal.append_and_sync(
                     "context.limit_reached",
                     Some(&turn_id),
-                    json!({ "error": error.to_string() }),
+                    json!({
+                        "error": error.to_string(),
+                        "context": prepared_tools.context.audit_value()?,
+                    }),
                 )?;
                 return Err(error);
             }
@@ -232,6 +261,7 @@ impl Agent {
                 json!({
                     "response_attempt_id": response_attempt_id,
                     "response_index": outcome.responses + 1,
+                    "context": prepared_tools.context.audit_value()?,
                 }),
             )?;
             if let Err(error) = observer.on_response_started() {
@@ -844,9 +874,18 @@ impl Agent {
         Ok(())
     }
 
-    fn prepare_request(&self, turn_id: Option<&str>) -> Result<(ResponseRequest, PreparedToolSet)> {
+    fn prepare_request(
+        &mut self,
+        turn_id: Option<&str>,
+    ) -> Result<(ResponseRequest, PreparedToolSet)> {
         let events = self.journal.read_events()?;
         let chain = validate_checkpoint_chain(&events)?;
+        let checkpoint_id = chain
+            .latest()
+            .map(|checkpoint| checkpoint.checkpoint_id.clone());
+        let checkpoint_covers_through_seq = chain
+            .latest()
+            .map(|checkpoint| checkpoint.covers_through_seq);
         let input = if chain.latest().is_some() {
             project_checkpoint_and_tail(&events, &chain)?
         } else {
@@ -876,6 +915,41 @@ impl Agent {
             model: None,
             max_output_tokens: None,
         };
+        let measurement = measure_prepared_request(&request, &self.context_runtime)?;
+        let tool_snapshot = snapshot_tools(&definitions)?;
+        let tools_event_seq = match &self.tools_epoch {
+            Some((digest, seq)) if digest == &tool_snapshot.digest => *seq,
+            _ => {
+                let event = self.journal.append_and_sync(
+                    "context.tools",
+                    None,
+                    serde_json::to_value(&tool_snapshot)?,
+                )?;
+                self.tools_epoch = Some((tool_snapshot.digest.clone(), event.seq));
+                event.seq
+            }
+        };
+        let instructions_event_seq = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "context.instructions")
+            .map(|event| event.seq);
+        let configured_event_seq = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "context.configured")
+            .map(|event| event.seq);
+        let context = decide_context(
+            &events,
+            &self.context_runtime,
+            measurement,
+            events.last().map(|event| event.seq),
+            checkpoint_id,
+            checkpoint_covers_through_seq,
+            instructions_event_seq,
+            configured_event_seq,
+            tools_event_seq,
+        )?;
         Ok((
             request,
             PreparedToolSet {
@@ -883,23 +957,17 @@ impl Agent {
                 history,
                 history_quota,
                 history_exposed,
+                context,
             },
         ))
     }
 
-    fn estimate_context(&self, request: &ResponseRequest) -> Result<ContextEstimate> {
-        let input = serde_json::to_string(&request.input)?;
-        let tools = serde_json::to_string(&request.tools)?;
-        let instructions = request.instructions.as_deref().unwrap_or_default();
-        let estimated_tokens = estimate_tokens(&input)
-            .saturating_add(estimate_tokens(&tools))
-            .saturating_add(estimate_tokens(instructions))
-            .saturating_add(256);
-        Ok(ContextEstimate {
-            estimated_tokens,
-            context_window: self.context_limits.context_window,
-            reserve_tokens: self.context_limits.reserve_tokens,
-        })
+    fn context_estimate(&self, decision: &ContextDecision) -> ContextEstimate {
+        ContextEstimate {
+            estimated_tokens: decision.estimated_next_input_tokens,
+            context_window: self.context_runtime.limits.context_window,
+            reserve_tokens: self.context_runtime.limits.reserve_tokens,
+        }
     }
 
     fn check_context(&self, context: &ContextEstimate) -> Result<()> {
@@ -916,9 +984,9 @@ impl Agent {
         Ok(())
     }
 
-    fn next_context_estimate(&self) -> Result<ContextEstimate> {
-        let (request, _) = self.prepare_request(None)?;
-        self.estimate_context(&request)
+    fn next_context_estimate(&mut self) -> Result<ContextEstimate> {
+        let (_, prepared) = self.prepare_request(None)?;
+        Ok(self.context_estimate(&prepared.context))
     }
 }
 
@@ -970,19 +1038,6 @@ fn accumulate_usage(total: &mut Usage, usage: &Usage) {
         .reasoning_output_tokens
         .saturating_add(usage.reasoning_output_tokens);
     total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
-}
-
-fn estimate_tokens(text: &str) -> u64 {
-    let mut ascii = 0_u64;
-    let mut non_ascii = 0_u64;
-    for character in text.chars() {
-        if character.is_ascii() {
-            ascii += 1;
-        } else {
-            non_ascii += 1;
-        }
-    }
-    ascii.div_ceil(4).saturating_add(non_ascii)
 }
 
 struct ForwardObserver<'a> {
@@ -1249,6 +1304,7 @@ mod tests {
         CandidateEstimate, CompactionContext, CompactionSelection, compact_once,
         select_compaction_candidate,
     };
+    use crate::config::ContextValueSource;
     use crate::history::UNTRUSTED_HISTORY_NOTICE;
     use crate::session::{JournalEvent, SessionHeader, SessionStore};
     use crate::turn::{CompletionEvidence, TurnState, segment_turns};
@@ -1378,6 +1434,27 @@ mod tests {
             usage: Usage::default(),
             unknown_stream_events: Vec::new(),
         }
+    }
+
+    fn final_turn_with_usage(text: &str, input_tokens: u64) -> AssistantTurn {
+        let mut turn = final_turn(text);
+        turn.usage = Usage {
+            input_tokens,
+            cached_input_tokens: input_tokens / 2,
+            output_tokens: 10,
+            reasoning_output_tokens: 2,
+            total_tokens: input_tokens + 10,
+        };
+        turn.raw_response["id"] = json!(format!("response-{text}"));
+        turn.raw_response["status"] = json!("completed");
+        turn.raw_response["usage"] = json!({
+            "input_tokens":input_tokens,
+            "input_tokens_details":{"cached_tokens":input_tokens / 2},
+            "output_tokens":10,
+            "output_tokens_details":{"reasoning_tokens":2},
+            "total_tokens":input_tokens + 10,
+        });
+        turn
     }
 
     fn tool_turn(calls: Vec<ToolCall>) -> AssistantTurn {
@@ -1741,6 +1818,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_started_audits_exact_request_and_uses_previous_usage_anchor() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let journal = store
+            .create_with_id(
+                "context-anchor-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([
+            final_turn_with_usage("first", 2_000),
+            final_turn_with_usage("second", 2_400),
+        ]));
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        for prompt in ["first prompt", "second prompt"] {
+            agent
+                .run_turn(
+                    prompt,
+                    CancellationToken::new(),
+                    &mut NoopObserver,
+                    &mut DenyApproval,
+                )
+                .await
+                .unwrap();
+        }
+
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "context.tools")
+                .count(),
+            1
+        );
+        let started = events
+            .iter()
+            .filter(|event| event.kind == "response.started")
+            .collect::<Vec<_>>();
+        assert_eq!(started.len(), 2);
+        assert_eq!(started[0].data["context"]["method"], "full_request");
+        assert_eq!(started[1].data["context"]["method"], "usage_anchor");
+        assert_eq!(
+            started[1].data["context"]["anchor_reported_input_tokens"],
+            2_000
+        );
+        assert!(
+            started[1].data["context"]["estimate_delta_tokens"]
+                .as_i64()
+                .is_some()
+        );
+        assert_eq!(
+            started[0].data["context"]["tools_event_seq"],
+            started[1].data["context"]["tools_event_seq"]
+        );
+        assert_eq!(
+            started[1].data["context"]["measurement"]["request_digest"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_limit_records_the_full_preflight_without_provider_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let journal = store
+            .create_with_id(
+                "context-limit-audit-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("must not run")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits {
+                context_window: Some(300),
+                reserve_tokens: 100,
+                context_window_source: ContextValueSource::Cli,
+                reserve_tokens_source: ContextValueSource::Cli,
+            },
+            None,
+            None,
+        );
+
+        let error = agent
+            .run_turn(
+                "this request cannot fit",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::ContextLimit));
+        assert!(provider.requests().is_empty());
+        let event = agent
+            .journal()
+            .read_events()
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == "context.limit_reached")
+            .unwrap();
+        assert!(event.data["context"]["measurement"]["request_digest"].is_string());
+        assert!(event.data["context"]["estimated_next_input_tokens"].is_u64());
+        assert!(event.data["context"]["tools_event_seq"].is_u64());
+    }
+
+    #[tokio::test]
     async fn checkpoint_exposes_history_and_projects_lookup_result() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
@@ -1927,7 +2146,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let agent = Agent::new(
+        let mut agent = Agent::new(
             Arc::new(FinalResponseProvider),
             journal,
             tools,
