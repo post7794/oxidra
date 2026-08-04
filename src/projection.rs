@@ -3,7 +3,7 @@
 //! Rendering options deliberately do not enter this module. Compact or full
 //! terminal output must never change the bytes replayed to the provider.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
@@ -13,12 +13,12 @@ use crate::session::JournalEvent;
 use crate::turn::{complete_prefix_candidates, validate_turn_recovery};
 
 /// Current immutable event-to-item format used when building compaction input.
-pub const SOURCE_PROJECTION_VERSION: u32 = 2;
+pub const SOURCE_PROJECTION_VERSION: u32 = 3;
 
 /// Project only committed events into the stateless Responses `input` array.
 /// Partial deltas and aborted responses are intentionally absent.
 pub fn project_events(events: &[JournalEvent]) -> Result<Vec<Value>> {
-    project_events_v2(events)
+    project_events_v3(events)
 }
 
 /// Rebuild the exact event projection recorded by a compaction attempt.
@@ -27,6 +27,7 @@ pub fn project_events_for_compaction(version: u32, events: &[JournalEvent]) -> R
     match version {
         1 => project_events_v1(events),
         2 => project_events_v2(events),
+        3 => project_events_v3(events),
         _ => Err(OxidraError::Session(format!(
             "unsupported compaction source projection version {version}"
         ))),
@@ -34,18 +35,52 @@ pub fn project_events_for_compaction(version: u32, events: &[JournalEvent]) -> R
 }
 
 fn project_events_v1(events: &[JournalEvent]) -> Result<Vec<Value>> {
-    project_events_impl(events, false)
+    project_events_impl(events, false, false)
 }
 
 fn project_events_v2(events: &[JournalEvent]) -> Result<Vec<Value>> {
     // v2 新增显式 abandon 语义；v1 必须保持历史 checkpoint 的原始字节行为。
-    project_events_impl(events, true)
+    project_events_impl(events, true, false)
+}
+
+fn project_events_v3(events: &[JournalEvent]) -> Result<Vec<Value>> {
+    // v3 将较早 retry attempt 的取消终态从当前 projection 中移除。
+    project_events_impl(events, true, true)
 }
 
 fn project_events_impl(
     events: &[JournalEvent],
     supports_explicit_abandon: bool,
+    supports_retry_supersession: bool,
 ) -> Result<Vec<Value>> {
+    let recovery = if supports_explicit_abandon || supports_retry_supersession {
+        Some(validate_turn_recovery(events)?)
+    } else {
+        None
+    };
+    let latest_retry_by_turn = if supports_retry_supersession {
+        recovery
+            .as_ref()
+            .expect("retry-aware projection has recovery state")
+            .retries
+            .iter()
+            .fold(HashMap::<String, u64>::new(), |mut latest, retry| {
+                latest
+                    .entry(retry.turn_id.clone())
+                    .and_modify(|seq| *seq = (*seq).max(retry.retry_seq))
+                    .or_insert(retry.retry_seq);
+                latest
+            })
+    } else {
+        HashMap::new()
+    };
+    let superseded_by_retry = |event: &JournalEvent| {
+        event
+            .turn_id
+            .as_ref()
+            .and_then(|turn_id| latest_retry_by_turn.get(turn_id))
+            .is_some_and(|retry_seq| event.seq < *retry_seq)
+    };
     let completed_turns = events
         .iter()
         .filter(|event| event.kind == "response.completed")
@@ -54,13 +89,17 @@ fn project_events_impl(
     let abandoned_turns = events
         .iter()
         .filter(|event| matches!(event.kind.as_str(), "response.aborted" | "turn.cancelled"))
+        .filter(|event| !superseded_by_retry(event))
         .filter_map(|event| event.turn_id.clone())
         .filter(|turn_id| !completed_turns.contains(turn_id))
         .collect::<HashSet<_>>();
     let explicitly_abandoned_turns = if supports_explicit_abandon {
-        validate_turn_recovery(events)?
+        recovery
+            .as_ref()
+            .expect("abandon-aware projection has recovery state")
             .abandons
-            .into_keys()
+            .keys()
+            .cloned()
             .collect::<HashSet<_>>()
     } else {
         HashSet::new()
@@ -110,6 +149,9 @@ fn project_events_impl(
                 }
             }
             "response.aborted" | "turn.cancelled" => {
+                if superseded_by_retry(event) {
+                    continue;
+                }
                 if let Some(turn_id) = &event.turn_id {
                     if !explicitly_abandoned_turns.contains(turn_id)
                         && completed_turns.contains(turn_id)
@@ -734,6 +776,102 @@ mod tests {
                 .expect("digest v1 fixture"),
             "a19db4c28d0877d20c98d8eb59d67c7a089bdff99e746f0ea9f5c5bbab250d2d"
         );
+    }
+
+    #[test]
+    fn projection_v3_keeps_the_prompt_after_a_superseded_cancellation() {
+        let events = vec![
+            user(1, "limited"),
+            event(2, Some("limited"), "context.limit_reached", json!({})),
+            event(
+                3,
+                Some("limited"),
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-1",
+                    "user_message_seq":1,
+                    "context_limit_seq":2,
+                }),
+            ),
+            event(4, Some("limited"), "turn.cancelled", json!({})),
+            event(
+                5,
+                Some("limited"),
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-2",
+                    "user_message_seq":1,
+                    "context_limit_seq":2,
+                }),
+            ),
+        ];
+
+        assert!(
+            project_events_for_compaction(2, &events)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            project_events_for_compaction(3, &events).unwrap(),
+            vec![json!({"role":"user","content":"limited"})]
+        );
+    }
+
+    #[test]
+    fn projection_v3_omits_cancellation_notice_superseded_by_retry() {
+        let events = vec![
+            user(1, "limited"),
+            event(2, Some("limited"), "context.limit_reached", json!({})),
+            event(
+                3,
+                Some("limited"),
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-1",
+                    "user_message_seq":1,
+                    "context_limit_seq":2,
+                }),
+            ),
+            event(
+                4,
+                Some("limited"),
+                "response.completed",
+                json!({"output_items":[{
+                    "type":"function_call",
+                    "call_id":"call-1",
+                    "name":"shell",
+                    "arguments":"{}"
+                }]}),
+            ),
+            event(5, Some("limited"), "turn.cancelled", json!({})),
+            event(
+                6,
+                Some("limited"),
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-2",
+                    "user_message_seq":1,
+                    "context_limit_seq":2,
+                }),
+            ),
+        ];
+
+        let v2 = project_events_for_compaction(2, &events).unwrap();
+        assert!(v2.iter().any(|item| {
+            item.get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("previous turn was cancelled"))
+        }));
+        let v3 = project_events_for_compaction(3, &events).unwrap();
+        assert!(!v3.iter().any(|item| {
+            item.get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("previous turn was cancelled"))
+        }));
     }
 
     #[test]

@@ -567,6 +567,10 @@ impl Agent {
                                 | "response.completed"
                                 | "response.failed"
                                 | "response.aborted"
+                                | "turn.cancelled"
+                                | "agent.stalled"
+                                | "agent.limit_reached"
+                                | "context.limit_reached"
                         )
                 })
             });
@@ -1771,6 +1775,35 @@ mod tests {
         marker_seq
     }
 
+    fn append_pending_context_turn(
+        journal: &mut SessionJournal,
+        turn_id: &str,
+        prompt: &str,
+    ) -> (u64, u64) {
+        let user = journal
+            .append_and_sync(
+                "user.message",
+                Some(turn_id),
+                json!({
+                    "item":{"role":"user","content":prompt},
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let limit = journal
+            .append_and_sync(
+                "context.limit_reached",
+                Some(turn_id),
+                json!({"error":"context window limit reached"}),
+            )
+            .unwrap();
+        (user.seq, limit.seq)
+    }
+
+    fn count_events(events: &[JournalEvent], kind: &str) -> usize {
+        events.iter().filter(|event| event.kind == kind).count()
+    }
+
     async fn commit_checkpoint(journal: &mut SessionJournal, cutoff: u64) {
         let events = journal.read_events().unwrap();
         let chain = validate_checkpoint_chain(&events).unwrap();
@@ -2484,6 +2517,268 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_retry_can_be_retried_successfully() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "cancelled-retry-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        append_pending_context_turn(&mut journal, "limited-turn", "retry after cancellation");
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("done")]));
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(matches!(
+            agent
+                .retry_pending_context_turn(cancelled, &mut NoopObserver, &mut DenyApproval,)
+                .await,
+            Err(OxidraError::Interrupted)
+        ));
+        let outcome = agent
+            .retry_pending_context_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "done");
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "turn.retry_started"), 2);
+        assert_eq!(count_events(&events, "turn.cancelled"), 1);
+        assert_eq!(count_events(&events, "turn.completed"), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_retry_can_be_retried_successfully() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "stalled-retry-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        append_pending_context_turn(&mut journal, "limited-turn", "retry after stall");
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let failed_read = |id: &str| {
+            tool_turn(vec![ToolCall {
+                id: id.to_owned(),
+                name: "read".to_owned(),
+                arguments: json!({"path":"missing.txt"}),
+            }])
+        };
+        let provider = Arc::new(RecordingProvider::new([
+            failed_read("read-1"),
+            failed_read("read-2"),
+            failed_read("read-3"),
+            final_turn("done"),
+        ]));
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let stalled = agent
+            .retry_pending_context_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert!(stalled.stalled);
+        let outcome = agent
+            .retry_pending_context_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "done");
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "agent.stalled"), 1);
+        assert_eq!(count_events(&events, "turn.retry_started"), 2);
+        assert_eq!(count_events(&events, "turn.completed"), 1);
+    }
+
+    #[tokio::test]
+    async fn response_limited_retry_can_be_retried_successfully() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(project_root.join("a.txt"), "ok").unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "limited-retry-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        append_pending_context_turn(&mut journal, "limited-turn", "retry after response limit");
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([
+            tool_turn(vec![ToolCall {
+                id: "read-1".to_owned(),
+                name: "read".to_owned(),
+                arguments: json!({"path":"a.txt"}),
+            }]),
+            final_turn("done"),
+        ]));
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            Some(1),
+            None,
+        );
+
+        assert!(matches!(
+            agent
+                .retry_pending_context_turn(
+                    CancellationToken::new(),
+                    &mut NoopObserver,
+                    &mut DenyApproval,
+                )
+                .await,
+            Err(OxidraError::Limit(_))
+        ));
+        let outcome = agent
+            .retry_pending_context_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "done");
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "agent.limit_reached"), 1);
+        assert_eq!(count_events(&events, "turn.retry_started"), 2);
+        assert_eq!(count_events(&events, "turn.completed"), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_limited_retry_can_be_retried_successfully() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(project_root.join("a.txt"), "a").unwrap();
+        std::fs::write(project_root.join("b.txt"), "b").unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "tool-limited-retry-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        append_pending_context_turn(&mut journal, "limited-turn", "retry after tool limit");
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([
+            tool_turn(vec![
+                ToolCall {
+                    id: "read-a".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({"path":"a.txt"}),
+                },
+                ToolCall {
+                    id: "read-b".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({"path":"b.txt"}),
+                },
+            ]),
+            final_turn("done"),
+        ]));
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            Some(1),
+        );
+
+        assert!(matches!(
+            agent
+                .retry_pending_context_turn(
+                    CancellationToken::new(),
+                    &mut NoopObserver,
+                    &mut DenyApproval,
+                )
+                .await,
+            Err(OxidraError::Limit(_))
+        ));
+        let outcome = agent
+            .retry_pending_context_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "done");
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "agent.limit_reached"), 1);
+        assert_eq!(count_events(&events, "tool.skipped_due_to_limit"), 1);
+        assert_eq!(count_events(&events, "turn.retry_started"), 2);
+        assert_eq!(count_events(&events, "turn.completed"), 1);
     }
 
     #[tokio::test]

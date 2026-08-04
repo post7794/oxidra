@@ -82,9 +82,10 @@ pub(crate) struct ValidatedTurnRecovery {
 /// 重复事件任一不成立时都 fail closed。
 pub(crate) fn validate_turn_recovery(events: &[JournalEvent]) -> Result<ValidatedTurnRecovery> {
     let mut users = HashMap::new();
-    let mut limits: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut limits: HashMap<String, Vec<&JournalEvent>> = HashMap::new();
+    let mut failed_responses: HashMap<String, Vec<&JournalEvent>> = HashMap::new();
     let mut completion_seqs: HashMap<String, Vec<u64>> = HashMap::new();
-    let mut response_terminal_seqs: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut attempt_terminal_seqs: HashMap<String, Vec<u64>> = HashMap::new();
 
     for event in events {
         match event.kind.as_str() {
@@ -108,10 +109,7 @@ pub(crate) fn validate_turn_recovery(events: &[JournalEvent]) -> Result<Validate
                         event.seq
                     ))
                 })?;
-                limits
-                    .entry(turn_id.to_owned())
-                    .or_default()
-                    .push(event.seq);
+                limits.entry(turn_id.to_owned()).or_default().push(event);
             }
             "turn.completed" => {
                 let turn_id = event.turn_id.as_deref().ok_or_else(|| {
@@ -129,7 +127,13 @@ pub(crate) fn validate_turn_recovery(events: &[JournalEvent]) -> Result<Validate
         }
         if matches!(
             event.kind.as_str(),
-            "response.completed" | "response.failed" | "response.aborted"
+            "response.completed"
+                | "response.failed"
+                | "response.aborted"
+                | "turn.cancelled"
+                | "agent.stalled"
+                | "agent.limit_reached"
+                | "context.limit_reached"
         ) {
             let turn_id = event.turn_id.as_deref().ok_or_else(|| {
                 OxidraError::Session(format!(
@@ -137,10 +141,22 @@ pub(crate) fn validate_turn_recovery(events: &[JournalEvent]) -> Result<Validate
                     event.kind, event.seq
                 ))
             })?;
-            response_terminal_seqs
+            attempt_terminal_seqs
                 .entry(turn_id.to_owned())
                 .or_default()
                 .push(event.seq);
+        }
+        if event.kind == "response.failed" {
+            let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "response.failed at seq {} has no turn_id",
+                    event.seq
+                ))
+            })?;
+            failed_responses
+                .entry(turn_id.to_owned())
+                .or_default()
+                .push(event);
         }
         if event.data.get("turn_completion").is_some() {
             let turn_id = event.turn_id.as_deref().ok_or_else(|| {
@@ -153,6 +169,31 @@ pub(crate) fn validate_turn_recovery(events: &[JournalEvent]) -> Result<Validate
                 .entry(turn_id.to_owned())
                 .or_default()
                 .push(event.seq);
+        }
+    }
+
+    for (turn_id, turn_limits) in &limits {
+        let user_message_seq = users.get(turn_id).copied().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "context.limit_reached references unknown turn {turn_id}"
+            ))
+        })?;
+        for limit in turn_limits {
+            if completion_seqs
+                .get(turn_id)
+                .is_some_and(|seqs| seqs.iter().any(|seq| *seq < limit.seq))
+            {
+                return Err(OxidraError::Session(format!(
+                    "context.limit_reached at seq {} follows completion of turn {turn_id}",
+                    limit.seq
+                )));
+            }
+            validate_context_limit_binding(
+                turn_id,
+                user_message_seq,
+                limit,
+                failed_responses.get(turn_id).map(Vec::as_slice),
+            )?;
         }
     }
 
@@ -190,27 +231,33 @@ pub(crate) fn validate_turn_recovery(events: &[JournalEvent]) -> Result<Validate
                 "completed turn {turn_id} cannot be abandoned"
             )));
         }
-        let limit_seq = limits
+        let limit = limits
             .get(turn_id)
-            .and_then(|seqs| seqs.iter().copied().filter(|seq| *seq < event.seq).max())
+            .and_then(|limits| {
+                limits
+                    .iter()
+                    .copied()
+                    .filter(|limit| limit.seq < event.seq)
+                    .max_by_key(|limit| limit.seq)
+            })
             .ok_or_else(|| {
                 OxidraError::Session(format!(
                     "turn.abandoned at seq {} is not preceded by context.limit_reached",
                     event.seq
                 ))
             })?;
-        if event.seq <= user_message_seq {
-            return Err(OxidraError::Session(format!(
-                "turn.abandoned at seq {} precedes its user.message",
-                event.seq
-            )));
-        }
+        validate_context_limit_binding(
+            turn_id,
+            user_message_seq,
+            limit,
+            failed_responses.get(turn_id).map(Vec::as_slice),
+        )?;
         abandons.insert(
             turn_id.to_owned(),
             ValidatedAbandon {
                 turn_id: turn_id.to_owned(),
                 user_message_seq,
-                limit_seq,
+                limit_seq: limit.seq,
                 abandon_seq: event.seq,
             },
         );
@@ -305,21 +352,33 @@ pub(crate) fn validate_turn_recovery(events: &[JournalEvent]) -> Result<Validate
             })?;
         let latest_limit = limits
             .get(turn_id)
-            .and_then(|seqs| seqs.iter().copied().filter(|seq| *seq < event.seq).max())
+            .and_then(|limits| {
+                limits
+                    .iter()
+                    .copied()
+                    .filter(|limit| limit.seq < event.seq)
+                    .max_by_key(|limit| limit.seq)
+            })
             .ok_or_else(|| {
                 OxidraError::Session(format!(
                     "turn.retry_started at seq {} is not preceded by context.limit_reached",
                     event.seq
                 ))
             })?;
-        if limit_seq != latest_limit {
+        if limit_seq != latest_limit.seq {
             return Err(OxidraError::Session(format!(
                 "turn.retry_started at seq {} does not reference the latest context limit",
                 event.seq
             )));
         }
+        validate_context_limit_binding(
+            turn_id,
+            user_message_seq,
+            latest_limit,
+            failed_responses.get(turn_id).map(Vec::as_slice),
+        )?;
         if let Some(previous) = previous_retry_seq.get(turn_id) {
-            let previous_was_settled = response_terminal_seqs
+            let previous_was_settled = attempt_terminal_seqs
                 .get(turn_id)
                 .is_some_and(|seqs| seqs.iter().any(|seq| *seq > *previous && *seq < event.seq));
             if limit_seq <= *previous && !previous_was_settled {
@@ -340,6 +399,52 @@ pub(crate) fn validate_turn_recovery(events: &[JournalEvent]) -> Result<Validate
     }
 
     Ok(ValidatedTurnRecovery { abandons, retries })
+}
+
+fn validate_context_limit_binding(
+    turn_id: &str,
+    user_message_seq: u64,
+    limit: &JournalEvent,
+    failed_responses: Option<&[&JournalEvent]>,
+) -> Result<()> {
+    if user_message_seq >= limit.seq {
+        return Err(OxidraError::Session(format!(
+            "context.limit_reached at seq {} does not follow turn {turn_id}'s user.message",
+            limit.seq
+        )));
+    }
+    let response_attempt_id = limit
+        .data
+        .get("response_attempt_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let provider_reported = limit.data.get("source").and_then(Value::as_str) == Some("provider");
+    if provider_reported && response_attempt_id.is_none() {
+        return Err(OxidraError::Session(format!(
+            "provider context.limit_reached at seq {} has no response_attempt_id",
+            limit.seq
+        )));
+    }
+    if let Some(response_attempt_id) = response_attempt_id {
+        let bound = failed_responses.is_some_and(|responses| {
+            responses.iter().any(|response| {
+                response.seq > user_message_seq
+                    && response.seq < limit.seq
+                    && response
+                        .data
+                        .get("response_attempt_id")
+                        .and_then(Value::as_str)
+                        == Some(response_attempt_id)
+            })
+        });
+        if !bound {
+            return Err(OxidraError::Session(format!(
+                "context.limit_reached at seq {} is not bound to response.failed attempt {response_attempt_id}",
+                limit.seq
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Segment user turns without changing or projecting any journal content.
@@ -386,7 +491,12 @@ fn segment_turns_v2(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
                 event.seq < *retry_seq
                     && matches!(
                         event.kind.as_str(),
-                        "response.failed" | "response.aborted" | "context.limit_reached"
+                        "response.failed"
+                            | "response.aborted"
+                            | "turn.cancelled"
+                            | "agent.stalled"
+                            | "agent.limit_reached"
+                            | "context.limit_reached"
                     )
             })
         {
@@ -1616,6 +1726,18 @@ mod tests {
             event(3, "limited", "context.limit_reached", json!({})),
         ];
         assert!(validate_turn_recovery(&out_of_order).is_err());
+
+        let limit_before_user = vec![
+            event(1, "limited", "context.limit_reached", json!({})),
+            user(2, "limited", true),
+            event(
+                3,
+                "limited",
+                "turn.abandoned",
+                json!({"user_message_seq":2,"reason":"forged"}),
+            ),
+        ];
+        assert!(validate_turn_recovery(&limit_before_user).is_err());
     }
 
     #[test]
@@ -1711,6 +1833,56 @@ mod tests {
             ),
         ];
         assert!(validate_turn_recovery(&completed).is_err());
+
+        let limit_before_user = vec![
+            event(1, "limited", "context.limit_reached", json!({})),
+            user(2, "limited", true),
+            event(
+                3,
+                "limited",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-forged-order",
+                    "user_message_seq":2,
+                    "context_limit_seq":1,
+                }),
+            ),
+        ];
+        assert!(validate_turn_recovery(&limit_before_user).is_err());
+    }
+
+    #[test]
+    fn provider_context_limit_must_bind_to_the_failed_response_attempt() {
+        let mismatched = vec![
+            user(1, "limited", true),
+            event(
+                2,
+                "limited",
+                "response.failed",
+                json!({"response_attempt_id":"attempt-a"}),
+            ),
+            event(
+                3,
+                "limited",
+                "context.limit_reached",
+                json!({
+                    "source":"provider",
+                    "response_attempt_id":"attempt-b",
+                }),
+            ),
+            event(
+                4,
+                "limited",
+                "turn.abandoned",
+                json!({"user_message_seq":1,"reason":"forged"}),
+            ),
+        ];
+        assert!(validate_turn_recovery(&mismatched).is_err());
+
+        let mut matched = mismatched;
+        matched[2].data["response_attempt_id"] = json!("attempt-a");
+        assert!(validate_turn_recovery(&matched).is_ok());
     }
 
     #[test]
@@ -1739,6 +1911,89 @@ mod tests {
             TurnState::Complete(CompletionEvidence::ExplicitMarker)
         );
         assert_eq!(complete_prefix_candidates(&events).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn boundary_v2_supersedes_every_earlier_retry_attempt_terminal() {
+        for terminal_kind in [
+            "turn.cancelled",
+            "agent.stalled",
+            "agent.limit_reached",
+            "response.aborted",
+        ] {
+            let events = vec![
+                user(1, "limited", true),
+                event(2, "limited", "response.failed", json!({})),
+                event(3, "limited", "context.limit_reached", json!({})),
+                event(
+                    4,
+                    "limited",
+                    "turn.retry_started",
+                    json!({
+                        "retry_version":1,
+                        "retry_id":format!("retry-1-{terminal_kind}"),
+                        "user_message_seq":1,
+                        "context_limit_seq":3,
+                    }),
+                ),
+                event(5, "limited", terminal_kind, json!({})),
+                event(
+                    6,
+                    "limited",
+                    "turn.retry_started",
+                    json!({
+                        "retry_version":1,
+                        "retry_id":format!("retry-2-{terminal_kind}"),
+                        "user_message_seq":1,
+                        "context_limit_seq":3,
+                    }),
+                ),
+                inline_response(7, "limited", 1),
+                marker(8, "limited", 1, 7),
+            ];
+            let turns =
+                segment_turns(&events).unwrap_or_else(|error| panic!("{terminal_kind}: {error}"));
+            assert!(
+                matches!(turns[0].state, TurnState::Complete(_)),
+                "{terminal_kind}: {:?}",
+                turns[0].state
+            );
+        }
+
+        let events = vec![
+            user(1, "limited", true),
+            event(2, "limited", "response.failed", json!({})),
+            event(3, "limited", "context.limit_reached", json!({})),
+            event(
+                4,
+                "limited",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-before-limit",
+                    "user_message_seq":1,
+                    "context_limit_seq":3,
+                }),
+            ),
+            event(5, "limited", "context.limit_reached", json!({})),
+            event(
+                6,
+                "limited",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-after-limit",
+                    "user_message_seq":1,
+                    "context_limit_seq":5,
+                }),
+            ),
+            inline_response(7, "limited", 1),
+            marker(8, "limited", 1, 7),
+        ];
+        assert!(matches!(
+            segment_turns(&events).unwrap()[0].state,
+            TurnState::Complete(_)
+        ));
     }
 
     #[test]
