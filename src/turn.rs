@@ -43,6 +43,11 @@ pub struct TurnSpan {
     /// projection-neutral events, and an explicit marker may follow an already
     /// validated inline completion.
     pub completion_seq: Option<u64>,
+    /// Whether the visible prefix ends at a safe boundary for dispatching the
+    /// next Provider request.  This is deliberately independent of
+    /// `TurnState`: an `OpenTail` may still contain an unterminated response
+    /// attempt or unresolved tool lifecycle.
+    pub request_ready: bool,
     /// Whether a later complete boundary may safely cover this turn.
     pub cut_safe: bool,
 }
@@ -772,7 +777,9 @@ fn segment_turns_v2(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
             event.kind = "turn.retry_superseded".to_owned();
         }
     }
-    segment_turns_v1(&normalized)
+    let mut turns = segment_turns_v1(&normalized)?;
+    annotate_request_readiness(&normalized, &latest_retry_by_turn, &mut turns)?;
+    Ok(turns)
 }
 
 fn normalize_boundary_version_v2_for_v1(event: &mut JournalEvent) -> Result<()> {
@@ -850,7 +857,9 @@ fn segment_turns_v3(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
             event.kind = "turn.retry_superseded".to_owned();
         }
     }
-    segment_turns_v1(&normalized)
+    let mut turns = segment_turns_v1(&normalized)?;
+    annotate_request_readiness(&normalized, &latest_retry_by_turn, &mut turns)?;
+    Ok(turns)
 }
 
 fn normalize_boundary_version_v3_for_v1(event: &mut JournalEvent) -> Result<()> {
@@ -983,7 +992,10 @@ fn segment_turns_v1(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
         }
 
         let calls = validate_call_outputs(&turn_events)?;
-        let has_next_user = position + 1 < starts.len();
+        let next_user_seq = starts
+            .get(position + 1)
+            .map(|(next_start_index, _)| events[*next_start_index].seq);
+        let has_next_user = next_user_seq.is_some();
         let inline_completion = inline_completions.first().copied();
         if let Some(response) = inline_completion {
             validate_inline_completion(user_event, response, &turn_events, &calls)?;
@@ -1018,11 +1030,20 @@ fn segment_turns_v1(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
                 } else {
                     user_event.seq
                 };
-                let completion_seq = matches!(state, TurnState::Complete(_))
-                    .then(|| last_response_event_seq(&turn_events))
-                    .flatten();
+                // Legacy completion is only knowable when the next durable
+                // user.message appears.  Backdating this evidence to the
+                // previous response lets that same next message
+                // retroactively resolve controls inserted in between.
+                let completion_seq = match state {
+                    TurnState::Complete(CompletionEvidence::LegacyNextUser) => next_user_seq,
+                    TurnState::Complete(_) => last_response_event_seq(&turn_events),
+                    _ => None,
+                };
                 (state, covers_through_seq, completion_seq)
             };
+        let request_ready = matches!(state, TurnState::OpenTail)
+            && calls.is_resolved()
+            && response_attempts_allow_next_request(&turn_events);
         let cut_safe = match state {
             TurnState::Complete(_) => true,
             TurnState::Cancelled
@@ -1042,10 +1063,38 @@ fn segment_turns_v1(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
             covers_through_seq,
             state,
             completion_seq,
+            request_ready,
             cut_safe,
         });
     }
     Ok(turns)
+}
+
+/// Recompute request readiness for the active retry epoch.  Turn state and
+/// cutoff semantics remain those of the frozen reducer version; this derived
+/// permission bit ignores attempts that a validated retry intent superseded.
+fn annotate_request_readiness(
+    events: &[JournalEvent],
+    latest_retry_by_turn: &HashMap<String, u64>,
+    turns: &mut [TurnSpan],
+) -> Result<()> {
+    for turn in turns {
+        let retry_seq = latest_retry_by_turn.get(&turn.turn_id).copied();
+        let turn_events = events[turn.start_index..turn.end_index_exclusive]
+            .iter()
+            .filter(|event| event.turn_id.as_deref() == Some(turn.turn_id.as_str()))
+            .collect::<Vec<_>>();
+        let calls = validate_call_outputs(&turn_events)?;
+        let response_epoch = turn_events
+            .iter()
+            .copied()
+            .filter(|event| retry_seq.is_none_or(|retry_seq| event.seq > retry_seq))
+            .collect::<Vec<_>>();
+        turn.request_ready = matches!(turn.state, TurnState::OpenTail)
+            && calls.is_resolved()
+            && response_attempts_allow_next_request(&response_epoch);
+    }
+    Ok(())
 }
 
 /// Return complete cutoffs in the contiguous cut-safe prefix.
@@ -1353,6 +1402,59 @@ impl CallValidation {
     fn is_resolved(&self) -> bool {
         self.pending_count == 0 && !self.unresolved_in_doubt && !self.uncertain
     }
+}
+
+/// Return true only when the current attempt epoch is durably idle at a point
+/// where another normal Provider request is meaningful.  Missing/duplicate
+/// attempt identifiers fail closed instead of being guessed from event order.
+fn response_attempts_allow_next_request(turn_events: &[&JournalEvent]) -> bool {
+    let mut active = HashSet::<String>::new();
+    let mut seen = HashSet::<String>::new();
+    let mut valid = true;
+    let mut last_lifecycle = None::<&JournalEvent>;
+
+    for event in turn_events {
+        match event.kind.as_str() {
+            "response.started" => {
+                last_lifecycle = Some(event);
+                let Some(attempt_id) = response_attempt_id(event) else {
+                    valid = false;
+                    continue;
+                };
+                if !seen.insert(attempt_id.to_owned()) || !active.insert(attempt_id.to_owned()) {
+                    valid = false;
+                }
+            }
+            "response.completed" | "response.failed" | "response.aborted" => {
+                last_lifecycle = Some(event);
+                let Some(attempt_id) = response_attempt_id(event) else {
+                    valid = false;
+                    continue;
+                };
+                if !active.remove(attempt_id) {
+                    valid = false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !valid || !active.is_empty() {
+        return false;
+    }
+    match last_lifecycle {
+        None => true,
+        Some(event) if event.kind == "response.completed" => response_has_function_call(event),
+        Some(_) => false,
+    }
+}
+
+fn response_attempt_id(event: &JournalEvent) -> Option<&str> {
+    event
+        .data
+        .get("response_attempt_id")
+        .and_then(Value::as_str)
+        .filter(|attempt_id| !attempt_id.trim().is_empty())
 }
 
 fn validate_call_outputs(turn_events: &[&JournalEvent]) -> Result<CallValidation> {
@@ -1873,6 +1975,176 @@ mod tests {
         );
         assert!(turns[0].cut_safe);
         assert_eq!(turns[0].covers_through_seq, 2);
+    }
+
+    #[test]
+    fn legacy_completion_seq_is_the_next_user_evidence() {
+        let events = vec![
+            user(1, "legacy", false),
+            response(3, "legacy"),
+            user(4, "next", true),
+        ];
+
+        let turns = segment_turns(&events).expect("valid legacy boundary");
+        assert_eq!(
+            turns[0].state,
+            TurnState::Complete(CompletionEvidence::LegacyNextUser)
+        );
+        assert_eq!(turns[0].completion_seq, Some(4));
+    }
+
+    #[test]
+    fn request_readiness_is_independent_from_open_tail_state() {
+        let user_only = segment_turns(&[user(1, "ready", true)]).expect("user-only turn");
+        assert_eq!(user_only[0].state, TurnState::OpenTail);
+        assert!(user_only[0].request_ready);
+
+        let in_flight = vec![
+            user(1, "in-flight", true),
+            event(
+                2,
+                "in-flight",
+                "response.started",
+                json!({"response_attempt_id":"attempt-1"}),
+            ),
+        ];
+        let turns = segment_turns(&in_flight).expect("valid in-flight response");
+        assert_eq!(turns[0].state, TurnState::OpenTail);
+        assert!(!turns[0].request_ready);
+    }
+
+    #[test]
+    fn request_readiness_requires_resolved_tools_and_response_attempts() {
+        let mut events = vec![
+            user(1, "tools", true),
+            event(
+                2,
+                "tools",
+                "response.started",
+                json!({"response_attempt_id":"attempt-1"}),
+            ),
+            event(
+                3,
+                "tools",
+                "response.completed",
+                json!({
+                    "response_attempt_id":"attempt-1",
+                    "output_items":[{
+                        "type":"function_call",
+                        "call_id":"call-1",
+                        "name":"read",
+                        "arguments":"{}",
+                    }],
+                }),
+            ),
+        ];
+        let pending = segment_turns(&events).expect("valid pending tool call");
+        assert_eq!(pending[0].state, TurnState::OpenTail);
+        assert!(!pending[0].request_ready);
+
+        events.push(event(
+            4,
+            "tools",
+            "tool.started",
+            json!({"call_id":"call-1"}),
+        ));
+        events.push(event(
+            5,
+            "tools",
+            "tool.completed",
+            json!({"call_id":"call-1","started_seq":4,"output":"ok"}),
+        ));
+        let resolved = segment_turns(&events).expect("valid resolved tool call");
+        assert_eq!(resolved[0].state, TurnState::OpenTail);
+        assert!(resolved[0].request_ready);
+    }
+
+    #[test]
+    fn request_readiness_ignores_attempts_superseded_by_valid_retry() {
+        let events = vec![
+            user(1, "limited", true),
+            event(
+                2,
+                "limited",
+                "response.started",
+                json!({"response_attempt_id":"attempt-old"}),
+            ),
+            event(
+                3,
+                "limited",
+                "response.failed",
+                json!({"response_attempt_id":"attempt-old"}),
+            ),
+            event(4, "limited", "context.limit_reached", json!({})),
+            event(
+                5,
+                "limited",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-1",
+                    "user_message_seq":1,
+                    "context_limit_seq":4,
+                }),
+            ),
+        ];
+
+        let turns = segment_turns(&events).expect("valid retry epoch");
+        assert_eq!(turns[0].state, TurnState::OpenTail);
+        assert!(turns[0].request_ready);
+
+        let unresolved_before_retry = vec![
+            user(1, "limited-tools", true),
+            event(
+                2,
+                "limited-tools",
+                "response.started",
+                json!({"response_attempt_id":"attempt-tools"}),
+            ),
+            event(
+                3,
+                "limited-tools",
+                "response.completed",
+                json!({
+                    "response_attempt_id":"attempt-tools",
+                    "output_items":[{
+                        "type":"function_call",
+                        "call_id":"call-pending",
+                        "name":"read",
+                        "arguments":"{}",
+                    }],
+                }),
+            ),
+            event(
+                4,
+                "limited-tools",
+                "response.started",
+                json!({"response_attempt_id":"attempt-limit"}),
+            ),
+            event(
+                5,
+                "limited-tools",
+                "response.failed",
+                json!({"response_attempt_id":"attempt-limit"}),
+            ),
+            event(6, "limited-tools", "context.limit_reached", json!({})),
+            event(
+                7,
+                "limited-tools",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"retry-tools",
+                    "user_message_seq":1,
+                    "context_limit_seq":6,
+                }),
+            ),
+        ];
+        let turns = segment_turns(&unresolved_before_retry).expect("valid retry metadata");
+        assert!(
+            !turns[0].request_ready,
+            "retry must not erase pending tools"
+        );
     }
 
     #[test]

@@ -16,14 +16,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{OxidraError, Result};
+use crate::event_kind::{is_response_terminal, is_tool_lifecycle};
 use crate::projection::{
     SOURCE_PROJECTION_VERSION, project_events_for_compaction, validate_response_output_items,
 };
 use crate::provider::{ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{JournalEvent, SessionJournal};
 use crate::turn::{
-    TURN_BOUNDARY_VALIDATOR_VERSION, TurnState, complete_prefix_candidates_for_version,
-    segment_turns_for_version,
+    CompletionEvidence, TURN_BOUNDARY_VALIDATOR_VERSION, TurnState,
+    complete_prefix_candidates_for_version, segment_turns_for_version,
 };
 use crate::types::AssistantTurn;
 
@@ -998,9 +999,14 @@ pub fn validate_compaction_boundary_chain(
                 .map(|completion_seq| (turn.turn_id.clone(), completion_seq))
         })
         .collect::<HashMap<_, _>>();
-    let completion_turn_by_seq = completion_seq_by_turn
+    let completion_by_seq = turns
         .iter()
-        .map(|(turn_id, seq)| (*seq, turn_id.as_str()))
+        .filter_map(|turn| match (turn.completion_seq, turn.state) {
+            (Some(seq), TurnState::Complete(evidence)) => {
+                Some((seq, (turn.turn_id.as_str(), evidence)))
+            }
+            _ => None,
+        })
         .collect::<HashMap<_, _>>();
 
     let mut records = Vec::<Record>::new();
@@ -1022,6 +1028,34 @@ pub fn validate_compaction_boundary_chain(
                 "{} at seq {} must be a global event; turn binding belongs in its payload",
                 event.kind, event.seq
             ));
+        }
+
+        // `boundary.started` consumes the turn reducer's request-ready proof
+        // and reserves that Provider slot for compaction.  Without this gate,
+        // a normal response/tool attempt could start after the proof was
+        // checked but before `compaction.started`, recreating the same overlap
+        // as an in-flight response that predates the boundary.
+        if matches!(event.kind.as_str(), "response.started")
+            || is_response_terminal(&event.kind)
+            || is_tool_lifecycle(&event.kind)
+        {
+            let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "{} at seq {} has no turn_id",
+                    event.kind, event.seq
+                ))
+            })?;
+            if let Some(index) = active_by_turn.get(turn_id).copied() {
+                let record = &records[index];
+                if record.started_seq < event.seq
+                    && record.state != CompactionBoundaryState::Checkpointed
+                {
+                    return session_error(format!(
+                        "compaction boundary {} reserves turn {} until checkpointed; {} at seq {} cannot overlap it",
+                        record.boundary.boundary_id, turn_id, event.kind, event.seq
+                    ));
+                }
+            }
         }
 
         match event.kind.as_str() {
@@ -1367,8 +1401,17 @@ pub fn validate_compaction_boundary_chain(
         // Only the immutable turn reducer may declare completion.  Raw fields
         // such as `turn_completion` on an unrelated journal event are merely
         // untrusted payload and must never resolve a boundary.
-        if let Some(turn_id) = completion_turn_by_seq.get(&event.seq).copied() {
-            if event.turn_id.as_deref() != Some(turn_id) {
+        if let Some((turn_id, evidence)) = completion_by_seq.get(&event.seq).copied() {
+            let evidence_event_matches = match evidence {
+                CompletionEvidence::LegacyNextUser => {
+                    event.kind == "user.message"
+                        && event.turn_id.as_deref().is_some_and(|id| id != turn_id)
+                }
+                CompletionEvidence::ExplicitMarker | CompletionEvidence::InlineResponse => {
+                    event.turn_id.as_deref() == Some(turn_id)
+                }
+            };
+            if !evidence_event_matches {
                 return session_error(format!(
                     "validated turn completion at seq {} has an inconsistent turn binding",
                     event.seq
@@ -1474,6 +1517,12 @@ fn validate_boundary_start_context(
         return session_error(format!(
             "compaction boundary {} targets turn {} in state {:?}, not an open tail",
             boundary.boundary_id, boundary.turn_id, active_turn.state
+        ));
+    }
+    if !active_turn.request_ready {
+        return session_error(format!(
+            "compaction boundary {} targets turn {} before a safe Provider request boundary",
+            boundary.boundary_id, boundary.turn_id
         ));
     }
     Ok(())
@@ -5166,8 +5215,15 @@ mod tests {
         events.push(event(
             15,
             Some("turn-4"),
+            "response.started",
+            json!({"response_attempt_id":"normal-attempt"}),
+        ));
+        events.push(event(
+            16,
+            Some("turn-4"),
             "response.completed",
             json!({
+                "response_attempt_id":"normal-attempt",
                 "output_items": [{
                     "type": "message",
                     "role": "assistant",
@@ -5176,20 +5232,20 @@ mod tests {
                 "turn_completion": {
                     "turn_boundary_version": TURN_BOUNDARY_VERSION,
                     "covers_from_seq": 10,
-                    "final_response_seq": 15,
-                    "covers_through_seq": 15,
+                    "final_response_seq": 16,
+                    "covers_through_seq": 16,
                 },
             }),
         ));
         events.push(event(
-            16,
+            17,
             Some("turn-4"),
             "turn.completed",
             json!({
                 "turn_boundary_version": TURN_BOUNDARY_VERSION,
                 "covers_from_seq": 10,
-                "final_response_seq": 15,
-                "covers_through_seq": 16,
+                "final_response_seq": 16,
+                "covers_through_seq": 17,
             }),
         ));
 
@@ -5431,6 +5487,147 @@ mod tests {
             .expect_err("a cancelled turn must be retried before compaction")
             .to_string();
         assert!(error.contains("not an open tail"));
+    }
+
+    #[test]
+    fn legacy_next_user_cannot_retroactively_resolve_a_boundary() {
+        let events = vec![
+            event(
+                1,
+                Some("legacy-turn"),
+                "user.message",
+                json!({"item":{"role":"user","content":"legacy prompt"}}),
+            ),
+            boundary_started(2, "boundary-1", "legacy-turn", 1),
+            event(
+                3,
+                Some("legacy-turn"),
+                "response.completed",
+                json!({
+                    "output_items":[{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[{"type":"output_text","text":"done"}],
+                    }],
+                }),
+            ),
+            open_user(4, "next-turn", "next prompt"),
+        ];
+
+        let turns =
+            segment_turns_for_version(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1, &events)
+                .expect("legacy completion should remain identifiable");
+        assert_eq!(turns[0].completion_seq, Some(4));
+
+        let error = validate_compaction_boundary_chain(&events)
+            .expect_err("the next user cannot also retroactively resolve the pending boundary")
+            .to_string();
+        assert!(
+            error.contains("reserves turn legacy-turn until checkpointed"),
+            "unexpected boundary error: {error}"
+        );
+    }
+
+    #[test]
+    fn boundary_started_requires_a_safe_provider_request_boundary() {
+        let in_flight = vec![
+            open_user(1, "turn-1", "prompt"),
+            event(
+                2,
+                Some("turn-1"),
+                "response.started",
+                json!({"response_attempt_id":"attempt-1"}),
+            ),
+            boundary_started(3, "boundary-1", "turn-1", 1),
+        ];
+        let error = validate_compaction_boundary_chain(&in_flight)
+            .expect_err("compaction cannot overlap a normal Provider attempt")
+            .to_string();
+        assert!(error.contains("before a safe Provider request boundary"));
+
+        let request_after_boundary = vec![
+            open_user(1, "turn-1", "prompt"),
+            boundary_started(2, "boundary-1", "turn-1", 1),
+            event(
+                3,
+                Some("turn-1"),
+                "response.started",
+                json!({"response_attempt_id":"attempt-1"}),
+            ),
+        ];
+        let error = validate_compaction_boundary_chain(&request_after_boundary)
+            .expect_err("a durable compaction boundary must reserve the Provider slot")
+            .to_string();
+        assert!(error.contains("reserves turn turn-1 until checkpointed"));
+
+        let unresolved_tool = vec![
+            open_user(1, "turn-1", "prompt"),
+            event(
+                2,
+                Some("turn-1"),
+                "response.started",
+                json!({"response_attempt_id":"attempt-1"}),
+            ),
+            event(
+                3,
+                Some("turn-1"),
+                "response.completed",
+                json!({
+                    "response_attempt_id":"attempt-1",
+                    "output_items":[{
+                        "type":"function_call",
+                        "call_id":"call-1",
+                        "name":"read",
+                        "arguments":"{}",
+                    }],
+                }),
+            ),
+            boundary_started(4, "boundary-1", "turn-1", 1),
+        ];
+        let error = validate_compaction_boundary_chain(&unresolved_tool)
+            .expect_err("compaction cannot cross an unresolved tool lifecycle")
+            .to_string();
+        assert!(error.contains("before a safe Provider request boundary"));
+
+        let ready = vec![
+            open_user(1, "turn-1", "prompt"),
+            event(
+                2,
+                Some("turn-1"),
+                "response.started",
+                json!({"response_attempt_id":"attempt-1"}),
+            ),
+            event(
+                3,
+                Some("turn-1"),
+                "response.completed",
+                json!({
+                    "response_attempt_id":"attempt-1",
+                    "output_items":[{
+                        "type":"function_call",
+                        "call_id":"call-1",
+                        "name":"read",
+                        "arguments":"{}",
+                    }],
+                }),
+            ),
+            event(
+                4,
+                Some("turn-1"),
+                "tool.started",
+                json!({"call_id":"call-1"}),
+            ),
+            event(
+                5,
+                Some("turn-1"),
+                "tool.completed",
+                json!({"call_id":"call-1","started_seq":4,"output":"ok"}),
+            ),
+            boundary_started(6, "boundary-1", "turn-1", 1),
+        ];
+        let chain = validate_compaction_boundary_chain(&ready)
+            .expect("settled response and tools form a safe request boundary");
+        assert_eq!(chain.pending().len(), 1);
     }
 
     #[test]
