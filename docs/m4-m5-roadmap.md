@@ -1,6 +1,6 @@
 # Oxidra M4/M5 实施规划
 
-状态：设计与部分实现。M4 按实际使用数据推迟。M5 的显式 turn 边界、原始 projection、checkpoint 数据模型与 reducer、低权限 summary envelope、不可变格式版本注册表、checkpoint + tail projection、真实 Responses Provider `compact_once`、8192 输出上限、Provider 完成到 checkpoint 落盘窗口的生产路径故障注入、三个受控历史回查工具、model-aware context 配置、prepared-request usage-anchor 测量/审计，以及 Provider context 超限后的显式 retry/abandon 恢复已经实现。Agent 在存在有效 checkpoint 时会严格投影 summary + tail，并在同一个 prepared-request 快照上暴露和执行 history tools；compaction 用户入口和自动触发尚未实现。自动 compaction 在漂移测量完成前必须保持默认关闭。
+状态：设计与部分实现。M4 按实际使用数据推迟。M5 的显式 turn 边界、原始 projection、checkpoint 数据模型与 reducer、低权限 summary envelope、不可变格式版本注册表、checkpoint + tail projection、真实 Responses Provider `compact_once`、8192 输出上限、Provider 完成到 checkpoint 落盘窗口的生产路径故障注入、连续父子 checkpoint 与失败 child 重试内核测试、三个受控历史回查工具、model-aware context 配置、prepared-request usage-anchor 测量/审计，以及 Provider context 超限后的显式 retry/abandon 恢复已经实现。Agent 在存在有效 checkpoint 时会严格投影 summary + tail，并在同一个 prepared-request 快照上暴露和执行 history tools；compaction 用户入口和自动触发尚未实现。自动 compaction 在漂移测量完成前必须保持默认关闭。
 
 本文只规划两个后续里程碑：
 
@@ -513,7 +513,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 1. 已实现真实 Provider `compact_once` 内核：复用已注册的六类 v1 协议、无 tools、8192 输出上限、完整 raw response/usage 提交，并让 Agent 在有效 checkpoint 存在时实际使用 checkpoint + tail projection。当前没有用户入口，自动触发仍关闭。
 2. 已实现当前 session、最新 checkpoint 覆盖前缀内的 `history_search` / `history_turn` / `history_artifact`：同一 request boundary 只读一次 journal，schema 和执行器绑定同一不可变 snapshot；确定性检索、引用、cursor、artifact schema v1/v2 校验和单 turn 配额已经接入 Agent 主循环。
 3. 已实现 model-aware context 配置、prepared-request 精确 request-shape 测量、`context.configured` / `context.tools` / `response.started` / `context.limit_reached` 审计、真实 usage 差分锚点，以及 Provider context-limit 的 retry/abandon E2E。估算只用于 telemetry 和未来 compaction trigger；普通请求不再被 heuristic 伪装成 hard limit 拦截。
-4. 完成连续多次 compaction、compaction failure pending boundary 与 history 回查闭环 E2E。
+4. 已完成内核级连续两次真实 `compact_once`：失败 child 不替换 parent checkpoint，随后以同一候选显式重试可形成合法子链，最终 projection 只使用最新 summary + tail。仍缺自动 preflight 接入后的 compaction-failure pending boundary，以及覆盖该边界和 history 回查的进程级闭环 E2E。
 5. 用固定 fixture 测量父摘要连续 3/5/10 次重摘要后的漂移，保存 model、prompt version、原始输出和指标，先建立基线，不预设发布阈值。
 6. 根据测量结果另行锁定默认启用门槛；只有门槛满足后才改变默认值。
 7. 只有线性扫描或 journal 体积出现实际性能证据后，才考虑可重建索引或物理分段。

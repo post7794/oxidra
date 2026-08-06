@@ -1659,50 +1659,12 @@ mod tests {
             )
             .expect("create compaction journal");
         for index in 1..=3 {
-            let turn_id = format!("turn-{index}");
-            let user = journal
-                .append_and_sync(
-                    "user.message",
-                    Some(&turn_id),
-                    json!({
-                        "turn_boundary_version": TURN_BOUNDARY_VERSION,
-                        "item": {"role": "user", "content": format!("question {index}")},
-                    }),
-                )
-                .expect("append user message");
-            let response_seq = journal.next_seq();
-            let response = journal
-                .append_and_sync(
-                    "response.completed",
-                    Some(&turn_id),
-                    json!({
-                        "output_items": [{
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": format!("answer {index}")}],
-                        }],
-                        "turn_completion": {
-                            "turn_boundary_version": TURN_BOUNDARY_VERSION,
-                            "covers_from_seq": user.seq,
-                            "final_response_seq": response_seq,
-                            "covers_through_seq": response_seq,
-                        },
-                    }),
-                )
-                .expect("append response");
-            let marker_seq = journal.next_seq();
-            journal
-                .append_and_sync(
-                    "turn.completed",
-                    Some(&turn_id),
-                    json!({
-                        "turn_boundary_version": TURN_BOUNDARY_VERSION,
-                        "covers_from_seq": user.seq,
-                        "final_response_seq": response.seq,
-                        "covers_through_seq": marker_seq,
-                    }),
-                )
-                .expect("append turn marker");
+            append_completed_turn_to_journal(
+                &mut journal,
+                &format!("turn-{index}"),
+                &format!("question {index}"),
+                &format!("answer {index}"),
+            );
         }
 
         let events = journal.read_events().expect("read compaction journal");
@@ -1729,6 +1691,98 @@ mod tests {
             panic!("expected an eligible compaction candidate")
         };
         (temp, journal, candidate)
+    }
+
+    fn append_completed_turn_to_journal(
+        journal: &mut SessionJournal,
+        turn_id: &str,
+        prompt: &str,
+        answer: &str,
+    ) -> JournalEvent {
+        let user = journal
+            .append_and_sync(
+                "user.message",
+                Some(turn_id),
+                json!({
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                    "item": {"role": "user", "content": prompt},
+                }),
+            )
+            .expect("append recursive-compaction user message");
+        let response_seq = journal.next_seq();
+        let response = journal
+            .append_and_sync(
+                "response.completed",
+                Some(turn_id),
+                json!({
+                    "output_items": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": answer}],
+                    }],
+                    "turn_completion": {
+                        "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                        "covers_from_seq": user.seq,
+                        "final_response_seq": response_seq,
+                        "covers_through_seq": response_seq,
+                    },
+                }),
+            )
+            .expect("append recursive-compaction response");
+        let marker_seq = journal.next_seq();
+        journal
+            .append_and_sync(
+                "turn.completed",
+                Some(turn_id),
+                json!({
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                    "covers_from_seq": user.seq,
+                    "final_response_seq": response.seq,
+                    "covers_through_seq": marker_seq,
+                }),
+            )
+            .expect("append recursive-compaction turn marker")
+    }
+
+    fn select_first_eligible_candidate(
+        events: &[JournalEvent],
+        chain: &CheckpointChain,
+    ) -> CompactionCandidate {
+        let parent_cutoff = chain
+            .latest()
+            .map(|checkpoint| checkpoint.covers_through_seq)
+            .unwrap_or_default();
+        let suffix = events
+            .iter()
+            .filter(|event| event.seq > parent_cutoff)
+            .cloned()
+            .collect::<Vec<_>>();
+        let estimates =
+            complete_prefix_candidates_for_version(TURN_BOUNDARY_VALIDATOR_VERSION, &suffix)
+                .expect("derive recursive-compaction candidates")
+                .into_iter()
+                .map(|candidate| CandidateEstimate {
+                    covers_through_seq: candidate.covers_through_seq,
+                    estimated_input_tokens_after: 40,
+                })
+                .collect::<Vec<_>>();
+        match select_compaction_candidate(
+            events,
+            chain,
+            &CompactionContext {
+                current_input_tokens: 100,
+                target_input_tokens: 50,
+                min_recent_complete_turns: MIN_RECENT_COMPLETE_TURNS,
+                estimates,
+            },
+        )
+        .expect("select recursive-compaction candidate")
+        {
+            CompactionSelection::Selected(candidate) => candidate,
+            CompactionSelection::Unavailable(reason) => {
+                panic!("expected eligible recursive-compaction candidate, got {reason:?}")
+            }
+        }
     }
 
     #[tokio::test]
@@ -1791,6 +1845,157 @@ mod tests {
         assert_eq!(
             chain.latest().expect("latest checkpoint").checkpoint_id,
             checkpoint.checkpoint_id
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_compaction_preserves_the_parent_across_a_failed_child_retry() {
+        let (_temp, mut journal, first_candidate) = compaction_journal();
+        let first_provider = RecordingCompactionProvider::new(20);
+        let first = compact_once(
+            &first_provider,
+            &mut journal,
+            &first_candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .expect("commit first checkpoint");
+
+        for index in 4..=6 {
+            append_completed_turn_to_journal(
+                &mut journal,
+                &format!("turn-{index}"),
+                &format!("question {index}"),
+                &format!("answer {index}"),
+            );
+        }
+
+        let after_first = journal.read_events().expect("read post-checkpoint journal");
+        let first_chain = validate_checkpoint_chain(&after_first).expect("validate first chain");
+        assert_eq!(first_chain.len(), 1);
+        let second_candidate = select_first_eligible_candidate(&after_first, &first_chain);
+        assert_eq!(
+            second_candidate.parent_checkpoint_id.as_deref(),
+            Some(first.checkpoint_id.as_str())
+        );
+
+        let failed_provider = RecordingCompactionProvider::new(20);
+        let error = compact_once(
+            &failed_provider,
+            &mut journal,
+            &second_candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Err(OxidraError::ContextLimit),
+        )
+        .await
+        .expect_err("failed child validation must not replace the parent checkpoint");
+        assert!(matches!(error, OxidraError::ContextLimit));
+
+        let after_failure = journal.read_events().expect("read failed child attempt");
+        let preserved_chain =
+            validate_checkpoint_chain(&after_failure).expect("failed child preserves parent chain");
+        assert_eq!(preserved_chain.len(), 1);
+        assert_eq!(
+            preserved_chain
+                .latest()
+                .expect("preserved parent checkpoint")
+                .checkpoint_id,
+            first.checkpoint_id
+        );
+        let preserved_projection = project_checkpoint_and_tail(&after_failure, &preserved_chain)
+            .expect("failed child keeps the parent projection usable");
+        assert!(
+            preserved_projection[0]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("validated summary"))
+        );
+        assert!(
+            preserved_projection
+                .iter()
+                .any(|item| { item.get("content") == Some(&json!("question 6")) })
+        );
+
+        let second_provider = RecordingCompactionProvider::new(20);
+        let second = compact_once(
+            &second_provider,
+            &mut journal,
+            &second_candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .expect("commit recursive checkpoint");
+
+        let events = journal.read_events().expect("read recursive journal");
+        let chain = validate_checkpoint_chain(&events).expect("validate recursive chain");
+        assert_eq!(chain.len(), 2);
+        assert_eq!(
+            chain
+                .latest()
+                .expect("latest recursive checkpoint")
+                .checkpoint_id,
+            second.checkpoint_id
+        );
+        assert!(second.covers_through_seq > first.covers_through_seq);
+
+        let projected = project_checkpoint_and_tail(&events, &chain)
+            .expect("project latest summary and recursive tail");
+        assert_eq!(projected[0]["role"], "user");
+        assert!(
+            projected[0]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("validated summary"))
+        );
+        let bytes = serde_json::to_vec(&projected).expect("serialize recursive projection");
+        let text = String::from_utf8(bytes).expect("projection is UTF-8");
+        assert!(!text.contains("question 1"));
+        assert!(text.contains("question 6"));
+
+        let second_request = second_provider
+            .request
+            .lock()
+            .expect("read second compaction request")
+            .take()
+            .expect("second provider received a request");
+        assert_eq!(second_request.input[0]["role"], "user");
+        assert!(
+            second_request.input[0]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("validated summary"))
+        );
+        assert!(
+            !second_request
+                .input
+                .iter()
+                .any(|item| { item.get("content") == Some(&json!("question 1")) })
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == COMPACTION_STARTED_KIND)
+                .count(),
+            3
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == COMPACTION_FAILED_KIND)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == COMPACTION_CHECKPOINT_KIND)
+                .count(),
+            2
         );
     }
 
