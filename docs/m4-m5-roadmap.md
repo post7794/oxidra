@@ -1,6 +1,6 @@
 # Oxidra M4/M5 实施规划
 
-状态：设计与部分实现。M4 按实际使用数据推迟。M5 的显式 turn 边界、原始 projection、checkpoint 数据模型与 reducer、低权限 summary envelope、不可变格式版本注册表、checkpoint + tail projection、真实 Responses Provider `compact_once`、8192 输出上限、Provider 完成到 checkpoint 落盘窗口的生产路径故障注入、连续父子 checkpoint 与失败 child 重试内核测试、三个受控历史回查工具、model-aware context 配置、prepared-request usage-anchor 测量/审计，以及 Provider context 超限后的显式 retry/abandon 恢复已经实现。Agent 在存在有效 checkpoint 时会严格投影 summary + tail，并在同一个 prepared-request 快照上暴露和执行 history tools；compaction 用户入口和自动触发尚未实现。自动 compaction 在漂移测量完成前必须保持默认关闭。
+状态：设计与部分实现。M4 按实际使用数据推迟。M5 的显式 turn 边界、原始 projection、checkpoint 数据模型与 reducer、低权限 summary envelope、不可变格式版本注册表、checkpoint + tail projection、真实 Responses Provider `compact_once`、boundary-bound Provider 调用、8192 输出上限、Provider 完成到 checkpoint 落盘窗口的生产路径故障注入、连续父子 checkpoint 与失败 child 重试内核测试、三个受控历史回查工具、model-aware context 配置、prepared-request usage-anchor 测量/审计，以及 Provider context 超限后的显式 retry/abandon 恢复已经实现。session-open 会把 boundary 的三个崩溃窗口确定地恢复为 failed 或 checkpointed，Agent 在存在有效 checkpoint 时会严格投影 summary + tail，并在同一个 prepared-request 快照上暴露和执行 history tools；compaction 的 Agent/CLI 入口和自动触发尚未实现。自动 compaction 在漂移测量完成前必须保持默认关闭。
 
 本文只规划两个后续里程碑：
 
@@ -486,6 +486,18 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 6. `--retry-pending` 明确是非交互 batch；它与普通 `-p` 共用取消、流收尾和 `approval_required` 转换。shell 未带 `--full-auto` 时返回 exit 3，而不是把审批拒绝误报成 Ctrl+C/130。
 7. 回归测试覆盖审批拒绝后带 `--full-auto` 再次成功、retry 取消后再次成功、stalled 后再次成功，以及 tool/response limit 后再次成功；较早 attempt 的终态不得污染最终 turn completion。
 
+自动 compaction 另外使用独立、版本化的 request-boundary 协议，不能把全局 `compaction.started` 误当成用户 turn 已经被恢复：
+
+1. 在候选选择或 Provider 调用之前先同步写 `compaction.boundary.started`，保存 `boundary_id`、`turn_id`、原始 `user_message_seq`、trigger 和 boundary version。边界事件保持 global，turn 绑定只存在于已校验 payload 中，避免旧 turn reducer 被新全局管理事件静默改义。
+2. 真正的 `compaction.started` 在开放的 `extra.boundary` 中保存同一份绑定；checkpoint 只能通过该绑定归属到边界，不能拿一个无关但合法的 checkpoint 伪造“本 turn 已压缩”。旧 checkpoint 固定字段和已发布版本不变。
+3. checkpoint durable 后追加 `compaction.boundary.checkpointed`。该状态仍是 pending：它只证明摘要已经提交，不证明原用户请求已经收到正常响应。只有同 turn 的完整 completion、显式 abandon，或后续 retry supersession 才解除 pending。
+4. 无安全候选、Provider/本地失败、取消或摘要校验失败写 `compaction.boundary.failed`。若存在 Provider attempt，必须引用同 boundary 的已终结 `compaction.failed` / `compaction.aborted`；候选选择前失败可以没有 attempt id。
+5. 显式 retry 写 `compaction.boundary.retry_started`，生成新的 boundary id、保留同一 `turn_id` 与 `user_message_seq`，并把上一 failed boundary 标为 superseded；不追加第二条 user message。显式 abandon 写 `compaction.boundary.abandoned`，只改变当前 projection，原文继续留在 journal。
+6. started、checkpointed 和 failed 都属于 pending 状态。pending 后若出现另一个 user message、引用错 user/checkpoint/attempt、重复终态或跨 turn retry，reducer 一律 fail closed。
+7. `validate_compaction_boundary_chain` 与 checkpoint reducer 分离：checkpoint chain 回答“哪个 summary 可用”，boundary chain 回答“触发它的用户请求是否已经完成”。两者任何一边非法都不能继续 Provider 请求。
+
+当前代码已经实现 boundary v1 数据模型、checkpoint/attempt 绑定、纯 reducer、`compact_once_for_boundary` 和 session-open 自动恢复。恢复顺序先把孤立 Provider attempt 写成 `compaction.aborted`，再根据 durable terminal 补 `boundary.failed` 或 `boundary.checkpointed`；候选选择前崩溃则补无 attempt 的明确 failure。Agent/CLI 和自动 preflight 尚未消费该协议，因此默认 compaction 仍保持关闭。
+
 ### 3.9 CLI 与可见性
 
 自动触发时只在 stderr 显示简短状态，不污染 assistant stdout：
@@ -513,7 +525,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 1. 已实现真实 Provider `compact_once` 内核：复用已注册的六类 v1 协议、无 tools、8192 输出上限、完整 raw response/usage 提交，并让 Agent 在有效 checkpoint 存在时实际使用 checkpoint + tail projection。当前没有用户入口，自动触发仍关闭。
 2. 已实现当前 session、最新 checkpoint 覆盖前缀内的 `history_search` / `history_turn` / `history_artifact`：同一 request boundary 只读一次 journal，schema 和执行器绑定同一不可变 snapshot；确定性检索、引用、cursor、artifact schema v1/v2 校验和单 turn 配额已经接入 Agent 主循环。
 3. 已实现 model-aware context 配置、prepared-request 精确 request-shape 测量、`context.configured` / `context.tools` / `response.started` / `context.limit_reached` 审计、真实 usage 差分锚点，以及 Provider context-limit 的 retry/abandon E2E。估算只用于 telemetry 和未来 compaction trigger；普通请求不再被 heuristic 伪装成 hard limit 拦截。
-4. 已完成内核级连续两次真实 `compact_once`：失败 child 不替换 parent checkpoint，随后以同一候选显式重试可形成合法子链，最终 projection 只使用最新 summary + tail。仍缺自动 preflight 接入后的 compaction-failure pending boundary，以及覆盖该边界和 history 回查的进程级闭环 E2E。
+4. 已完成内核级连续两次真实 `compact_once`，并加入 compaction request-boundary v1 的数据模型、provider-attempt/checkpoint 绑定、fail-closed 纯 reducer、bound Provider 调用和 session-open 恢复：失败 child 不替换 parent checkpoint，随后以同一候选显式重试可形成合法子链，最终 projection 只使用最新 summary + tail。仍缺 Agent/CLI 对 pending/retry/abandon 的消费，以及覆盖 boundary 与 history 回查的进程级闭环 E2E。
 5. 用固定 fixture 测量父摘要连续 3/5/10 次重摘要后的漂移，保存 model、prompt version、原始输出和指标，先建立基线，不预设发布阈值。
 6. 根据测量结果另行锁定默认启用门槛；只有门槛满足后才改变默认值。
 7. 只有线性扫描或 journal 体积出现实际性能证据后，才考虑可重建索引或物理分段。
@@ -539,7 +551,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 - 单独 `compaction.started` 恢复为 aborted，partial summary 不使用。
 - 现有 journal sync/损坏尾行测试继续通过；进程级故障注入覆盖真实 `compact_once` 的 started 已同步、Provider 已完成但 checkpoint 尚未落盘、checkpoint 已同步三个窗口，证明恢复不启用未提交 summary。
 - compaction usage 和时间完整写入 checkpoint；M4 推迟期间不做累计预算判断。
-- 压缩失败、无候选或压缩后无法达到 target 时终止当前请求；同一 boundary 不循环 compact。当前 Provider context-limit retry 使用持久化 intent 并继续原 turn；显式 abandon 是另一条独立且严格校验的状态迁移。未来 compaction failure 的 pending boundary 必须另行锁定，不能被这条现状描述假定为已经完成。
+- 压缩失败、无候选或压缩后无法达到 target 时终止当前请求；同一 boundary 不循环 compact。Provider context-limit retry 使用既有持久化 intent；compaction boundary v1 则独立记录 started/checkpointed/failed/retry/abandon，并保持原 user message。纯 reducer、bound `compact_once` 和 session-open 崩溃恢复已实现；Agent/CLI pending 管理、projection/history 的 abandon 语义和进程级闭环 E2E 仍是默认启用前的阻塞项。
 - history 三个工具只访问最新 checkpoint 覆盖前缀，使用稳定排序、带引用分页和硬输出配额；无 checkpoint 时不额外暴露历史。
 - history cursor、排序、分页、artifact ID/hash 授权和当前用户 turn 累计配额均有确定性测试；崩溃/resume 不重置配额，耗尽后移除 history schemas。
 - 同一 journal 在不同 render/折叠设置下生成完全相同的 Provider projection 字节。

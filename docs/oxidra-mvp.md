@@ -301,7 +301,7 @@ stdout 只承载 assistant 文本；工具状态、diff、确认、诊断和错�
 
 M4 与 M5 的完整实施契约见 [`m4-m5-roadmap.md`](m4-m5-roadmap.md)。
 
-1. M5 checkpoint 核心、真实 Provider `compact_once`、受控历史回查、model-aware 配置、prepared-request usage-anchor 测量，以及 Provider context-limit retry/abandon 已经实现；下一步接默认关闭的 compaction 实验入口和 compaction failure 的 pending boundary。
+1. M5 checkpoint 核心、真实 Provider `compact_once`、受控历史回查、model-aware 配置、prepared-request usage-anchor 测量、Provider context-limit retry/abandon，以及 compaction request-boundary v1 的数据模型、纯 reducer、bound Provider 调用与 session-open 恢复已经实现；下一步让 Agent/CLI 和 projection/history 消费 pending/retry/abandon，再接默认关闭的 compaction 实验入口。
 2. 完成崩溃/连续压缩/history 闭环后，先测量 3/5/10 次递归摘要漂移；只有数据支持时才默认启用自动 compaction。
 3. M4：每会话 token/执行时间预算按实际使用数据推迟，后续作为独立里程碑。
 4. 只有实际高频需要时才重新评估子 agent；它必须使用独立子会话，并受父级预算约束。

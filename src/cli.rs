@@ -552,6 +552,24 @@ fn validate_resumed_session(
             recovery.aborted_responses
         );
     }
+    if recovery.aborted_compactions > 0 {
+        eprintln!(
+            "Recovered {} unterminated compaction attempt(s) as aborted.",
+            recovery.aborted_compactions
+        );
+    }
+    if recovery.failed_compaction_boundaries > 0 {
+        eprintln!(
+            "Recovered {} interrupted compaction request boundary/boundaries as failed.",
+            recovery.failed_compaction_boundaries
+        );
+    }
+    if recovery.checkpointed_compaction_boundaries > 0 {
+        eprintln!(
+            "Recovered {} durable compaction checkpoint boundary marker(s).",
+            recovery.checkpointed_compaction_boundaries
+        );
+    }
     if recovery.skipped_before_start > 0 {
         eprintln!(
             "Recovered {} tool call(s) that were never dispatched as skipped.",

@@ -12,7 +12,11 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::compaction::{COMPACTION_ABORTED_KIND, COMPACTION_STARTED_KIND};
+use crate::compaction::{
+    COMPACTION_ABORTED_KIND, COMPACTION_BOUNDARY_CHECKPOINTED_KIND,
+    COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_STARTED_KIND, CompactionBoundaryRecoveryAction,
+    compaction_boundary_recovery_actions,
+};
 #[cfg(test)]
 use crate::compaction::{COMPACTION_CHECKPOINT_KIND, COMPACTION_FAILED_KIND};
 use crate::error::{OxidraError, Result};
@@ -332,6 +336,22 @@ impl SessionStore {
             })
             .count();
         let aborted_compactions = previously_aborted_compactions + unfinished_compactions.len();
+        let failed_compaction_boundaries = scan
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == COMPACTION_BOUNDARY_FAILED_KIND
+                    && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
+            })
+            .count();
+        let checkpointed_compaction_boundaries = scan
+            .events
+            .iter()
+            .filter(|event| {
+                event.kind == COMPACTION_BOUNDARY_CHECKPOINTED_KIND
+                    && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
+            })
+            .count();
         let unstarted_tools = unstarted_tool_calls(&scan.events);
         let previously_skipped = scan
             .events
@@ -340,21 +360,16 @@ impl SessionStore {
             .count();
         let skipped_before_start = previously_skipped + unstarted_tools.len();
         let in_doubt = pending_tools(&scan.events);
-        let marker_seq = matching_recovery_marker(
-            &scan.events,
-            &in_doubt,
-            skipped_before_start,
-            aborted_responses,
-            aborted_compactions,
-        );
         let mut recovery = RecoveryInfo {
             truncated_tail: scan.truncated_tail,
             normalized_missing_newline: scan.normalized_missing_newline,
             in_doubt,
-            marker_seq,
+            marker_seq: None,
             skipped_before_start,
             aborted_responses,
             aborted_compactions,
+            failed_compaction_boundaries,
+            checkpointed_compaction_boundaries,
         };
 
         let mut journal = SessionJournal {
@@ -421,6 +436,23 @@ impl SessionStore {
             )?;
         }
 
+        let recovered_boundaries = recover_compaction_boundaries(&mut journal)?;
+        recovery.failed_compaction_boundaries = recovery
+            .failed_compaction_boundaries
+            .saturating_add(recovered_boundaries.failed);
+        recovery.checkpointed_compaction_boundaries = recovery
+            .checkpointed_compaction_boundaries
+            .saturating_add(recovered_boundaries.checkpointed);
+        recovery.marker_seq = matching_recovery_marker(
+            &scan.events,
+            &recovery.in_doubt,
+            recovery.skipped_before_start,
+            recovery.aborted_responses,
+            recovery.aborted_compactions,
+            recovery.failed_compaction_boundaries,
+            recovery.checkpointed_compaction_boundaries,
+        );
+
         if recovery.truncated_tail.is_some()
             || recovered_unfinished_response
             || recovered_unfinished_compaction
@@ -429,6 +461,8 @@ impl SessionStore {
             || (recovery.skipped_before_start > 0 && recovery.marker_seq.is_none())
             || (recovery.aborted_responses > 0 && recovery.marker_seq.is_none())
             || (recovery.aborted_compactions > 0 && recovery.marker_seq.is_none())
+            || (recovery.failed_compaction_boundaries > 0 && recovery.marker_seq.is_none())
+            || (recovery.checkpointed_compaction_boundaries > 0 && recovery.marker_seq.is_none())
         {
             let event =
                 journal.append_and_sync(RECOVERY_KIND, None, recovery_marker_data(&recovery))?;
@@ -451,6 +485,10 @@ pub struct RecoveryInfo {
     pub aborted_responses: usize,
     #[serde(default)]
     pub aborted_compactions: usize,
+    #[serde(default)]
+    pub failed_compaction_boundaries: usize,
+    #[serde(default)]
+    pub checkpointed_compaction_boundaries: usize,
 }
 
 impl RecoveryInfo {
@@ -1066,6 +1104,51 @@ fn unfinished_compactions(events: &[JournalEvent]) -> Vec<UnfinishedCompaction> 
     attempts
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RecoveredCompactionBoundaries {
+    failed: usize,
+    checkpointed: usize,
+}
+
+fn recover_compaction_boundaries(
+    journal: &mut SessionJournal,
+) -> Result<RecoveredCompactionBoundaries> {
+    let events = journal.read_events()?;
+    let actions = compaction_boundary_recovery_actions(&events)?;
+    let mut recovered = RecoveredCompactionBoundaries::default();
+    for action in actions {
+        match action {
+            CompactionBoundaryRecoveryAction::Checkpointed(payload) => {
+                journal.append_and_sync(
+                    COMPACTION_BOUNDARY_CHECKPOINTED_KIND,
+                    None,
+                    serde_json::to_value(payload)?,
+                )?;
+                recovered.checkpointed = recovered.checkpointed.saturating_add(1);
+            }
+            CompactionBoundaryRecoveryAction::Failed(payload) => {
+                journal.append_and_sync(
+                    COMPACTION_BOUNDARY_FAILED_KIND,
+                    None,
+                    serde_json::to_value(payload)?,
+                )?;
+                recovered.failed = recovered.failed.saturating_add(1);
+            }
+        }
+    }
+
+    // Re-run the pure reducer against the committed bytes.  Recovery must not
+    // merely append plausible-looking events; the resulting protocol state
+    // must be self-consistent and require no second repair pass.
+    let remaining = compaction_boundary_recovery_actions(&journal.read_events()?)?;
+    if !remaining.is_empty() {
+        return Err(OxidraError::Session(
+            "compaction boundary recovery did not reach a stable state".to_owned(),
+        ));
+    }
+    Ok(recovered)
+}
+
 fn unstarted_tool_calls(events: &[JournalEvent]) -> Vec<UnstartedTool> {
     let mut unstarted = BTreeMap::<u64, UnstartedTool>::new();
     let mut next_key = 0u64;
@@ -1136,11 +1219,15 @@ fn matching_recovery_marker(
     skipped_before_start: usize,
     aborted_responses: usize,
     aborted_compactions: usize,
+    failed_compaction_boundaries: usize,
+    checkpointed_compaction_boundaries: usize,
 ) -> Option<u64> {
     if in_doubt.is_empty()
         && skipped_before_start == 0
         && aborted_responses == 0
         && aborted_compactions == 0
+        && failed_compaction_boundaries == 0
+        && checkpointed_compaction_boundaries == 0
     {
         return None;
     }
@@ -1167,10 +1254,23 @@ fn matching_recovery_marker(
                 .get("aborted_compactions")
                 .and_then(Value::as_u64)
                 .unwrap_or_default() as usize;
+            let marked_failed_compaction_boundaries = event
+                .data
+                .get("failed_compaction_boundaries")
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as usize;
+            let marked_checkpointed_compaction_boundaries = event
+                .data
+                .get("checkpointed_compaction_boundaries")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                as usize;
             (same_in_doubt_set(&marked, in_doubt)
                 && marked_skipped == skipped_before_start
                 && marked_aborted == aborted_responses
-                && marked_aborted_compactions == aborted_compactions)
+                && marked_aborted_compactions == aborted_compactions
+                && marked_failed_compaction_boundaries == failed_compaction_boundaries
+                && marked_checkpointed_compaction_boundaries == checkpointed_compaction_boundaries)
                 .then_some(event.seq)
         })
 }
@@ -1209,6 +1309,10 @@ fn recovery_marker_data(recovery: &RecoveryInfo) -> Value {
             "response_aborted"
         } else if recovery.aborted_compactions > 0 {
             "compaction_aborted"
+        } else if recovery.failed_compaction_boundaries > 0 {
+            "compaction_boundary_failed"
+        } else if recovery.checkpointed_compaction_boundaries > 0 {
+            "compaction_boundary_checkpointed"
         } else if recovery.skipped_before_start > 0 {
             "tool_not_started"
         } else {
@@ -1219,6 +1323,8 @@ fn recovery_marker_data(recovery: &RecoveryInfo) -> Value {
         "skipped_before_start": recovery.skipped_before_start,
         "aborted_responses": recovery.aborted_responses,
         "aborted_compactions": recovery.aborted_compactions,
+        "failed_compaction_boundaries": recovery.failed_compaction_boundaries,
+        "checkpointed_compaction_boundaries": recovery.checkpointed_compaction_boundaries,
     })
 }
 
@@ -1645,6 +1751,78 @@ mod tests {
                 .unwrap()
                 .iter()
                 .filter(|event| event.kind == COMPACTION_ABORTED_KIND)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recovers_compaction_boundary_before_provider_attempt_once() {
+        use crate::compaction::{
+            COMPACTION_BOUNDARY_FAILED_KIND, CompactionBoundary, CompactionBoundaryStarted,
+            validate_compaction_boundary_chain,
+        };
+        use crate::turn::TURN_BOUNDARY_VERSION;
+
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("unfinished-compaction-boundary", header(temp.path()))
+            .unwrap();
+        let user = journal
+            .append_and_sync(
+                "user.message",
+                Some("turn-boundary"),
+                json!({
+                    "item":{"role":"user","content":"continue after recovery"},
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                crate::compaction::COMPACTION_BOUNDARY_STARTED_KIND,
+                None,
+                serde_json::to_value(CompactionBoundaryStarted {
+                    boundary: CompactionBoundary::new(
+                        "boundary-before-attempt",
+                        "turn-boundary",
+                        user.seq,
+                    ),
+                    trigger: "context_trigger".to_owned(),
+                    extra: Map::new(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        drop(journal);
+
+        let recovered = store.open("unfinished-compaction-boundary").unwrap();
+        assert_eq!(recovered.recovery_info().failed_compaction_boundaries, 1);
+        let events = recovered.read_events().unwrap();
+        let failed = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_BOUNDARY_FAILED_KIND)
+            .expect("session-open recovery appends a boundary failure");
+        assert_eq!(failed.data["boundary_id"], "boundary-before-attempt");
+        assert_eq!(failed.data["code"], "interrupted_before_attempt");
+        assert_eq!(failed.data["recovered"], true);
+        assert!(
+            validate_compaction_boundary_chain(&events)
+                .unwrap()
+                .latest_pending()
+                .is_some()
+        );
+        drop(recovered);
+
+        let reopened = store.open("unfinished-compaction-boundary").unwrap();
+        assert_eq!(reopened.recovery_info().failed_compaction_boundaries, 1);
+        assert_eq!(
+            reopened
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == COMPACTION_BOUNDARY_FAILED_KIND)
                 .count(),
             1
         );

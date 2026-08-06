@@ -32,6 +32,20 @@ pub const COMPACTION_CHECKPOINT_KIND: &str = "compaction.checkpoint";
 pub const COMPACTION_FAILED_KIND: &str = "compaction.failed";
 pub const COMPACTION_ABORTED_KIND: &str = "compaction.aborted";
 
+// The provider attempt lifecycle above is not sufficient to recover the
+// *user turn* that caused an automatic compaction.  A process can stop before
+// candidate selection, after the checkpoint is durable but before the normal
+// response is dispatched, or after a failed provider attempt.  These global
+// boundary events are the durable intent/state machine for that larger
+// request boundary.  They deliberately live in `extra`/open journal kinds so
+// the already-published checkpoint protocol remains byte-for-byte compatible.
+pub const COMPACTION_BOUNDARY_VERSION: u32 = 1;
+pub const COMPACTION_BOUNDARY_STARTED_KIND: &str = "compaction.boundary.started";
+pub const COMPACTION_BOUNDARY_CHECKPOINTED_KIND: &str = "compaction.boundary.checkpointed";
+pub const COMPACTION_BOUNDARY_FAILED_KIND: &str = "compaction.boundary.failed";
+pub const COMPACTION_BOUNDARY_RETRY_STARTED_KIND: &str = "compaction.boundary.retry_started";
+pub const COMPACTION_BOUNDARY_ABANDONED_KIND: &str = "compaction.boundary.abandoned";
+
 pub const COMPACTION_PROMPT_VERSION: u32 = 1;
 pub const SUMMARY_ENVELOPE_VERSION: u32 = 1;
 pub const SOURCE_DIGEST_VERSION: u32 = 1;
@@ -193,6 +207,320 @@ pub struct CompactionFailure {
     pub message: String,
     #[serde(default, flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// Identifies the user turn and prompt that owns one automatic-compaction
+/// request boundary.  The object is persisted inside the boundary event and,
+/// for provider attempts, under `CompactionStarted.extra["boundary"]` so old
+/// checkpoint JSON remains readable without a schema rewrite.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionBoundary {
+    pub version: u32,
+    pub boundary_id: String,
+    pub turn_id: String,
+    pub user_message_seq: u64,
+}
+
+impl CompactionBoundary {
+    pub fn new(
+        boundary_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        user_message_seq: u64,
+    ) -> Self {
+        Self {
+            version: COMPACTION_BOUNDARY_VERSION,
+            boundary_id: boundary_id.into(),
+            turn_id: turn_id.into(),
+            user_message_seq,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionBoundaryStarted {
+    pub boundary: CompactionBoundary,
+    pub trigger: String,
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionBoundaryCheckpointed {
+    pub boundary_id: String,
+    pub checkpoint_id: String,
+    pub checkpoint_seq: u64,
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionBoundaryFailed {
+    pub boundary_id: String,
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionBoundaryRetryStarted {
+    pub retry_id: String,
+    pub previous_boundary_id: String,
+    pub boundary: CompactionBoundary,
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionBoundaryAbandoned {
+    pub boundary_id: String,
+    pub turn_id: String,
+    pub user_message_seq: u64,
+    pub reason: String,
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionBoundaryState {
+    Started,
+    Checkpointed,
+    Failed,
+    Superseded,
+    Abandoned,
+    CompletedTurn,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidatedCompactionBoundary {
+    pub boundary: CompactionBoundary,
+    pub started_seq: u64,
+    pub state: CompactionBoundaryState,
+    pub state_seq: u64,
+    pub checkpoint_id: Option<String>,
+    pub failed_code: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactionBoundaryChain {
+    boundaries: Vec<ValidatedCompactionBoundary>,
+}
+
+impl CompactionBoundaryChain {
+    pub fn boundaries(&self) -> &[ValidatedCompactionBoundary] {
+        &self.boundaries
+    }
+
+    pub fn pending(&self) -> Vec<&ValidatedCompactionBoundary> {
+        self.boundaries
+            .iter()
+            .filter(|boundary| {
+                matches!(
+                    boundary.state,
+                    CompactionBoundaryState::Started
+                        | CompactionBoundaryState::Checkpointed
+                        | CompactionBoundaryState::Failed
+                )
+            })
+            .collect()
+    }
+
+    pub fn latest_pending(&self) -> Option<&ValidatedCompactionBoundary> {
+        self.pending()
+            .into_iter()
+            .max_by_key(|boundary| boundary.started_seq)
+    }
+}
+
+/// Deterministic journal repairs that session-open recovery may append after
+/// ordinary compaction-attempt recovery has settled every provider attempt.
+///
+/// These are descriptions, not mutations.  Keeping action derivation pure
+/// lets process-level tests prove the exact crash windows without granting the
+/// reducer direct filesystem access.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompactionBoundaryRecoveryAction {
+    Checkpointed(CompactionBoundaryCheckpointed),
+    Failed(CompactionBoundaryFailed),
+}
+
+/// Derive missing request-boundary terminal markers after a process restart.
+///
+/// The caller must first turn every orphaned `compaction.started` into a
+/// durable `compaction.aborted`.  A durable checkpoint wins over interruption:
+/// if the process stopped after the checkpoint fsync but before the boundary
+/// marker fsync, recovery emits `compaction.boundary.checkpointed`.  Otherwise
+/// a started boundary becomes an explicit failure and remains available for a
+/// later user-directed retry or abandon.
+pub fn compaction_boundary_recovery_actions(
+    events: &[JournalEvent],
+) -> Result<Vec<CompactionBoundaryRecoveryAction>> {
+    let uses_boundary_protocol = events.iter().any(|event| {
+        matches!(
+            event.kind.as_str(),
+            COMPACTION_BOUNDARY_STARTED_KIND
+                | COMPACTION_BOUNDARY_CHECKPOINTED_KIND
+                | COMPACTION_BOUNDARY_FAILED_KIND
+                | COMPACTION_BOUNDARY_RETRY_STARTED_KIND
+                | COMPACTION_BOUNDARY_ABANDONED_KIND
+        ) || (event.kind == COMPACTION_STARTED_KIND && event.data.get("boundary").is_some())
+    });
+    if !uses_boundary_protocol {
+        return Ok(Vec::new());
+    }
+
+    #[derive(Clone)]
+    enum AttemptTerminal {
+        Checkpoint {
+            checkpoint_id: String,
+            checkpoint_seq: u64,
+        },
+        Failure {
+            code: String,
+            message: String,
+            terminal_seq: u64,
+        },
+    }
+
+    let chain = validate_compaction_boundary_chain(events)?;
+    let mut attempt_by_boundary = HashMap::<String, String>::new();
+    let mut terminal_by_attempt = HashMap::<String, AttemptTerminal>::new();
+
+    for event in events {
+        match event.kind.as_str() {
+            COMPACTION_STARTED_KIND => {
+                let started = parse_event_data::<CompactionStarted>(event)?;
+                if let Some(boundary) = attempt_boundary(&started.extra)? {
+                    attempt_by_boundary.insert(boundary.boundary_id, started.attempt_id);
+                }
+            }
+            COMPACTION_CHECKPOINT_KIND => {
+                let checkpoint = parse_event_data::<Checkpoint>(event)?;
+                terminal_by_attempt.insert(
+                    checkpoint.attempt_id,
+                    AttemptTerminal::Checkpoint {
+                        checkpoint_id: checkpoint.checkpoint_id,
+                        checkpoint_seq: event.seq,
+                    },
+                );
+            }
+            COMPACTION_FAILED_KIND | COMPACTION_ABORTED_KIND => {
+                let failure = parse_event_data::<CompactionFailure>(event)?;
+                terminal_by_attempt.insert(
+                    failure.attempt_id,
+                    AttemptTerminal::Failure {
+                        code: failure.code,
+                        message: failure.message,
+                        terminal_seq: event.seq,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut actions = Vec::new();
+    for record in chain
+        .boundaries()
+        .iter()
+        .filter(|record| record.state == CompactionBoundaryState::Started)
+    {
+        let Some(attempt_id) = attempt_by_boundary.get(&record.boundary.boundary_id) else {
+            let mut extra = Map::new();
+            extra.insert("recovered".to_owned(), json!(true));
+            extra.insert("boundary_started_seq".to_owned(), json!(record.started_seq));
+            actions.push(CompactionBoundaryRecoveryAction::Failed(
+                CompactionBoundaryFailed {
+                    boundary_id: record.boundary.boundary_id.clone(),
+                    code: "interrupted_before_attempt".to_owned(),
+                    message: "process stopped before a compaction provider attempt was committed"
+                        .to_owned(),
+                    attempt_id: None,
+                    extra,
+                },
+            ));
+            continue;
+        };
+
+        let terminal = terminal_by_attempt.get(attempt_id).ok_or_else(|| {
+            OxidraError::Session(format!(
+                "compaction boundary {} still has unterminated attempt {attempt_id} during recovery",
+                record.boundary.boundary_id
+            ))
+        })?;
+        match terminal {
+            AttemptTerminal::Checkpoint {
+                checkpoint_id,
+                checkpoint_seq,
+            } => {
+                let mut extra = Map::new();
+                extra.insert("recovered".to_owned(), json!(true));
+                actions.push(CompactionBoundaryRecoveryAction::Checkpointed(
+                    CompactionBoundaryCheckpointed {
+                        boundary_id: record.boundary.boundary_id.clone(),
+                        checkpoint_id: checkpoint_id.clone(),
+                        checkpoint_seq: *checkpoint_seq,
+                        extra,
+                    },
+                ));
+            }
+            AttemptTerminal::Failure {
+                code,
+                message,
+                terminal_seq,
+            } => {
+                let mut extra = Map::new();
+                extra.insert("recovered".to_owned(), json!(true));
+                extra.insert("attempt_terminal_seq".to_owned(), json!(terminal_seq));
+                actions.push(CompactionBoundaryRecoveryAction::Failed(
+                    CompactionBoundaryFailed {
+                        boundary_id: record.boundary.boundary_id.clone(),
+                        code: code.clone(),
+                        message: message.clone(),
+                        attempt_id: Some(attempt_id.clone()),
+                        extra,
+                    },
+                ));
+            }
+        }
+    }
+    Ok(actions)
+}
+
+/// Extract a typed boundary binding stored in a provider-attempt's extensible
+/// metadata.  Keeping this out of the fixed struct fields is intentional: old
+/// `compaction.started`/`checkpoint` rows remain deserializable and reserialise
+/// without inventing a new checkpoint protocol version.
+pub fn attempt_boundary(extra: &Map<String, Value>) -> Result<Option<CompactionBoundary>> {
+    let Some(value) = extra.get("boundary") else {
+        return Ok(None);
+    };
+    let boundary = serde_json::from_value(value.clone()).map_err(|error| {
+        OxidraError::Session(format!("invalid compaction boundary binding: {error}"))
+    })?;
+    validate_boundary_shape(&boundary)?;
+    Ok(Some(boundary))
+}
+
+fn validate_boundary_shape(boundary: &CompactionBoundary) -> Result<()> {
+    if boundary.version != COMPACTION_BOUNDARY_VERSION {
+        return session_error(format!(
+            "unsupported compaction boundary version {}",
+            boundary.version
+        ));
+    }
+    if boundary.boundary_id.trim().is_empty() {
+        return session_error("compaction boundary id cannot be empty".to_owned());
+    }
+    if boundary.turn_id.trim().is_empty() {
+        return session_error("compaction boundary turn id cannot be empty".to_owned());
+    }
+    if boundary.user_message_seq == 0 {
+        return session_error("compaction boundary user message seq cannot be zero".to_owned());
+    }
+    Ok(())
 }
 
 impl CompactionFailure {
@@ -479,6 +807,530 @@ pub fn validate_checkpoint_chain(events: &[JournalEvent]) -> Result<CheckpointCh
     Ok(chain)
 }
 
+/// Validate the durable request-boundary state machine used by automatic
+/// compaction.  This reducer is intentionally separate from
+/// `validate_checkpoint_chain`: a provider checkpoint can be valid while the
+/// user turn that requested it is still waiting for a normal response.
+///
+/// The reducer is fail-closed.  A boundary is pending until a checkpointed
+/// state is followed by a completed user turn, or until the caller records an
+/// explicit retry/abandon transition.  A later user message cannot silently
+/// resolve an older boundary.
+pub fn validate_compaction_boundary_chain(
+    events: &[JournalEvent],
+) -> Result<CompactionBoundaryChain> {
+    #[derive(Clone)]
+    struct Record {
+        boundary: CompactionBoundary,
+        started_seq: u64,
+        state: CompactionBoundaryState,
+        state_seq: u64,
+        checkpoint_id: Option<String>,
+        failed_code: Option<String>,
+    }
+
+    let checkpoint_chain = validate_checkpoint_chain(events)?;
+    let checkpoint_by_id = checkpoint_chain
+        .checkpoints()
+        .iter()
+        .map(|checkpoint| {
+            (
+                checkpoint.checkpoint_id.clone(),
+                (checkpoint.journal_seq, checkpoint.attempt_id.clone()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut attempt_terminal_by_id = HashMap::<String, (String, u64)>::new();
+    for event in events {
+        match event.kind.as_str() {
+            COMPACTION_CHECKPOINT_KIND => {
+                let checkpoint = parse_event_data::<Checkpoint>(event)?;
+                attempt_terminal_by_id.insert(
+                    checkpoint.attempt_id,
+                    (COMPACTION_CHECKPOINT_KIND.to_owned(), event.seq),
+                );
+            }
+            COMPACTION_FAILED_KIND | COMPACTION_ABORTED_KIND => {
+                let failure = parse_event_data::<CompactionFailure>(event)?;
+                attempt_terminal_by_id.insert(failure.attempt_id, (event.kind.clone(), event.seq));
+            }
+            _ => {}
+        }
+    }
+    let user_messages = events
+        .iter()
+        .filter(|event| event.kind == "user.message")
+        .filter_map(|event| {
+            event
+                .turn_id
+                .as_ref()
+                .map(|turn_id| (event.seq, turn_id.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+    let completion_seq_by_turn = events
+        .iter()
+        .filter(|event| {
+            event.kind == "turn.completed" || event.data.get("turn_completion").is_some()
+        })
+        .filter_map(|event| {
+            event
+                .turn_id
+                .as_ref()
+                .map(|turn_id| (turn_id.clone(), event.seq))
+        })
+        .fold(
+            HashMap::<String, u64>::new(),
+            |mut completions, (turn_id, seq)| {
+                completions
+                    .entry(turn_id)
+                    .and_modify(|current| *current = (*current).min(seq))
+                    .or_insert(seq);
+                completions
+            },
+        );
+
+    let mut records = Vec::<Record>::new();
+    let mut by_id = HashMap::<String, usize>::new();
+    let mut active_by_turn = HashMap::<String, usize>::new();
+    let mut attempt_boundary_by_id = HashMap::<String, CompactionBoundary>::new();
+    let mut attempt_by_boundary_id = HashMap::<String, String>::new();
+
+    for event in events {
+        if matches!(
+            event.kind.as_str(),
+            COMPACTION_BOUNDARY_STARTED_KIND
+                | COMPACTION_BOUNDARY_CHECKPOINTED_KIND
+                | COMPACTION_BOUNDARY_FAILED_KIND
+                | COMPACTION_BOUNDARY_RETRY_STARTED_KIND
+                | COMPACTION_BOUNDARY_ABANDONED_KIND
+        ) && event.turn_id.is_some()
+        {
+            return session_error(format!(
+                "{} at seq {} must be a global event; turn binding belongs in its payload",
+                event.kind, event.seq
+            ));
+        }
+
+        match event.kind.as_str() {
+            COMPACTION_BOUNDARY_STARTED_KIND => {
+                let payload = parse_event_data::<CompactionBoundaryStarted>(event)?;
+                validate_boundary_shape(&payload.boundary)?;
+                if payload.trigger.trim().is_empty() {
+                    return session_error(format!(
+                        "compaction boundary {} at seq {} has an empty trigger",
+                        payload.boundary.boundary_id, event.seq
+                    ));
+                }
+                if by_id.contains_key(&payload.boundary.boundary_id) {
+                    return session_error(format!(
+                        "duplicate compaction boundary {} at seq {}",
+                        payload.boundary.boundary_id, event.seq
+                    ));
+                }
+                validate_boundary_user_reference(
+                    &payload.boundary,
+                    event.seq,
+                    &user_messages,
+                    events,
+                )?;
+                if completion_seq_by_turn
+                    .get(&payload.boundary.turn_id)
+                    .is_some_and(|completion_seq| *completion_seq < event.seq)
+                {
+                    return session_error(format!(
+                        "compaction boundary {} starts after turn {} completed",
+                        payload.boundary.boundary_id, payload.boundary.turn_id
+                    ));
+                }
+                if let Some(previous) = active_by_turn.get(&payload.boundary.turn_id) {
+                    let previous = &records[*previous];
+                    if !matches!(
+                        previous.state,
+                        CompactionBoundaryState::Abandoned
+                            | CompactionBoundaryState::CompletedTurn
+                            | CompactionBoundaryState::Superseded
+                    ) {
+                        return session_error(format!(
+                            "turn {} has an unresolved compaction boundary {}",
+                            payload.boundary.turn_id, previous.boundary.boundary_id
+                        ));
+                    }
+                }
+                let index = records.len();
+                records.push(Record {
+                    boundary: payload.boundary.clone(),
+                    started_seq: event.seq,
+                    state: CompactionBoundaryState::Started,
+                    state_seq: event.seq,
+                    checkpoint_id: None,
+                    failed_code: None,
+                });
+                by_id.insert(payload.boundary.boundary_id.clone(), index);
+                active_by_turn.insert(payload.boundary.turn_id, index);
+            }
+            COMPACTION_STARTED_KIND => {
+                let payload = parse_event_data::<CompactionStarted>(event)?;
+                let Some(boundary) = attempt_boundary(&payload.extra)? else {
+                    continue;
+                };
+                let index = *by_id.get(&boundary.boundary_id).ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "compaction attempt {} at seq {} references unknown boundary {}",
+                        payload.attempt_id, event.seq, boundary.boundary_id
+                    ))
+                })?;
+                let record = &records[index];
+                if record.boundary != boundary || record.started_seq >= event.seq {
+                    return session_error(format!(
+                        "compaction attempt {} does not match its request boundary",
+                        payload.attempt_id
+                    ));
+                }
+                if let Some(previous) = attempt_by_boundary_id
+                    .insert(boundary.boundary_id.clone(), payload.attempt_id.clone())
+                {
+                    return session_error(format!(
+                        "compaction boundary {} has more than one provider attempt ({previous}, {})",
+                        boundary.boundary_id, payload.attempt_id
+                    ));
+                }
+                attempt_boundary_by_id.insert(payload.attempt_id, boundary);
+            }
+            COMPACTION_BOUNDARY_CHECKPOINTED_KIND => {
+                let payload = parse_event_data::<CompactionBoundaryCheckpointed>(event)?;
+                let index = *by_id.get(&payload.boundary_id).ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "boundary checkpoint at seq {} references unknown boundary {}",
+                        event.seq, payload.boundary_id
+                    ))
+                })?;
+                let record = &mut records[index];
+                if matches!(
+                    record.state,
+                    CompactionBoundaryState::Abandoned
+                        | CompactionBoundaryState::CompletedTurn
+                        | CompactionBoundaryState::Superseded
+                ) {
+                    return session_error(format!(
+                        "compaction boundary {} is already resolved",
+                        payload.boundary_id
+                    ));
+                }
+                if record.state == CompactionBoundaryState::Checkpointed {
+                    return session_error(format!(
+                        "compaction boundary {} has more than one checkpointed event",
+                        payload.boundary_id
+                    ));
+                }
+                if record.state == CompactionBoundaryState::Failed {
+                    return session_error(format!(
+                        "failed compaction boundary {} cannot later commit a checkpoint",
+                        payload.boundary_id
+                    ));
+                }
+                if payload.checkpoint_id.trim().is_empty() || payload.checkpoint_seq == 0 {
+                    return session_error(format!(
+                        "boundary checkpoint at seq {} has incomplete checkpoint reference",
+                        event.seq
+                    ));
+                }
+                let Some((actual_checkpoint_seq, attempt_id)) =
+                    checkpoint_by_id.get(&payload.checkpoint_id)
+                else {
+                    return session_error(format!(
+                        "boundary checkpoint at seq {} references unknown checkpoint {}",
+                        event.seq, payload.checkpoint_id
+                    ));
+                };
+                if *actual_checkpoint_seq != payload.checkpoint_seq
+                    || *actual_checkpoint_seq <= record.started_seq
+                    || *actual_checkpoint_seq >= event.seq
+                {
+                    return session_error(format!(
+                        "boundary checkpoint {} at seq {} has invalid checkpoint ordering",
+                        payload.checkpoint_id, event.seq
+                    ));
+                }
+                if attempt_boundary_by_id.get(attempt_id) != Some(&record.boundary) {
+                    return session_error(format!(
+                        "checkpoint {} is not bound to compaction boundary {}",
+                        payload.checkpoint_id, payload.boundary_id
+                    ));
+                }
+                record.state = CompactionBoundaryState::Checkpointed;
+                record.state_seq = event.seq;
+                record.checkpoint_id = Some(payload.checkpoint_id);
+            }
+            COMPACTION_BOUNDARY_FAILED_KIND => {
+                let payload = parse_event_data::<CompactionBoundaryFailed>(event)?;
+                let index = *by_id.get(&payload.boundary_id).ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "boundary failure at seq {} references unknown boundary {}",
+                        event.seq, payload.boundary_id
+                    ))
+                })?;
+                let record = &mut records[index];
+                if matches!(
+                    record.state,
+                    CompactionBoundaryState::Abandoned
+                        | CompactionBoundaryState::CompletedTurn
+                        | CompactionBoundaryState::Superseded
+                ) {
+                    return session_error(format!(
+                        "compaction boundary {} is already resolved",
+                        payload.boundary_id
+                    ));
+                }
+                if record.state == CompactionBoundaryState::Failed {
+                    return session_error(format!(
+                        "compaction boundary {} has more than one failure event",
+                        payload.boundary_id
+                    ));
+                }
+                if record.state == CompactionBoundaryState::Checkpointed {
+                    return session_error(format!(
+                        "checkpointed compaction boundary {} cannot later fail",
+                        payload.boundary_id
+                    ));
+                }
+                if payload.code.trim().is_empty() || payload.message.trim().is_empty() {
+                    return session_error(format!(
+                        "boundary failure at seq {} has an empty code or message",
+                        event.seq
+                    ));
+                }
+                if let Some(attempt_id) = payload.attempt_id.as_deref() {
+                    if attempt_boundary_by_id.get(attempt_id) != Some(&record.boundary) {
+                        return session_error(format!(
+                            "boundary failure at seq {} references an attempt from another boundary",
+                            event.seq
+                        ));
+                    }
+                    let Some((terminal_kind, terminal_seq)) =
+                        attempt_terminal_by_id.get(attempt_id)
+                    else {
+                        return session_error(format!(
+                            "boundary failure at seq {} references unterminated attempt {attempt_id}",
+                            event.seq
+                        ));
+                    };
+                    if !matches!(
+                        terminal_kind.as_str(),
+                        COMPACTION_FAILED_KIND | COMPACTION_ABORTED_KIND
+                    ) || *terminal_seq >= event.seq
+                    {
+                        return session_error(format!(
+                            "boundary failure at seq {} does not follow a failed compaction attempt",
+                            event.seq
+                        ));
+                    }
+                }
+                if event.seq <= record.started_seq {
+                    return session_error(format!(
+                        "boundary failure at seq {} precedes its start",
+                        event.seq
+                    ));
+                }
+                record.state = CompactionBoundaryState::Failed;
+                record.state_seq = event.seq;
+                record.failed_code = Some(payload.code);
+            }
+            COMPACTION_BOUNDARY_ABANDONED_KIND => {
+                let payload = parse_event_data::<CompactionBoundaryAbandoned>(event)?;
+                let index = *by_id.get(&payload.boundary_id).ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "boundary abandon at seq {} references unknown boundary {}",
+                        event.seq, payload.boundary_id
+                    ))
+                })?;
+                let record = &mut records[index];
+                if matches!(
+                    record.state,
+                    CompactionBoundaryState::Abandoned
+                        | CompactionBoundaryState::CompletedTurn
+                        | CompactionBoundaryState::Superseded
+                ) {
+                    return session_error(format!(
+                        "compaction boundary {} is already resolved",
+                        payload.boundary_id
+                    ));
+                }
+                if payload.turn_id != record.boundary.turn_id
+                    || payload.user_message_seq != record.boundary.user_message_seq
+                    || payload.reason.trim().is_empty()
+                {
+                    return session_error(format!(
+                        "boundary abandon at seq {} does not match its start",
+                        event.seq
+                    ));
+                }
+                if completion_seq_by_turn
+                    .get(&payload.turn_id)
+                    .is_some_and(|completion_seq| *completion_seq < event.seq)
+                {
+                    return session_error(format!(
+                        "boundary abandon at seq {} targets a completed turn",
+                        event.seq
+                    ));
+                }
+                record.state = CompactionBoundaryState::Abandoned;
+                record.state_seq = event.seq;
+            }
+            COMPACTION_BOUNDARY_RETRY_STARTED_KIND => {
+                let payload = parse_event_data::<CompactionBoundaryRetryStarted>(event)?;
+                validate_boundary_shape(&payload.boundary)?;
+                if payload.retry_id.trim().is_empty() {
+                    return session_error(format!(
+                        "boundary retry at seq {} has an empty retry id",
+                        event.seq
+                    ));
+                }
+                if by_id.contains_key(&payload.boundary.boundary_id) {
+                    return session_error(format!(
+                        "duplicate retried compaction boundary {} at seq {}",
+                        payload.boundary.boundary_id, event.seq
+                    ));
+                }
+                let previous_index =
+                    *by_id.get(&payload.previous_boundary_id).ok_or_else(|| {
+                        OxidraError::Session(format!(
+                            "boundary retry at seq {} references unknown boundary {}",
+                            event.seq, payload.previous_boundary_id
+                        ))
+                    })?;
+                let previous = &mut records[previous_index];
+                if previous.state != CompactionBoundaryState::Failed {
+                    return session_error(format!(
+                        "boundary retry at seq {} does not reference a failed boundary",
+                        event.seq
+                    ));
+                }
+                if previous.boundary.turn_id != payload.boundary.turn_id
+                    || previous.boundary.user_message_seq != payload.boundary.user_message_seq
+                {
+                    return session_error(format!(
+                        "boundary retry at seq {} changes the user turn",
+                        event.seq
+                    ));
+                }
+                validate_boundary_user_reference(
+                    &payload.boundary,
+                    event.seq,
+                    &user_messages,
+                    events,
+                )?;
+                if completion_seq_by_turn
+                    .get(&payload.boundary.turn_id)
+                    .is_some_and(|completion_seq| *completion_seq < event.seq)
+                {
+                    return session_error(format!(
+                        "boundary retry at seq {} targets a completed turn",
+                        event.seq
+                    ));
+                }
+                previous.state = CompactionBoundaryState::Superseded;
+                previous.state_seq = event.seq;
+                let index = records.len();
+                records.push(Record {
+                    boundary: payload.boundary.clone(),
+                    started_seq: event.seq,
+                    state: CompactionBoundaryState::Started,
+                    state_seq: event.seq,
+                    checkpoint_id: None,
+                    failed_code: None,
+                });
+                by_id.insert(payload.boundary.boundary_id.clone(), index);
+                active_by_turn.insert(payload.boundary.turn_id, index);
+            }
+            _ => {}
+        }
+
+        // A successful normal turn resolves the newest active boundary for
+        // that turn.  This is deliberately evaluated after the event-specific
+        // branch so a boundary event cannot be retroactively resolved by an
+        // earlier completion marker.
+        if event.kind == "turn.completed" || event.data.get("turn_completion").is_some() {
+            if let Some(turn_id) = event.turn_id.as_deref() {
+                if let Some(index) = active_by_turn.get(turn_id).copied() {
+                    let record = &mut records[index];
+                    if matches!(
+                        record.state,
+                        CompactionBoundaryState::Started | CompactionBoundaryState::Checkpointed
+                    ) {
+                        record.state = CompactionBoundaryState::CompletedTurn;
+                        record.state_seq = event.seq;
+                    }
+                }
+            }
+        }
+    }
+
+    let boundaries = records
+        .into_iter()
+        .map(|record| ValidatedCompactionBoundary {
+            boundary: record.boundary,
+            started_seq: record.started_seq,
+            state: record.state,
+            state_seq: record.state_seq,
+            checkpoint_id: record.checkpoint_id,
+            failed_code: record.failed_code,
+        })
+        .collect::<Vec<_>>();
+    for boundary in boundaries.iter().filter(|boundary| {
+        !matches!(
+            boundary.state,
+            CompactionBoundaryState::Started
+                | CompactionBoundaryState::Checkpointed
+                | CompactionBoundaryState::Failed
+        )
+    }) {
+        if let Some(later_user) = events.iter().find(|event| {
+            event.kind == "user.message"
+                && event.seq > boundary.started_seq
+                && event.turn_id.as_deref() != Some(boundary.boundary.turn_id.as_str())
+        }) {
+            return session_error(format!(
+                "pending compaction boundary {} is followed by user.message at seq {} without retry or abandon",
+                boundary.boundary.boundary_id, later_user.seq
+            ));
+        }
+    }
+
+    Ok(CompactionBoundaryChain { boundaries })
+}
+
+fn validate_boundary_user_reference(
+    boundary: &CompactionBoundary,
+    event_seq: u64,
+    user_messages: &HashMap<u64, &str>,
+    events: &[JournalEvent],
+) -> Result<()> {
+    let Some(turn_id) = user_messages.get(&boundary.user_message_seq) else {
+        return session_error(format!(
+            "compaction boundary {} at seq {} references missing user.message seq {}",
+            boundary.boundary_id, event_seq, boundary.user_message_seq
+        ));
+    };
+    if *turn_id != boundary.turn_id || boundary.user_message_seq >= event_seq {
+        return session_error(format!(
+            "compaction boundary {} has invalid user.message ordering or turn binding",
+            boundary.boundary_id
+        ));
+    }
+    if events.iter().any(|event| {
+        event.seq > boundary.user_message_seq
+            && event.seq < event_seq
+            && event.turn_id.as_deref() == Some(boundary.turn_id.as_str())
+            && event.kind == "user.message"
+    }) {
+        return session_error(format!(
+            "compaction boundary {} follows a second user.message for the same turn",
+            boundary.boundary_id
+        ));
+    }
+    Ok(())
+}
+
 /// Construct the exact source input for a proposed checkpoint cutoff.
 pub fn build_compaction_source(
     events: &[JournalEvent],
@@ -690,17 +1542,103 @@ pub async fn compact_once<F>(
 where
     F: FnOnce(&str) -> Result<()>,
 {
+    compact_once_impl(
+        provider,
+        journal,
+        candidate,
+        model,
+        None,
+        observer,
+        cancellation,
+        validate_summary_before_commit,
+    )
+    .await
+}
+
+/// Run one compaction attempt owned by a durable request boundary.
+///
+/// Unlike [`compact_once`], every successful or failed return is paired with
+/// a boundary transition whenever the journal remains writable.  Crashes in
+/// the two unavoidable gaps (attempt terminal -> boundary failure and
+/// checkpoint -> boundary checkpointed) are repaired by session-open
+/// recovery from the already durable lower-level event.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_once_for_boundary<F>(
+    provider: &dyn ResponseProvider,
+    journal: &mut SessionJournal,
+    boundary: &CompactionBoundary,
+    candidate: &CompactionCandidate,
+    model: &str,
+    observer: &mut dyn StreamObserver,
+    cancellation: CancellationToken,
+    validate_summary_before_commit: F,
+) -> Result<Checkpoint>
+where
+    F: FnOnce(&str) -> Result<()>,
+{
+    compact_once_impl(
+        provider,
+        journal,
+        candidate,
+        model,
+        Some(boundary),
+        observer,
+        cancellation,
+        validate_summary_before_commit,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compact_once_impl<F>(
+    provider: &dyn ResponseProvider,
+    journal: &mut SessionJournal,
+    candidate: &CompactionCandidate,
+    model: &str,
+    boundary: Option<&CompactionBoundary>,
+    observer: &mut dyn StreamObserver,
+    cancellation: CancellationToken,
+    validate_summary_before_commit: F,
+) -> Result<Checkpoint>
+where
+    F: FnOnce(&str) -> Result<()>,
+{
+    let events = journal.read_events()?;
+    if let Some(boundary) = boundary {
+        validate_boundary_dispatch(&events, boundary)?;
+    }
     if model.trim().is_empty() {
-        return Err(OxidraError::Config(
-            "compaction model cannot be empty".to_owned(),
-        ));
+        let error = OxidraError::Config("compaction model cannot be empty".to_owned());
+        append_boundary_failure_if_bound(
+            journal,
+            boundary,
+            None,
+            "invalid_model",
+            &error.to_string(),
+        )?;
+        return Err(error);
     }
     if cancellation.is_cancelled() {
+        append_boundary_failure_if_bound(
+            journal,
+            boundary,
+            None,
+            "cancelled",
+            "compaction was cancelled before candidate validation",
+        )?;
         return Err(OxidraError::Interrupted);
     }
 
-    let events = journal.read_events()?;
-    validate_dispatch_candidate(&events, candidate)?;
+    if let Err(error) = validate_dispatch_candidate(&events, candidate) {
+        append_boundary_failure_if_bound(
+            journal,
+            boundary,
+            None,
+            "invalid_candidate",
+            &error.to_string(),
+        )?;
+        return Err(error);
+    }
 
     let attempt_id = Uuid::now_v7().to_string();
     let mut extra = Map::new();
@@ -712,6 +1650,9 @@ where
         "newly_compacted_complete_turns".to_owned(),
         json!(candidate.newly_compacted_complete_turns),
     );
+    if let Some(boundary) = boundary {
+        extra.insert("boundary".to_owned(), serde_json::to_value(boundary)?);
+    }
     let started = CompactionStarted {
         attempt_id: attempt_id.clone(),
         parent_checkpoint_id: candidate.parent_checkpoint_id.clone(),
@@ -742,14 +1683,22 @@ where
     )?;
 
     if cancellation.is_cancelled() {
+        let message = "compaction was cancelled before the Provider request";
         append_compaction_terminal(
             journal,
             COMPACTION_ABORTED_KIND,
             &attempt_id,
             started_event.seq,
             "cancelled",
-            "compaction was cancelled before the Provider request",
+            message,
             Map::new(),
+        )?;
+        append_boundary_failure_if_bound(
+            journal,
+            boundary,
+            Some(&attempt_id),
+            "cancelled",
+            message,
         )?;
         return Err(OxidraError::Interrupted);
     }
@@ -801,19 +1750,34 @@ where
                 &error.to_string(),
                 Map::new(),
             )?;
+            append_boundary_failure_if_bound(
+                journal,
+                boundary,
+                Some(&attempt_id),
+                code,
+                &error.to_string(),
+            )?;
             return Err(error);
         }
     };
 
     if cancellation.is_cancelled() {
+        let message = "compaction was cancelled before checkpoint validation";
         append_compaction_terminal(
             journal,
             COMPACTION_ABORTED_KIND,
             &attempt_id,
             started_event.seq,
             "cancelled",
-            "compaction was cancelled before checkpoint validation",
+            message,
             compaction_response_audit(&turn, duration_ms),
+        )?;
+        append_boundary_failure_if_bound(
+            journal,
+            boundary,
+            Some(&attempt_id),
+            "cancelled",
+            message,
         )?;
         return Err(OxidraError::Interrupted);
     }
@@ -830,6 +1794,13 @@ where
                 &error.to_string(),
                 compaction_response_audit(&turn, duration_ms),
             )?;
+            append_boundary_failure_if_bound(
+                journal,
+                boundary,
+                Some(&attempt_id),
+                "invalid_response",
+                &error.to_string(),
+            )?;
             return Err(error);
         }
     };
@@ -843,17 +1814,32 @@ where
             &error.to_string(),
             compaction_response_audit(&turn, duration_ms),
         )?;
+        append_boundary_failure_if_bound(
+            journal,
+            boundary,
+            Some(&attempt_id),
+            "post_validation_failed",
+            &error.to_string(),
+        )?;
         return Err(error);
     }
     if cancellation.is_cancelled() {
+        let message = "compaction was cancelled before checkpoint commit";
         append_compaction_terminal(
             journal,
             COMPACTION_ABORTED_KIND,
             &attempt_id,
             started_event.seq,
             "cancelled",
-            "compaction was cancelled before checkpoint commit",
+            message,
             compaction_response_audit(&turn, duration_ms),
+        )?;
+        append_boundary_failure_if_bound(
+            journal,
+            boundary,
+            Some(&attempt_id),
+            "cancelled",
+            message,
         )?;
         return Err(OxidraError::Interrupted);
     }
@@ -884,6 +1870,18 @@ where
         serde_json::to_value(&checkpoint)?,
     )?;
     checkpoint.journal_seq = checkpoint_event.seq;
+    if let Some(boundary) = boundary {
+        journal.append_and_sync(
+            COMPACTION_BOUNDARY_CHECKPOINTED_KIND,
+            None,
+            serde_json::to_value(CompactionBoundaryCheckpointed {
+                boundary_id: boundary.boundary_id.clone(),
+                checkpoint_id: checkpoint.checkpoint_id.clone(),
+                checkpoint_seq: checkpoint_event.seq,
+                extra: Map::new(),
+            })?,
+        )?;
+    }
     Ok(checkpoint)
 }
 
@@ -895,6 +1893,63 @@ impl StreamObserver for CompactionObserver<'_> {
     fn on_event(&mut self, event: crate::provider::ProviderEvent) -> Result<()> {
         self.observer.on_event(event).map_err(OxidraError::observer)
     }
+}
+
+fn validate_boundary_dispatch(
+    events: &[JournalEvent],
+    boundary: &CompactionBoundary,
+) -> Result<()> {
+    validate_boundary_shape(boundary)?;
+    let chain = validate_compaction_boundary_chain(events)?;
+    let Some(pending) = chain.latest_pending() else {
+        return session_error(format!(
+            "compaction boundary {} is not pending",
+            boundary.boundary_id
+        ));
+    };
+    if pending.boundary != *boundary || pending.state != CompactionBoundaryState::Started {
+        return session_error(format!(
+            "compaction boundary {} is not the current unattempted boundary",
+            boundary.boundary_id
+        ));
+    }
+    for event in events
+        .iter()
+        .filter(|event| event.kind == COMPACTION_STARTED_KIND)
+    {
+        let started = parse_event_data::<CompactionStarted>(event)?;
+        if attempt_boundary(&started.extra)?.as_ref() == Some(boundary) {
+            return session_error(format!(
+                "compaction boundary {} already has provider attempt {}",
+                boundary.boundary_id, started.attempt_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn append_boundary_failure_if_bound(
+    journal: &mut SessionJournal,
+    boundary: Option<&CompactionBoundary>,
+    attempt_id: Option<&str>,
+    code: &str,
+    message: &str,
+) -> Result<()> {
+    let Some(boundary) = boundary else {
+        return Ok(());
+    };
+    journal.append_and_sync(
+        COMPACTION_BOUNDARY_FAILED_KIND,
+        None,
+        serde_json::to_value(CompactionBoundaryFailed {
+            boundary_id: boundary.boundary_id.clone(),
+            code: code.to_owned(),
+            message: message.to_owned(),
+            attempt_id: attempt_id.map(str::to_owned),
+            extra: Map::new(),
+        })?,
+    )?;
+    Ok(())
 }
 
 fn validate_dispatch_candidate(
@@ -1137,6 +2192,7 @@ fn validate_checkpoint_link(
 }
 
 fn validate_started_protocol(started: &CompactionStarted) -> Result<()> {
+    attempt_boundary(&started.extra)?;
     let expected_instructions =
         compaction_instructions(started.prompt_version).ok_or_else(|| {
             OxidraError::Session(format!(
@@ -1647,6 +2703,37 @@ mod tests {
             .collect()
     }
 
+    fn open_user(seq: u64, turn_id: &str, prompt: &str) -> JournalEvent {
+        event(
+            seq,
+            Some(turn_id),
+            "user.message",
+            json!({
+                "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                "item": {"role": "user", "content": prompt},
+            }),
+        )
+    }
+
+    fn boundary_started(
+        seq: u64,
+        boundary_id: &str,
+        turn_id: &str,
+        user_message_seq: u64,
+    ) -> JournalEvent {
+        event(
+            seq,
+            None,
+            COMPACTION_BOUNDARY_STARTED_KIND,
+            serde_json::to_value(CompactionBoundaryStarted {
+                boundary: CompactionBoundary::new(boundary_id, turn_id, user_message_seq),
+                trigger: "context_trigger".to_owned(),
+                extra: Map::new(),
+            })
+            .expect("serialize boundary start"),
+        )
+    }
+
     fn compaction_journal() -> (tempfile::TempDir, SessionJournal, CompactionCandidate) {
         let temp = tempfile::tempdir().expect("create compaction data directory");
         let project = temp.path().join("project");
@@ -1691,6 +2778,44 @@ mod tests {
             panic!("expected an eligible compaction candidate")
         };
         (temp, journal, candidate)
+    }
+
+    fn append_test_compaction_boundary(journal: &mut SessionJournal) -> CompactionBoundary {
+        let user = journal
+            .append_and_sync(
+                "user.message",
+                Some("boundary-turn"),
+                json!({
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                    "item": {"role": "user", "content": "continue after compaction"},
+                }),
+            )
+            .expect("append boundary user message");
+        let boundary = CompactionBoundary::new("boundary-test", "boundary-turn", user.seq);
+        journal
+            .append_and_sync(
+                COMPACTION_BOUNDARY_STARTED_KIND,
+                None,
+                serde_json::to_value(CompactionBoundaryStarted {
+                    boundary: boundary.clone(),
+                    trigger: "context_trigger".to_owned(),
+                    extra: Map::new(),
+                })
+                .expect("serialize boundary start"),
+            )
+            .expect("append boundary start");
+        boundary
+    }
+
+    fn remove_last_journal_event(path: &std::path::Path) {
+        let mut bytes = std::fs::read(path).expect("read journal for crash simulation");
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        let previous_newline = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .expect("journal retains at least one earlier event");
+        bytes.truncate(previous_newline + 1);
+        std::fs::write(path, bytes).expect("remove final synced event");
     }
 
     fn append_completed_turn_to_journal(
@@ -1845,6 +2970,210 @@ mod tests {
         assert_eq!(
             chain.latest().expect("latest checkpoint").checkpoint_id,
             checkpoint.checkpoint_id
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_compaction_commits_attempt_and_boundary_checkpoint_together() {
+        let (_temp, mut journal, candidate) = compaction_journal();
+        let boundary = append_test_compaction_boundary(&mut journal);
+        let provider = RecordingCompactionProvider::new(20);
+        let checkpoint = compact_once_for_boundary(
+            &provider,
+            &mut journal,
+            &boundary,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .expect("commit boundary-owned checkpoint");
+
+        let events = journal.read_events().unwrap();
+        let started = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_STARTED_KIND)
+            .unwrap();
+        assert_eq!(started.data["boundary"]["boundary_id"], "boundary-test");
+        let checkpointed = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_BOUNDARY_CHECKPOINTED_KIND)
+            .unwrap();
+        assert_eq!(checkpointed.data["checkpoint_id"], checkpoint.checkpoint_id);
+        assert_eq!(checkpointed.data["checkpoint_seq"], checkpoint.journal_seq);
+        assert_eq!(
+            validate_compaction_boundary_chain(&events)
+                .unwrap()
+                .latest_pending()
+                .unwrap()
+                .state,
+            CompactionBoundaryState::Checkpointed
+        );
+        assert!(
+            compaction_boundary_recovery_actions(&events)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn bound_compaction_failure_is_durable_and_not_automatically_retried() {
+        let (_temp, mut journal, candidate) = compaction_journal();
+        let boundary = append_test_compaction_boundary(&mut journal);
+        let provider = RecordingCompactionProvider::new(20);
+        let error = compact_once_for_boundary(
+            &provider,
+            &mut journal,
+            &boundary,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Err(OxidraError::ContextLimit),
+        )
+        .await
+        .expect_err("post-validation failure must fail its request boundary");
+        assert!(matches!(error, OxidraError::ContextLimit));
+
+        let events = journal.read_events().unwrap();
+        let failed_attempt = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_FAILED_KIND)
+            .unwrap();
+        let failed_boundary = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_BOUNDARY_FAILED_KIND)
+            .unwrap();
+        assert_eq!(failed_boundary.data["code"], "post_validation_failed");
+        assert_eq!(
+            failed_boundary.data["attempt_id"],
+            failed_attempt.data["attempt_id"]
+        );
+        assert_eq!(
+            validate_compaction_boundary_chain(&events)
+                .unwrap()
+                .latest_pending()
+                .unwrap()
+                .state,
+            CompactionBoundaryState::Failed
+        );
+        assert!(
+            compaction_boundary_recovery_actions(&events)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_open_recovers_checkpoint_synced_before_boundary_marker() {
+        let (temp, mut journal, candidate) = compaction_journal();
+        let boundary = append_test_compaction_boundary(&mut journal);
+        let provider = RecordingCompactionProvider::new(20);
+        let checkpoint = compact_once_for_boundary(
+            &provider,
+            &mut journal,
+            &boundary,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        let path = journal.journal_path().to_owned();
+        drop(journal);
+        remove_last_journal_event(&path);
+
+        let store = SessionStore::new(temp.path()).unwrap();
+        let recovered = store.open("compact-once-test").unwrap();
+        assert_eq!(
+            recovered.recovery_info().checkpointed_compaction_boundaries,
+            1
+        );
+        let events = recovered.read_events().unwrap();
+        let checkpointed = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_BOUNDARY_CHECKPOINTED_KIND)
+            .unwrap();
+        assert_eq!(checkpointed.data["checkpoint_id"], checkpoint.checkpoint_id);
+        assert_eq!(checkpointed.data["checkpoint_seq"], checkpoint.journal_seq);
+        assert_eq!(checkpointed.data["recovered"], true);
+        assert_eq!(
+            validate_compaction_boundary_chain(&events)
+                .unwrap()
+                .latest_pending()
+                .unwrap()
+                .state,
+            CompactionBoundaryState::Checkpointed
+        );
+        drop(recovered);
+
+        let reopened = store.open("compact-once-test").unwrap();
+        assert_eq!(
+            reopened
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == COMPACTION_BOUNDARY_CHECKPOINTED_KIND)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn session_open_recovers_attempt_terminal_before_boundary_failure() {
+        let (temp, mut journal, candidate) = compaction_journal();
+        let boundary = append_test_compaction_boundary(&mut journal);
+        let provider = RecordingCompactionProvider::new(20);
+        compact_once_for_boundary(
+            &provider,
+            &mut journal,
+            &boundary,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Err(OxidraError::ContextLimit),
+        )
+        .await
+        .expect_err("test leaves a failed provider attempt");
+        let path = journal.journal_path().to_owned();
+        drop(journal);
+        remove_last_journal_event(&path);
+
+        let store = SessionStore::new(temp.path()).unwrap();
+        let recovered = store.open("compact-once-test").unwrap();
+        assert_eq!(recovered.recovery_info().failed_compaction_boundaries, 1);
+        assert_eq!(recovered.recovery_info().aborted_compactions, 0);
+        let events = recovered.read_events().unwrap();
+        let failed = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_BOUNDARY_FAILED_KIND)
+            .unwrap();
+        assert_eq!(failed.data["code"], "post_validation_failed");
+        assert_eq!(failed.data["recovered"], true);
+        assert_eq!(
+            failed.data["attempt_id"],
+            events
+                .iter()
+                .find(|event| event.kind == COMPACTION_FAILED_KIND)
+                .unwrap()
+                .data["attempt_id"]
+        );
+        drop(recovered);
+
+        let reopened = store.open("compact-once-test").unwrap();
+        assert_eq!(
+            reopened
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == COMPACTION_BOUNDARY_FAILED_KIND)
+                .count(),
+            1
         );
     }
 
@@ -3455,5 +4784,280 @@ mod tests {
         };
         assert_eq!(selected.covers_through_seq, 3);
         assert!(selected.covers_through_seq < events[9].seq);
+    }
+
+    #[test]
+    fn compaction_boundary_failure_retry_and_abandon_are_explicit() {
+        let mut events = vec![open_user(1, "turn-1", "keep this prompt")];
+        events.push(boundary_started(2, "boundary-1", "turn-1", 1));
+        events.push(event(
+            3,
+            None,
+            COMPACTION_BOUNDARY_FAILED_KIND,
+            serde_json::to_value(CompactionBoundaryFailed {
+                boundary_id: "boundary-1".to_owned(),
+                code: "no_candidate".to_owned(),
+                message: "no safe complete prefix".to_owned(),
+                attempt_id: None,
+                extra: Map::new(),
+            })
+            .unwrap(),
+        ));
+
+        let failed = validate_compaction_boundary_chain(&events).unwrap();
+        assert_eq!(failed.pending().len(), 1);
+        assert_eq!(
+            failed.latest_pending().unwrap().state,
+            CompactionBoundaryState::Failed
+        );
+
+        events.push(event(
+            4,
+            None,
+            COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+            serde_json::to_value(CompactionBoundaryRetryStarted {
+                retry_id: "retry-1".to_owned(),
+                previous_boundary_id: "boundary-1".to_owned(),
+                boundary: CompactionBoundary::new("boundary-2", "turn-1", 1),
+                extra: Map::new(),
+            })
+            .unwrap(),
+        ));
+        let retried = validate_compaction_boundary_chain(&events).unwrap();
+        assert_eq!(retried.pending().len(), 1);
+        assert_eq!(
+            retried.latest_pending().unwrap().boundary.boundary_id,
+            "boundary-2"
+        );
+        assert_eq!(
+            retried.boundaries()[0].state,
+            CompactionBoundaryState::Superseded
+        );
+
+        events.push(event(
+            5,
+            None,
+            COMPACTION_BOUNDARY_ABANDONED_KIND,
+            serde_json::to_value(CompactionBoundaryAbandoned {
+                boundary_id: "boundary-2".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                user_message_seq: 1,
+                reason: "explicit user abandon".to_owned(),
+                extra: Map::new(),
+            })
+            .unwrap(),
+        ));
+        let abandoned = validate_compaction_boundary_chain(&events).unwrap();
+        assert!(abandoned.pending().is_empty());
+        assert_eq!(
+            abandoned.boundaries()[1].state,
+            CompactionBoundaryState::Abandoned
+        );
+    }
+
+    #[test]
+    fn boundary_recovery_converts_a_settled_failed_attempt_into_boundary_failure() {
+        let mut events = completed_turns(3);
+        events.push(open_user(10, "turn-4", "current prompt"));
+        let boundary = CompactionBoundary::new("boundary-1", "turn-4", 10);
+        events.push(boundary_started(11, "boundary-1", "turn-4", 10));
+        append_checkpoint_attempt(
+            &mut events,
+            None,
+            3,
+            "attempt-1",
+            "discarded-checkpoint",
+            "discarded summary",
+        );
+        let checkpoint = events.pop().expect("remove synthetic checkpoint");
+        assert_eq!(checkpoint.kind, COMPACTION_CHECKPOINT_KIND);
+        let started = events.last_mut().expect("compaction.started remains");
+        assert_eq!(started.kind, COMPACTION_STARTED_KIND);
+        started.data["boundary"] = serde_json::to_value(&boundary).unwrap();
+        events.push(event(
+            checkpoint.seq,
+            None,
+            COMPACTION_ABORTED_KIND,
+            serde_json::to_value(CompactionFailure::new(
+                "attempt-1",
+                "interrupted",
+                "provider attempt was interrupted",
+            ))
+            .unwrap(),
+        ));
+
+        let actions = compaction_boundary_recovery_actions(&events).unwrap();
+        assert_eq!(actions.len(), 1);
+        let CompactionBoundaryRecoveryAction::Failed(failed) = &actions[0] else {
+            panic!("expected recovered boundary failure")
+        };
+        assert_eq!(failed.boundary_id, "boundary-1");
+        assert_eq!(failed.attempt_id.as_deref(), Some("attempt-1"));
+        assert_eq!(failed.code, "interrupted");
+        assert_eq!(failed.extra["recovered"], true);
+        assert_eq!(failed.extra["attempt_terminal_seq"], checkpoint.seq);
+    }
+
+    #[test]
+    fn boundary_recovery_preserves_a_durable_checkpoint() {
+        let mut events = completed_turns(3);
+        events.push(open_user(10, "turn-4", "current prompt"));
+        let boundary = CompactionBoundary::new("boundary-1", "turn-4", 10);
+        events.push(boundary_started(11, "boundary-1", "turn-4", 10));
+        append_checkpoint_attempt(
+            &mut events,
+            None,
+            3,
+            "attempt-1",
+            "checkpoint-1",
+            "durable summary",
+        );
+        let started = events
+            .iter_mut()
+            .find(|event| event.kind == COMPACTION_STARTED_KIND)
+            .expect("compaction.started");
+        started.data["boundary"] = serde_json::to_value(&boundary).unwrap();
+
+        let actions = compaction_boundary_recovery_actions(&events).unwrap();
+        assert_eq!(actions.len(), 1);
+        let CompactionBoundaryRecoveryAction::Checkpointed(checkpointed) = &actions[0] else {
+            panic!("expected recovered checkpoint boundary")
+        };
+        assert_eq!(checkpointed.boundary_id, "boundary-1");
+        assert_eq!(checkpointed.checkpoint_id, "checkpoint-1");
+        assert_eq!(checkpointed.checkpoint_seq, 13);
+        assert_eq!(checkpointed.extra["recovered"], true);
+
+        events.push(event(
+            14,
+            None,
+            COMPACTION_BOUNDARY_CHECKPOINTED_KIND,
+            serde_json::to_value(checkpointed).unwrap(),
+        ));
+        assert!(
+            compaction_boundary_recovery_actions(&events)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            validate_compaction_boundary_chain(&events)
+                .unwrap()
+                .latest_pending()
+                .unwrap()
+                .state,
+            CompactionBoundaryState::Checkpointed
+        );
+    }
+
+    #[test]
+    fn checkpointed_boundary_remains_pending_until_the_user_turn_completes() {
+        let mut events = completed_turns(3);
+        events.push(open_user(10, "turn-4", "current prompt"));
+        let boundary = CompactionBoundary::new("boundary-1", "turn-4", 10);
+        events.push(boundary_started(11, "boundary-1", "turn-4", 10));
+        append_checkpoint_attempt(&mut events, None, 3, "attempt-1", "checkpoint-1", "summary");
+        let started = events
+            .iter_mut()
+            .find(|event| {
+                event.kind == COMPACTION_STARTED_KIND && event.data["attempt_id"] == "attempt-1"
+            })
+            .unwrap();
+        started.data["boundary"] = serde_json::to_value(&boundary).unwrap();
+        events.push(event(
+            14,
+            None,
+            COMPACTION_BOUNDARY_CHECKPOINTED_KIND,
+            serde_json::to_value(CompactionBoundaryCheckpointed {
+                boundary_id: "boundary-1".to_owned(),
+                checkpoint_id: "checkpoint-1".to_owned(),
+                checkpoint_seq: 13,
+                extra: Map::new(),
+            })
+            .unwrap(),
+        ));
+
+        let checkpointed = validate_compaction_boundary_chain(&events).unwrap();
+        assert_eq!(checkpointed.pending().len(), 1);
+        assert_eq!(
+            checkpointed.latest_pending().unwrap().state,
+            CompactionBoundaryState::Checkpointed
+        );
+
+        events.push(event(
+            15,
+            Some("turn-4"),
+            "response.completed",
+            json!({
+                "output_items": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                }],
+                "turn_completion": {
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                    "covers_from_seq": 10,
+                    "final_response_seq": 15,
+                    "covers_through_seq": 15,
+                },
+            }),
+        ));
+        events.push(event(
+            16,
+            Some("turn-4"),
+            "turn.completed",
+            json!({
+                "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                "covers_from_seq": 10,
+                "final_response_seq": 15,
+                "covers_through_seq": 16,
+            }),
+        ));
+
+        let completed = validate_compaction_boundary_chain(&events).unwrap();
+        assert!(completed.pending().is_empty());
+        assert_eq!(
+            completed.boundaries()[0].state,
+            CompactionBoundaryState::CompletedTurn
+        );
+    }
+
+    #[test]
+    fn compaction_boundary_rejects_forged_user_and_checkpoint_bindings() {
+        let forged_user = vec![
+            open_user(1, "turn-1", "prompt"),
+            boundary_started(2, "boundary-1", "other-turn", 1),
+        ];
+        let error = validate_compaction_boundary_chain(&forged_user)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid user.message ordering or turn binding"));
+
+        let mut forged_checkpoint = completed_turns(3);
+        forged_checkpoint.push(open_user(10, "turn-4", "prompt"));
+        forged_checkpoint.push(boundary_started(11, "boundary-1", "turn-4", 10));
+        append_checkpoint_attempt(
+            &mut forged_checkpoint,
+            None,
+            3,
+            "attempt-1",
+            "checkpoint-1",
+            "summary",
+        );
+        forged_checkpoint.push(event(
+            14,
+            None,
+            COMPACTION_BOUNDARY_CHECKPOINTED_KIND,
+            serde_json::to_value(CompactionBoundaryCheckpointed {
+                boundary_id: "boundary-1".to_owned(),
+                checkpoint_id: "checkpoint-1".to_owned(),
+                checkpoint_seq: 13,
+                extra: Map::new(),
+            })
+            .unwrap(),
+        ));
+        let error = validate_compaction_boundary_chain(&forged_checkpoint)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not bound to compaction boundary"));
     }
 }
