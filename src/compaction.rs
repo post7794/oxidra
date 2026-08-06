@@ -1074,39 +1074,12 @@ pub fn validate_compaction_boundary_chain(
     }
 
     let (_checkpoint_chain, attempts) = validate_checkpoint_protocol(events)?;
+    let user_messages = index_boundary_user_messages(events)?;
     // User references are protocol-neutral; completion evidence is not.  Keep
     // separate frozen v1 and current v2 facts so a later event cannot change
     // the meaning of an older boundary record.
     let facts_v1 = boundary_turn_facts(COMPACTION_BOUNDARY_VERSION_V1, events)?;
     let facts_v2 = boundary_turn_facts(COMPACTION_BOUNDARY_VERSION_V2, events)?;
-    let user_messages = events
-        .iter()
-        .filter(|event| event.kind == "user.message")
-        .map(|event| {
-            let turn_id = event.turn_id.as_deref().ok_or_else(|| {
-                OxidraError::Session(format!("user.message at seq {} has no turn_id", event.seq))
-            })?;
-            let turn_boundary_version = event
-                .data
-                .get("turn_boundary_version")
-                .map(|value| {
-                    let version = value.as_u64().ok_or_else(|| {
-                        OxidraError::Session(format!(
-                            "turn boundary version at seq {} is not an unsigned integer",
-                            event.seq
-                        ))
-                    })?;
-                    u32::try_from(version).map_err(|_| {
-                        OxidraError::Session(format!(
-                            "unsupported turn boundary version {version} at seq {}",
-                            event.seq
-                        ))
-                    })
-                })
-                .transpose()?;
-            Ok((event.seq, (turn_id, turn_boundary_version)))
-        })
-        .collect::<Result<HashMap<_, _>>>()?;
 
     let mut records = Vec::<Record>::new();
     let mut by_id = HashMap::<String, usize>::new();
@@ -1426,6 +1399,32 @@ pub fn validate_compaction_boundary_chain(
                         event.seq
                     ));
                 }
+                if record.state == CompactionBoundaryState::Started
+                    && attempt_by_boundary_id.contains_key(&record.boundary.boundary_id)
+                {
+                    return session_error(format!(
+                        "compaction boundary {} cannot be abandoned before its Provider attempt is reflected by boundary.failed or boundary.checkpointed",
+                        record.boundary.boundary_id
+                    ));
+                }
+                if record.boundary.version >= COMPACTION_BOUNDARY_VERSION_V2
+                    && record.state == CompactionBoundaryState::Checkpointed
+                {
+                    let slot = provider_request_slot_state_for_version(
+                        PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+                        &events[..=event_index],
+                        &payload.turn_id,
+                    )?;
+                    if !matches!(
+                        slot,
+                        ProviderRequestSlotState::Ready | ProviderRequestSlotState::Terminal
+                    ) {
+                        return session_error(format!(
+                            "compaction boundary {} cannot abandon turn {} from unsettled Provider request-slot state {slot:?}",
+                            record.boundary.boundary_id, payload.turn_id
+                        ));
+                    }
+                }
                 let facts = boundary_facts_for_boundary(&record.boundary, &facts_v1, &facts_v2)?;
                 if facts
                     .completion_seq_by_turn
@@ -1710,6 +1709,70 @@ fn boundary_facts_for_boundary<'a>(
         COMPACTION_BOUNDARY_VERSION_V2 => Ok(facts_v2),
         version => session_error(format!("unsupported compaction boundary version {version}")),
     }
+}
+
+/// Index user turns while enforcing a session-prefix protocol epoch.  Legacy
+/// sessions may move forward into tagged turn protocols, but once a writer has
+/// emitted a newer version, later user messages cannot opt back into weaker
+/// semantics by omitting or lowering `turn_boundary_version`.
+fn index_boundary_user_messages(
+    events: &[JournalEvent],
+) -> Result<HashMap<u64, (&str, Option<u32>)>> {
+    let mut users = HashMap::new();
+    let mut highest_protocol = None::<(u32, u64)>;
+    for event in events.iter().filter(|event| event.kind == "user.message") {
+        let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+            OxidraError::Session(format!("user.message at seq {} has no turn_id", event.seq))
+        })?;
+        let version = user_turn_boundary_version(event)?;
+        let protocol_epoch = version.unwrap_or(0);
+        if let Some((highest, highest_seq)) = highest_protocol {
+            if protocol_epoch < highest {
+                let current = version
+                    .map(|version| format!("v{version}"))
+                    .unwrap_or_else(|| "legacy".to_owned());
+                return session_error(format!(
+                    "user.message at seq {} downgrades the session turn boundary protocol from v{highest} at seq {highest_seq} to {current}",
+                    event.seq
+                ));
+            }
+        }
+        if highest_protocol.is_none_or(|(highest, _)| protocol_epoch > highest) {
+            highest_protocol = Some((protocol_epoch, event.seq));
+        }
+        if users.insert(event.seq, (turn_id, version)).is_some() {
+            return session_error(format!(
+                "duplicate user.message seq {} while indexing boundary protocol",
+                event.seq
+            ));
+        }
+    }
+    Ok(users)
+}
+
+fn user_turn_boundary_version(event: &JournalEvent) -> Result<Option<u32>> {
+    let Some(value) = event.data.get("turn_boundary_version") else {
+        return Ok(None);
+    };
+    let version = value.as_u64().ok_or_else(|| {
+        OxidraError::Session(format!(
+            "turn boundary version at seq {} is not an unsigned integer",
+            event.seq
+        ))
+    })?;
+    let version = u32::try_from(version).map_err(|_| {
+        OxidraError::Session(format!(
+            "unsupported turn boundary version {version} at seq {}",
+            event.seq
+        ))
+    })?;
+    if !(1..=TURN_BOUNDARY_VALIDATOR_VERSION).contains(&version) {
+        return session_error(format!(
+            "unsupported turn boundary version {version} at seq {}",
+            event.seq
+        ));
+    }
+    Ok(Some(version))
 }
 
 fn validate_boundary_user_reference(
@@ -5543,6 +5606,69 @@ mod tests {
             "unexpected boundary error: {error}"
         );
 
+        let mut unsettled_abandon = events.clone();
+        unsettled_abandon.push(event(
+            15,
+            Some("turn-4"),
+            "response.started",
+            json!({"response_attempt_id":"attempt-a"}),
+        ));
+        unsettled_abandon.push(event(
+            16,
+            None,
+            COMPACTION_BOUNDARY_ABANDONED_KIND,
+            serde_json::to_value(CompactionBoundaryAbandoned {
+                boundary_id: "boundary-1".to_owned(),
+                turn_id: "turn-4".to_owned(),
+                user_message_seq: 10,
+                reason: "replace prompt".to_owned(),
+                extra: Map::new(),
+            })
+            .unwrap(),
+        ));
+        unsettled_abandon.push(open_user(17, "turn-5", "replacement prompt"));
+        let error = validate_compaction_boundary_chain(&unsettled_abandon)
+            .expect_err("abandon must not release an in-flight normal Provider slot")
+            .to_string();
+        assert!(
+            error.contains("unsettled Provider request-slot state ResponseInFlight"),
+            "unexpected boundary error: {error}"
+        );
+
+        let mut settled_abandon = events.clone();
+        settled_abandon.push(event(
+            15,
+            Some("turn-4"),
+            "response.started",
+            json!({"response_attempt_id":"attempt-a"}),
+        ));
+        settled_abandon.push(event(
+            16,
+            Some("turn-4"),
+            "response.aborted",
+            json!({"response_attempt_id":"attempt-a","reason":"cancelled"}),
+        ));
+        settled_abandon.push(event(
+            17,
+            None,
+            COMPACTION_BOUNDARY_ABANDONED_KIND,
+            serde_json::to_value(CompactionBoundaryAbandoned {
+                boundary_id: "boundary-1".to_owned(),
+                turn_id: "turn-4".to_owned(),
+                user_message_seq: 10,
+                reason: "replace prompt".to_owned(),
+                extra: Map::new(),
+            })
+            .unwrap(),
+        ));
+        settled_abandon.push(open_user(18, "turn-5", "replacement prompt"));
+        let abandoned = validate_compaction_boundary_chain(&settled_abandon)
+            .expect("a terminal Provider slot may be explicitly abandoned");
+        assert_eq!(
+            abandoned.boundaries()[0].state,
+            CompactionBoundaryState::Abandoned
+        );
+
         events.push(event(
             15,
             Some("turn-4"),
@@ -5585,6 +5711,41 @@ mod tests {
         assert_eq!(
             completed.boundaries()[0].state,
             CompactionBoundaryState::CompletedTurn
+        );
+    }
+
+    #[test]
+    fn abandon_cannot_hide_a_bound_compaction_attempt() {
+        let mut events = completed_turns(3);
+        events.push(open_user(10, "turn-4", "current prompt"));
+        let boundary = CompactionBoundary::new("boundary-1", "turn-4", 10);
+        events.push(boundary_started(11, "boundary-1", "turn-4", 10));
+        append_checkpoint_attempt(&mut events, None, 3, "attempt-1", "checkpoint-1", "summary");
+        let started = events
+            .iter_mut()
+            .find(|event| event.kind == COMPACTION_STARTED_KIND)
+            .expect("compaction.started");
+        started.data["boundary"] = serde_json::to_value(&boundary).unwrap();
+        events.push(event(
+            14,
+            None,
+            COMPACTION_BOUNDARY_ABANDONED_KIND,
+            serde_json::to_value(CompactionBoundaryAbandoned {
+                boundary_id: "boundary-1".to_owned(),
+                turn_id: "turn-4".to_owned(),
+                user_message_seq: 10,
+                reason: "hide durable attempt".to_owned(),
+                extra: Map::new(),
+            })
+            .unwrap(),
+        ));
+
+        let error = validate_compaction_boundary_chain(&events)
+            .expect_err("abandon must not bypass the attempt-to-boundary terminal mapping")
+            .to_string();
+        assert!(
+            error.contains("cannot be abandoned before its Provider attempt is reflected"),
+            "unexpected boundary error: {error}"
         );
     }
 
@@ -6030,6 +6191,65 @@ mod tests {
         ];
         validate_compaction_boundary_chain(&historical)
             .expect("historical turn validator v3 retains boundary v1 semantics");
+    }
+
+    #[test]
+    fn session_turn_protocol_version_is_monotonic() {
+        let mut downgraded = complete_turn(1, "turn-1");
+        downgraded.push(open_user_with_boundary_version(
+            4,
+            "turn-2",
+            "downgraded prompt",
+            3,
+        ));
+        downgraded.push(boundary_started_with_version(
+            5,
+            "boundary-v1",
+            "turn-2",
+            4,
+            1,
+        ));
+        downgraded.push(event(
+            6,
+            Some("turn-2"),
+            "response.started",
+            json!({"response_attempt_id":"attempt-1"}),
+        ));
+        let error = validate_compaction_boundary_chain(&downgraded)
+            .expect_err("a session that reached turn v4 must not return to v3")
+            .to_string();
+        assert!(
+            error.contains("downgrades the session turn boundary protocol from v4"),
+            "unexpected boundary error: {error}"
+        );
+
+        let mut missing_version = complete_turn(1, "turn-1");
+        missing_version.push(event(
+            4,
+            Some("turn-2"),
+            "user.message",
+            json!({"item":{"role":"user","content":"legacy downgrade"}}),
+        ));
+        missing_version.push(boundary_started_with_version(
+            5,
+            "boundary-v1",
+            "turn-2",
+            4,
+            1,
+        ));
+        let error = validate_compaction_boundary_chain(&missing_version)
+            .expect_err("a session that reached turn v4 must not return to legacy")
+            .to_string();
+        assert!(
+            error.contains("to legacy"),
+            "unexpected boundary error: {error}"
+        );
+
+        let mut upgraded = complete_turn_with_boundary_version(1, "turn-1", 3);
+        upgraded.push(open_user(4, "turn-2", "upgraded prompt"));
+        upgraded.push(boundary_started(5, "boundary-v2", "turn-2", 4));
+        validate_compaction_boundary_chain(&upgraded)
+            .expect("a session may monotonically upgrade from turn v3 to v4");
     }
 
     #[test]
