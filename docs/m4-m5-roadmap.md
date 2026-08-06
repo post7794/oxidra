@@ -493,8 +493,8 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 3. checkpoint durable 后追加 `compaction.boundary.checkpointed`。该状态仍是 pending：它只证明摘要已经提交，不证明原用户请求已经收到正常响应。只有同 turn 的完整 completion、显式 abandon，或后续 retry supersession 才解除 pending。
 4. 无安全候选、Provider/本地失败、取消或摘要校验失败写 `compaction.boundary.failed`。若存在 Provider attempt，必须引用同 boundary 的已终结 `compaction.failed` / `compaction.aborted`；候选选择前失败可以没有 attempt id。
 5. 显式 retry 写 `compaction.boundary.retry_started`，生成新的 boundary id、保留同一 `turn_id` 与 `user_message_seq`，并把上一 failed boundary 标为 superseded；不追加第二条 user message。显式 abandon 写 `compaction.boundary.abandoned`，只改变当前 projection，原文继续留在 journal。
-6. started、checkpointed 和 failed 都属于 pending 状态。pending 后若出现另一个 user message、引用错 user/checkpoint/attempt、重复终态或跨 turn retry，reducer 一律 fail closed。
-7. `validate_compaction_boundary_chain` 与 checkpoint reducer 分离：checkpoint chain 回答“哪个 summary 可用”，boundary chain 回答“触发它的用户请求是否已经完成”。两者任何一边非法都不能继续 Provider 请求。
+6. started、checkpointed 和 failed 都属于 pending 状态。pending 后若出现另一个 user message、引用错 user/checkpoint/attempt、重复终态或跨 turn retry，reducer 一律 fail closed；只有在更早的 `state_seq` 已记录 abandoned、superseded 或 completed-turn，后续 user message 才合法。Provider attempt、checkpoint、failure、abandon、retry 和 completion 必须通过单一 boundary transition 表；普通 `boundary.started` 不能复活 abandoned/superseded 的原 prompt。
+7. `validate_compaction_boundary_chain` 只能消费 turn validator 的已验证 completion 与 checkpoint/attempt reducer 的已验证 attempt→terminal 映射，不得再次从原始字段推断控制状态。checkpoint chain 回答“哪个 summary 可用”，boundary chain 回答“触发它的用户请求是否已经完成”。两者任何一边非法都不能继续 Provider 请求。
 
 当前代码已经实现 boundary v1 数据模型、checkpoint/attempt 绑定、纯 reducer、`compact_once_for_boundary` 和 session-open 自动恢复。恢复顺序先把孤立 Provider attempt 写成 `compaction.aborted`，再根据 durable terminal 补 `boundary.failed` 或 `boundary.checkpointed`；候选选择前崩溃则补无 attempt 的明确 failure。Agent/CLI 和自动 preflight 尚未消费该协议，因此默认 compaction 仍保持关闭。
 
