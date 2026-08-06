@@ -1,0 +1,8 @@
+{"schema":1,"seq":1,"ts":"1970-01-01T00:00:00Z","kind":"user.message","session_id":"session","turn_id":"retry-turn","data":{"item":{"role":"user","content":"retry prompt"},"turn_boundary_version":2}}
+{"schema":1,"seq":2,"ts":"1970-01-01T00:00:00Z","kind":"response.failed","session_id":"session","turn_id":"retry-turn","data":{"response_attempt_id":"initial"}}
+{"schema":1,"seq":3,"ts":"1970-01-01T00:00:00Z","kind":"context.limit_reached","session_id":"session","turn_id":"retry-turn","data":{}}
+{"schema":1,"seq":4,"ts":"1970-01-01T00:00:00Z","kind":"turn.retry_started","session_id":"session","turn_id":"retry-turn","data":{"retry_version":1,"retry_id":"retry-1","user_message_seq":1,"context_limit_seq":3}}
+{"schema":1,"seq":5,"ts":"1970-01-01T00:00:00Z","kind":"response.completed","session_id":"session","turn_id":"retry-turn","data":{"output_items":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"first retry"}]}]}}
+{"schema":1,"seq":6,"ts":"1970-01-01T00:00:00Z","kind":"turn.cancelled","session_id":"session","turn_id":"retry-turn","data":{}}
+{"schema":1,"seq":7,"ts":"1970-01-01T00:00:00Z","kind":"turn.retry_started","session_id":"session","turn_id":"retry-turn","data":{"retry_version":1,"retry_id":"retry-2","user_message_seq":1,"context_limit_seq":3}}
+{"schema":1,"seq":8,"ts":"1970-01-01T00:00:00Z","kind":"response.completed","session_id":"session","turn_id":"retry-turn","data":{"output_items":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"final retry"}]}],"turn_completion":{"turn_boundary_version":2,"covers_from_seq":1,"final_response_seq":8,"covers_through_seq":8}}}

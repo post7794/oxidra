@@ -10,7 +10,10 @@ use serde_json::{Value, json};
 use crate::compaction::{COMPACTION_CHECKPOINT_KIND, CheckpointChain, compacted_history_item};
 use crate::error::{OxidraError, Result};
 use crate::session::JournalEvent;
-use crate::turn::{complete_prefix_candidates, validate_turn_recovery};
+use crate::turn::{
+    ValidatedTurnRecovery, complete_prefix_candidates, validate_turn_recovery_v2,
+    validate_turn_recovery_v3,
+};
 
 /// Current immutable event-to-item format used when building compaction input.
 pub const SOURCE_PROJECTION_VERSION: u32 = 3;
@@ -35,32 +38,28 @@ pub fn project_events_for_compaction(version: u32, events: &[JournalEvent]) -> R
 }
 
 fn project_events_v1(events: &[JournalEvent]) -> Result<Vec<Value>> {
-    project_events_impl(events, false, false)
+    project_events_impl(events, None, false)
 }
 
 fn project_events_v2(events: &[JournalEvent]) -> Result<Vec<Value>> {
     // v2 新增显式 abandon 语义；v1 必须保持历史 checkpoint 的原始字节行为。
-    project_events_impl(events, true, false)
+    let recovery = validate_turn_recovery_v2(events)?;
+    project_events_impl(events, Some(&recovery), false)
 }
 
 fn project_events_v3(events: &[JournalEvent]) -> Result<Vec<Value>> {
     // v3 将较早 retry attempt 的取消终态从当前 projection 中移除。
-    project_events_impl(events, true, true)
+    let recovery = validate_turn_recovery_v3(events)?;
+    project_events_impl(events, Some(&recovery), true)
 }
 
 fn project_events_impl(
     events: &[JournalEvent],
-    supports_explicit_abandon: bool,
+    recovery: Option<&ValidatedTurnRecovery>,
     supports_retry_supersession: bool,
 ) -> Result<Vec<Value>> {
-    let recovery = if supports_explicit_abandon || supports_retry_supersession {
-        Some(validate_turn_recovery(events)?)
-    } else {
-        None
-    };
     let latest_retry_by_turn = if supports_retry_supersession {
         recovery
-            .as_ref()
             .expect("retry-aware projection has recovery state")
             .retries
             .iter()
@@ -93,14 +92,8 @@ fn project_events_impl(
         .filter_map(|event| event.turn_id.clone())
         .filter(|turn_id| !completed_turns.contains(turn_id))
         .collect::<HashSet<_>>();
-    let explicitly_abandoned_turns = if supports_explicit_abandon {
-        recovery
-            .as_ref()
-            .expect("abandon-aware projection has recovery state")
-            .abandons
-            .keys()
-            .cloned()
-            .collect::<HashSet<_>>()
+    let explicitly_abandoned_turns = if let Some(recovery) = recovery {
+        recovery.abandons.keys().cloned().collect::<HashSet<_>>()
     } else {
         HashSet::new()
     };
@@ -347,6 +340,18 @@ mod tests {
             turn_id: turn_id.map(str::to_owned),
             data,
         }
+    }
+
+    fn frozen_retry_events() -> Vec<JournalEvent> {
+        include_str!("../tests/fixtures/retry_recovery_v2.jsonl")
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("retry_recovery_v2 fixture line {}: {error}", index + 1)
+                })
+            })
+            .collect()
     }
 
     fn user(seq: u64, turn_id: &str) -> JournalEvent {
@@ -809,9 +814,8 @@ mod tests {
         ];
 
         assert!(
-            project_events_for_compaction(2, &events)
-                .unwrap()
-                .is_empty()
+            project_events_for_compaction(2, &events).is_err(),
+            "frozen v2 did not treat cancellation as a settled retry attempt"
         );
         assert_eq!(
             project_events_for_compaction(3, &events).unwrap(),
@@ -872,6 +876,27 @@ mod tests {
                 .and_then(Value::as_str)
                 .is_some_and(|content| content.contains("previous turn was cancelled"))
         }));
+    }
+
+    #[test]
+    fn frozen_source_projection_v2_remains_literal_after_v3_upgrade() {
+        let events = frozen_retry_events();
+        let expected: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/retry_projection_v2.json"))
+                .expect("valid frozen projection fixture");
+
+        assert_eq!(
+            project_events_for_compaction(2, &events).expect("frozen v2 projection"),
+            expected
+        );
+
+        let v3 = project_events_for_compaction(3, &events).expect("current v3 projection");
+        assert!(!v3.iter().any(|item| {
+            item.get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("previous turn was cancelled"))
+        }));
+        assert_eq!(v3[0], json!({"role":"user","content":"retry prompt"}));
     }
 
     #[test]

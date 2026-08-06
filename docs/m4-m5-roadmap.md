@@ -359,14 +359,14 @@ fn validate_compaction_usage(version: u32, usage: &Value) -> Result<()>;
 
 规则：
 
-1. 注册表中已经发布的 match arm 与输出字节不可修改；升级只能新增版本，并只把新默认用于新 attempt。
+1. 注册表中已经发布的 match arm、它调用的传递依赖语义与输出字节都不可修改；改共享 helper 若会改变旧版本结果，也等同于修改旧协议。升级只能新增版本，并只把新默认用于新 attempt。
 2. `compaction.started.instructions` 必须与其 `prompt_version` 的注册文本逐字相等。
 3. 普通 projection 使用最新 checkpoint 自己保存的 `summary_envelope_version`。
 4. 构建子 checkpoint source 时，父 summary 使用父 checkpoint 保存的 envelope version；原始事件、cutoff 校验和 digest 分别使用本次 started 保存的 source projection、turn validator 和 digest version。
 5. parent cutoff 已由 checkpoint chain 按 parent 自己的历史版本验证。child validator 只能处理 `seq > parent.covers_through_seq` 的未压缩后缀，不能用新版本重新审判旧 parent cutoff。
 6. reducer 重建历史 source 并校验 checkpoint usage 时按事件版本执行，不能调用当前默认 renderer、turn reducer、digest、输出上限或 usage 规则。未知、缺失、已撤销或 started/checkpoint 不一致的版本全部 fail closed，不回退最新版本或全量历史。
 
-当前安全的 user-envelope、固定 prompt、source projection、turn validator、source digest 和 usage contract 是首个可由 Provider 实际生成并由 Agent 消费的 v1。它由独立字面量、frozen JSONL、golden source digest 和 usage 边界测试锁定，测试不能通过调用当前实现生成自己的期望值。此前仅存在于未接 Provider 的开发代码/测试夹具中的无版本 developer envelope 从未成为可用发布格式，不注册为可投影的 legacy 版本；对应 frozen fixture 必须证明它会 fail closed。若存在手工构造的此类 journal，只允许审计或从完整原文显式重做 checkpoint，不能为了兼容而重新发送 developer summary。
+六类协议的首个可执行版本都是 v1，并由独立字面量、frozen JSONL、golden source digest 和 usage 边界测试锁定；测试不能通过调用当前实现生成自己的期望值。当前新 attempt 使用的版本组合是 `prompt=1`、`summary envelope=1`、`source projection=3`、`turn validator=3`、`source digest=1`、`usage contract=1`。source projection v2 与 turn validator v2 仍是受支持的历史版本，必须按首次登记时的字面语义重建，不能吸收 v3 的修正。此前仅存在于未接 Provider 的开发代码/测试夹具中的无版本 developer envelope 从未成为可用发布格式，不注册为可投影的 legacy 版本；对应 frozen fixture 必须证明它会 fail closed。若存在手工构造的此类 journal，只允许审计或从完整原文显式重做 checkpoint，不能为了兼容而重新发送 developer summary。
 
 ### 3.5 调用与提交协议
 
@@ -482,7 +482,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 2. `run_turn` 在追加新 `user.message` 前检查 pending；存在 pending 时返回明确错误，因此 `-p --resume` 不会继续叠加新消息，也不会再次毒化 session。
 3. `--retry-pending --resume <ID>` 先同步写入 `turn.retry_started`，再在原 `turn_id` 和原 `user.message` 上继续，不重复追加 prompt，也不需要用 abandon 模拟 retry。崩溃若发生在 intent sync 后、Provider dispatch 前，resume 复用同一 intent；若 response attempt 已开始后崩溃，统一恢复为 `response.aborted`，下一次显式 retry 写入新的 intent 后继续。
 4. `--abandon-pending --resume <ID>` 只追加经 reducer 校验的 `turn.abandoned`；之后可以在同一次进程中用 `-p` 提交替代 prompt，或进入 REPL。该事件只改变 projection/history，不删除 journal 原文。
-5. turn-boundary validator v1 保持历史语义；v2 按 latest retry 划分 attempt epoch。成功 retry 会 supersede 较早 epoch 的 `response.failed`、`response.aborted`、`turn.cancelled`、`agent.stalled`、`agent.limit_reached` 和 `context.limit_reached`，但不会隐藏 latest retry 之后的新终态。source projection v3 同样不再因被后续 retry 覆盖的 cancellation 删除原 prompt或注入取消提示；历史 projection v1/v2 保持原字节语义。history extractor v2 仍保留这些 attempt 状态作为可审计历史证据，只排除 reducer 已验证的 abandon。
+5. turn-boundary validator v1 保持最初的 turn 边界语义。v2 冻结首次登记的 retry 规则：它只 supersede latest retry 之前的 `response.failed`、`response.aborted` 和 `context.limit_reached`，且保留当时较宽松的 recovery 顺序校验；不得把后续修复回填进 v2。v3 才要求 `user.message < context.limit_reached < control event`、校验 Provider response attempt 绑定，并把较早 epoch 的 `turn.cancelled`、`agent.stalled`、`agent.limit_reached` 一并视为已被后续 retry 覆盖。source projection v3 使用 v3 recovery，保留原 prompt并移除已 supersede 的取消提示；历史 projection v1/v2 保持原字节与原接受/拒绝语义。history extractor v3 使用当前严格 recovery，旧 extractor cursor 不会被静默按新语义解释。
 6. `--retry-pending` 明确是非交互 batch；它与普通 `-p` 共用取消、流收尾和 `approval_required` 转换。shell 未带 `--full-auto` 时返回 exit 3，而不是把审批拒绝误报成 Ctrl+C/130。
 7. 回归测试覆盖审批拒绝后带 `--full-auto` 再次成功、retry 取消后再次成功、stalled 后再次成功，以及 tool/response limit 后再次成功；较早 attempt 的终态不得污染最终 turn completion。
 
@@ -525,7 +525,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 - `compact_once` 发出的真实请求无 tools、使用 prompt v1 和 8192 output token 上限；reducer 独立拒绝 Provider 返回的超限 checkpoint。
 - summary 在普通 projection 和下一次 compaction source 中始终由 checkpoint 自身的受支持 envelope 渲染为 `role: "user"`；恶意历史经过摘要、普通 replay 和再次摘要都不会进入 developer/system item。
 - Provider output message 在提交前与 journal replay 时都强制为 `role: "assistant"`，journal user item 强制为 `role: "user"`；伪造或缺失 role 不得进入普通 projection 或 compaction source。
-- prompt、summary envelope、source projection、turn validator、source digest 和 usage contract 的首个可执行 v1 在新增默认版本后仍按原规则重建；字面量/frozen fixture/golden digest/usage 边界必须锁住 v1。此前未发布的 developer-envelope 实验格式必须由负 fixture 证明 fail closed；任一版本缺失、未知或 started/checkpoint 不一致都不能退回当前默认实现。
+- prompt、summary envelope、source projection、turn validator、source digest 和 usage contract 的首个可执行 v1 在新增默认版本后仍按原规则重建；历史 source projection v2 与 turn validator v2 也由字面量 fixture 锁定，不能调用 v3 recovery 或接受 v3 boundary tag。当前新 attempt 使用 `1/1/3/3/1/1` 版本组合。此前未发布的 developer-envelope 实验格式必须由负 fixture 证明 fail closed；任一版本缺失、未知或 started/checkpoint 不一致都不能退回当前默认实现。
 - checkpoint usage 与 `raw_response.usage` 逐字一致，并满足 total 等式、cached/input 与 reasoning/output 子计数关系及 8192 输出上限；矛盾 usage 只生成可审计的 failed attempt，不进入 checkpoint chain。
 - 有可比较 usage 时使用真实 `input_tokens` 锚点和完整 prepared-request 的有符号估算差；无锚点时才估算完整请求。
 - cached input 不从上下文占用中扣除；usage 缺失不冒充真实 `0`。

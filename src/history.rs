@@ -20,7 +20,8 @@ use crate::turn::validate_turn_recovery;
 use crate::types::ToolDefinition;
 
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
-pub const HISTORY_EXTRACTOR_VERSION: u32 = 2;
+/// Increment when the recovery/provenance semantics change; old cursors fail closed.
+pub const HISTORY_EXTRACTOR_VERSION: u32 = 3;
 pub const HISTORY_CURSOR_VERSION: u32 = 1;
 pub const MAX_HISTORY_QUERY_BYTES: usize = 512;
 pub const MAX_HISTORY_CURSOR_BYTES: usize = 2_048;

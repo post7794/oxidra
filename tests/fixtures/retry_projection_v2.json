@@ -1,0 +1,6 @@
+[
+  {"role":"user","content":"retry prompt"},
+  {"type":"message","role":"assistant","content":[{"type":"output_text","text":"first retry"}]},
+  {"role":"user","content":"[Oxidra: the previous turn was cancelled. Do not continue unfinished work from it unless the user requests it again.]"},
+  {"type":"message","role":"assistant","content":[{"type":"output_text","text":"final retry"}]}
+]
