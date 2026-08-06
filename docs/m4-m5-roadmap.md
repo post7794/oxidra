@@ -366,7 +366,7 @@ fn validate_compaction_usage(version: u32, usage: &Value) -> Result<()>;
 5. parent cutoff 已由 checkpoint chain 按 parent 自己的历史版本验证。child validator 只能处理 `seq > parent.covers_through_seq` 的未压缩后缀，不能用新版本重新审判旧 parent cutoff。
 6. reducer 重建历史 source 并校验 checkpoint usage 时按事件版本执行，不能调用当前默认 renderer、turn reducer、digest、输出上限或 usage 规则。未知、缺失、已撤销或 started/checkpoint 不一致的版本全部 fail closed，不回退最新版本或全量历史。
 
-六类协议的首个可执行版本都是 v1，并由独立字面量、frozen JSONL、golden source digest 和 usage 边界测试锁定；测试不能通过调用当前实现生成自己的期望值。当前新 attempt 使用的版本组合是 `prompt=1`、`summary envelope=1`、`source projection=3`、`turn validator=3`、`source digest=1`、`usage contract=1`。source projection v2 与 turn validator v2 仍是受支持的历史版本，必须按首次登记时的字面语义重建，不能吸收 v3 的修正。此前仅存在于未接 Provider 的开发代码/测试夹具中的无版本 developer envelope 从未成为可用发布格式，不注册为可投影的 legacy 版本；对应 frozen fixture 必须证明它会 fail closed。若存在手工构造的此类 journal，只允许审计或从完整原文显式重做 checkpoint，不能为了兼容而重新发送 developer summary。
+六类基础协议的首个可执行版本都是 v1，并由独立字面量、frozen JSONL、golden source digest 和 usage 边界测试锁定；测试不能通过调用当前实现生成自己的期望值。当前新 compaction attempt 使用的版本组合是 `prompt=1`、`summary envelope=1`、`source projection=3`、`turn validator=4`、`source digest=1`、`usage contract=1`。turn validator v1/v2/v3 和 compaction boundary v1 均已冻结；v4 才修正 legacy completion evidence 的时间，boundary v2 才绑定 v4 与独立的 Provider request-slot validator v1。source projection v2 与 turn validator v2/v3 仍是受支持的历史版本，必须按首次登记时的字面语义重建，不能吸收后续修正。此前仅存在于未接 Provider 的开发代码/测试夹具中的无版本 developer envelope 从未成为可用发布格式，不注册为可投影的 legacy 版本；对应 frozen fixture 必须证明它会 fail closed。若存在手工构造的此类 journal，只允许审计或从完整原文显式重做 checkpoint，不能为了兼容而重新发送 developer summary。
 
 ### 3.5 调用与提交协议
 
@@ -482,7 +482,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 2. `run_turn` 在追加新 `user.message` 前检查 pending；存在 pending 时返回明确错误，因此 `-p --resume` 不会继续叠加新消息，也不会再次毒化 session。
 3. `--retry-pending --resume <ID>` 先同步写入 `turn.retry_started`，再在原 `turn_id` 和原 `user.message` 上继续，不重复追加 prompt，也不需要用 abandon 模拟 retry。崩溃若发生在 intent sync 后、Provider dispatch 前，resume 复用同一 intent；若 response attempt 已开始后崩溃，统一恢复为 `response.aborted`，下一次显式 retry 写入新的 intent 后继续。
 4. `--abandon-pending --resume <ID>` 只追加经 reducer 校验的 `turn.abandoned`；之后可以在同一次进程中用 `-p` 提交替代 prompt，或进入 REPL。该事件只改变 projection/history，不删除 journal 原文。
-5. turn-boundary validator v1 保持最初的 turn 边界语义。v2 冻结首次登记的 retry 规则：它只 supersede latest retry 之前的 `response.failed`、`response.aborted` 和 `context.limit_reached`，且保留当时较宽松的 recovery 顺序校验；不得把后续修复回填进 v2。v3 才要求 `user.message < context.limit_reached < control event`、校验 Provider response attempt 绑定，并把较早 epoch 的 `turn.cancelled`、`agent.stalled`、`agent.limit_reached` 一并视为已被后续 retry 覆盖。source projection v3 使用 v3 recovery，保留原 prompt并移除已 supersede 的取消提示；历史 projection v1/v2 保持原字节与原接受/拒绝语义。history extractor v3 使用当前严格 recovery，旧 extractor cursor 不会被静默按新语义解释。
+5. turn-boundary validator v1 保持最初的 turn 边界语义。v2 冻结首次登记的 retry 规则：它只 supersede latest retry 之前的 `response.failed`、`response.aborted` 和 `context.limit_reached`，且保留当时较宽松的 recovery 顺序校验；不得把后续修复回填进 v2。v3 才要求 `user.message < context.limit_reached < control event`、校验 Provider response attempt 绑定，并把较早 epoch 的 `turn.cancelled`、`agent.stalled`、`agent.limit_reached` 一并视为已被后续 retry 覆盖。v4 只新增 legacy completion evidence 的正确时序，不改变 v1-v3 的结果。source projection v3 使用 v3 recovery，保留原 prompt并移除已 supersede 的取消提示；历史 projection v1/v2 保持原字节与原接受/拒绝语义。history extractor v3 使用当前严格 recovery，旧 extractor cursor 不会被静默按新语义解释。
 6. `--retry-pending` 明确是非交互 batch；它与普通 `-p` 共用取消、流收尾和 `approval_required` 转换。shell 未带 `--full-auto` 时返回 exit 3，而不是把审批拒绝误报成 Ctrl+C/130。
 7. 回归测试覆盖审批拒绝后带 `--full-auto` 再次成功、retry 取消后再次成功、stalled 后再次成功，以及 tool/response limit 后再次成功；较早 attempt 的终态不得污染最终 turn completion。
 
@@ -494,10 +494,10 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 4. 无安全候选、Provider/本地失败、取消或摘要校验失败写 `compaction.boundary.failed`。若存在 Provider attempt，必须引用同 boundary 的已终结 `compaction.failed` / `compaction.aborted`；候选选择前失败可以没有 attempt id。
 5. 显式 retry 写 `compaction.boundary.retry_started`，生成新的 boundary id、保留同一 `turn_id` 与 `user_message_seq`，并把上一 failed boundary 标为 superseded；不追加第二条 user message。显式 abandon 写 `compaction.boundary.abandoned`，只改变当前 projection，原文继续留在 journal。
 6. started、checkpointed 和 failed 都属于 pending 状态。pending 后若出现另一个 user message、引用错 user/checkpoint/attempt、重复终态或跨 turn retry，reducer 一律 fail closed；只有在更早的 `state_seq` 已记录 abandoned、superseded 或 completed-turn，后续 user message 才合法。Provider attempt、checkpoint、failure、abandon、retry 和 completion 必须通过单一 boundary transition 表；普通 `boundary.started` 不能复活 abandoned/superseded 的原 prompt。
-7. `boundary.started` 只能引用该事件可见前缀中的最新、仍为 `OpenTail` 且 `request_ready` 的 user turn；`OpenTail` 只表示 turn 尚未完成，不是 Provider dispatch 的权限证明。`request_ready` 还必须证明当前 attempt epoch 没有未终结的 `response.started`，且所有 tool call 已解决；boundary durable 后即保留该 Provider request slot，在 boundary checkpointed 前不得插入普通 response/tool lifecycle。后续追加事件不得追溯性地使一个越过、正在请求或已终止的 turn 合法。turn reducer 输出最早的 completion evidence `completion_seq`（inline completion 用 response seq，显式 marker 用 marker seq，legacy turn 只有在下一条 user.message 出现时才用该 user seq），boundary reducer 直接消费它。
+7. boundary v1 保持首次登记时的接受/拒绝语义。新 boundary v2 只能引用该事件可见前缀中的最新、仍为 `OpenTail` 的 user turn，并额外消费独立、版本化的 Provider request-slot reducer v1。该 reducer 逐事件验证单 Provider slot：不能并发 `response.started`，上一 response 产生的 function call/tool lifecycle 未全部解决前不能启动下一 response，且 retry 必须从已验证的 terminal 状态重新取得 slot。`OpenTail` 只表示 turn 尚未完成，不是 Provider dispatch 的权限证明；boundary v2 durable 后即保留该 Provider request slot，在 boundary checkpointed 前不得插入普通 response/tool lifecycle。后续追加事件不得追溯性地使一个越过、正在请求或已终止的 turn 合法。turn v4 输出最早的 completion evidence `completion_seq`（inline completion 用 response seq，显式 marker 用 marker seq，legacy turn 只有在下一条 user.message 出现时才用该 user seq），boundary v2 直接消费它。
 8. `validate_compaction_boundary_chain` 只能消费 turn validator 的已验证 completion 与 checkpoint/attempt reducer 的已验证 attempt→terminal 映射，不得再次从原始字段推断控制状态。checkpoint chain 回答“哪个 summary 可用”，boundary chain 回答“触发它的用户请求是否已经完成”。两者任何一边非法都不能继续 Provider 请求。
 
-当前代码已经实现 boundary v1 数据模型、checkpoint/attempt 绑定、纯 reducer、`compact_once_for_boundary` 和 session-open 自动恢复。恢复顺序先把孤立 Provider attempt 写成 `compaction.aborted`，再根据 durable terminal 补 `boundary.failed` 或 `boundary.checkpointed`；候选选择前崩溃则补无 attempt 的明确 failure。Agent/CLI 和自动 preflight 尚未消费该协议，因此默认 compaction 仍保持关闭。
+当前代码已经实现 boundary v1/v2 数据模型、checkpoint/attempt 绑定、纯 reducer、版本化 request-slot 校验、`compact_once_for_boundary` 和 session-open 自动恢复。恢复顺序先把孤立 Provider attempt 写成 `compaction.aborted`，再根据 durable terminal 补 `boundary.failed` 或 `boundary.checkpointed`；候选选择前崩溃则补无 attempt 的明确 failure。Agent/CLI 和自动 preflight 尚未消费该协议，因此默认 compaction 仍保持关闭。
 
 ### 3.9 CLI 与可见性
 
@@ -526,7 +526,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 1. 已实现真实 Provider `compact_once` 内核：复用已注册的六类 v1 协议、无 tools、8192 输出上限、完整 raw response/usage 提交，并让 Agent 在有效 checkpoint 存在时实际使用 checkpoint + tail projection。当前没有用户入口，自动触发仍关闭。
 2. 已实现当前 session、最新 checkpoint 覆盖前缀内的 `history_search` / `history_turn` / `history_artifact`：同一 request boundary 只读一次 journal，schema 和执行器绑定同一不可变 snapshot；确定性检索、引用、cursor、artifact schema v1/v2 校验和单 turn 配额已经接入 Agent 主循环。
 3. 已实现 model-aware context 配置、prepared-request 精确 request-shape 测量、`context.configured` / `context.tools` / `response.started` / `context.limit_reached` 审计、真实 usage 差分锚点，以及 Provider context-limit 的 retry/abandon E2E。估算只用于 telemetry 和未来 compaction trigger；普通请求不再被 heuristic 伪装成 hard limit 拦截。
-4. 已完成内核级连续两次真实 `compact_once`，并加入 compaction request-boundary v1 的数据模型、provider-attempt/checkpoint 绑定、fail-closed 纯 reducer、bound Provider 调用和 session-open 恢复：失败 child 不替换 parent checkpoint，随后以同一候选显式重试可形成合法子链，最终 projection 只使用最新 summary + tail。仍缺 Agent/CLI 对 pending/retry/abandon 的消费，以及覆盖 boundary 与 history 回查的进程级闭环 E2E。
+4. 已完成内核级连续两次真实 `compact_once`，并加入 compaction request-boundary v1/v2 的数据模型、provider-attempt/checkpoint 绑定、fail-closed 纯 reducer、版本化 request-slot 状态机、bound Provider 调用和 session-open 恢复：失败 child 不替换 parent checkpoint，随后以同一候选显式重试可形成合法子链，最终 projection 只使用最新 summary + tail。仍缺 Agent/CLI 对 pending/retry/abandon 的消费，以及覆盖 boundary 与 history 回查的进程级闭环 E2E。
 5. 用固定 fixture 测量父摘要连续 3/5/10 次重摘要后的漂移，保存 model、prompt version、原始输出和指标，先建立基线，不预设发布阈值。
 6. 根据测量结果另行锁定默认启用门槛；只有门槛满足后才改变默认值。
 7. 只有线性扫描或 journal 体积出现实际性能证据后，才考虑可重建索引或物理分段。
@@ -538,7 +538,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 - `compact_once` 发出的真实请求无 tools、使用 prompt v1 和 8192 output token 上限；reducer 独立拒绝 Provider 返回的超限 checkpoint。
 - summary 在普通 projection 和下一次 compaction source 中始终由 checkpoint 自身的受支持 envelope 渲染为 `role: "user"`；恶意历史经过摘要、普通 replay 和再次摘要都不会进入 developer/system item。
 - Provider output message 在提交前与 journal replay 时都强制为 `role: "assistant"`，journal user item 强制为 `role: "user"`；伪造或缺失 role 不得进入普通 projection 或 compaction source。
-- prompt、summary envelope、source projection、turn validator、source digest 和 usage contract 的首个可执行 v1 在新增默认版本后仍按原规则重建；历史 source projection v2 与 turn validator v2 也由字面量 fixture 锁定，不能调用 v3 recovery 或接受 v3 boundary tag。当前新 attempt 使用 `1/1/3/3/1/1` 版本组合。此前未发布的 developer-envelope 实验格式必须由负 fixture 证明 fail closed；任一版本缺失、未知或 started/checkpoint 不一致都不能退回当前默认实现。
+- prompt、summary envelope、source projection、turn validator、source digest 和 usage contract 的首个可执行 v1 在新增默认版本后仍按原规则重建；历史 source projection v2 与 turn validator v2/v3 也由字面量 fixture 锁定，不能调用新 v4 reducer 或接受未知 boundary tag。当前新 attempt 使用 `1/1/3/4/1/1` 版本组合，compaction boundary 新事件使用 v2，Provider request-slot 使用 v1。此前未发布的 developer-envelope 实验格式必须由负 fixture 证明 fail closed；任一版本缺失、未知或 started/checkpoint 不一致都不能退回当前默认实现。
 - checkpoint usage 与 `raw_response.usage` 逐字一致，并满足 total 等式、cached/input 与 reasoning/output 子计数关系及 8192 输出上限；矛盾 usage 只生成可审计的 failed attempt，不进入 checkpoint chain。
 - 有可比较 usage 时使用真实 `input_tokens` 锚点和完整 prepared-request 的有符号估算差；无锚点时才估算完整请求。
 - cached input 不从上下文占用中扣除；usage 缺失不冒充真实 `0`。
@@ -552,7 +552,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 - 单独 `compaction.started` 恢复为 aborted，partial summary 不使用。
 - 现有 journal sync/损坏尾行测试继续通过；进程级故障注入覆盖真实 `compact_once` 的 started 已同步、Provider 已完成但 checkpoint 尚未落盘、checkpoint 已同步三个窗口，证明恢复不启用未提交 summary。
 - compaction usage 和时间完整写入 checkpoint；M4 推迟期间不做累计预算判断。
-- 压缩失败、无候选或压缩后无法达到 target 时终止当前请求；同一 boundary 不循环 compact。Provider context-limit retry 使用既有持久化 intent；compaction boundary v1 则独立记录 started/checkpointed/failed/retry/abandon，并保持原 user message。纯 reducer、bound `compact_once` 和 session-open 崩溃恢复已实现；Agent/CLI pending 管理、projection/history 的 abandon 语义和进程级闭环 E2E 仍是默认启用前的阻塞项。
+- 压缩失败、无候选或压缩后无法达到 target 时终止当前请求；同一 boundary 不循环 compact。Provider context-limit retry 使用既有持久化 intent；compaction boundary v1/v2 则独立记录 started/checkpointed/failed/retry/abandon，并保持原 user message。纯 reducer、bound `compact_once` 和 session-open 崩溃恢复已实现；Agent/CLI pending 管理、projection/history 的 abandon 语义和进程级闭环 E2E 仍是默认启用前的阻塞项。
 - history 三个工具只访问最新 checkpoint 覆盖前缀，使用稳定排序、带引用分页和硬输出配额；无 checkpoint 时不额外暴露历史。
 - history cursor、排序、分页、artifact ID/hash 授权和当前用户 turn 累计配额均有确定性测试；崩溃/resume 不重置配额，耗尽后移除 history schemas。
 - 同一 journal 在不同 render/折叠设置下生成完全相同的 Provider projection 字节。

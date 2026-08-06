@@ -7,8 +7,9 @@ use serde_json::Value;
 use crate::error::{OxidraError, Result};
 use crate::session::JournalEvent;
 
-pub const TURN_BOUNDARY_VALIDATOR_VERSION: u32 = 3;
+pub const TURN_BOUNDARY_VALIDATOR_VERSION: u32 = 4;
 pub const TURN_BOUNDARY_VERSION: u64 = TURN_BOUNDARY_VALIDATOR_VERSION as u64;
+pub(crate) const PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionEvidence {
@@ -43,13 +44,19 @@ pub struct TurnSpan {
     /// projection-neutral events, and an explicit marker may follow an already
     /// validated inline completion.
     pub completion_seq: Option<u64>,
-    /// Whether the visible prefix ends at a safe boundary for dispatching the
-    /// next Provider request.  This is deliberately independent of
-    /// `TurnState`: an `OpenTail` may still contain an unterminated response
-    /// attempt or unresolved tool lifecycle.
-    pub request_ready: bool,
     /// Whether a later complete boundary may safely cover this turn.
     pub cut_safe: bool,
+}
+
+/// Versioned Provider request-slot reducer output.  This is intentionally not
+/// folded into `TurnState`: turn completion and permission to dispatch the
+/// next Provider request are different state machines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProviderRequestSlotState {
+    Ready,
+    ResponseInFlight,
+    AwaitingTools,
+    Terminal,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -739,6 +746,7 @@ pub(crate) fn segment_turns_for_version(
         1 => segment_turns_v1(events),
         2 => segment_turns_v2(events),
         3 => segment_turns_v3(events),
+        4 => segment_turns_v4(events),
         _ => Err(OxidraError::Session(format!(
             "unsupported turn boundary reducer version {version}"
         ))),
@@ -777,9 +785,7 @@ fn segment_turns_v2(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
             event.kind = "turn.retry_superseded".to_owned();
         }
     }
-    let mut turns = segment_turns_v1(&normalized)?;
-    annotate_request_readiness(&normalized, &latest_retry_by_turn, &mut turns)?;
-    Ok(turns)
+    segment_turns_v1(&normalized)
 }
 
 fn normalize_boundary_version_v2_for_v1(event: &mut JournalEvent) -> Result<()> {
@@ -857,9 +863,7 @@ fn segment_turns_v3(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
             event.kind = "turn.retry_superseded".to_owned();
         }
     }
-    let mut turns = segment_turns_v1(&normalized)?;
-    annotate_request_readiness(&normalized, &latest_retry_by_turn, &mut turns)?;
-    Ok(turns)
+    segment_turns_v1(&normalized)
 }
 
 fn normalize_boundary_version_v3_for_v1(event: &mut JournalEvent) -> Result<()> {
@@ -901,7 +905,98 @@ fn normalize_boundary_version_v3_for_v1(event: &mut JournalEvent) -> Result<()> 
     Ok(())
 }
 
+fn segment_turns_v4(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
+    let recovery = validate_turn_recovery_v3(events)?;
+    let latest_retry_by_turn =
+        recovery
+            .retries
+            .iter()
+            .fold(HashMap::<String, u64>::new(), |mut latest, retry| {
+                latest
+                    .entry(retry.turn_id.clone())
+                    .and_modify(|seq| *seq = (*seq).max(retry.retry_seq))
+                    .or_insert(retry.retry_seq);
+                latest
+            });
+    let mut normalized = events.to_vec();
+    for event in &mut normalized {
+        normalize_boundary_version_v4_for_v1(event)?;
+        if event
+            .turn_id
+            .as_ref()
+            .and_then(|turn_id| latest_retry_by_turn.get(turn_id))
+            .is_some_and(|retry_seq| {
+                event.seq < *retry_seq
+                    && matches!(
+                        event.kind.as_str(),
+                        "response.failed"
+                            | "response.aborted"
+                            | "turn.cancelled"
+                            | "agent.stalled"
+                            | "agent.limit_reached"
+                            | "context.limit_reached"
+                    )
+            })
+        {
+            event.kind = "turn.retry_superseded".to_owned();
+        }
+    }
+    segment_turns_base(&normalized, LegacyCompletionSeq::NextUserEvidence)
+}
+
+fn normalize_boundary_version_v4_for_v1(event: &mut JournalEvent) -> Result<()> {
+    if let Some(version) = event.data.get_mut("turn_boundary_version") {
+        let value = version.as_u64().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "turn boundary version at seq {} is not an unsigned integer",
+                event.seq
+            ))
+        })?;
+        if !matches!(value, 1..=4) {
+            return Err(OxidraError::Session(format!(
+                "unsupported turn boundary version {value} at seq {}",
+                event.seq
+            )));
+        }
+        *version = Value::from(1);
+    }
+    if let Some(version) = event
+        .data
+        .get_mut("turn_completion")
+        .and_then(Value::as_object_mut)
+        .and_then(|completion| completion.get_mut("turn_boundary_version"))
+    {
+        let value = version.as_u64().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "inline turn boundary version at seq {} is not an unsigned integer",
+                event.seq
+            ))
+        })?;
+        if !matches!(value, 1..=4) {
+            return Err(OxidraError::Session(format!(
+                "unsupported inline turn boundary version {value} at seq {}",
+                event.seq
+            )));
+        }
+        *version = Value::from(1);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum LegacyCompletionSeq {
+    LastResponse,
+    NextUserEvidence,
+}
+
 fn segment_turns_v1(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
+    segment_turns_base(events, LegacyCompletionSeq::LastResponse)
+}
+
+fn segment_turns_base(
+    events: &[JournalEvent],
+    legacy_completion_seq: LegacyCompletionSeq,
+) -> Result<Vec<TurnSpan>> {
     let mut starts = Vec::new();
     let mut seen_turn_ids = HashSet::new();
     for (index, event) in events.iter().enumerate() {
@@ -1000,50 +1095,49 @@ fn segment_turns_v1(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
         if let Some(response) = inline_completion {
             validate_inline_completion(user_event, response, &turn_events, &calls)?;
         }
-        let (state, covers_through_seq, completion_seq) =
-            if let Some(marker) = markers.first().copied() {
-                validate_completed_marker(user_event, marker, &turn_events, &calls)?;
-                if let Some(response) = inline_completion {
-                    let marker_response_seq = required_u64(marker, "final_response_seq")?;
-                    if marker_response_seq != response.seq {
-                        return Err(OxidraError::Session(format!(
-                            "turn.completed at seq {} conflicts with inline completion at seq {}",
-                            marker.seq, response.seq
-                        )));
+        let (state, covers_through_seq, completion_seq) = if let Some(marker) =
+            markers.first().copied()
+        {
+            validate_completed_marker(user_event, marker, &turn_events, &calls)?;
+            if let Some(response) = inline_completion {
+                let marker_response_seq = required_u64(marker, "final_response_seq")?;
+                if marker_response_seq != response.seq {
+                    return Err(OxidraError::Session(format!(
+                        "turn.completed at seq {} conflicts with inline completion at seq {}",
+                        marker.seq, response.seq
+                    )));
+                }
+            }
+            (
+                TurnState::Complete(CompletionEvidence::ExplicitMarker),
+                marker.seq,
+                Some(inline_completion.map_or(marker.seq, |response| response.seq)),
+            )
+        } else if let Some(response) = inline_completion {
+            (
+                TurnState::Complete(CompletionEvidence::InlineResponse),
+                response.seq,
+                Some(response.seq),
+            )
+        } else {
+            let state = classify_unmarked_turn(&turn_events, tagged, has_next_user, &calls);
+            let covers_through_seq = if end_index_exclusive > *start_index {
+                events[end_index_exclusive - 1].seq
+            } else {
+                user_event.seq
+            };
+            let completion_seq = match state {
+                TurnState::Complete(CompletionEvidence::LegacyNextUser) => {
+                    match legacy_completion_seq {
+                        LegacyCompletionSeq::LastResponse => last_response_event_seq(&turn_events),
+                        LegacyCompletionSeq::NextUserEvidence => next_user_seq,
                     }
                 }
-                (
-                    TurnState::Complete(CompletionEvidence::ExplicitMarker),
-                    marker.seq,
-                    Some(inline_completion.map_or(marker.seq, |response| response.seq)),
-                )
-            } else if let Some(response) = inline_completion {
-                (
-                    TurnState::Complete(CompletionEvidence::InlineResponse),
-                    response.seq,
-                    Some(response.seq),
-                )
-            } else {
-                let state = classify_unmarked_turn(&turn_events, tagged, has_next_user, &calls);
-                let covers_through_seq = if end_index_exclusive > *start_index {
-                    events[end_index_exclusive - 1].seq
-                } else {
-                    user_event.seq
-                };
-                // Legacy completion is only knowable when the next durable
-                // user.message appears.  Backdating this evidence to the
-                // previous response lets that same next message
-                // retroactively resolve controls inserted in between.
-                let completion_seq = match state {
-                    TurnState::Complete(CompletionEvidence::LegacyNextUser) => next_user_seq,
-                    TurnState::Complete(_) => last_response_event_seq(&turn_events),
-                    _ => None,
-                };
-                (state, covers_through_seq, completion_seq)
+                TurnState::Complete(_) => last_response_event_seq(&turn_events),
+                _ => None,
             };
-        let request_ready = matches!(state, TurnState::OpenTail)
-            && calls.is_resolved()
-            && response_attempts_allow_next_request(&turn_events);
+            (state, covers_through_seq, completion_seq)
+        };
         let cut_safe = match state {
             TurnState::Complete(_) => true,
             TurnState::Cancelled
@@ -1063,38 +1157,10 @@ fn segment_turns_v1(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
             covers_through_seq,
             state,
             completion_seq,
-            request_ready,
             cut_safe,
         });
     }
     Ok(turns)
-}
-
-/// Recompute request readiness for the active retry epoch.  Turn state and
-/// cutoff semantics remain those of the frozen reducer version; this derived
-/// permission bit ignores attempts that a validated retry intent superseded.
-fn annotate_request_readiness(
-    events: &[JournalEvent],
-    latest_retry_by_turn: &HashMap<String, u64>,
-    turns: &mut [TurnSpan],
-) -> Result<()> {
-    for turn in turns {
-        let retry_seq = latest_retry_by_turn.get(&turn.turn_id).copied();
-        let turn_events = events[turn.start_index..turn.end_index_exclusive]
-            .iter()
-            .filter(|event| event.turn_id.as_deref() == Some(turn.turn_id.as_str()))
-            .collect::<Vec<_>>();
-        let calls = validate_call_outputs(&turn_events)?;
-        let response_epoch = turn_events
-            .iter()
-            .copied()
-            .filter(|event| retry_seq.is_none_or(|retry_seq| event.seq > retry_seq))
-            .collect::<Vec<_>>();
-        turn.request_ready = matches!(turn.state, TurnState::OpenTail)
-            && calls.is_resolved()
-            && response_attempts_allow_next_request(&response_epoch);
-    }
-    Ok(())
 }
 
 /// Return complete cutoffs in the contiguous cut-safe prefix.
@@ -1404,49 +1470,378 @@ impl CallValidation {
     }
 }
 
-/// Return true only when the current attempt epoch is durably idle at a point
-/// where another normal Provider request is meaningful.  Missing/duplicate
-/// attempt identifiers fail closed instead of being guessed from event order.
-fn response_attempts_allow_next_request(turn_events: &[&JournalEvent]) -> bool {
-    let mut active = HashSet::<String>::new();
-    let mut seen = HashSet::<String>::new();
-    let mut valid = true;
-    let mut last_lifecycle = None::<&JournalEvent>;
+/// Rebuild the Provider request slot from the durable journal prefix.
+///
+/// Unlike a final `TurnSpan` boolean, this reducer validates every transition:
+/// only one response attempt may be active, a later request cannot start until
+/// all calls from the previous response are settled, and a retry must be a
+/// validated recovery transition. Published match arms are immutable; add a
+/// new version when these rules change.
+pub(crate) fn provider_request_slot_state_for_version(
+    version: u32,
+    events: &[JournalEvent],
+    turn_id: &str,
+) -> Result<ProviderRequestSlotState> {
+    match version {
+        1 => provider_request_slot_state_v1(events, turn_id),
+        _ => Err(OxidraError::Session(format!(
+            "unsupported Provider request-slot reducer version {version}"
+        ))),
+    }
+}
 
-    for event in turn_events {
+#[derive(Clone, Debug)]
+struct ProviderSlotCall {
+    call_id: String,
+    started_seq: Option<u64>,
+    in_doubt: bool,
+    terminal: bool,
+}
+
+fn provider_request_slot_state_v1(
+    events: &[JournalEvent],
+    turn_id: &str,
+) -> Result<ProviderRequestSlotState> {
+    let recovery = validate_turn_recovery_v3(events)?;
+    let validated_retry_seqs = recovery
+        .retries
+        .iter()
+        .filter(|retry| retry.turn_id == turn_id)
+        .map(|retry| retry.retry_seq)
+        .collect::<HashSet<_>>();
+
+    let mut saw_user = false;
+    let mut state = ProviderRequestSlotState::Ready;
+    let mut active_attempt = None::<String>;
+    let mut seen_attempts = HashSet::<String>::new();
+    let mut calls = Vec::<ProviderSlotCall>::new();
+    let mut seen_call_ids = HashSet::<String>::new();
+
+    for event in events {
+        if is_provider_slot_event_kind(&event.kind) && event.turn_id.is_none() {
+            return Err(OxidraError::Session(format!(
+                "{} at seq {} has no turn_id",
+                event.kind, event.seq
+            )));
+        }
+    }
+
+    for event in events
+        .iter()
+        .filter(|event| event.turn_id.as_deref() == Some(turn_id))
+    {
         match event.kind.as_str() {
-            "response.started" => {
-                last_lifecycle = Some(event);
-                let Some(attempt_id) = response_attempt_id(event) else {
-                    valid = false;
-                    continue;
-                };
-                if !seen.insert(attempt_id.to_owned()) || !active.insert(attempt_id.to_owned()) {
-                    valid = false;
+            "user.message" => {
+                if saw_user {
+                    return Err(OxidraError::Session(format!(
+                        "turn {turn_id} has more than one user.message"
+                    )));
                 }
+                saw_user = true;
+            }
+            "response.started" => {
+                require_slot_user(saw_user, event, turn_id)?;
+                if state != ProviderRequestSlotState::Ready
+                    || active_attempt.is_some()
+                    || calls.iter().any(|call| !call.terminal)
+                {
+                    return Err(OxidraError::Session(format!(
+                        "response.started at seq {} cannot acquire turn {turn_id}'s Provider request slot from state {state:?}",
+                        event.seq
+                    )));
+                }
+                let attempt_id = required_response_attempt_id(event)?;
+                if !seen_attempts.insert(attempt_id.to_owned()) {
+                    return Err(OxidraError::Session(format!(
+                        "duplicate response attempt id {attempt_id} at seq {}",
+                        event.seq
+                    )));
+                }
+                active_attempt = Some(attempt_id.to_owned());
+                state = ProviderRequestSlotState::ResponseInFlight;
             }
             "response.completed" | "response.failed" | "response.aborted" => {
-                last_lifecycle = Some(event);
-                let Some(attempt_id) = response_attempt_id(event) else {
-                    valid = false;
-                    continue;
-                };
-                if !active.remove(attempt_id) {
-                    valid = false;
+                require_slot_user(saw_user, event, turn_id)?;
+                let attempt_id = required_response_attempt_id(event)?;
+                if state != ProviderRequestSlotState::ResponseInFlight
+                    || active_attempt.as_deref() != Some(attempt_id)
+                {
+                    return Err(OxidraError::Session(format!(
+                        "{} at seq {} does not terminate the active response attempt for turn {turn_id}",
+                        event.kind, event.seq
+                    )));
                 }
+                active_attempt = None;
+                if event.kind == "response.completed" {
+                    let call_ids = response_function_call_ids(event)?;
+                    if call_ids.is_empty() {
+                        state = ProviderRequestSlotState::Terminal;
+                    } else {
+                        for call_id in call_ids {
+                            if !seen_call_ids.insert(call_id.clone()) {
+                                return Err(OxidraError::Session(format!(
+                                    "duplicate function call id {call_id} at seq {}",
+                                    event.seq
+                                )));
+                            }
+                            calls.push(ProviderSlotCall {
+                                call_id,
+                                started_seq: None,
+                                in_doubt: false,
+                                terminal: false,
+                            });
+                        }
+                        state = ProviderRequestSlotState::AwaitingTools;
+                    }
+                } else {
+                    state = ProviderRequestSlotState::Terminal;
+                }
+            }
+            "tool.started" => {
+                require_slot_user(saw_user, event, turn_id)?;
+                require_awaiting_tools(state, event, turn_id)?;
+                let call_id = required_call_id(event)?;
+                let Some(call) = calls.iter_mut().find(|call| {
+                    call.call_id == call_id && call.started_seq.is_none() && !call.terminal
+                }) else {
+                    return Err(OxidraError::Session(format!(
+                        "tool.started at seq {} does not match an unstarted call {call_id}",
+                        event.seq
+                    )));
+                };
+                call.started_seq = Some(event.seq);
+            }
+            "tool.in_doubt" => {
+                require_slot_user(saw_user, event, turn_id)?;
+                require_awaiting_tools(state, event, turn_id)?;
+                let index = slot_call_index(&calls, event, SlotCallMatch::Started)?;
+                if calls[index].in_doubt {
+                    return Err(OxidraError::Session(format!(
+                        "tool.in_doubt at seq {} duplicates call {}",
+                        event.seq, calls[index].call_id
+                    )));
+                }
+                calls[index].in_doubt = true;
+            }
+            kind if is_tool_terminal_v1(kind) => {
+                require_slot_user(saw_user, event, turn_id)?;
+                require_awaiting_tools(state, event, turn_id)?;
+                let match_kind = if kind == "tool.in_doubt_resolved" {
+                    SlotCallMatch::InDoubt
+                } else if kind.starts_with("tool.skipped_due_to_") {
+                    SlotCallMatch::Unstarted
+                } else {
+                    SlotCallMatch::AnyPending
+                };
+                let index = slot_call_index(&calls, event, match_kind)?;
+                if kind != "tool.in_doubt_resolved" && calls[index].in_doubt {
+                    return Err(OxidraError::Session(format!(
+                        "{} at seq {} cannot settle in-doubt call {} without explicit resolution",
+                        event.kind, event.seq, calls[index].call_id
+                    )));
+                }
+                calls[index].terminal = true;
+                calls[index].in_doubt = false;
+                if calls.iter().all(|call| call.terminal) {
+                    state = ProviderRequestSlotState::Ready;
+                }
+            }
+            "turn.retry_started" => {
+                require_slot_user(saw_user, event, turn_id)?;
+                if !validated_retry_seqs.contains(&event.seq) {
+                    return Err(OxidraError::Session(format!(
+                        "turn.retry_started at seq {} is absent from the validated recovery reducer",
+                        event.seq
+                    )));
+                }
+                if state != ProviderRequestSlotState::Terminal
+                    || active_attempt.is_some()
+                    || calls.iter().any(|call| !call.terminal)
+                {
+                    return Err(OxidraError::Session(format!(
+                        "turn.retry_started at seq {} cannot reacquire turn {turn_id}'s Provider request slot from state {state:?}",
+                        event.seq
+                    )));
+                }
+                state = ProviderRequestSlotState::Ready;
+            }
+            "turn.cancelled"
+            | "agent.stalled"
+            | "agent.limit_reached"
+            | "context.limit_reached"
+            | "turn.completed" => {
+                require_slot_user(saw_user, event, turn_id)?;
+                if active_attempt.is_some()
+                    || state == ProviderRequestSlotState::ResponseInFlight
+                    || calls.iter().any(|call| !call.terminal)
+                {
+                    return Err(OxidraError::Session(format!(
+                        "{} at seq {} terminates turn {turn_id} while its Provider request slot is unsettled",
+                        event.kind, event.seq
+                    )));
+                }
+                state = ProviderRequestSlotState::Terminal;
             }
             _ => {}
         }
     }
 
-    if !valid || !active.is_empty() {
-        return false;
+    if !saw_user {
+        return Err(OxidraError::Session(format!(
+            "Provider request-slot reducer cannot find turn {turn_id}'s user.message"
+        )));
     }
-    match last_lifecycle {
-        None => true,
-        Some(event) if event.kind == "response.completed" => response_has_function_call(event),
-        Some(_) => false,
+    Ok(state)
+}
+
+fn is_provider_slot_event_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "response.started"
+            | "response.completed"
+            | "response.failed"
+            | "response.aborted"
+            | "turn.retry_started"
+            | "turn.cancelled"
+            | "agent.stalled"
+            | "agent.limit_reached"
+            | "context.limit_reached"
+            | "turn.completed"
+            | "tool.started"
+            | "tool.in_doubt"
+            | "tool.completed"
+            | "tool.cancelled"
+            | "tool.in_doubt_resolved"
+            | "tool.skipped_due_to_cancel"
+            | "tool.skipped_due_to_in_doubt"
+            | "tool.skipped_due_to_limit"
+            | "tool.skipped_due_to_stalled"
+            | "tool.skipped_due_to_recovery"
+    )
+}
+
+fn require_slot_user(saw_user: bool, event: &JournalEvent, turn_id: &str) -> Result<()> {
+    if saw_user {
+        return Ok(());
     }
+    Err(OxidraError::Session(format!(
+        "{} at seq {} precedes turn {turn_id}'s user.message",
+        event.kind, event.seq
+    )))
+}
+
+fn require_awaiting_tools(
+    state: ProviderRequestSlotState,
+    event: &JournalEvent,
+    turn_id: &str,
+) -> Result<()> {
+    if state == ProviderRequestSlotState::AwaitingTools {
+        return Ok(());
+    }
+    Err(OxidraError::Session(format!(
+        "{} at seq {} cannot run for turn {turn_id} from Provider request-slot state {state:?}",
+        event.kind, event.seq
+    )))
+}
+
+fn required_response_attempt_id(event: &JournalEvent) -> Result<&str> {
+    response_attempt_id(event).ok_or_else(|| {
+        OxidraError::Session(format!(
+            "{} at seq {} has no response_attempt_id",
+            event.kind, event.seq
+        ))
+    })
+}
+
+fn required_call_id(event: &JournalEvent) -> Result<&str> {
+    event_call_id(event)
+        .filter(|call_id| !call_id.trim().is_empty())
+        .ok_or_else(|| {
+            OxidraError::Session(format!(
+                "{} at seq {} has no call_id",
+                event.kind, event.seq
+            ))
+        })
+}
+
+fn response_function_call_ids(event: &JournalEvent) -> Result<Vec<String>> {
+    let items = event
+        .data
+        .get("output_items")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            event
+                .data
+                .get("raw_response")
+                .and_then(|response| response.get("output"))
+                .and_then(Value::as_array)
+        })
+        .ok_or_else(|| {
+            OxidraError::Session(format!(
+                "response.completed at seq {} has no committed output array",
+                event.seq
+            ))
+        })?;
+    items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .map(|item| {
+            item.get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .filter(|call_id| !call_id.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "function call in response.completed at seq {} has no call_id",
+                        event.seq
+                    ))
+                })
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum SlotCallMatch {
+    Started,
+    InDoubt,
+    Unstarted,
+    AnyPending,
+}
+
+fn slot_call_index(
+    calls: &[ProviderSlotCall],
+    event: &JournalEvent,
+    match_kind: SlotCallMatch,
+) -> Result<usize> {
+    let call_id = required_call_id(event)?;
+    let started_seq = event.data.get("started_seq").and_then(Value::as_u64);
+    let matches_kind = |call: &ProviderSlotCall| match match_kind {
+        SlotCallMatch::Started => call.started_seq.is_some(),
+        SlotCallMatch::InDoubt => call.in_doubt,
+        SlotCallMatch::Unstarted => call.started_seq.is_none(),
+        SlotCallMatch::AnyPending => true,
+    };
+    let position = started_seq
+        .and_then(|started_seq| {
+            calls.iter().position(|call| {
+                !call.terminal
+                    && call.started_seq == Some(started_seq)
+                    && call.call_id == call_id
+                    && matches_kind(call)
+            })
+        })
+        .or_else(|| {
+            calls
+                .iter()
+                .position(|call| !call.terminal && call.call_id == call_id && matches_kind(call))
+        });
+    position.ok_or_else(|| {
+        OxidraError::Session(format!(
+            "{} at seq {} does not match pending call {call_id}",
+            event.kind, event.seq
+        ))
+    })
 }
 
 fn response_attempt_id(event: &JournalEvent) -> Option<&str> {
@@ -1994,10 +2389,44 @@ mod tests {
     }
 
     #[test]
-    fn request_readiness_is_independent_from_open_tail_state() {
-        let user_only = segment_turns(&[user(1, "ready", true)]).expect("user-only turn");
-        assert_eq!(user_only[0].state, TurnState::OpenTail);
-        assert!(user_only[0].request_ready);
+    fn frozen_turn_reducers_keep_legacy_completion_seq_until_v4() {
+        let events = vec![
+            user(1, "legacy", false),
+            response(2, "legacy"),
+            user(3, "next", false),
+        ];
+        for version in 1..=3 {
+            assert_eq!(
+                segment_turns_for_version(version, &events)
+                    .expect("historical reducer remains readable")[0]
+                    .completion_seq,
+                Some(2),
+                "turn validator v{version} must retain its published evidence seq"
+            );
+        }
+        assert_eq!(
+            segment_turns_for_version(4, &events).expect("v4 reducer uses the evidence event")[0]
+                .completion_seq,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn request_slot_readiness_is_independent_from_open_tail_state() {
+        let user_only = vec![user(1, "ready", true)];
+        assert_eq!(
+            segment_turns(&user_only).expect("user-only turn")[0].state,
+            TurnState::OpenTail
+        );
+        assert_eq!(
+            provider_request_slot_state_for_version(
+                PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+                &user_only,
+                "ready"
+            )
+            .expect("user-only slot"),
+            ProviderRequestSlotState::Ready
+        );
 
         let in_flight = vec![
             user(1, "in-flight", true),
@@ -2010,11 +2439,19 @@ mod tests {
         ];
         let turns = segment_turns(&in_flight).expect("valid in-flight response");
         assert_eq!(turns[0].state, TurnState::OpenTail);
-        assert!(!turns[0].request_ready);
+        assert_eq!(
+            provider_request_slot_state_for_version(
+                PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+                &in_flight,
+                "in-flight"
+            )
+            .expect("in-flight slot"),
+            ProviderRequestSlotState::ResponseInFlight
+        );
     }
 
     #[test]
-    fn request_readiness_requires_resolved_tools_and_response_attempts() {
+    fn request_slot_requires_resolved_tools_and_response_attempts() {
         let mut events = vec![
             user(1, "tools", true),
             event(
@@ -2040,7 +2477,15 @@ mod tests {
         ];
         let pending = segment_turns(&events).expect("valid pending tool call");
         assert_eq!(pending[0].state, TurnState::OpenTail);
-        assert!(!pending[0].request_ready);
+        assert_eq!(
+            provider_request_slot_state_for_version(
+                PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+                &events,
+                "tools"
+            )
+            .expect("pending tool slot"),
+            ProviderRequestSlotState::AwaitingTools
+        );
 
         events.push(event(
             4,
@@ -2056,11 +2501,87 @@ mod tests {
         ));
         let resolved = segment_turns(&events).expect("valid resolved tool call");
         assert_eq!(resolved[0].state, TurnState::OpenTail);
-        assert!(resolved[0].request_ready);
+        assert_eq!(
+            provider_request_slot_state_for_version(
+                PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+                &events,
+                "tools"
+            )
+            .expect("resolved tool slot"),
+            ProviderRequestSlotState::Ready
+        );
     }
 
     #[test]
-    fn request_readiness_ignores_attempts_superseded_by_valid_retry() {
+    fn request_slot_rejects_concurrent_response_attempts() {
+        let events = vec![
+            user(1, "concurrent", true),
+            event(
+                2,
+                "concurrent",
+                "response.started",
+                json!({"response_attempt_id":"attempt-a"}),
+            ),
+            event(
+                3,
+                "concurrent",
+                "response.started",
+                json!({"response_attempt_id":"attempt-b"}),
+            ),
+        ];
+        assert!(
+            provider_request_slot_state_for_version(
+                PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+                &events,
+                "concurrent"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn request_slot_rejects_next_response_before_tool_resolution() {
+        let events = vec![
+            user(1, "causal", true),
+            event(
+                2,
+                "causal",
+                "response.started",
+                json!({"response_attempt_id":"attempt-a"}),
+            ),
+            event(
+                3,
+                "causal",
+                "response.completed",
+                json!({
+                    "response_attempt_id":"attempt-a",
+                    "output_items":[{
+                        "type":"function_call",
+                        "call_id":"call-1",
+                        "name":"read",
+                        "arguments":"{}"
+                    }]
+                }),
+            ),
+            event(
+                4,
+                "causal",
+                "response.started",
+                json!({"response_attempt_id":"attempt-b"}),
+            ),
+        ];
+        let error = provider_request_slot_state_for_version(
+            PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+            &events,
+            "causal",
+        )
+        .expect_err("tool result must precede the next Provider request")
+        .to_string();
+        assert!(error.contains("cannot acquire"));
+    }
+
+    #[test]
+    fn request_slot_retry_reacquires_a_terminal_attempt() {
         let events = vec![
             user(1, "limited", true),
             event(
@@ -2091,7 +2612,15 @@ mod tests {
 
         let turns = segment_turns(&events).expect("valid retry epoch");
         assert_eq!(turns[0].state, TurnState::OpenTail);
-        assert!(turns[0].request_ready);
+        assert_eq!(
+            provider_request_slot_state_for_version(
+                PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+                &events,
+                "limited"
+            )
+            .expect("retry slot"),
+            ProviderRequestSlotState::Ready
+        );
 
         let unresolved_before_retry = vec![
             user(1, "limited-tools", true),
@@ -2140,10 +2669,15 @@ mod tests {
                 }),
             ),
         ];
-        let turns = segment_turns(&unresolved_before_retry).expect("valid retry metadata");
+        let turns = segment_turns(&unresolved_before_retry).expect("turn segmentation is separate");
+        assert_eq!(turns[0].state, TurnState::OpenTail);
         assert!(
-            !turns[0].request_ready,
-            "retry must not erase pending tools"
+            provider_request_slot_state_for_version(
+                PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+                &unresolved_before_retry,
+                "limited-tools"
+            )
+            .is_err()
         );
     }
 
