@@ -38,6 +38,11 @@ pub struct TurnSpan {
     pub covers_from_seq: u64,
     pub covers_through_seq: u64,
     pub state: TurnState,
+    /// The earliest event sequence accepted as completion evidence.  This is
+    /// separate from `covers_through_seq`: a legacy cutoff may include later
+    /// projection-neutral events, and an explicit marker may follow an already
+    /// validated inline completion.
+    pub completion_seq: Option<u64>,
     /// Whether a later complete boundary may safely cover this turn.
     pub cut_safe: bool,
 }
@@ -983,35 +988,41 @@ fn segment_turns_v1(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
         if let Some(response) = inline_completion {
             validate_inline_completion(user_event, response, &turn_events, &calls)?;
         }
-        let (state, covers_through_seq) = if let Some(marker) = markers.first().copied() {
-            validate_completed_marker(user_event, marker, &turn_events, &calls)?;
-            if let Some(response) = inline_completion {
-                let marker_response_seq = required_u64(marker, "final_response_seq")?;
-                if marker_response_seq != response.seq {
-                    return Err(OxidraError::Session(format!(
-                        "turn.completed at seq {} conflicts with inline completion at seq {}",
-                        marker.seq, response.seq
-                    )));
+        let (state, covers_through_seq, completion_seq) =
+            if let Some(marker) = markers.first().copied() {
+                validate_completed_marker(user_event, marker, &turn_events, &calls)?;
+                if let Some(response) = inline_completion {
+                    let marker_response_seq = required_u64(marker, "final_response_seq")?;
+                    if marker_response_seq != response.seq {
+                        return Err(OxidraError::Session(format!(
+                            "turn.completed at seq {} conflicts with inline completion at seq {}",
+                            marker.seq, response.seq
+                        )));
+                    }
                 }
-            }
-            (
-                TurnState::Complete(CompletionEvidence::ExplicitMarker),
-                marker.seq,
-            )
-        } else if let Some(response) = inline_completion {
-            (
-                TurnState::Complete(CompletionEvidence::InlineResponse),
-                response.seq,
-            )
-        } else {
-            let state = classify_unmarked_turn(&turn_events, tagged, has_next_user, &calls);
-            let covers_through_seq = if end_index_exclusive > *start_index {
-                events[end_index_exclusive - 1].seq
+                (
+                    TurnState::Complete(CompletionEvidence::ExplicitMarker),
+                    marker.seq,
+                    Some(inline_completion.map_or(marker.seq, |response| response.seq)),
+                )
+            } else if let Some(response) = inline_completion {
+                (
+                    TurnState::Complete(CompletionEvidence::InlineResponse),
+                    response.seq,
+                    Some(response.seq),
+                )
             } else {
-                user_event.seq
+                let state = classify_unmarked_turn(&turn_events, tagged, has_next_user, &calls);
+                let covers_through_seq = if end_index_exclusive > *start_index {
+                    events[end_index_exclusive - 1].seq
+                } else {
+                    user_event.seq
+                };
+                let completion_seq = matches!(state, TurnState::Complete(_))
+                    .then(|| last_response_event_seq(&turn_events))
+                    .flatten();
+                (state, covers_through_seq, completion_seq)
             };
-            (state, covers_through_seq)
-        };
         let cut_safe = match state {
             TurnState::Complete(_) => true,
             TurnState::Cancelled
@@ -1030,6 +1041,7 @@ fn segment_turns_v1(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
             covers_from_seq: user_event.seq,
             covers_through_seq,
             state,
+            completion_seq,
             cut_safe,
         });
     }

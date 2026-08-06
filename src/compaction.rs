@@ -22,8 +22,8 @@ use crate::projection::{
 use crate::provider::{ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{JournalEvent, SessionJournal};
 use crate::turn::{
-    CompletionEvidence, TURN_BOUNDARY_VALIDATOR_VERSION, TurnState,
-    complete_prefix_candidates_for_version, segment_turns_for_version,
+    TURN_BOUNDARY_VALIDATOR_VERSION, TurnState, complete_prefix_candidates_for_version,
+    segment_turns_for_version,
 };
 use crate::types::AssistantTurn;
 
@@ -993,14 +993,11 @@ pub fn validate_compaction_boundary_chain(
         .collect::<HashMap<_, _>>();
     let completion_seq_by_turn = turns
         .iter()
-        .filter(|turn| matches!(turn.state, TurnState::Complete(_)))
-        .map(|turn| {
-            Ok((
-                turn.turn_id.clone(),
-                validated_turn_completion_seq(turn, events)?,
-            ))
+        .filter_map(|turn| {
+            turn.completion_seq
+                .map(|completion_seq| (turn.turn_id.clone(), completion_seq))
         })
-        .collect::<Result<HashMap<_, _>>>()?;
+        .collect::<HashMap<_, _>>();
     let completion_turn_by_seq = completion_seq_by_turn
         .iter()
         .map(|(turn_id, seq)| (*seq, turn_id.as_str()))
@@ -1011,7 +1008,7 @@ pub fn validate_compaction_boundary_chain(
     let mut active_by_turn = HashMap::<String, usize>::new();
     let mut attempt_by_boundary_id = HashMap::<String, String>::new();
 
-    for event in events {
+    for (event_index, event) in events.iter().enumerate() {
         if matches!(
             event.kind.as_str(),
             COMPACTION_BOUNDARY_STARTED_KIND
@@ -1049,6 +1046,7 @@ pub fn validate_compaction_boundary_chain(
                     &user_messages,
                     events,
                 )?;
+                validate_boundary_start_context(&payload.boundary, event_index, events)?;
                 if completion_seq_by_turn
                     .get(&payload.boundary.turn_id)
                     .is_some_and(|completion_seq| *completion_seq < event.seq)
@@ -1444,66 +1442,41 @@ pub fn validate_compaction_boundary_chain(
     Ok(CompactionBoundaryChain { boundaries })
 }
 
-/// Return the exact event sequence that the selected turn reducer accepted as
-/// completion.  `TurnSpan::covers_through_seq` is a cutoff, not always an
-/// event carrying the turn id: legacy turns may have global management events
-/// between the final response and the next user message.  Boundary state must
-/// therefore use the validated completion evidence itself, never a guessed
-/// `turn_completion` field from an arbitrary event.
-fn validated_turn_completion_seq(
-    turn: &crate::turn::TurnSpan,
+/// Validate that a request boundary is written for the current, still-open
+/// turn in the journal prefix visible at this event.  Looking only at the
+/// final journal would allow a later user message or completion marker to
+/// retroactively bless an already-invalid boundary.
+fn validate_boundary_start_context(
+    boundary: &CompactionBoundary,
+    event_index: usize,
     events: &[JournalEvent],
-) -> Result<u64> {
-    let turn_events = events[turn.start_index..turn.end_index_exclusive]
-        .iter()
-        .filter(|event| event.turn_id.as_deref() == Some(turn.turn_id.as_str()))
-        .collect::<Vec<_>>();
-    match turn.state {
-        TurnState::Complete(CompletionEvidence::ExplicitMarker) => turn_events
-            .iter()
-            .find(|event| event.seq == turn.covers_through_seq && event.kind == "turn.completed")
-            .map(|event| event.seq)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "validated explicit completion for turn {} has no matching marker",
-                    turn.turn_id
-                ))
-            }),
-        TurnState::Complete(CompletionEvidence::InlineResponse) => turn_events
-            .iter()
-            .find(|event| {
-                event.seq == turn.covers_through_seq
-                    && event.kind == "response.completed"
-                    && event.data.get("turn_completion").is_some()
-            })
-            .map(|event| event.seq)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "validated inline completion for turn {} has no matching response",
-                    turn.turn_id
-                ))
-            }),
-        TurnState::Complete(CompletionEvidence::LegacyNextUser) => turn_events
-            .iter()
-            .rev()
-            .find(|event| {
-                matches!(
-                    event.kind.as_str(),
-                    "response.completed" | "response.failed" | "response.aborted"
-                )
-            })
-            .map(|event| event.seq)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "validated legacy completion for turn {} has no response event",
-                    turn.turn_id
-                ))
-            }),
-        _ => Err(OxidraError::Session(format!(
-            "turn {} is not complete",
-            turn.turn_id
-        ))),
+) -> Result<()> {
+    let visible_events = &events[..=event_index];
+    let turns = segment_turns_for_version(
+        COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1,
+        visible_events,
+    )?;
+    let Some(active_turn) = turns.last() else {
+        return session_error(format!(
+            "compaction boundary {} has no active user turn",
+            boundary.boundary_id
+        ));
+    };
+    if active_turn.turn_id != boundary.turn_id
+        || active_turn.covers_from_seq != boundary.user_message_seq
+    {
+        return session_error(format!(
+            "compaction boundary {} does not reference the latest active turn",
+            boundary.boundary_id
+        ));
     }
+    if !matches!(active_turn.state, TurnState::OpenTail) {
+        return session_error(format!(
+            "compaction boundary {} targets turn {} in state {:?}, not an open tail",
+            boundary.boundary_id, boundary.turn_id, active_turn.state
+        ));
+    }
+    Ok(())
 }
 
 fn validate_boundary_user_reference(
@@ -5435,5 +5408,74 @@ mod tests {
             .expect_err("plain boundary.started cannot reopen an abandoned prompt")
             .to_string();
         assert!(error.contains("reuse of the original prompt requires"));
+    }
+
+    #[test]
+    fn boundary_started_must_target_the_latest_live_turn() {
+        let crossed = vec![
+            open_user(1, "turn-1", "first"),
+            open_user(2, "turn-2", "second"),
+            boundary_started(3, "boundary-1", "turn-1", 1),
+        ];
+        let error = validate_compaction_boundary_chain(&crossed)
+            .expect_err("a boundary cannot target a turn crossed by a later prompt")
+            .to_string();
+        assert!(error.contains("latest active turn"));
+
+        let terminated = vec![
+            open_user(1, "turn-1", "first"),
+            event(2, Some("turn-1"), "turn.cancelled", json!({})),
+            boundary_started(3, "boundary-1", "turn-1", 1),
+        ];
+        let error = validate_compaction_boundary_chain(&terminated)
+            .expect_err("a cancelled turn must be retried before compaction")
+            .to_string();
+        assert!(error.contains("not an open tail"));
+    }
+
+    #[test]
+    fn inline_completion_is_the_earliest_completion_evidence() {
+        let events = vec![
+            open_user(1, "turn-1", "prompt"),
+            event(
+                2,
+                Some("turn-1"),
+                "response.completed",
+                json!({
+                    "output_items": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    }],
+                    "turn_completion": {
+                        "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                        "covers_from_seq": 1,
+                        "final_response_seq": 2,
+                        "covers_through_seq": 2,
+                    },
+                }),
+            ),
+            boundary_started(3, "boundary-1", "turn-1", 1),
+            event(
+                4,
+                Some("turn-1"),
+                "turn.completed",
+                json!({
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                    "covers_from_seq": 1,
+                    "final_response_seq": 2,
+                    "covers_through_seq": 4,
+                }),
+            ),
+        ];
+        let turns =
+            segment_turns_for_version(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1, &events)
+                .unwrap();
+        assert_eq!(turns[0].completion_seq, Some(2));
+
+        let error = validate_compaction_boundary_chain(&events)
+            .expect_err("a boundary after inline completion must not be retroactively valid")
+            .to_string();
+        assert!(error.contains("not an open tail"));
     }
 }
