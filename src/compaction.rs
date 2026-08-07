@@ -21,14 +21,14 @@ use crate::projection::{
     SOURCE_PROJECTION_VERSION, project_events_for_compaction,
     source_projection_supports_boundary_exclusions, validate_response_output_items,
 };
-use crate::provider::{ResponseProvider, ResponseRequest, StreamObserver};
+use crate::provider::{ResponseProvider, ResponseRequest, StreamObserver, parse_usage};
 use crate::session::{JournalEvent, SessionJournal};
 use crate::turn::{
     CompletionEvidence, ProviderRequestSlotState, TURN_BOUNDARY_VALIDATOR_VERSION, TurnState,
     complete_prefix_candidates_for_version, is_provider_slot_event_kind,
     provider_request_slot_state_for_version, segment_turns_for_version,
 };
-use crate::types::AssistantTurn;
+use crate::types::{AssistantTurn, Usage};
 
 pub const COMPACTION_STARTED_KIND: &str = "compaction.started";
 pub const COMPACTION_CHECKPOINT_KIND: &str = "compaction.checkpoint";
@@ -3899,6 +3899,47 @@ fn validate_compaction_turn(
     Ok((summary, usage))
 }
 
+/// Validate a completed compaction response preserved outside the journal.
+///
+/// Drift artifacts use this production contract before re-scoring: the
+/// summary must be the exact assistant output text, the raw output must obey
+/// Provider role/tool constraints, raw usage must satisfy the registered
+/// compaction contract, and the separately serialized typed usage must be the
+/// canonical parse of that same raw usage object.
+pub fn validate_recorded_compaction_response(
+    raw_response: &Value,
+    reported_usage: &Usage,
+    usage_contract_version: u32,
+) -> Result<String> {
+    let output = raw_response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            OxidraError::Provider(
+                "recorded compaction response has no complete output array".to_owned(),
+            )
+        })?;
+    validate_response_output_items(output)?;
+    let summary = extract_compaction_summary(raw_response).map_err(|error| {
+        OxidraError::Provider(format!("invalid recorded compaction response: {error}"))
+    })?;
+    let raw_usage = raw_response.get("usage").ok_or_else(|| {
+        OxidraError::Provider("recorded compaction response has no usage".to_owned())
+    })?;
+    validate_compaction_usage(usage_contract_version, raw_usage).map_err(|error| {
+        OxidraError::Provider(format!(
+            "invalid recorded compaction response usage: {error}"
+        ))
+    })?;
+    let parsed_usage = parse_usage(Some(raw_usage));
+    if parsed_usage != *reported_usage {
+        return Err(OxidraError::Provider(
+            "recorded typed usage does not match raw_response.usage".to_owned(),
+        ));
+    }
+    Ok(summary)
+}
+
 fn append_compaction_terminal(
     journal: &mut SessionJournal,
     kind: &str,
@@ -5653,6 +5694,10 @@ mod tests {
         assert!(prompt.contains("do not replace them with a refusal"));
         assert!(prompt.contains("status polarity"));
         assert!(prompt.contains("recursively retain its durable facts"));
+        assert_eq!(
+            hex::encode(Sha256::digest(prompt.as_bytes())),
+            "d06c42e6f62fffa886e2c270a653f34ab73278310e09d78900927bf281aad5c9"
+        );
     }
 
     #[test]

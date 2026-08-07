@@ -663,7 +663,7 @@ fn build_turn(mut response: Value, stream_state: &StreamState) -> Result<Assista
     })
 }
 
-fn parse_usage(value: Option<&Value>) -> Usage {
+pub(crate) fn parse_usage(value: Option<&Value>) -> Usage {
     let Some(value) = value else {
         return Usage::default();
     };

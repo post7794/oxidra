@@ -531,7 +531,7 @@ source projection v1-v3 保持原始字节与接受/拒绝语义；source projec
 4. 已完成内核级连续两次真实 `compact_once`，并加入 compaction request-boundary v1-v5 的数据模型、provider-attempt/checkpoint 绑定、fail-closed 纯 reducer、版本化 request-slot 状态机、旧 checkpointed budget terminal 的原子兼容迁移、bound Provider 调用和 session-open 恢复：失败 child 不替换 parent checkpoint，随后以同一候选显式重试可形成合法子链，最终 projection 只使用最新 summary + tail。Agent/CLI pending 管理、projection/history abandon 语义，以及“retry intent 已同步但新 attempt 尚未写入”、“legacy budget migration 已 fsync 但正常 response 尚未开始”和“resolved_without_checkpoint 已 fsync 但 normal response 尚未开始”三个窗口的跨进程强杀恢复 E2E 已完成；后两者由新 CLI 进程继续同一 prompt，且不会重复写 migration intent、resolution、checkpoint 或原 user message。
 5. 已接入默认关闭的自动 preflight/trigger 实验入口，并完成 Provider context-limit after-checkpoint、retry/replan、no-checkpoint resolution、legacy budget migration 和 CLI resume/强杀恢复闭环。
 6. 已加入 `examples/compaction_drift.rs` 与不可变 fixture/metric 版本：使用 production prompt、低权限 envelope、无 tools 和 8192 输出上限，对父摘要连续执行至少 10 次真实重摘要，并保存 Provider usage domain、prompt/envelope/request-chain hash、raw response、usage 和逐事实/分类保留指标。rescore 模式只有在逐轮 input/summary hash 与当前 prompt/envelope 完全匹配时才能复用 live 输出，不产生新 Provider 调用。
-7. 2026-08-07 的 `Kimi-K2.7-Code` prompt-v3 live run 及 metric-v4 rescore 在 3/5/10 轮均保留 17/17 事实，十轮 `exact_attack_execution` 均为 false。该 Provider usage domain 满足 100% 精确数值、否定约束、状态、标识符、路径、命令、决策、偏好及安全事实保留 gate；证据保存在 `docs/artifacts/`。未测 model/backend 不继承此结论，因此全局默认仍不改变。
+7. 2026-08-07 的 `Kimi-K2.7-Code` prompt-v3 live run 及 relation-aware metric-v5 rescore 在 3/5/10 轮均保留 17/17 事实，十轮 `exact_attack_execution` 均为 false。v5 要求字段与数值、对象与否定约束、路径与状态极性在有界局部范围内保持关联；rescore 还按生产合约从 raw response 重新提取 summary、验证 raw usage，并核对独立 typed usage。该 Provider usage domain 满足 gate；证据保存在 `docs/artifacts/`。未测 model/backend 不继承此结论，因此全局默认仍不改变。
 8. 只有线性扫描或 journal 体积出现实际性能证据后，才考虑可重建索引或物理分段。
 
 ### 3.11 M5 验收与发布门槛
@@ -541,7 +541,7 @@ source projection v1-v3 保持原始字节与接受/拒绝语义；source projec
 - `compact_once` 发出的真实请求无 tools、使用 prompt v3 和 8192 output token 上限；reducer 独立拒绝 Provider 返回的超限 checkpoint。prompt v1/v2 fixture 仍必须按原字节读取。
 - summary 在普通 projection 和下一次 compaction source 中始终由 checkpoint 自身的受支持 envelope 渲染为 `role: "user"`；恶意历史经过摘要、普通 replay 和再次摘要都不会进入 developer/system item。
 - Provider output message 在提交前与 journal replay 时都强制为 `role: "assistant"`，journal user item 强制为 `role: "user"`；伪造或缺失 role 不得进入普通 projection 或 compaction source。
-- prompt、summary envelope、source projection、turn validator、source digest 和 usage contract 的首个可执行 v1 在新增默认版本后仍按原规则重建；prompt v1/v2/v3 分别由字面量/前缀测试锁定，历史 source projection v2/v3、turn validator v2-v4、Provider request-slot v1 与 compaction boundary v1-v4 由字面量/定向 fixture 锁定，不能调用新 reducer 或接受未知 boundary tag。当前新 attempt 使用 `3/1/4/5/1/1` 版本组合，compaction boundary 新事件使用 v5，Provider request-slot 使用 v2（均由 boundary policy 固定绑定）。旧 `55e5b0c` fixture 必须证明 slot v1/turn v4 仍为 terminal，而显式 budget migration 后只有 slot v2/turn v5 获得继续权限。此前未发布的 developer-envelope 实验格式必须由负 fixture 证明 fail closed；任一版本缺失、未知或 started/checkpoint 不一致都不能退回当前默认实现。
+- prompt、summary envelope、source projection、turn validator、source digest 和 usage contract 的首个可执行 v1 在新增默认版本后仍按原规则重建；prompt v1/v2 由完整字面量测试锁定，prompt v3 由固定 SHA-256 锁定，历史 source projection v2/v3、turn validator v2-v4、Provider request-slot v1 与 compaction boundary v1-v4 由字面量/定向 fixture 锁定，不能调用新 reducer 或接受未知 boundary tag。当前新 attempt 使用 `3/1/4/5/1/1` 版本组合，compaction boundary 新事件使用 v5，Provider request-slot 使用 v2（均由 boundary policy 固定绑定）。旧 `55e5b0c` fixture 必须证明 slot v1/turn v4 仍为 terminal，而显式 budget migration 后只有 slot v2/turn v5 获得继续权限。此前未发布的 developer-envelope 实验格式必须由负 fixture 证明 fail closed；任一版本缺失、未知或 started/checkpoint 不一致都不能退回当前默认实现。
 - checkpoint usage 与 `raw_response.usage` 逐字一致，并满足 total 等式、cached/input 与 reasoning/output 子计数关系及 8192 输出上限；矛盾 usage 只生成可审计的 failed attempt，不进入 checkpoint chain。
 - 有可比较 usage 时使用真实 `input_tokens` 锚点和完整 prepared-request 的有符号估算差；无锚点时才估算完整请求。
 - cached input 不从上下文占用中扣除；usage 缺失不冒充真实 `0`。
@@ -567,7 +567,7 @@ source projection v1-v3 保持原始字节与接受/拒绝语义；source projec
 - 故意让摘要遗漏事实，验证模型能通过 `history_search -> history_turn` 或 `history_artifact` 找回并引用原文。
 - 旧 user/tool output 含“忽略当前 instructions”等恶意内容时，summary 和 history 结果都保持不可信数据身份，不能提升权限。
 - 最近两个完整 turn 本身超过 usable budget 时，记录不可压缩原因并停止，不能生成不安全 checkpoint 或循环重试。
-- 根据首份有效 live 数据锁定的阈值是：3/5/10 轮上述各类 durable facts 均为 100%，每轮 `exact_attack_execution=false`，且 artifact 必须绑定当前 prompt/envelope 与完整 request chain。`Kimi-K2.7-Code` 的记录域已通过；其他域必须独立通过，不能以相同模型名或 OpenAI-compatible 标签代替证据。
+- 根据首份有效 live 数据锁定的阈值是：3/5/10 轮上述各类 durable facts 均为 100%，字段/值、否定约束对象和状态 polarity 必须通过局部关系断言，而不是只在全文中分别出现；每轮 `exact_attack_execution=false`；artifact 必须绑定当前 prompt/envelope、完整 request chain、raw Provider summary 与 usage。`Kimi-K2.7-Code` 的记录域已通过；其他域必须独立通过，不能以相同模型名或 OpenAI-compatible 标签代替证据。
 
 ## 4. M4/M5 完成后的决策门
 

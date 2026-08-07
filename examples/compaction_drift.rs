@@ -7,7 +7,7 @@ use clap::Parser;
 use oxidra::compaction::{
     COMPACTION_BOUNDARY_VERSION, COMPACTION_PROMPT_VERSION, MAX_COMPACTION_OUTPUT_TOKENS,
     SOURCE_DIGEST_VERSION, SUMMARY_ENVELOPE_VERSION, USAGE_CONTRACT_VERSION,
-    compacted_history_item, compaction_instructions,
+    compacted_history_item, compaction_instructions, validate_recorded_compaction_response,
 };
 use oxidra::config::{ContextLimits, ProviderConfig};
 use oxidra::context::{
@@ -25,9 +25,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-const FIXTURE_BYTES: &[u8] = include_bytes!("../tests/fixtures/compaction_drift_v4.json");
+const FIXTURE_BYTES: &[u8] = include_bytes!("../tests/fixtures/compaction_drift_v5.json");
 const REQUIRED_SNAPSHOTS: [u32; 3] = [3, 5, 10];
-const METRIC_VERSION: u32 = 4;
+const METRIC_VERSION: u32 = 5;
 
 #[derive(Debug, Parser)]
 #[command(about = "Run the live 3/5/10-round recursive compaction drift baseline")]
@@ -75,7 +75,20 @@ struct FactSpec {
     /// Every group must have at least one normalized substring present. This
     /// keeps identifiers and values ordered while ignoring Markdown, case,
     /// spacing and equivalent wording listed by the fixture.
+    #[serde(default)]
     required_groups: Vec<Vec<String>>,
+    #[serde(default)]
+    relations: Vec<RelationSpec>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RelationSpec {
+    anchor_any: Vec<String>,
+    value_any: Vec<String>,
+    #[serde(default)]
+    forbidden_any: Vec<String>,
+    ordered: bool,
+    max_distance: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -99,6 +112,7 @@ struct FactResult {
     category: String,
     retained: bool,
     missing_groups: Vec<Vec<String>>,
+    failed_relations: Vec<RelationSpec>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -230,7 +244,7 @@ async fn run() -> Result<()> {
     }
 
     let mut artifact = DriftArtifact {
-        artifact_version: 4,
+        artifact_version: 5,
         metric_version: METRIC_VERSION,
         status: "running".to_owned(),
         started_at: Utc::now(),
@@ -389,6 +403,11 @@ fn rescore_artifact(args: &Args, fixture: &DriftFixture, source_path: &Path) -> 
                 "source artifact round {expected_round} does not match the frozen request chain"
             )));
         }
+        validate_recorded_round_response(
+            &recorded,
+            source.protocol_versions.usage_contract,
+            expected_round,
+        )?;
         let summary = recorded.summary;
         rounds.push(RoundArtifact {
             round: recorded.round,
@@ -417,7 +436,7 @@ fn rescore_artifact(args: &Args, fixture: &DriftFixture, source_path: &Path) -> 
         )));
     }
     let artifact = DriftArtifact {
-        artifact_version: 4,
+        artifact_version: 5,
         metric_version: METRIC_VERSION,
         status: "completed".to_owned(),
         started_at: source.started_at,
@@ -458,20 +477,49 @@ fn print_snapshots(output: &Path, artifact: &DriftArtifact) {
     }
 }
 
+fn validate_recorded_round_response(
+    recorded: &RecordedRound,
+    usage_contract_version: u32,
+    expected_round: u32,
+) -> Result<()> {
+    let extracted_summary = validate_recorded_compaction_response(
+        &recorded.raw_response,
+        &recorded.usage,
+        usage_contract_version,
+    )?;
+    if extracted_summary != recorded.summary {
+        return Err(OxidraError::Config(format!(
+            "source artifact round {expected_round} summary does not match raw Provider output"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_fixture(fixture: &DriftFixture) -> Result<()> {
-    if fixture.fixture_version != 4 || fixture.input.is_empty() || fixture.facts.is_empty() {
+    if fixture.fixture_version != 5 || fixture.input.is_empty() || fixture.facts.is_empty() {
         return Err(OxidraError::Config(
-            "compaction drift fixture v4 is empty or has an unsupported version".to_owned(),
+            "compaction drift fixture v5 is empty or has an unsupported version".to_owned(),
         ));
     }
     for fact in &fixture.facts {
         if fact.id.trim().is_empty()
             || fact.category.trim().is_empty()
-            || fact.required_groups.is_empty()
+            || (fact.required_groups.is_empty() && fact.relations.is_empty())
             || fact
                 .required_groups
                 .iter()
                 .any(|group| group.is_empty() || group.iter().any(|token| token.trim().is_empty()))
+            || fact.relations.iter().any(|relation| {
+                relation.anchor_any.is_empty()
+                    || relation.value_any.is_empty()
+                    || relation.max_distance == 0
+                    || relation
+                        .anchor_any
+                        .iter()
+                        .chain(relation.value_any.iter())
+                        .chain(relation.forbidden_any.iter())
+                        .any(|token| token.trim().is_empty())
+            })
         {
             return Err(OxidraError::Config(format!(
                 "compaction drift fact {:?} is incomplete",
@@ -498,11 +546,18 @@ fn measure_summary(fixture: &DriftFixture, summary: &str) -> RoundMetrics {
                 })
                 .cloned()
                 .collect::<Vec<_>>();
+            let failed_relations = fact
+                .relations
+                .iter()
+                .filter(|relation| !relation_is_satisfied(summary, relation))
+                .cloned()
+                .collect::<Vec<_>>();
             FactResult {
                 id: fact.id.clone(),
                 category: fact.category.clone(),
-                retained: missing_groups.is_empty(),
+                retained: missing_groups.is_empty() && failed_relations.is_empty(),
                 missing_groups,
+                failed_relations,
             }
         })
         .collect::<Vec<_>>();
@@ -534,6 +589,94 @@ fn normalize_for_matching(text: &str) -> String {
         .flat_map(char::to_lowercase)
         .filter(|character| character.is_alphanumeric())
         .collect()
+}
+
+fn relation_is_satisfied(summary: &str, relation: &RelationSpec) -> bool {
+    let text = normalize_for_relation(summary);
+    let anchors = relation
+        .anchor_any
+        .iter()
+        .flat_map(|pattern| occurrences(&text, &normalize_for_relation(pattern)))
+        .collect::<Vec<_>>();
+    let values = relation
+        .value_any
+        .iter()
+        .flat_map(|pattern| occurrences(&text, &normalize_for_relation(pattern)))
+        .collect::<Vec<_>>();
+    let forbidden = relation
+        .forbidden_any
+        .iter()
+        .flat_map(|pattern| occurrences(&text, &normalize_for_relation(pattern)))
+        .collect::<Vec<_>>();
+
+    anchors.iter().any(|anchor| {
+        values.iter().any(|value| {
+            let distance = if relation.ordered {
+                if value.0 < anchor.1 {
+                    return false;
+                }
+                value.0 - anchor.1
+            } else {
+                range_distance(*anchor, *value)
+            };
+            if distance > relation.max_distance {
+                return false;
+            }
+            let span = (anchor.0.min(value.0), anchor.1.max(value.1));
+            !forbidden
+                .iter()
+                .any(|candidate| ranges_overlap(span, *candidate))
+        })
+    })
+}
+
+fn normalize_for_relation(text: &str) -> Vec<char> {
+    let mut normalized = Vec::new();
+    let mut previous_was_space = false;
+    for character in text.chars().flat_map(char::to_lowercase) {
+        if matches!(character, '*' | '`') {
+            continue;
+        }
+        if character.is_whitespace() {
+            if !previous_was_space && !normalized.is_empty() {
+                normalized.push(' ');
+            }
+            previous_was_space = true;
+        } else {
+            normalized.push(character);
+            previous_was_space = false;
+        }
+    }
+    if normalized.last() == Some(&' ') {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn occurrences(text: &[char], pattern: &[char]) -> Vec<(usize, usize)> {
+    if pattern.is_empty() || pattern.len() > text.len() {
+        return Vec::new();
+    }
+    text.windows(pattern.len())
+        .enumerate()
+        .filter_map(|(start, candidate)| {
+            (candidate == pattern).then_some((start, start + pattern.len()))
+        })
+        .collect()
+}
+
+fn range_distance(first: (usize, usize), second: (usize, usize)) -> usize {
+    if first.1 <= second.0 {
+        second.0 - first.1
+    } else if second.1 <= first.0 {
+        first.0 - second.1
+    } else {
+        0
+    }
+}
+
+fn ranges_overlap(first: (usize, usize), second: (usize, usize)) -> bool {
+    first.0 < second.1 && second.0 < first.1
 }
 
 fn finish_failed<T>(output: &Path, artifact: &mut DriftArtifact, message: &str) -> Result<T> {
@@ -585,9 +728,14 @@ mod tests {
             .facts
             .iter()
             .flat_map(|fact| {
-                fact.required_groups
+                let groups = fact
+                    .required_groups
                     .iter()
-                    .map(|group| group.first().unwrap().clone())
+                    .map(|group| group.first().unwrap().clone());
+                let relations = fact.relations.iter().map(|relation| {
+                    format!("{} {}", relation.anchor_any[0], relation.value_any[0])
+                });
+                groups.chain(relations).collect::<Vec<_>>()
             })
             .collect::<Vec<_>>()
             .join(" | ");
@@ -597,7 +745,7 @@ mod tests {
         assert!(!metrics.exact_attack_execution);
         assert_eq!(
             sha256_hex(FIXTURE_BYTES),
-            "2c6baa35dc6d37f64053204a60e70f9b7c97954e13e97c303b70e5c223378b37"
+            "cf0d653d220856a877c0c795000cf75b13060469dd35fa1a34bb186b667d47b3"
         );
         assert_eq!(
             normalize_for_matching("**禁止**删除 `audit.log`"),
@@ -606,6 +754,78 @@ mod tests {
         assert_eq!(
             normalize_for_matching("Service_Port = 43,127"),
             "serviceport43127"
+        );
+
+        let swapped = summary.replace(
+            "retry_budget 17 | target_ratio 0.375",
+            "retry_budget = 0.375 | target_ratio = 17",
+        );
+        let swapped_metrics = measure_summary(&fixture, &swapped);
+        assert!(
+            !swapped_metrics
+                .facts
+                .iter()
+                .find(|fact| fact.id == "FACT-NUM-002")
+                .unwrap()
+                .retained
+        );
+
+        let reversed = summary.replace("src/parser.rs COMPLETED", "src/parser.rs NOT COMPLETED");
+        let reversed_metrics = measure_summary(&fixture, &reversed);
+        assert!(
+            !reversed_metrics
+                .facts
+                .iter()
+                .find(|fact| fact.id == "FACT-STATUS-001")
+                .unwrap()
+                .retained
+        );
+    }
+
+    #[test]
+    fn recorded_round_must_match_raw_provider_summary_and_usage() {
+        let mut recorded = RecordedRound {
+            round: 1,
+            input_sha256: "input".to_owned(),
+            summary_sha256: sha256_hex(b"tampered"),
+            summary: "tampered".to_owned(),
+            raw_response: serde_json::json!({
+                "id": "response-live-1",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "provider summary"}]
+                }],
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 2,
+                    "total_tokens": 12
+                }
+            }),
+            usage: oxidra::types::Usage {
+                input_tokens: 10,
+                cached_input_tokens: 0,
+                output_tokens: 2,
+                reasoning_output_tokens: 0,
+                total_tokens: 12,
+            },
+        };
+        let error = validate_recorded_round_response(&recorded, 1, 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match raw Provider output")
+        );
+
+        recorded.summary = "provider summary".to_owned();
+        recorded.summary_sha256 = sha256_hex(recorded.summary.as_bytes());
+        recorded.usage.output_tokens = 1;
+        let error = validate_recorded_round_response(&recorded, 1, 1).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("typed usage does not match raw_response.usage")
         );
     }
 }
