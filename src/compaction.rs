@@ -1003,8 +1003,8 @@ enum CandidateDispatchPolicy {
 /// before the replacement `compaction.started` is written. Walking through
 /// `previous_boundary_id` preserves the original candidate without inventing
 /// a second user message or relying on process memory. Preflight-only failures
-/// have no durable candidate and must be recomputed by the future automatic
-/// trigger or explicitly abandoned.
+/// have no durable candidate and are recomputed by the unified pending retry
+/// path (or explicitly abandoned).
 pub fn rebuild_failed_boundary_candidate(
     events: &[JournalEvent],
     boundary_id: &str,
@@ -1104,7 +1104,7 @@ pub fn rebuild_failed_boundary_candidate(
         }
         let previous_boundary_id = previous_boundary_id.ok_or_else(|| {
             OxidraError::ApprovalRequired(format!(
-                "compaction boundary {boundary_id} failed before recording a replayable candidate; abandon it or rerun compaction preflight"
+                "compaction boundary {boundary_id} failed before recording a replayable candidate; retry pending to rerun compaction preflight, or abandon it"
             ))
         })?;
         current_boundary_id = previous_boundary_id;
