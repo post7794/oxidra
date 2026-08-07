@@ -1,6 +1,6 @@
 # Oxidra M4/M5 实施规划
 
-状态：设计与部分实现。M4 按实际使用数据推迟。M5 的显式 turn 边界、原始 projection、checkpoint 数据模型与 reducer、低权限 summary envelope、不可变格式版本注册表、checkpoint + tail projection、真实 Responses Provider `compact_once`、boundary-bound Provider 调用、8192 输出上限、Provider 完成到 checkpoint 落盘窗口的生产路径故障注入、连续父子 checkpoint 与失败 child 重试内核测试、三个受控历史回查工具、model-aware context 配置、prepared-request usage-anchor 测量/审计、Provider context 超限后的显式 retry/abandon 恢复，以及默认关闭的 `--experimental-auto-compact` preflight 已经实现。session-open 会把 boundary 的三个崩溃窗口确定地恢复为 failed 或 checkpointed；Agent/CLI 已消费 boundary pending/retry/abandon，当前 Provider projection 与 history 会排除已验证的 abandoned turn，并有跨进程恢复 E2E。尚未完成的是自动触发专用的跨进程/CLI 闭环测试、递归摘要漂移测量与默认启用决策。自动 compaction 在漂移测量完成前必须保持默认关闭。
+状态：设计与部分实现。M4 按实际使用数据推迟。M5 的显式 turn 边界、原始 projection、checkpoint 数据模型与 reducer、低权限 summary envelope、不可变格式版本注册表、checkpoint + tail projection、真实 Responses Provider `compact_once`、boundary-bound Provider 调用、8192 输出上限、Provider 完成到 checkpoint 落盘窗口的生产路径故障注入、连续父子 checkpoint 与失败 child 重试内核测试、三个受控历史回查工具、model-aware context 配置、prepared-request usage-anchor 测量/审计、Provider context 超限后的显式 retry/abandon 恢复，以及默认关闭的 `--experimental-auto-compact` preflight 已经实现。session-open 会把 boundary 的三个崩溃窗口确定地恢复为 failed 或 checkpointed；Agent/CLI 已消费 boundary pending/retry/abandon，当前 Provider projection 与 history 会排除已验证的 abandoned turn，并有跨进程恢复 E2E。自动触发、retry/replan、no-checkpoint resolution、legacy budget migration 与跨进程 CLI 恢复已经闭环，source projection v4 也可安全跨越已验证 abandoned turn。尚未完成的是执行一次明确授权的 live 3/5/10 漂移 run、审阅其 artifact 并记录默认启用决策；在此之前自动 compaction 必须保持默认关闭。
 
 本文只规划两个后续里程碑：
 
@@ -529,8 +529,8 @@ source projection v1-v3 保持原始字节与接受/拒绝语义；source projec
 2. 已实现当前 session、最新 checkpoint 覆盖前缀内的 `history_search` / `history_turn` / `history_artifact`：同一 request boundary 只读一次 journal，schema 和执行器绑定同一不可变 snapshot；确定性检索、引用、cursor、artifact schema v1/v2 校验和单 turn 配额已经接入 Agent 主循环。
 3. 已实现 model-aware context 配置、prepared-request 精确 request-shape 测量、`context.configured` / `context.tools` / `response.started` / `context.limit_reached` 审计、真实 usage 差分锚点，以及 Provider context-limit 的 retry/abandon E2E。估算只用于 telemetry 和显式 opt-in compaction planning；普通请求不再被 heuristic 伪装成 hard limit 拦截。
 4. 已完成内核级连续两次真实 `compact_once`，并加入 compaction request-boundary v1-v5 的数据模型、provider-attempt/checkpoint 绑定、fail-closed 纯 reducer、版本化 request-slot 状态机、旧 checkpointed budget terminal 的原子兼容迁移、bound Provider 调用和 session-open 恢复：失败 child 不替换 parent checkpoint，随后以同一候选显式重试可形成合法子链，最终 projection 只使用最新 summary + tail。Agent/CLI pending 管理、projection/history abandon 语义，以及“retry intent 已同步但新 attempt 尚未写入”、“legacy budget migration 已 fsync 但正常 response 尚未开始”和“resolved_without_checkpoint 已 fsync 但 normal response 尚未开始”三个窗口的跨进程强杀恢复 E2E 已完成；后两者由新 CLI 进程继续同一 prompt，且不会重复写 migration intent、resolution、checkpoint 或原 user message。
-5. 已接入默认关闭的自动 preflight/trigger 实验入口；下一笔补自动触发的进程故障、Provider context-limit after-checkpoint 和 CLI resume 闭环。
-6. 用固定 fixture 测量父摘要连续 3/5/10 次重摘要后的漂移，保存 model、prompt version、原始输出和指标，先建立基线，不预设发布阈值。
+5. 已接入默认关闭的自动 preflight/trigger 实验入口，并完成 Provider context-limit after-checkpoint、retry/replan、no-checkpoint resolution、legacy budget migration 和 CLI resume/强杀恢复闭环。
+6. 已加入 `examples/compaction_drift.rs` 与 frozen fixture：使用 production prompt、低权限 envelope、无 tools 和 8192 输出上限，对父摘要连续执行至少 10 次真实重摘要，并在 3/5/10 轮保存 model、全部协议版本、fixture/input/summary hash、raw response、usage 和逐事实/分类保留指标。live run 必须显式确认，不在 CI 或启动路径中隐式消费 Provider；第一份实际 artifact 仍不预设发布阈值。
 7. 根据测量结果另行锁定默认启用门槛；只有门槛满足后才改变默认值。
 8. 只有线性扫描或 journal 体积出现实际性能证据后，才考虑可重建索引或物理分段。
 

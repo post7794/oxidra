@@ -1,6 +1,6 @@
 # Oxidra 个人 CLI Agent 设计
 
-状态：M1-M3 已实现；M5 checkpoint 协议、低权限版本化 summary envelope、真实 Provider `compact_once`、checkpoint-aware Agent projection、受控历史回查、model-aware context 测量/审计、Provider context 超限后的显式 retry/abandon 恢复，以及默认关闭的 `--experimental-auto-compact` preflight 已经实现。当前改动已通过本地 Windows 验证；推送后仍需由 Linux、macOS 和 Windows 远程 CI 重新确认。当前主线定位为个人使用的轻量 coding agent，不包含扩展系统。自动 compaction 在递归摘要漂移测量完成前不会默认启用。
+状态：M1-M3 已实现；M5 checkpoint 协议、低权限版本化 summary envelope、真实 Provider `compact_once`、checkpoint-aware Agent projection、受控历史回查、model-aware context 测量/审计、Provider context 超限后的显式 retry/abandon 恢复，以及默认关闭的 `--experimental-auto-compact` preflight 已经实现。当前改动已通过本地 Windows 验证；推送后仍需由 Linux、macOS 和 Windows 远程 CI 重新确认。当前主线定位为个人使用的轻量 coding agent，不包含扩展系统。递归摘要漂移 harness 已实现，但在明确授权的 live 3/5/10 artifact 完成并审阅前，自动 compaction 不会默认启用。
 
 已删除的协议实验代码仅作为历史源码保存在 Git tag `archive/mcp-mvp`，主线不为其保留兼容层或扩展接口。
 
@@ -305,6 +305,6 @@ stdout 只承载 assistant 文本；工具状态、diff、确认、诊断和错�
 M4 与 M5 的完整实施契约见 [`m4-m5-roadmap.md`](m4-m5-roadmap.md)。
 
 1. M5 checkpoint 核心、真实 Provider `compact_once`、受控历史回查、model-aware 配置、prepared-request usage-anchor 测量、Provider context-limit retry/abandon、compaction request-boundary v1-v5、不可变版本 policy、版本化 request-slot reducer、旧 budget terminal 兼容迁移、bound Provider 调用、session-open 恢复、Agent/CLI pending 管理、projection/history abandon 语义，以及默认关闭的自动 compaction preflight 实验入口已经实现。legacy budget migration 和 no-checkpoint resolution 都有 fsync 后强杀、由新 CLI 进程继续同一 prompt 的测试，恢复不会重复追加 intent、resolution、checkpoint 或原 user message。
-2. 下一步测量 3/5/10 次递归摘要漂移并保存可复现基线；只有数据支持时才默认启用自动 compaction。
+2. 已加入 `examples/compaction_drift.rs` 与 frozen fixture，按 production prompt、低权限 envelope、无 tools 和 8192 输出上限运行 3/5/10 次真实递归摘要，逐轮保存 raw response、usage、summary hash 和事实保留指标。live run 需要显式 `--confirm-live-calls`；仓库不伪造离线结果。只有实际 artifact 数据支持时才默认启用自动 compaction。
 3. M4：每会话 token/执行时间预算按实际使用数据推迟，后续作为独立里程碑。
 4. 只有实际高频需要时才重新评估子 agent；它必须使用独立子会话，并受父级预算约束。

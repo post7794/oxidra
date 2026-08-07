@@ -4758,6 +4758,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_compaction_can_cross_a_validated_abandoned_boundary_turn() {
+        let (_temp, provider, mut agent) = automatic_compaction_test_agent(
+            "automatic-compaction-after-boundary-abandon",
+            0,
+            40_000,
+            [compaction_summary_turn(), final_turn("done")],
+            true,
+        );
+        let abandoned = append_open_compaction_boundary(
+            agent.journal_mut(),
+            "obsolete-turn",
+            "obsolete prompt must not enter the checkpoint source",
+        );
+        agent
+            .journal_mut()
+            .append_and_sync(
+                COMPACTION_BOUNDARY_ABANDONED_KIND,
+                None,
+                serde_json::to_value(CompactionBoundaryAbandoned {
+                    boundary_id: abandoned.boundary_id,
+                    turn_id: abandoned.turn_id,
+                    user_message_seq: abandoned.user_message_seq,
+                    reason: "replace obsolete prompt".to_owned(),
+                    extra: Map::new(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        append_large_complete_turns(agent.journal_mut(), 6, 40_000);
+
+        let outcome = agent
+            .run_turn(
+                "current prompt",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.text, "done");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        let compaction_input = serde_json::to_string(&requests[0].input).unwrap();
+        assert!(!compaction_input.contains("obsolete prompt"));
+        assert!(compaction_input.contains("old-question-0"));
+        let normal_input = serde_json::to_string(&requests[1].input).unwrap();
+        assert!(!normal_input.contains("obsolete prompt"));
+
+        let events = agent.journal().read_events().unwrap();
+        let started = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_STARTED_KIND)
+            .map(|event| serde_json::from_value::<CompactionStarted>(event.data.clone()).unwrap())
+            .unwrap();
+        assert_eq!(started.source_projection_version, SOURCE_PROJECTION_VERSION);
+        assert!(started.covers_through_seq > abandoned.user_message_seq);
+    }
+
+    #[tokio::test]
     async fn cancellation_after_compaction_checkpoint_does_not_start_normal_response() {
         let provider = Arc::new(CancellationAwareCompactionProvider::default());
         let (_temp, mut agent) = automatic_compaction_test_agent_with_provider(

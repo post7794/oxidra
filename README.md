@@ -146,6 +146,9 @@ v5 boundary records a durable `resolved_without_checkpoint` result, skips the
 compaction Provider call and checkpoint, and continues the original turn. A
 crash after that resolution is synced resumes the same prompt with
 `--retry-pending` without duplicating the user message or compaction attempt.
+The reproducible live 3/5/10-round drift benchmark is documented in
+`docs/compaction-drift.md`; it requires an explicit live-call acknowledgement
+and writes raw outputs and retention metrics under a caller-selected path.
 
 Useful options:
 
