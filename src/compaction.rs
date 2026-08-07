@@ -5,7 +5,7 @@
 //! validates the committed single chain, and selects a deterministic cutoff
 //! from estimates supplied by the caller.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::fmt;
 use std::time::Instant;
 
@@ -41,7 +41,7 @@ pub const COMPACTION_ABORTED_KIND: &str = "compaction.aborted";
 // boundary events are the durable intent/state machine for that larger
 // request boundary.  They deliberately live in `extra`/open journal kinds so
 // the already-published checkpoint protocol remains byte-for-byte compatible.
-pub const COMPACTION_BOUNDARY_VERSION: u32 = 2;
+pub const COMPACTION_BOUNDARY_VERSION: u32 = 3;
 pub const COMPACTION_BOUNDARY_STARTED_KIND: &str = "compaction.boundary.started";
 pub const COMPACTION_BOUNDARY_CHECKPOINTED_KIND: &str = "compaction.boundary.checkpointed";
 pub const COMPACTION_BOUNDARY_FAILED_KIND: &str = "compaction.boundary.failed";
@@ -51,11 +51,61 @@ pub const COMPACTION_BOUNDARY_ABANDONED_KIND: &str = "compaction.boundary.abando
 // validator v3.  Future turn-validator changes must not silently change which
 // completion can resolve a persisted v1 boundary.
 const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1: u32 = 3;
-// Boundary v2 is the first version that owns a Provider request slot.  These
+// Boundary v2 is the first version that owns a Provider request slot. Boundary
+// v3 keeps that frozen behavior and adds exit/session continuity. These
 // bindings are protocol registry entries: never retarget them in place.
 const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2: u32 = 4;
+const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V3: u32 = 4;
 const COMPACTION_BOUNDARY_VERSION_V1: u32 = 1;
 const COMPACTION_BOUNDARY_VERSION_V2: u32 = 2;
+const COMPACTION_BOUNDARY_VERSION_V3: u32 = 3;
+const SUPPORTED_COMPACTION_BOUNDARY_VERSIONS: [u32; 3] = [
+    COMPACTION_BOUNDARY_VERSION_V1,
+    COMPACTION_BOUNDARY_VERSION_V2,
+    COMPACTION_BOUNDARY_VERSION_V3,
+];
+
+#[derive(Clone, Copy)]
+struct CompactionBoundaryPolicy {
+    turn_validator_version: u32,
+    downgrade_current_turn_metadata: bool,
+    owns_provider_request_slot: bool,
+    enforces_session_protocol_epoch: bool,
+    requires_attempt_resolution_before_abandon: bool,
+    requires_settled_slot_before_abandon: bool,
+}
+
+/// Immutable policy registry for every persisted boundary protocol. Add a new
+/// match arm for stronger semantics; never change an existing arm.
+fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> {
+    match version {
+        COMPACTION_BOUNDARY_VERSION_V1 => Ok(CompactionBoundaryPolicy {
+            turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1,
+            downgrade_current_turn_metadata: true,
+            owns_provider_request_slot: false,
+            enforces_session_protocol_epoch: false,
+            requires_attempt_resolution_before_abandon: false,
+            requires_settled_slot_before_abandon: false,
+        }),
+        COMPACTION_BOUNDARY_VERSION_V2 => Ok(CompactionBoundaryPolicy {
+            turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2,
+            downgrade_current_turn_metadata: false,
+            owns_provider_request_slot: true,
+            enforces_session_protocol_epoch: false,
+            requires_attempt_resolution_before_abandon: false,
+            requires_settled_slot_before_abandon: false,
+        }),
+        COMPACTION_BOUNDARY_VERSION_V3 => Ok(CompactionBoundaryPolicy {
+            turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V3,
+            downgrade_current_turn_metadata: false,
+            owns_provider_request_slot: true,
+            enforces_session_protocol_epoch: true,
+            requires_attempt_resolution_before_abandon: true,
+            requires_settled_slot_before_abandon: true,
+        }),
+        _ => session_error(format!("unsupported compaction boundary version {version}")),
+    }
+}
 
 pub const COMPACTION_PROMPT_VERSION: u32 = 1;
 pub const SUMMARY_ENVELOPE_VERSION: u32 = 1;
@@ -587,10 +637,7 @@ pub fn attempt_boundary(extra: &Map<String, Value>) -> Result<Option<CompactionB
 }
 
 fn validate_boundary_shape(boundary: &CompactionBoundary) -> Result<()> {
-    if !matches!(
-        boundary.version,
-        COMPACTION_BOUNDARY_VERSION_V1 | COMPACTION_BOUNDARY_VERSION_V2
-    ) {
+    if !SUPPORTED_COMPACTION_BOUNDARY_VERSIONS.contains(&boundary.version) {
         return session_error(format!(
             "unsupported compaction boundary version {}",
             boundary.version
@@ -614,27 +661,19 @@ struct BoundaryTurnFacts {
     completion_by_seq: HashMap<u64, (String, CompletionEvidence)>,
 }
 
-/// Build completion evidence for one boundary protocol version.  The v1
-/// compatibility view intentionally uses the frozen v3 turn reducer; v2 uses
-/// the new v4 reducer whose legacy evidence is the later `user.message` seq.
+/// Build completion evidence for one boundary protocol version using only its
+/// immutable registry policy. v1 intentionally uses the frozen v3 turn
+/// reducer; v2/v3 use frozen turn validator v4.
 fn boundary_turn_facts(version: u32, events: &[JournalEvent]) -> Result<BoundaryTurnFacts> {
-    let turns = match version {
-        COMPACTION_BOUNDARY_VERSION_V1 => {
-            let compatibility_events = downgrade_v4_turn_metadata_for_v3(events)?;
-            segment_turns_for_version(
-                COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1,
-                &compatibility_events,
-            )?
-        }
-        COMPACTION_BOUNDARY_VERSION_V2 => {
-            segment_turns_for_version(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2, events)?
-        }
-        _ => {
-            return Err(OxidraError::Session(format!(
-                "unsupported compaction boundary version {version}"
-            )));
-        }
+    let policy = compaction_boundary_policy(version)?;
+    let compatibility_events;
+    let validation_events = if policy.downgrade_current_turn_metadata {
+        compatibility_events = downgrade_v4_turn_metadata_for_v3(events)?;
+        compatibility_events.as_slice()
+    } else {
+        events
     };
+    let turns = segment_turns_for_version(policy.turn_validator_version, validation_events)?;
     let mut facts = BoundaryTurnFacts::default();
     for turn in turns {
         if let Some(seq) = turn.completion_seq {
@@ -1075,18 +1114,20 @@ pub fn validate_compaction_boundary_chain(
 
     let (_checkpoint_chain, attempts) = validate_checkpoint_protocol(events)?;
     let user_messages = index_boundary_user_messages(events)?;
-    // User references are protocol-neutral; completion evidence is not.  Keep
-    // separate frozen v1 and current v2 facts so a later event cannot change
-    // the meaning of an older boundary record.
-    let facts_v1 = boundary_turn_facts(COMPACTION_BOUNDARY_VERSION_V1, events)?;
-    let facts_v2 = boundary_turn_facts(COMPACTION_BOUNDARY_VERSION_V2, events)?;
+    // Completion facts are built lazily only for versions actually present in
+    // this journal. A v1-only chain must never be rejected by a newer reducer.
+    let mut facts_by_version = HashMap::<u32, BoundaryTurnFacts>::new();
 
     let mut records = Vec::<Record>::new();
     let mut by_id = HashMap::<String, usize>::new();
     let mut active_by_turn = HashMap::<String, usize>::new();
     let mut attempt_by_boundary_id = HashMap::<String, String>::new();
+    let mut session_boundary_protocol_epoch = None::<(u32, u64)>;
 
     for (event_index, event) in events.iter().enumerate() {
+        if session_boundary_protocol_epoch.is_some() && event.kind == "user.message" {
+            validate_user_turn_protocol_epoch(&events[..=event_index])?;
+        }
         if matches!(
             event.kind.as_str(),
             COMPACTION_BOUNDARY_STARTED_KIND
@@ -1102,12 +1143,10 @@ pub fn validate_compaction_boundary_chain(
             ));
         }
 
-        // Boundary v2 owns the Provider slot for its whole lifetime.  Before
-        // checkpoint commit, ordinary response/tool lifecycle events cannot
-        // overlap the compaction attempt.  After checkpoint commit, the slot
-        // returns to the normal Provider reducer rather than becoming
-        // unvalidated: every later turn-scoped event is checked against the
-        // durable prefix visible at that event.
+        // Versions whose immutable policy owns the Provider slot retain it for
+        // their whole lifetime. Before checkpoint commit, ordinary lifecycle
+        // events cannot overlap the compaction attempt. After checkpoint, the
+        // slot returns to the normal Provider reducer.
         let ordinary_provider_lifecycle = matches!(event.kind.as_str(), "response.started")
             || is_response_terminal(&event.kind)
             || is_tool_lifecycle(&event.kind);
@@ -1120,9 +1159,8 @@ pub fn validate_compaction_boundary_chain(
         if let Some(turn_id) = event.turn_id.as_deref() {
             if let Some(index) = active_by_turn.get(turn_id).copied() {
                 let record = &records[index];
-                if record.boundary.version >= COMPACTION_BOUNDARY_VERSION_V2
-                    && record.started_seq < event.seq
-                {
+                let policy = compaction_boundary_policy(record.boundary.version)?;
+                if policy.owns_provider_request_slot && record.started_seq < event.seq {
                     if record.state == CompactionBoundaryState::Checkpointed {
                         provider_request_slot_state_for_version(
                             PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
@@ -1143,6 +1181,15 @@ pub fn validate_compaction_boundary_chain(
             COMPACTION_BOUNDARY_STARTED_KIND => {
                 let payload = parse_event_data::<CompactionBoundaryStarted>(event)?;
                 validate_boundary_shape(&payload.boundary)?;
+                let policy = compaction_boundary_policy(payload.boundary.version)?;
+                validate_boundary_session_epoch_transition(
+                    session_boundary_protocol_epoch,
+                    payload.boundary.version,
+                    event.seq,
+                )?;
+                if policy.enforces_session_protocol_epoch {
+                    validate_user_turn_protocol_epoch(&events[..=event_index])?;
+                }
                 if payload.trigger.trim().is_empty() {
                     return session_error(format!(
                         "compaction boundary {} at seq {} has an empty trigger",
@@ -1162,7 +1209,11 @@ pub fn validate_compaction_boundary_chain(
                     events,
                 )?;
                 validate_boundary_start_context(&payload.boundary, event_index, events)?;
-                let facts = boundary_facts_for_boundary(&payload.boundary, &facts_v1, &facts_v2)?;
+                let facts = boundary_turn_facts_for_version(
+                    &mut facts_by_version,
+                    payload.boundary.version,
+                    events,
+                )?;
                 if facts
                     .completion_seq_by_turn
                     .get(&payload.boundary.turn_id)
@@ -1191,6 +1242,11 @@ pub fn validate_compaction_boundary_chain(
                 });
                 by_id.insert(payload.boundary.boundary_id.clone(), index);
                 active_by_turn.insert(payload.boundary.turn_id, index);
+                update_boundary_session_epoch(
+                    &mut session_boundary_protocol_epoch,
+                    payload.boundary.version,
+                    event.seq,
+                );
             }
             COMPACTION_STARTED_KIND => {
                 let attempt = attempts.by_started_seq(event.seq).ok_or_else(|| {
@@ -1399,7 +1455,9 @@ pub fn validate_compaction_boundary_chain(
                         event.seq
                     ));
                 }
-                if record.state == CompactionBoundaryState::Started
+                let policy = compaction_boundary_policy(record.boundary.version)?;
+                if policy.requires_attempt_resolution_before_abandon
+                    && record.state == CompactionBoundaryState::Started
                     && attempt_by_boundary_id.contains_key(&record.boundary.boundary_id)
                 {
                     return session_error(format!(
@@ -1407,7 +1465,7 @@ pub fn validate_compaction_boundary_chain(
                         record.boundary.boundary_id
                     ));
                 }
-                if record.boundary.version >= COMPACTION_BOUNDARY_VERSION_V2
+                if policy.requires_settled_slot_before_abandon
                     && record.state == CompactionBoundaryState::Checkpointed
                 {
                     let slot = provider_request_slot_state_for_version(
@@ -1425,7 +1483,11 @@ pub fn validate_compaction_boundary_chain(
                         ));
                     }
                 }
-                let facts = boundary_facts_for_boundary(&record.boundary, &facts_v1, &facts_v2)?;
+                let facts = boundary_turn_facts_for_version(
+                    &mut facts_by_version,
+                    record.boundary.version,
+                    events,
+                )?;
                 if facts
                     .completion_seq_by_turn
                     .get(&payload.turn_id)
@@ -1442,6 +1504,7 @@ pub fn validate_compaction_boundary_chain(
             COMPACTION_BOUNDARY_RETRY_STARTED_KIND => {
                 let payload = parse_event_data::<CompactionBoundaryRetryStarted>(event)?;
                 validate_boundary_shape(&payload.boundary)?;
+                let policy = compaction_boundary_policy(payload.boundary.version)?;
                 if payload.retry_id.trim().is_empty() {
                     return session_error(format!(
                         "boundary retry at seq {} has an empty retry id",
@@ -1482,6 +1545,14 @@ pub fn validate_compaction_boundary_chain(
                     payload.boundary.version,
                     event.seq,
                 )?;
+                validate_boundary_session_epoch_transition(
+                    session_boundary_protocol_epoch,
+                    payload.boundary.version,
+                    event.seq,
+                )?;
+                if policy.enforces_session_protocol_epoch {
+                    validate_user_turn_protocol_epoch(&events[..=event_index])?;
+                }
                 validate_boundary_user_reference(
                     &payload.boundary,
                     event.seq,
@@ -1489,7 +1560,11 @@ pub fn validate_compaction_boundary_chain(
                     events,
                 )?;
                 validate_boundary_start_context(&payload.boundary, event_index, events)?;
-                let facts = boundary_facts_for_boundary(&payload.boundary, &facts_v1, &facts_v2)?;
+                let facts = boundary_turn_facts_for_version(
+                    &mut facts_by_version,
+                    payload.boundary.version,
+                    events,
+                )?;
                 if facts
                     .completion_seq_by_turn
                     .get(&payload.boundary.turn_id)
@@ -1513,6 +1588,11 @@ pub fn validate_compaction_boundary_chain(
                 });
                 by_id.insert(payload.boundary.boundary_id.clone(), index);
                 active_by_turn.insert(payload.boundary.turn_id, index);
+                update_boundary_session_epoch(
+                    &mut session_boundary_protocol_epoch,
+                    payload.boundary.version,
+                    event.seq,
+                );
             }
             _ => {}
         }
@@ -1520,22 +1600,19 @@ pub fn validate_compaction_boundary_chain(
         // Only the immutable turn reducer may declare completion.  Raw fields
         // such as `turn_completion` on an unrelated journal event are merely
         // untrusted payload and must never resolve a boundary.
-        let completion_candidate = [
-            (
-                COMPACTION_BOUNDARY_VERSION_V1,
-                facts_v1.completion_by_seq.get(&event.seq),
-            ),
-            (
-                COMPACTION_BOUNDARY_VERSION_V2,
-                facts_v2.completion_by_seq.get(&event.seq),
-            ),
-        ]
-        .into_iter()
-        .find_map(|(version, candidate)| {
-            let (turn_id, evidence) = candidate?;
-            let index = active_by_turn.get(turn_id).copied()?;
-            (records[index].boundary.version == version).then_some((index, turn_id, *evidence))
-        });
+        let completion_candidate =
+            SUPPORTED_COMPACTION_BOUNDARY_VERSIONS
+                .into_iter()
+                .find_map(|version| {
+                    let candidate = facts_by_version
+                        .get(&version)?
+                        .completion_by_seq
+                        .get(&event.seq);
+                    let (turn_id, evidence) = candidate?;
+                    let index = active_by_turn.get(turn_id).copied()?;
+                    (records[index].boundary.version == version)
+                        .then_some((index, turn_id, *evidence))
+                });
         if let Some((index, turn_id, evidence)) = completion_candidate {
             let evidence_event_matches = match evidence {
                 CompletionEvidence::LegacyNextUser
@@ -1559,7 +1636,7 @@ pub fn validate_compaction_boundary_chain(
                 ));
             }
             let record = &mut records[index];
-            if record.boundary.version >= COMPACTION_BOUNDARY_VERSION_V2 {
+            if compaction_boundary_policy(record.boundary.version)?.owns_provider_request_slot {
                 let slot = provider_request_slot_state_for_version(
                     PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
                     &events[..=event_index],
@@ -1647,22 +1724,15 @@ fn validate_boundary_start_context(
     events: &[JournalEvent],
 ) -> Result<()> {
     let visible_events = &events[..=event_index];
-    let turns = match boundary.version {
-        COMPACTION_BOUNDARY_VERSION_V1 => {
-            let compatibility_events = downgrade_v4_turn_metadata_for_v3(visible_events)?;
-            segment_turns_for_version(
-                COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1,
-                &compatibility_events,
-            )?
-        }
-        COMPACTION_BOUNDARY_VERSION_V2 => segment_turns_for_version(
-            COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2,
-            visible_events,
-        )?,
-        version => {
-            return session_error(format!("unsupported compaction boundary version {version}"));
-        }
+    let policy = compaction_boundary_policy(boundary.version)?;
+    let compatibility_events;
+    let validation_events = if policy.downgrade_current_turn_metadata {
+        compatibility_events = downgrade_v4_turn_metadata_for_v3(visible_events)?;
+        compatibility_events.as_slice()
+    } else {
+        visible_events
     };
+    let turns = segment_turns_for_version(policy.turn_validator_version, validation_events)?;
     let Some(active_turn) = turns.last() else {
         return session_error(format!(
             "compaction boundary {} has no active user turn",
@@ -1683,7 +1753,7 @@ fn validate_boundary_start_context(
             boundary.boundary_id, boundary.turn_id, active_turn.state
         ));
     }
-    if boundary.version >= COMPACTION_BOUNDARY_VERSION_V2 {
+    if policy.owns_provider_request_slot {
         let slot = provider_request_slot_state_for_version(
             PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
             visible_events,
@@ -1699,47 +1769,29 @@ fn validate_boundary_start_context(
     Ok(())
 }
 
-fn boundary_facts_for_boundary<'a>(
-    boundary: &CompactionBoundary,
-    facts_v1: &'a BoundaryTurnFacts,
-    facts_v2: &'a BoundaryTurnFacts,
+fn boundary_turn_facts_for_version<'a>(
+    facts_by_version: &'a mut HashMap<u32, BoundaryTurnFacts>,
+    version: u32,
+    events: &[JournalEvent],
 ) -> Result<&'a BoundaryTurnFacts> {
-    match boundary.version {
-        COMPACTION_BOUNDARY_VERSION_V1 => Ok(facts_v1),
-        COMPACTION_BOUNDARY_VERSION_V2 => Ok(facts_v2),
-        version => session_error(format!("unsupported compaction boundary version {version}")),
-    }
+    let facts = match facts_by_version.entry(version) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => entry.insert(boundary_turn_facts(version, events)?),
+    };
+    Ok(facts)
 }
 
-/// Index user turns while enforcing a session-prefix protocol epoch.  Legacy
-/// sessions may move forward into tagged turn protocols, but once a writer has
-/// emitted a newer version, later user messages cannot opt back into weaker
-/// semantics by omitting or lowering `turn_boundary_version`.
+/// Frozen protocol-neutral user index used by boundary v1/v2 as well as v3.
+/// Do not add session-wide policy here: doing so would reinterpret old chains.
 fn index_boundary_user_messages(
     events: &[JournalEvent],
 ) -> Result<HashMap<u64, (&str, Option<u32>)>> {
     let mut users = HashMap::new();
-    let mut highest_protocol = None::<(u32, u64)>;
     for event in events.iter().filter(|event| event.kind == "user.message") {
         let turn_id = event.turn_id.as_deref().ok_or_else(|| {
             OxidraError::Session(format!("user.message at seq {} has no turn_id", event.seq))
         })?;
-        let version = user_turn_boundary_version(event)?;
-        let protocol_epoch = version.unwrap_or(0);
-        if let Some((highest, highest_seq)) = highest_protocol {
-            if protocol_epoch < highest {
-                let current = version
-                    .map(|version| format!("v{version}"))
-                    .unwrap_or_else(|| "legacy".to_owned());
-                return session_error(format!(
-                    "user.message at seq {} downgrades the session turn boundary protocol from v{highest} at seq {highest_seq} to {current}",
-                    event.seq
-                ));
-            }
-        }
-        if highest_protocol.is_none_or(|(highest, _)| protocol_epoch > highest) {
-            highest_protocol = Some((protocol_epoch, event.seq));
-        }
+        let version = parse_user_turn_boundary_version(event)?;
         if users.insert(event.seq, (turn_id, version)).is_some() {
             return session_error(format!(
                 "duplicate user.message seq {} while indexing boundary protocol",
@@ -1750,7 +1802,7 @@ fn index_boundary_user_messages(
     Ok(users)
 }
 
-fn user_turn_boundary_version(event: &JournalEvent) -> Result<Option<u32>> {
+fn parse_user_turn_boundary_version(event: &JournalEvent) -> Result<Option<u32>> {
     let Some(value) = event.data.get("turn_boundary_version") else {
         return Ok(None);
     };
@@ -1766,13 +1818,62 @@ fn user_turn_boundary_version(event: &JournalEvent) -> Result<Option<u32>> {
             event.seq
         ))
     })?;
-    if !(1..=TURN_BOUNDARY_VALIDATOR_VERSION).contains(&version) {
-        return session_error(format!(
-            "unsupported turn boundary version {version} at seq {}",
-            event.seq
-        ));
-    }
     Ok(Some(version))
+}
+
+/// Boundary v3 establishes a session protocol epoch. Its visible prefix and
+/// every later user message must keep or raise the turn protocol version.
+fn validate_user_turn_protocol_epoch(events: &[JournalEvent]) -> Result<()> {
+    let mut highest_protocol = None::<(u32, u64)>;
+    for event in events.iter().filter(|event| event.kind == "user.message") {
+        let version = parse_user_turn_boundary_version(event)?;
+        let protocol_epoch = version.unwrap_or(0);
+        if version.is_some() && !(1..=TURN_BOUNDARY_VALIDATOR_VERSION).contains(&protocol_epoch) {
+            return session_error(format!(
+                "unsupported turn boundary version {protocol_epoch} at seq {}",
+                event.seq
+            ));
+        }
+        if let Some((highest, highest_seq)) = highest_protocol {
+            if protocol_epoch < highest {
+                let current = version
+                    .map(|version| format!("v{version}"))
+                    .unwrap_or_else(|| "legacy".to_owned());
+                return session_error(format!(
+                    "user.message at seq {} downgrades the boundary v3 session turn protocol from v{highest} at seq {highest_seq} to {current}",
+                    event.seq
+                ));
+            }
+        }
+        if highest_protocol.is_none_or(|(highest, _)| protocol_epoch > highest) {
+            highest_protocol = Some((protocol_epoch, event.seq));
+        }
+    }
+    Ok(())
+}
+
+fn validate_boundary_session_epoch_transition(
+    epoch: Option<(u32, u64)>,
+    next_version: u32,
+    event_seq: u64,
+) -> Result<()> {
+    if let Some((current_version, epoch_seq)) = epoch {
+        if next_version < current_version {
+            return session_error(format!(
+                "compaction boundary at seq {event_seq} downgrades the session boundary protocol from v{current_version} at seq {epoch_seq} to v{next_version}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn update_boundary_session_epoch(epoch: &mut Option<(u32, u64)>, version: u32, event_seq: u64) {
+    if version < COMPACTION_BOUNDARY_VERSION_V3 {
+        return;
+    }
+    if epoch.is_none_or(|(current, _)| version > current) {
+        *epoch = Some((version, event_seq));
+    }
 }
 
 fn validate_boundary_user_reference(
@@ -1863,6 +1964,15 @@ fn validate_boundary_version_transition(
         ) | (
             COMPACTION_BOUNDARY_VERSION_V2,
             COMPACTION_BOUNDARY_VERSION_V2
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V1,
+            COMPACTION_BOUNDARY_VERSION_V3
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V2,
+            COMPACTION_BOUNDARY_VERSION_V3
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V3,
+            COMPACTION_BOUNDARY_VERSION_V3
         )
     );
     if !allowed {
@@ -6195,74 +6305,125 @@ mod tests {
 
     #[test]
     fn session_turn_protocol_version_is_monotonic() {
-        let mut downgraded = complete_turn(1, "turn-1");
+        let mut downgraded = vec![
+            open_user(1, "turn-1", "establish boundary v3 epoch"),
+            boundary_started_with_version(2, "boundary-v3", "turn-1", 1, 3),
+            event(
+                3,
+                None,
+                COMPACTION_BOUNDARY_ABANDONED_KIND,
+                json!({
+                    "boundary_id":"boundary-v3",
+                    "turn_id":"turn-1",
+                    "user_message_seq":1,
+                    "reason":"replace prompt"
+                }),
+            ),
+        ];
         downgraded.push(open_user_with_boundary_version(
             4,
             "turn-2",
             "downgraded prompt",
             3,
         ));
-        downgraded.push(boundary_started_with_version(
-            5,
-            "boundary-v1",
-            "turn-2",
-            4,
-            1,
-        ));
-        downgraded.push(event(
-            6,
-            Some("turn-2"),
-            "response.started",
-            json!({"response_attempt_id":"attempt-1"}),
-        ));
         let error = validate_compaction_boundary_chain(&downgraded)
-            .expect_err("a session that reached turn v4 must not return to v3")
+            .expect_err("a boundary v3 session epoch must not return to turn v3")
             .to_string();
         assert!(
-            error.contains("downgrades the session turn boundary protocol from v4"),
+            error.contains("downgrades the boundary v3 session turn protocol from v4"),
             "unexpected boundary error: {error}"
         );
 
-        let mut missing_version = complete_turn(1, "turn-1");
+        let mut missing_version = vec![
+            open_user(1, "turn-1", "establish boundary v3 epoch"),
+            boundary_started_with_version(2, "boundary-v3", "turn-1", 1, 3),
+            event(
+                3,
+                None,
+                COMPACTION_BOUNDARY_ABANDONED_KIND,
+                json!({
+                    "boundary_id":"boundary-v3",
+                    "turn_id":"turn-1",
+                    "user_message_seq":1,
+                    "reason":"replace prompt"
+                }),
+            ),
+        ];
         missing_version.push(event(
             4,
             Some("turn-2"),
             "user.message",
             json!({"item":{"role":"user","content":"legacy downgrade"}}),
         ));
-        missing_version.push(boundary_started_with_version(
-            5,
-            "boundary-v1",
-            "turn-2",
-            4,
-            1,
-        ));
         let error = validate_compaction_boundary_chain(&missing_version)
-            .expect_err("a session that reached turn v4 must not return to legacy")
+            .expect_err("a boundary v3 session epoch must not return to legacy")
             .to_string();
         assert!(
             error.contains("to legacy"),
             "unexpected boundary error: {error}"
         );
 
-        let mut upgraded = complete_turn_with_boundary_version(1, "turn-1", 3);
+        let mut upgraded = vec![
+            open_user_with_boundary_version(1, "turn-1", "old prompt", 3),
+            boundary_started_with_version(2, "boundary-v3-1", "turn-1", 1, 3),
+            event(
+                3,
+                None,
+                COMPACTION_BOUNDARY_ABANDONED_KIND,
+                json!({
+                    "boundary_id":"boundary-v3-1",
+                    "turn_id":"turn-1",
+                    "user_message_seq":1,
+                    "reason":"replace prompt"
+                }),
+            ),
+        ];
         upgraded.push(open_user(4, "turn-2", "upgraded prompt"));
-        upgraded.push(boundary_started(5, "boundary-v2", "turn-2", 4));
+        upgraded.push(boundary_started(5, "boundary-v3-2", "turn-2", 4));
         validate_compaction_boundary_chain(&upgraded)
             .expect("a session may monotonically upgrade from turn v3 to v4");
     }
 
     #[test]
+    fn boundary_v3_establishes_a_non_downgradable_session_epoch() {
+        let events = vec![
+            open_user(1, "turn-1", "first prompt"),
+            boundary_started_with_version(2, "boundary-v3", "turn-1", 1, 3),
+            event(
+                3,
+                None,
+                COMPACTION_BOUNDARY_ABANDONED_KIND,
+                json!({
+                    "boundary_id":"boundary-v3",
+                    "turn_id":"turn-1",
+                    "user_message_seq":1,
+                    "reason":"replace prompt"
+                }),
+            ),
+            open_user(4, "turn-2", "second prompt"),
+            boundary_started_with_version(5, "boundary-v2", "turn-2", 4, 2),
+        ];
+        let error = validate_compaction_boundary_chain(&events)
+            .expect_err("a durable boundary v3 epoch must not return to boundary v2")
+            .to_string();
+        assert!(
+            error.contains("downgrades the session boundary protocol from v3"),
+            "unexpected boundary error: {error}"
+        );
+    }
+
+    #[test]
     fn boundary_retry_protocol_versions_are_monotonic() {
-        for (previous, next) in [(1, 1), (1, 2), (2, 2)] {
+        for (previous, next) in [(1, 1), (1, 2), (2, 2), (1, 3), (2, 3), (3, 3)] {
             validate_boundary_version_transition(previous, next, 1)
                 .expect("registered boundary migration must remain supported");
         }
         assert!(validate_boundary_version_transition(2, 1, 1).is_err());
+        assert!(validate_boundary_version_transition(3, 2, 1).is_err());
 
         let events = vec![
             open_user(1, "turn-1", "prompt"),
-            boundary_started(2, "boundary-v2", "turn-1", 1),
+            boundary_started_with_version(2, "boundary-v2", "turn-1", 1, 2),
             event(
                 3,
                 None,
@@ -6299,7 +6460,7 @@ mod tests {
     }
 
     #[test]
-    fn boundary_v2_retry_rechecks_the_live_turn_and_request_slot() {
+    fn boundary_retry_rechecks_the_live_turn_and_request_slot() {
         let mut events = vec![open_user(1, "turn-1", "prompt")];
         events.push(boundary_started(2, "boundary-1", "turn-1", 1));
         events.push(event(
@@ -6423,5 +6584,34 @@ mod tests {
             .expect_err("a boundary after inline completion must not be retroactively valid")
             .to_string();
         assert!(error.contains("not an open tail"));
+    }
+
+    #[test]
+    fn frozen_boundary_v1_v2_fixtures_keep_pre_v3_semantics() {
+        // Literal snapshots of the pre-v3 acceptance set. Do not regenerate
+        // these expectations from the current policy registry.
+        for (version, fixture) in [
+            (
+                1,
+                include_str!("../tests/fixtures/compaction_boundary_v1.jsonl"),
+            ),
+            (
+                2,
+                include_str!("../tests/fixtures/compaction_boundary_v2.jsonl"),
+            ),
+        ] {
+            let events = fixture
+                .lines()
+                .map(|line| serde_json::from_str::<JournalEvent>(line).expect("literal JSONL"))
+                .collect::<Vec<_>>();
+            let chain = validate_compaction_boundary_chain(&events)
+                .unwrap_or_else(|error| panic!("frozen boundary v{version} changed: {error}"));
+            assert_eq!(chain.boundaries().len(), 1);
+            assert_eq!(chain.boundaries()[0].boundary.version, version);
+            assert_eq!(
+                chain.boundaries()[0].state,
+                CompactionBoundaryState::Abandoned
+            );
+        }
     }
 }
