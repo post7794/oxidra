@@ -16,7 +16,9 @@ use crate::compaction::{
 };
 use crate::error::{OxidraError, Result};
 use crate::event_kind::is_tool_terminal;
-use crate::projection::validate_response_output_items;
+use crate::projection::{
+    source_projection_supports_boundary_exclusions, validate_response_output_items,
+};
 use crate::session::{JOURNAL_SCHEMA, JournalEvent};
 use crate::turn::validate_turn_recovery;
 use crate::types::ToolDefinition;
@@ -550,6 +552,7 @@ pub(crate) fn validate_history_snapshot_after_compaction(
     chain: &CheckpointChain,
     boundary_chain: &CompactionBoundaryChain,
     covers_through_seq: u64,
+    source_projection_version: u32,
 ) -> Result<HistorySnapshot> {
     chain.ensure_matches(events)?;
     boundary_chain.ensure_checkpoint_projection_safe(chain)?;
@@ -561,11 +564,14 @@ pub(crate) fn validate_history_snapshot_after_compaction(
             "prospective history cutoff {covers_through_seq} does not advance beyond {parent_cutoff}"
         )));
     }
-    if let Some(user_message_seq) = boundary_chain.first_abandoned_user_seq_after(parent_cutoff) {
-        if covers_through_seq >= user_message_seq {
-            return Err(OxidraError::Session(format!(
-                "prospective history cutoff {covers_through_seq} crosses abandoned compaction-boundary turn at user.message seq {user_message_seq}"
-            )));
+    if !source_projection_supports_boundary_exclusions(source_projection_version)? {
+        if let Some(user_message_seq) = boundary_chain.first_abandoned_user_seq_after(parent_cutoff)
+        {
+            if covers_through_seq >= user_message_seq {
+                return Err(OxidraError::Session(format!(
+                    "prospective history cutoff {covers_through_seq} crosses abandoned compaction-boundary turn at user.message seq {user_message_seq}"
+                )));
+            }
         }
     }
 

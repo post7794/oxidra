@@ -1,0 +1,5 @@
+[
+  {"role":"user","content":"question turn-1"},
+  {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer turn-1"}]},
+  {"role":"user","content":"replacement"}
+]

@@ -47,10 +47,10 @@ use crate::history::{
 use crate::history_artifact::{HistoryArtifactReader, HistoryArtifactRequest};
 pub use crate::projection::project_events;
 use crate::projection::{
-    project_checkpoint_and_tail_for_recovery_planning,
+    SOURCE_PROJECTION_VERSION, project_checkpoint_and_tail_for_recovery_planning,
     project_checkpoint_and_tail_with_boundary_chain, project_compaction_summary_and_tail,
     project_events_for_recovery_planning, project_events_with_boundary_chain,
-    validate_response_output_items,
+    source_projection_supports_boundary_exclusions, validate_response_output_items,
 };
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{JournalEvent, SessionJournal};
@@ -1150,6 +1150,7 @@ impl Agent {
             &replacement.turn_id,
             candidate.covers_through_seq,
             candidate.summary_envelope_version,
+            candidate.source_projection_version,
         )?;
         // Exercise the same tail projection and request measurement before any
         // retry intent is durable. The real summary is checked again in the
@@ -1310,6 +1311,7 @@ impl Agent {
         turn_id: &str,
         covers_through_seq: u64,
         summary_envelope_version: u32,
+        source_projection_version: u32,
     ) -> Result<PlannedCompactionContinuationV1> {
         let checkpoint_chain = validate_checkpoint_chain(events.as_slice())?;
         let prospective_history = validate_history_snapshot_after_compaction(
@@ -1317,6 +1319,7 @@ impl Agent {
             &checkpoint_chain,
             boundary_chain.as_ref(),
             covers_through_seq,
+            source_projection_version,
         )?;
         let history_quota = rebuild_history_quota_for_compaction_preview(
             events.as_slice(),
@@ -2461,7 +2464,12 @@ impl Agent {
             .into_iter()
             .filter(|turn| matches!(turn.state, TurnState::Complete(_)))
             .count();
-        let abandoned_barrier = boundary_chain.first_abandoned_user_seq_after(parent_cutoff);
+        let abandoned_barrier =
+            if source_projection_supports_boundary_exclusions(SOURCE_PROJECTION_VERSION)? {
+                None
+            } else {
+                boundary_chain.first_abandoned_user_seq_after(parent_cutoff)
+            };
         let events = Arc::new(snapshot.clone());
         let boundary_chain = Arc::new(boundary_chain);
         let planning_summary = automatic_compaction_summary_placeholder_v1()?;
@@ -2477,6 +2485,7 @@ impl Agent {
                 &boundary.turn_id,
                 cutoff.covers_through_seq,
                 SUMMARY_ENVELOPE_VERSION,
+                SOURCE_PROJECTION_VERSION,
             )?;
             let projected = continuation.context_for_summary(&planning_summary)?;
             estimates.push(CandidateEstimate {
@@ -6128,6 +6137,7 @@ mod tests {
             )
             .unwrap();
         let mut candidate = candidate_for_cutoff(&journal, cutoff);
+        candidate.source_projection_version = 3;
         candidate.turn_boundary_validator_version = 3;
         let error = compact_replay_once_for_boundary(
             &ProviderFailureProvider,

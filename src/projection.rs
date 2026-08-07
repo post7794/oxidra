@@ -19,7 +19,23 @@ use crate::turn::{
 };
 
 /// Current immutable event-to-item format used when building compaction input.
-pub const SOURCE_PROJECTION_VERSION: u32 = 3;
+pub const SOURCE_PROJECTION_VERSION: u32 = 4;
+
+/// Whether a persisted source projection version can prove that a validated
+/// compaction-boundary abandon was excluded from the opaque summary source.
+///
+/// Keep every match arm immutable. This capability is consumed by checkpoint
+/// safety checks so advancing the current writer cannot reinterpret old
+/// source bytes.
+pub(crate) fn source_projection_supports_boundary_exclusions(version: u32) -> Result<bool> {
+    match version {
+        1..=3 => Ok(false),
+        4 => Ok(true),
+        _ => Err(OxidraError::Session(format!(
+            "unsupported compaction source projection version {version}"
+        ))),
+    }
+}
 
 /// Project only committed events into the stateless Responses `input` array.
 /// Partial deltas and aborted responses are intentionally absent.
@@ -57,6 +73,7 @@ pub fn project_events_for_compaction(version: u32, events: &[JournalEvent]) -> R
         1 => project_events_v1(events),
         2 => project_events_v2(events),
         3 => project_events_v3(events),
+        4 => project_events_v4(events),
         _ => Err(OxidraError::Session(format!(
             "unsupported compaction source projection version {version}"
         ))),
@@ -77,6 +94,16 @@ fn project_events_v3(events: &[JournalEvent]) -> Result<Vec<Value>> {
     // v3 将较早 retry attempt 的取消终态从当前 projection 中移除。
     let recovery = validate_turn_recovery_v3(events)?;
     project_events_impl(events, Some(&recovery), true, None)
+}
+
+fn project_events_v4(events: &[JournalEvent]) -> Result<Vec<Value>> {
+    // v4 is the first compaction source format that consumes the independently
+    // versioned boundary reducer and removes every item from a validated
+    // abandoned boundary turn. v1-v3 intentionally remain unaware of it.
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+    let recovery = validate_turn_recovery_v3(events)?;
+    project_events_impl(events, Some(&recovery), true, Some(&excluded_turn_ids))
 }
 
 /// Build the current runtime projection after applying the separately
@@ -772,11 +799,36 @@ mod tests {
         let events = boundary_v2_fixture();
         let current = project_events(&events).expect("current boundary view is valid");
         let frozen = project_events_for_compaction(3, &events).expect("v3 stays registered");
+        let boundary_aware =
+            project_events_for_compaction(4, &events).expect("v4 consumes boundary state");
         let current = serde_json::to_string(&current).unwrap();
         let frozen = serde_json::to_string(&frozen).unwrap();
+        let boundary_aware = serde_json::to_string(&boundary_aware).unwrap();
         assert!(!current.contains("\"content\":\"prompt\""));
         assert!(current.contains("replacement"));
         assert!(frozen.contains("\"content\":\"prompt\""));
+        assert_eq!(boundary_aware, current);
+    }
+
+    #[test]
+    fn source_projection_v4_boundary_exclusion_fixture_is_frozen() {
+        let events = boundary_v2_fixture();
+        let expected: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/boundary_projection_v4.json"
+        ))
+        .expect("valid frozen boundary-aware projection fixture");
+
+        assert_eq!(
+            project_events_for_compaction(4, &events).expect("source v4 is registered"),
+            expected
+        );
+        assert!(
+            project_events_for_compaction(3, &events)
+                .expect("frozen source v3 remains readable")
+                .iter()
+                .any(|item| item.get("content") == Some(&json!("prompt"))),
+            "source v3 must not gain boundary exclusion retroactively"
+        );
     }
 
     #[test]

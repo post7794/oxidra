@@ -18,7 +18,8 @@ use uuid::Uuid;
 use crate::error::{OxidraError, Result};
 use crate::event_kind::{is_response_terminal, is_tool_lifecycle};
 use crate::projection::{
-    SOURCE_PROJECTION_VERSION, project_events_for_compaction, validate_response_output_items,
+    SOURCE_PROJECTION_VERSION, project_events_for_compaction,
+    source_projection_supports_boundary_exclusions, validate_response_output_items,
 };
 use crate::provider::{ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{JournalEvent, SessionJournal};
@@ -663,8 +664,8 @@ impl CompactionBoundaryChain {
             .collect()
     }
 
-    /// Earliest model-visible sequence that a future checkpoint must not
-    /// cross until a boundary-aware source projection version is registered.
+    /// Earliest model-visible sequence that a source projection without
+    /// boundary exclusions must not cross.
     pub fn first_abandoned_user_seq_after(&self, after_seq: u64) -> Option<u64> {
         let abandoned = self.abandoned_turn_ids();
         self.boundaries
@@ -679,11 +680,15 @@ impl CompactionBoundaryChain {
     /// that the current boundary view explicitly abandoned.
     ///
     /// Source projection v1-v3 are byte-frozen and do not understand
-    /// `compaction.boundary.abandoned`. Until a new source version can encode
-    /// that exclusion without changing old digests, crossing such a turn must
-    /// fail closed rather than replaying it from inside an opaque summary.
+    /// `compaction.boundary.abandoned`; v4 does. Safety is selected from each
+    /// checkpoint's persisted source version, so adding v4 never retroactively
+    /// blesses an older opaque summary that crossed an abandoned turn.
     pub fn ensure_checkpoint_projection_safe(&self, chain: &CheckpointChain) -> Result<()> {
         for checkpoint in chain.checkpoints() {
+            if source_projection_supports_boundary_exclusions(checkpoint.source_projection_version)?
+            {
+                continue;
+            }
             let parent_cutoff = checkpoint
                 .parent_checkpoint_id
                 .as_deref()
@@ -3173,7 +3178,12 @@ pub fn select_compaction_candidate(
             },
         ));
     }
-    let abandoned_barrier = boundary_chain.first_abandoned_user_seq_after(parent_cutoff);
+    let abandoned_barrier =
+        if source_projection_supports_boundary_exclusions(SOURCE_PROJECTION_VERSION)? {
+            None
+        } else {
+            boundary_chain.first_abandoned_user_seq_after(parent_cutoff)
+        };
     let eligible = recent_eligible
         .into_iter()
         .filter(|candidate| {
@@ -3748,12 +3758,15 @@ fn validate_dispatch_candidate(
     }
 
     let parent_cutoff = expected_parent.map_or(0, |checkpoint| checkpoint.covers_through_seq);
-    if let Some(user_message_seq) = boundary_chain.first_abandoned_user_seq_after(parent_cutoff) {
-        if candidate.covers_through_seq >= user_message_seq {
-            return session_error(format!(
-                "compaction candidate cutoff {} crosses abandoned compaction-boundary turn at user.message seq {user_message_seq}",
-                candidate.covers_through_seq
-            ));
+    if !source_projection_supports_boundary_exclusions(candidate.source_projection_version)? {
+        if let Some(user_message_seq) = boundary_chain.first_abandoned_user_seq_after(parent_cutoff)
+        {
+            if candidate.covers_through_seq >= user_message_seq {
+                return session_error(format!(
+                    "compaction candidate cutoff {} crosses abandoned compaction-boundary turn at user.message seq {user_message_seq}",
+                    candidate.covers_through_seq
+                ));
+            }
         }
     }
     let uncompacted_events = events
@@ -6540,7 +6553,7 @@ mod tests {
     }
 
     #[test]
-    fn candidate_selection_never_summarizes_across_an_abandoned_boundary_turn() {
+    fn candidate_selection_crosses_abandoned_turn_only_with_boundary_aware_source() {
         let legacy_boundary = CompactionBoundary {
             version: COMPACTION_BOUNDARY_VERSION_V1,
             boundary_id: "abandoned-boundary".to_owned(),
@@ -6594,12 +6607,81 @@ mod tests {
             },
         )
         .unwrap();
+        let CompactionSelection::Selected(selected) = selection else {
+            panic!("boundary-aware source should make the cutoff eligible")
+        };
+        assert_eq!(selected.covers_through_seq, 6);
         assert_eq!(
-            selection,
-            CompactionSelection::Unavailable(NoCompactionCandidate::AbandonedTurnBarrier {
-                user_message_seq: 1,
-            })
+            selected.source_projection_version,
+            SOURCE_PROJECTION_VERSION
         );
+        let source = serde_json::to_string(selected.source.items()).unwrap();
+        assert!(!source.contains("obsolete"));
+        assert!(source.contains("question turn-2"));
+
+        let frozen_source = build_compaction_source_with_versions(
+            &events,
+            None,
+            6,
+            TURN_BOUNDARY_VALIDATOR_VERSION,
+            3,
+        )
+        .unwrap();
+        let frozen_candidate = CompactionCandidate {
+            parent_checkpoint_id: None,
+            covers_through_seq: 6,
+            newly_compacted_complete_turns: 1,
+            estimated_input_tokens_after: 400,
+            prompt_version: COMPACTION_PROMPT_VERSION,
+            summary_envelope_version: SUMMARY_ENVELOPE_VERSION,
+            source_projection_version: 3,
+            turn_boundary_validator_version: TURN_BOUNDARY_VALIDATOR_VERSION,
+            source_digest_version: SOURCE_DIGEST_VERSION,
+            usage_contract_version: USAGE_CONTRACT_VERSION,
+            source_digest: frozen_source.digest().unwrap(),
+            source: frozen_source,
+        };
+        let error = validate_replay_compaction_candidate(&events, &frozen_candidate)
+            .expect_err("frozen v3 source still cannot cross a boundary abandon")
+            .to_string();
+        assert!(error.contains("crosses abandoned"), "{error}");
+
+        let mut current_checkpoint_events = events.clone();
+        append_checkpoint_attempt(
+            &mut current_checkpoint_events,
+            None,
+            6,
+            "attempt-v4",
+            "checkpoint-v4",
+            "safe boundary-aware summary",
+        );
+        let current_chain = validate_checkpoint_chain(&current_checkpoint_events).unwrap();
+        validate_compaction_boundary_chain(&current_checkpoint_events)
+            .unwrap()
+            .ensure_checkpoint_projection_safe(&current_chain)
+            .expect("source v4 proves the abandoned turn was excluded");
+
+        let mut frozen_checkpoint_events = events;
+        append_checkpoint_attempt_with_versions(
+            &mut frozen_checkpoint_events,
+            None,
+            6,
+            "attempt-v3",
+            "checkpoint-v3",
+            "opaque unsafe summary",
+            COMPACTION_PROMPT_VERSION,
+            SUMMARY_ENVELOPE_VERSION,
+            3,
+            TURN_BOUNDARY_VALIDATOR_VERSION,
+            SOURCE_DIGEST_VERSION,
+        );
+        let frozen_chain = validate_checkpoint_chain(&frozen_checkpoint_events).unwrap();
+        let error = validate_compaction_boundary_chain(&frozen_checkpoint_events)
+            .unwrap()
+            .ensure_checkpoint_projection_safe(&frozen_chain)
+            .expect_err("source v3 cannot prove the abandoned turn was excluded")
+            .to_string();
+        assert!(error.contains("source projection v3"), "{error}");
     }
 
     #[test]
