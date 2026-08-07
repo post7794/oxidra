@@ -24,8 +24,8 @@ use crate::provider::{ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{JournalEvent, SessionJournal};
 use crate::turn::{
     CompletionEvidence, ProviderRequestSlotState, TURN_BOUNDARY_VALIDATOR_VERSION, TurnState,
-    complete_prefix_candidates_for_version, provider_request_slot_state_for_version,
-    segment_turns_for_version, validate_provider_budget_retries_v1,
+    complete_prefix_candidates_for_version, is_provider_slot_event_kind,
+    provider_request_slot_state_for_version, segment_turns_for_version,
 };
 use crate::types::AssistantTurn;
 
@@ -129,7 +129,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
         }),
         COMPACTION_BOUNDARY_VERSION_V4 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4,
-            turn_metadata_ceiling: None,
+            turn_metadata_ceiling: Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4),
             provider_budget_retry_overlay_version: None,
             provider_request_slot_validator_version: Some(
                 COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V2,
@@ -454,6 +454,20 @@ pub struct CompactionBoundaryBudgetRetryStarted {
     pub consumed_provider_call_intents: u64,
     #[serde(default, flatten)]
     pub extra: Map<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ValidatedProviderBudgetRetry {
+    pub retry_seq: u64,
+    pub retry_id: String,
+    pub previous_boundary_id: String,
+    pub boundary: CompactionBoundary,
+    pub checkpoint_id: String,
+    pub limit_seq: u64,
+    pub previous_limit: u64,
+    pub current_limit: Option<u64>,
+    pub budget_disabled: bool,
+    pub consumed_provider_call_intents: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1954,44 +1968,21 @@ pub fn validate_compaction_boundary_chain(
                             event.seq
                         ))
                     })?;
-                if validated_retry.retry_id != payload.retry_id
-                    || validated_retry.turn_id != payload.boundary.turn_id
-                    || validated_retry.limit_seq != payload.limit_seq
-                    || validated_retry.previous_limit != payload.previous_limit
-                    || validated_retry.current_limit != payload.current_limit
-                    || validated_retry.budget_disabled != payload.budget_disabled
-                    || validated_retry.consumed_provider_call_intents
-                        != payload.consumed_provider_call_intents
-                {
+                let expected_retry = ValidatedProviderBudgetRetry {
+                    retry_seq: event.seq,
+                    retry_id: payload.retry_id.clone(),
+                    previous_boundary_id: payload.previous_boundary_id.clone(),
+                    boundary: payload.boundary.clone(),
+                    checkpoint_id: payload.checkpoint_id.clone(),
+                    limit_seq: payload.limit_seq,
+                    previous_limit: payload.previous_limit,
+                    current_limit: payload.current_limit,
+                    budget_disabled: payload.budget_disabled,
+                    consumed_provider_call_intents: payload.consumed_provider_call_intents,
+                };
+                if validated_retry != expected_retry {
                     return session_error(format!(
-                        "boundary budget retry at seq {} disagrees with its validated turn facts",
-                        event.seq
-                    ));
-                }
-                let consumed = durable_provider_call_intents_for_boundary_turn(
-                    events,
-                    &attempts,
-                    &payload.boundary.turn_id,
-                    event.seq,
-                )?;
-                if consumed != payload.consumed_provider_call_intents {
-                    return session_error(format!(
-                        "boundary budget retry at seq {} reports {} consumed calls but the journal proves {consumed}",
-                        event.seq, payload.consumed_provider_call_intents
-                    ));
-                }
-                let previous_policy = compaction_boundary_policy(previous.boundary.version)?;
-                let previous_slot_version = previous_policy
-                    .provider_request_slot_validator_version
-                    .expect("checkpointed boundary v3 owns a Provider slot");
-                let previous_slot = provider_request_slot_state_for_version(
-                    previous_slot_version,
-                    &events[..event_index],
-                    &payload.boundary.turn_id,
-                )?;
-                if previous_slot != ProviderRequestSlotState::Terminal {
-                    return session_error(format!(
-                        "boundary budget retry at seq {} requires the legacy Provider slot to be Terminal, not {previous_slot:?}",
+                        "boundary budget retry at seq {} disagrees with its canonical migration facts",
                         event.seq
                     ));
                 }
@@ -2280,6 +2271,239 @@ pub fn validate_compaction_boundary_chain(
     }
 
     Ok(CompactionBoundaryChain { boundaries })
+}
+
+/// Canonical validator for the one compatibility transition that can remove a
+/// legacy Provider-call budget terminal from a turn.
+///
+/// This is deliberately the sole authority consumed by boundary v4, turn v5,
+/// and Provider request-slot v2. Validation is performed against the durable
+/// prefix before each migration event, so the predecessor boundary and
+/// checkpoint are proven without asking the new event to authorize itself.
+pub(crate) fn validate_provider_budget_retries_v1(
+    events: &[JournalEvent],
+) -> Result<Vec<ValidatedProviderBudgetRetry>> {
+    let retry_indices = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.kind == COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if retry_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut retries = Vec::with_capacity(retry_indices.len());
+    let mut retry_ids = HashSet::new();
+    let mut limit_seqs = HashSet::new();
+    for event_index in retry_indices {
+        let event = &events[event_index];
+        if event.turn_id.is_some() {
+            return session_error(format!(
+                "{} at seq {} must be a global event",
+                event.kind, event.seq
+            ));
+        }
+        let payload = parse_event_data::<CompactionBoundaryBudgetRetryStarted>(event)?;
+        validate_boundary_shape(&payload.boundary)?;
+        if payload.retry_version != COMPACTION_BOUNDARY_BUDGET_RETRY_OVERLAY_VERSION_V1 {
+            return session_error(format!(
+                "Provider budget retry at seq {} uses unsupported version {}",
+                event.seq, payload.retry_version
+            ));
+        }
+        if payload.retry_id.trim().is_empty() || !retry_ids.insert(payload.retry_id.clone()) {
+            return session_error(format!(
+                "Provider budget retry at seq {} has an empty or duplicate retry id",
+                event.seq
+            ));
+        }
+        if !limit_seqs.insert(payload.limit_seq) {
+            return session_error(format!(
+                "agent.limit_reached at seq {} has more than one Provider budget retry",
+                payload.limit_seq
+            ));
+        }
+        if !event.data.as_object().is_some_and(|data| {
+            data.contains_key("current_limit") && data.contains_key("budget_disabled")
+        }) {
+            return session_error(format!(
+                "Provider budget retry at seq {} has incomplete current-budget metadata",
+                event.seq
+            ));
+        }
+        if payload.previous_limit == 0
+            || payload.budget_disabled == payload.current_limit.is_some()
+            || payload.consumed_provider_call_intents < payload.previous_limit
+            || payload
+                .current_limit
+                .is_some_and(|limit| limit <= payload.consumed_provider_call_intents)
+        {
+            return session_error(format!(
+                "Provider budget retry at seq {} does not grant capacity beyond {} durable calls",
+                event.seq, payload.consumed_provider_call_intents
+            ));
+        }
+
+        let prefix = &events[..event_index];
+        let predecessor_chain = validate_compaction_boundary_chain(prefix)?;
+        let previous = predecessor_chain
+            .boundaries()
+            .iter()
+            .find(|boundary| boundary.boundary.boundary_id == payload.previous_boundary_id)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "Provider budget retry at seq {} references unknown boundary {}",
+                    event.seq, payload.previous_boundary_id
+                ))
+            })?;
+        if predecessor_chain.pending().len() != 1
+            || predecessor_chain.latest_pending() != Some(previous)
+            || previous.state != CompactionBoundaryState::Checkpointed
+            || previous.boundary.version != COMPACTION_BOUNDARY_VERSION_V3
+        {
+            return session_error(format!(
+                "Provider budget retry at seq {} requires the unique checkpointed boundary v3 recovery owner",
+                event.seq
+            ));
+        }
+        if payload.boundary.version != COMPACTION_BOUNDARY_VERSION_V4
+            || payload.boundary.turn_id != previous.boundary.turn_id
+            || payload.boundary.user_message_seq != previous.boundary.user_message_seq
+            || payload.checkpoint_id.trim().is_empty()
+            || previous.checkpoint_id.as_deref() != Some(payload.checkpoint_id.as_str())
+            || predecessor_chain
+                .boundaries()
+                .iter()
+                .any(|boundary| boundary.boundary.boundary_id == payload.boundary.boundary_id)
+        {
+            return session_error(format!(
+                "Provider budget retry at seq {} does not preserve its checkpointed turn lineage",
+                event.seq
+            ));
+        }
+        validate_boundary_version_transition(
+            previous.boundary.version,
+            payload.boundary.version,
+            event.seq,
+        )?;
+        let user_messages = index_boundary_user_messages(&events[..=event_index])?;
+        validate_boundary_user_reference(
+            &payload.boundary,
+            event.seq,
+            &user_messages,
+            &events[..=event_index],
+        )?;
+
+        let limit = prefix
+            .iter()
+            .find(|candidate| candidate.seq == payload.limit_seq)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "Provider budget retry at seq {} references missing agent.limit_reached seq {}",
+                    event.seq, payload.limit_seq
+                ))
+            })?;
+        if limit.seq <= previous.state_seq
+            || limit.kind != "agent.limit_reached"
+            || limit.turn_id.as_deref() != Some(payload.boundary.turn_id.as_str())
+            || limit.data.get("kind").and_then(Value::as_str) != Some("responses")
+            || limit.data.get("limit").and_then(Value::as_u64) != Some(payload.previous_limit)
+            || limit.data.get("provider_call_budget_version").is_some()
+            || limit.data.get("consumed_provider_call_intents").is_some()
+        {
+            return session_error(format!(
+                "Provider budget retry at seq {} does not match the unversioned 55e5b0c response-limit event {}",
+                event.seq, payload.limit_seq
+            ));
+        }
+        if prefix.iter().any(|candidate| {
+            candidate.seq > limit.seq
+                && candidate.turn_id.as_deref() == Some(payload.boundary.turn_id.as_str())
+                && is_provider_slot_event_kind(&candidate.kind)
+        }) {
+            return session_error(format!(
+                "Provider budget retry at seq {} does not immediately follow turn {}'s terminal budget epoch",
+                event.seq, payload.boundary.turn_id
+            ));
+        }
+
+        let (_checkpoint_chain, attempts) = validate_checkpoint_protocol(prefix)?;
+        let consumed = durable_provider_call_intents_for_boundary_turn(
+            prefix,
+            &attempts,
+            &payload.boundary.turn_id,
+            event.seq,
+        )?;
+        if consumed != payload.consumed_provider_call_intents {
+            return session_error(format!(
+                "Provider budget retry at seq {} reports {} consumed calls but the journal proves {consumed}",
+                event.seq, payload.consumed_provider_call_intents
+            ));
+        }
+        let legacy_slot = provider_request_slot_state_for_version(
+            COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1,
+            prefix,
+            &payload.boundary.turn_id,
+        )?;
+        if legacy_slot != ProviderRequestSlotState::Terminal {
+            return session_error(format!(
+                "Provider budget retry at seq {} requires the legacy Provider slot to be Terminal, not {legacy_slot:?}",
+                event.seq
+            ));
+        }
+
+        let mut resumed_prefix = prefix.to_vec();
+        let resumed_limit = resumed_prefix
+            .iter_mut()
+            .find(|candidate| candidate.seq == payload.limit_seq)
+            .expect("validated legacy limit is present in the private prefix");
+        resumed_limit.kind = "turn.budget_retry_superseded".to_owned();
+        let resumed_slot = provider_request_slot_state_for_version(
+            COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1,
+            &resumed_prefix,
+            &payload.boundary.turn_id,
+        )?;
+        if resumed_slot != ProviderRequestSlotState::Ready {
+            return session_error(format!(
+                "Provider budget retry at seq {} does not restore a Ready Provider slot (state {resumed_slot:?})",
+                event.seq
+            ));
+        }
+        let turns = segment_turns_for_version(
+            COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4,
+            &resumed_prefix,
+        )?;
+        let Some(active_turn) = turns.last() else {
+            return session_error(format!(
+                "Provider budget retry at seq {} has no active turn",
+                event.seq
+            ));
+        };
+        if active_turn.turn_id != payload.boundary.turn_id
+            || active_turn.covers_from_seq != payload.boundary.user_message_seq
+            || !matches!(active_turn.state, TurnState::OpenTail)
+        {
+            return session_error(format!(
+                "Provider budget retry at seq {} does not restore the checkpointed turn as the current open tail",
+                event.seq
+            ));
+        }
+
+        retries.push(ValidatedProviderBudgetRetry {
+            retry_seq: event.seq,
+            retry_id: payload.retry_id,
+            previous_boundary_id: payload.previous_boundary_id,
+            boundary: payload.boundary,
+            checkpoint_id: payload.checkpoint_id,
+            limit_seq: payload.limit_seq,
+            previous_limit: payload.previous_limit,
+            current_limit: payload.current_limit,
+            budget_disabled: payload.budget_disabled,
+            consumed_provider_call_intents: payload.consumed_provider_call_intents,
+        });
+    }
+    Ok(retries)
 }
 
 fn durable_provider_call_intents_for_boundary_turn(
@@ -7046,6 +7270,13 @@ mod tests {
             None,
             "boundary v4 receives budget semantics through its pinned turn/slot reducers"
         );
+        assert_eq!(
+            compaction_boundary_policy(COMPACTION_BOUNDARY_VERSION_V4)
+                .expect("boundary v4 policy")
+                .turn_metadata_ceiling,
+            Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4),
+            "boundary v4 must retain a frozen turn-v5 compatibility ceiling"
+        );
     }
 
     #[test]
@@ -7139,6 +7370,35 @@ mod tests {
             .to_string();
         assert!(
             error.contains("checkpointed boundary v3 predecessor"),
+            "{error}"
+        );
+
+        let mut versioned_terminal = fixture();
+        versioned_terminal[9].data["provider_call_budget_version"] = json!(999);
+        versioned_terminal[9].data["consumed_provider_call_intents"] = json!(1);
+        versioned_terminal.push(retry_event());
+        assert!(
+            segment_turns_for_version(
+                COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4,
+                &versioned_terminal
+            )
+            .is_err(),
+            "turn v5 must not reinterpret an unknown budget-terminal protocol as legacy"
+        );
+        assert!(
+            provider_request_slot_state_for_version(
+                COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V2,
+                &versioned_terminal,
+                "turn-2"
+            )
+            .is_err(),
+            "slot v2 must not reinterpret an unknown budget-terminal protocol as legacy"
+        );
+        let error = validate_compaction_boundary_chain(&versioned_terminal)
+            .expect_err("unknown budget-terminal protocols are not legacy events")
+            .to_string();
+        assert!(
+            error.contains("unversioned 55e5b0c response-limit"),
             "{error}"
         );
     }

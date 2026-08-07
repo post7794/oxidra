@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
+use crate::compaction::validate_provider_budget_retries_v1;
 use crate::error::{OxidraError, Result};
 use crate::session::JournalEvent;
 
@@ -13,9 +14,6 @@ pub const TURN_BOUNDARY_VERSION: u64 = TURN_BOUNDARY_VALIDATOR_VERSION as u64;
 /// policies bind their own historical version and must not read this constant.
 #[allow(dead_code)]
 pub(crate) const PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION: u32 = 2;
-
-const COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND: &str =
-    "compaction.boundary.budget_retry_started";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionEvidence {
@@ -96,18 +94,6 @@ pub(crate) struct ValidatedRetry {
 pub(crate) struct ValidatedTurnRecovery {
     pub abandons: HashMap<String, ValidatedAbandon>,
     pub retries: Vec<ValidatedRetry>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ValidatedProviderBudgetRetry {
-    pub retry_seq: u64,
-    pub retry_id: String,
-    pub turn_id: String,
-    pub limit_seq: u64,
-    pub previous_limit: u64,
-    pub current_limit: Option<u64>,
-    pub budget_disabled: bool,
-    pub consumed_provider_call_intents: u64,
 }
 
 /// 校验并归约 turn recovery 控制事件，防止任意 journal 行获得历史删除或
@@ -747,211 +733,6 @@ fn validate_context_limit_binding(
         }
     }
     Ok(())
-}
-
-/// Validate the atomic compatibility intent that migrates a checkpointed
-/// compaction boundary away from a legacy `agent.limit_reached` terminal.
-///
-/// This reducer deliberately validates only the turn/request-slot facts. The
-/// compaction reducer separately validates the boundary lineage, checkpoint
-/// inheritance, and durable Provider-call count before granting the event any
-/// boundary transition authority.
-pub(crate) fn validate_provider_budget_retries_v1(
-    events: &[JournalEvent],
-) -> Result<Vec<ValidatedProviderBudgetRetry>> {
-    let mut retries = Vec::new();
-    let mut retry_ids = HashSet::new();
-    let mut limit_seqs = HashSet::new();
-
-    for event in events
-        .iter()
-        .filter(|event| event.kind == COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND)
-    {
-        if event.turn_id.is_some() {
-            return Err(OxidraError::Session(format!(
-                "{} at seq {} must be a global event",
-                event.kind, event.seq
-            )));
-        }
-        let retry_version = event
-            .data
-            .get("retry_version")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "Provider budget retry at seq {} has no integer retry_version",
-                    event.seq
-                ))
-            })?;
-        if retry_version != 1 {
-            return Err(OxidraError::Session(format!(
-                "Provider budget retry at seq {} uses unsupported version {retry_version}",
-                event.seq
-            )));
-        }
-        let retry_id = event
-            .data
-            .get("retry_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "Provider budget retry at seq {} has no retry_id",
-                    event.seq
-                ))
-            })?;
-        if !retry_ids.insert(retry_id.to_owned()) {
-            return Err(OxidraError::Session(format!(
-                "duplicate Provider budget retry id {retry_id} at seq {}",
-                event.seq
-            )));
-        }
-        let boundary = event
-            .data
-            .get("boundary")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "Provider budget retry at seq {} has no boundary object",
-                    event.seq
-                ))
-            })?;
-        let turn_id = boundary
-            .get("turn_id")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "Provider budget retry at seq {} has no boundary turn_id",
-                    event.seq
-                ))
-            })?;
-        let limit_seq = event
-            .data
-            .get("limit_seq")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "Provider budget retry at seq {} has no limit_seq",
-                    event.seq
-                ))
-            })?;
-        if !limit_seqs.insert(limit_seq) {
-            return Err(OxidraError::Session(format!(
-                "agent.limit_reached at seq {limit_seq} has more than one Provider budget retry"
-            )));
-        }
-        let previous_limit = event
-            .data
-            .get("previous_limit")
-            .and_then(Value::as_u64)
-            .filter(|value| *value > 0)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "Provider budget retry at seq {} has no positive previous_limit",
-                    event.seq
-                ))
-            })?;
-        let budget_disabled = event
-            .data
-            .get("budget_disabled")
-            .and_then(Value::as_bool)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "Provider budget retry at seq {} has no budget_disabled flag",
-                    event.seq
-                ))
-            })?;
-        let current_limit = event.data.get("current_limit").and_then(Value::as_u64);
-        if budget_disabled == current_limit.is_some() {
-            return Err(OxidraError::Session(format!(
-                "Provider budget retry at seq {} has inconsistent current budget fields",
-                event.seq
-            )));
-        }
-        let consumed_provider_call_intents = event
-            .data
-            .get("consumed_provider_call_intents")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "Provider budget retry at seq {} has no consumed Provider-call count",
-                    event.seq
-                ))
-            })?;
-        if consumed_provider_call_intents < previous_limit
-            || current_limit.is_some_and(|limit| limit <= consumed_provider_call_intents)
-        {
-            return Err(OxidraError::Session(format!(
-                "Provider budget retry at seq {} does not grant capacity beyond {} durable calls",
-                event.seq, consumed_provider_call_intents
-            )));
-        }
-
-        let limit = events
-            .iter()
-            .find(|candidate| candidate.seq == limit_seq)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "Provider budget retry at seq {} references missing agent.limit_reached seq {limit_seq}",
-                    event.seq
-                ))
-            })?;
-        if limit.seq >= event.seq
-            || limit.kind != "agent.limit_reached"
-            || limit.turn_id.as_deref() != Some(turn_id)
-            || limit.data.get("kind").and_then(Value::as_str) != Some("responses")
-            || limit.data.get("limit").and_then(Value::as_u64) != Some(previous_limit)
-        {
-            return Err(OxidraError::Session(format!(
-                "Provider budget retry at seq {} does not match response-limit event {limit_seq}",
-                event.seq
-            )));
-        }
-        let user_seq = events
-            .iter()
-            .find(|candidate| {
-                candidate.kind == "user.message"
-                    && candidate.turn_id.as_deref() == Some(turn_id)
-                    && candidate.seq < limit_seq
-            })
-            .map(|candidate| candidate.seq)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "Provider budget retry at seq {} references turn {turn_id} without an earlier user.message",
-                    event.seq
-                ))
-            })?;
-        if events.iter().any(|candidate| {
-            candidate.seq > limit_seq
-                && candidate.seq < event.seq
-                && candidate.turn_id.as_deref() == Some(turn_id)
-                && is_provider_slot_event_kind(&candidate.kind)
-        }) {
-            return Err(OxidraError::Session(format!(
-                "Provider budget retry at seq {} does not immediately follow turn {turn_id}'s terminal budget epoch",
-                event.seq
-            )));
-        }
-        if user_seq >= limit_seq {
-            return Err(OxidraError::Session(format!(
-                "Provider budget retry at seq {} has invalid user/limit ordering",
-                event.seq
-            )));
-        }
-
-        retries.push(ValidatedProviderBudgetRetry {
-            retry_seq: event.seq,
-            retry_id: retry_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            limit_seq,
-            previous_limit,
-            current_limit,
-            budget_disabled,
-            consumed_provider_call_intents,
-        });
-    }
-    Ok(retries)
 }
 
 /// Segment user turns without changing or projecting any journal content.
@@ -1805,7 +1586,7 @@ fn provider_request_slot_state_v2(
 ) -> Result<ProviderRequestSlotState> {
     let superseded_limit_seqs = validate_provider_budget_retries_v1(events)?
         .into_iter()
-        .filter(|retry| retry.turn_id == turn_id)
+        .filter(|retry| retry.boundary.turn_id == turn_id)
         .map(|retry| retry.limit_seq)
         .collect::<HashSet<_>>();
     let mut normalized = events.to_vec();
@@ -2021,7 +1802,7 @@ fn provider_request_slot_state_v1(
     Ok(state)
 }
 
-fn is_provider_slot_event_kind(kind: &str) -> bool {
+pub(crate) fn is_provider_slot_event_kind(kind: &str) -> bool {
     matches!(
         kind,
         "response.started"
@@ -2369,6 +2150,9 @@ fn event_call_id(event: &JournalEvent) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::{
+        COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND, validate_compaction_boundary_chain,
+    };
     use serde_json::json;
 
     fn fixture_events() -> Vec<JournalEvent> {
@@ -2381,6 +2165,45 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    fn checkpointed_budget_limit_fixture() -> Vec<JournalEvent> {
+        include_str!("../tests/fixtures/checkpointed_budget_limit_55e5b0c.jsonl")
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!(
+                        "checkpointed_budget_limit_55e5b0c fixture line {}: {error}",
+                        index + 1
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn provider_budget_retry_event() -> JournalEvent {
+        global_event(
+            11,
+            COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
+            json!({
+                "retry_version":1,
+                "retry_id":"budget-retry-1",
+                "previous_boundary_id":"legacy-budget-boundary",
+                "boundary":{
+                    "version":4,
+                    "boundary_id":"replacement-boundary",
+                    "turn_id":"turn-2",
+                    "user_message_seq":5
+                },
+                "checkpoint_id":"checkpoint-v2",
+                "limit_seq":10,
+                "previous_limit":1,
+                "current_limit":2,
+                "budget_disabled":false,
+                "consumed_provider_call_intents":1
+            }),
+        )
     }
 
     fn event(seq: u64, turn_id: &str, kind: &str, data: Value) -> JournalEvent {
@@ -3022,58 +2845,23 @@ mod tests {
 
     #[test]
     fn provider_budget_retry_is_versioned_and_does_not_rewrite_frozen_reducers() {
-        let legacy = vec![
-            event(
-                1,
-                "limited",
-                "user.message",
-                json!({
-                    "turn_boundary_version": 4,
-                    "item": {"role":"user","content":"prompt"},
-                }),
-            ),
-            event(
-                2,
-                "limited",
-                "agent.limit_reached",
-                json!({"kind":"responses","limit":1}),
-            ),
-        ];
+        let legacy = checkpointed_budget_limit_fixture();
         assert_eq!(
-            provider_request_slot_state_for_version(1, &legacy, "limited")
+            provider_request_slot_state_for_version(1, &legacy, "turn-2")
                 .expect("frozen slot v1 reads the legacy terminal"),
             ProviderRequestSlotState::Terminal
         );
         assert_eq!(
             segment_turns_for_version(4, &legacy)
-                .expect("frozen turn v4 reads the legacy terminal")[0]
+                .expect("frozen turn v4 reads the legacy terminal")
+                .last()
+                .expect("fixture has the limited turn")
                 .state,
             TurnState::LimitReached
         );
 
-        let retry = global_event(
-            3,
-            COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
-            json!({
-                "retry_version":1,
-                "retry_id":"budget-retry-1",
-                "previous_boundary_id":"legacy-boundary",
-                "boundary":{
-                    "version":4,
-                    "boundary_id":"replacement-boundary",
-                    "turn_id":"limited",
-                    "user_message_seq":1
-                },
-                "checkpoint_id":"checkpoint-1",
-                "limit_seq":2,
-                "previous_limit":1,
-                "current_limit":2,
-                "budget_disabled":false,
-                "consumed_provider_call_intents":1
-            }),
-        );
         let mut migrated = legacy.clone();
-        migrated.push(retry);
+        migrated.push(provider_budget_retry_event());
 
         assert_eq!(
             validate_provider_budget_retries_v1(&migrated)
@@ -3082,67 +2870,39 @@ mod tests {
             1
         );
         assert_eq!(
-            provider_request_slot_state_for_version(1, &migrated, "limited")
+            provider_request_slot_state_for_version(1, &migrated, "turn-2")
                 .expect("slot v1 remains frozen"),
             ProviderRequestSlotState::Terminal
         );
         assert_eq!(
-            provider_request_slot_state_for_version(2, &migrated, "limited")
+            provider_request_slot_state_for_version(2, &migrated, "turn-2")
                 .expect("slot v2 consumes the explicit migration"),
             ProviderRequestSlotState::Ready
         );
         assert_eq!(
-            segment_turns_for_version(4, &migrated).expect("turn v4 remains frozen")[0].state,
+            segment_turns_for_version(4, &migrated)
+                .expect("turn v4 remains frozen")
+                .last()
+                .expect("fixture has the limited turn")
+                .state,
             TurnState::LimitReached
         );
         assert_eq!(
             segment_turns_for_version(5, &migrated)
-                .expect("turn v5 consumes the explicit migration")[0]
+                .expect("turn v5 consumes the explicit migration")
+                .last()
+                .expect("fixture has the resumed turn")
                 .state,
             TurnState::OpenTail
         );
+        validate_compaction_boundary_chain(&migrated)
+            .expect("boundary, turn, and slot reducers consume the same canonical migration");
     }
 
     #[test]
     fn provider_budget_retry_rejects_forged_or_duplicate_grants() {
-        let base = vec![
-            event(
-                1,
-                "limited",
-                "user.message",
-                json!({
-                    "turn_boundary_version": 4,
-                    "item": {"role":"user","content":"prompt"},
-                }),
-            ),
-            event(
-                2,
-                "limited",
-                "agent.limit_reached",
-                json!({"kind":"responses","limit":1}),
-            ),
-        ];
-        let valid = global_event(
-            3,
-            COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
-            json!({
-                "retry_version":1,
-                "retry_id":"budget-retry-1",
-                "previous_boundary_id":"legacy-boundary",
-                "boundary":{
-                    "version":4,
-                    "boundary_id":"replacement-boundary",
-                    "turn_id":"limited",
-                    "user_message_seq":1
-                },
-                "checkpoint_id":"checkpoint-1",
-                "limit_seq":2,
-                "previous_limit":1,
-                "current_limit":2,
-                "budget_disabled":false,
-                "consumed_provider_call_intents":1
-            }),
-        );
+        let base = checkpointed_budget_limit_fixture();
+        let valid = provider_budget_retry_event();
 
         for (field, value) in [
             ("retry_id", json!("")),
@@ -3159,6 +2919,36 @@ mod tests {
                 "forged {field} must fail closed"
             );
         }
+
+        for (field, value) in [
+            ("previous_boundary_id", json!("missing-boundary")),
+            ("checkpoint_id", json!("missing-checkpoint")),
+        ] {
+            let mut events = base.clone();
+            let mut forged = valid.clone();
+            forged.data[field] = value;
+            events.push(forged);
+            assert!(
+                segment_turns_for_version(5, &events).is_err(),
+                "turn v5 must reject forged {field} lineage"
+            );
+            assert!(
+                provider_request_slot_state_for_version(2, &events, "turn-2").is_err(),
+                "slot v2 must reject forged {field} lineage"
+            );
+            assert!(
+                validate_compaction_boundary_chain(&events).is_err(),
+                "boundary v4 must reject forged {field} lineage"
+            );
+        }
+
+        let mut wrong_user = base.clone();
+        let mut forged = valid.clone();
+        forged.data["boundary"]["user_message_seq"] = json!(2);
+        wrong_user.push(forged);
+        assert!(segment_turns_for_version(5, &wrong_user).is_err());
+        assert!(provider_request_slot_state_for_version(2, &wrong_user, "turn-2").is_err());
+        assert!(validate_compaction_boundary_chain(&wrong_user).is_err());
 
         let mut duplicate = base;
         duplicate.push(valid.clone());
