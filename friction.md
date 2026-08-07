@@ -140,23 +140,23 @@
 
 ## 长任务与上下文管理
 
-### 没有可用的 compact 导致项目交接成本很高
+### 自动 compact 仍然是显式 opt-in
 
-- 当前没有自动 compact，长任务输出一段时间后就会把上下文塞满，任务很快无法继续。
+- 默认不会自动 compact；用户显式传入 `--experimental-auto-compact` 后，当前模型才会按完整 prepared-request 估算尝试压缩。
 - 每次交接都需要重新向模型解释大量背景，耗时且容易遗漏关键约束。
 - `remember` 不适合交接大型项目，只能保存零散的长期记忆，无法替代完整的任务状态、决策链和工作上下文。
 - 当前体验在长项目中很差，尤其不适合需要持续积累上下文的逆向分析和测试工作。
 
-状态：checkpoint 数据模型、链校验、projection、真实 Provider 摘要调用、故障恢复、压缩前缀历史回查和默认关闭的 `--experimental-auto-compact` 入口已实现；默认用户体验不变，递归摘要漂移尚未形成发布数据，因此不能默认启用。
+状态：checkpoint 数据模型、链校验、projection、真实 Provider 摘要调用、故障恢复、压缩前缀历史回查、递归摘要漂移 gate 和默认关闭的 `--experimental-auto-compact` 入口已实现；当前实现完成的是显式 opt-in 闭环。由于质量证据仍绑定具体 model/backend，不能据此对所有默认模型开启自动压缩。
 
 ### 磁盘保留完整历史不等于模型能回查历史
 
 - checkpoint 可以让 journal 永久保留压缩前原文，但压缩后的 Provider 请求默认只看到 summary 与 cutoff 后的 tail。
 - summary 遗漏精确数值、错误文本或旧 artifact 时，仅靠 `session show` 能让用户审计，不能让 agent 自己恢复事实。
-- 自动 compaction 在缺少受控历史回查时默认启用，会让“磁盘可恢复”和“模型可利用”之间出现功能断层。
+- 自动 compaction 在缺少受控历史回查时启用，会让“磁盘可恢复”和“模型可利用”之间出现功能断层。
 - 需要让模型只在当前 session 的 checkpoint 覆盖前缀内做确定性、带引用、有限额的回查；查询结果仍是不可信 tool output，不能获得 instructions 权限。
 
-状态：`history_search` / `history_turn` / `history_artifact` 已实现并通过配额、授权和跨平台测试；在 compaction 用户入口接通前仍无法由普通终端会话触发。详细契约保存在 `docs/m4-m5-roadmap.md`。
+状态：`history_search` / `history_turn` / `history_artifact` 已实现并通过配额、授权和跨平台测试；checkpoint 后的普通 Agent 请求可按边界和配额向模型暴露这些工具。详细契约保存在 `docs/m4-m5-roadmap.md`。
 
 ## 工具生态与扩展能力
 
