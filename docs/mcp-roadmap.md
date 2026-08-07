@@ -1,8 +1,9 @@
 # Oxidra MCP 接入路线
 
-状态：MCP stdio transport/session kernel v1 已实现，尚未接入 Agent、CLI
-配置或 session journal。当前代码只能由 Rust 调用方显式构造
-`McpStdioSession`；它不是已经对用户开放的插件入口。
+状态：MCP stdio transport/session kernel v1、显式 project-config reader v1 和
+session-scoped tool registry v1 已实现，尚未接入 Agent、CLI 参数或 session journal。
+当前代码只能由 Rust 调用方显式加载绝对 config path 并构造 registry；它不是已经
+对用户开放的插件入口。
 
 ## 1. 边界与原则
 
@@ -67,24 +68,43 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - modern `input_required` 等 nonterminal result 当前作为 unsupported interaction，
   关闭 transport 并返回 `in_doubt`。
 
-## 3. 尚未实现：Agent 与 CLI policy
+## 3. 已实现的 policy 基础
+
+### 3.1 显式 project config v1
+
+- 不自动发现仓库文件；调用方必须显式提供位于 project root 内的绝对 config path。
+- config 必须是非 symlink、UTF-8、至多 64 KiB，并声明 `version = 1`。
+- 最多 16 个 server；名称唯一，command 为绝对文件，cwd 为 project 内相对目录。
+- project config 只允许环境变量 inherit allowlist，不接受明文 `[servers.env]` secret。
+- 原始 config bytes 计算 SHA-256；effective canonical command/cwd、args、环境 allowlist
+  和协商协议另外进入 registry digest。
+
+### 3.2 session-scoped registry v1
+
+- 合并 server 工具后仍限制为 512 tools / 512 KiB，不把 per-server 限额误当全局限额。
+- raw identity `(server, tool)` 映射为满足 Responses function-name 约束的稳定 64-byte
+  namespace；alias 带 identity hash，且仍执行实际 collision 检查。
+- input/output schema、raw/provider name、协议版本和 effective runtime config 进入冻结的
+  registry-digest v1；字面量 fixture 固定其 SHA-256。
+- registry 可按 provider alias 调用对应长连接 session，并统一 shutdown 全部进程。
+
+## 4. 尚未实现：Agent 与 CLI policy
 
 下一阶段必须按以下顺序推进。
 
-### 3.1 项目配置与 trust
+### 4.1 CLI trust
 
-先定义版本化项目配置，而不是直接读取任意 MCP 客户端配置：
+config reader 已实现，但 CLI 还不能选择它。用户入口必须：
 
-- server name、绝对 executable、args、cwd；
-- 环境变量 inherit allowlist 与显式值，但凭据不得写入项目仓库；
-- server 默认禁用，必须由用户对当前项目根显式信任；
-- 配置解析后保存 canonical executable/cwd 和配置 digest；resume 时配置变化必须
-  重新取得 trust，不能沿用旧批准；
+- server 默认禁用，不能自动读取其他 MCP 客户端配置；
+- 启动前显示 canonical executable、cwd、args、inherit-env names 和 config SHA-256；
+- 非交互模式必须显式绑定 config SHA-256，不能只用 `--full-auto` 跳过；
+- resume 时 config/registry digest 变化必须重新取得 trust，不能沿用旧批准；
 - 第一版只接 stdio，不接 HTTP、OAuth、远程 discovery 或自动安装。
 
-### 3.2 session-scoped tool registry
+### 4.2 Agent tool registry
 
-连接所有已批准 server 后，一次性建立 registry：
+底层 registry 已能建立 snapshot；Agent 仍需：
 
 - raw identity 为 `(server_name, raw_tool_name)`；
 - 生成满足 Provider 约束的稳定 namespace，长度超限或 alias collision 时 fail closed；
@@ -97,7 +117,7 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - registry snapshot 进入 `context.tools`，同一 prepared request 与后续调用必须使用
   同一 epoch，不能在中途重新 list。
 
-### 3.3 journal 与恢复
+### 4.3 journal 与恢复
 
 优先复用现有 turn/tool reducer，不再建立第二套终态事实源：
 
@@ -112,7 +132,7 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - projection/history 继续只消费经过 turn reducer 验证的标准 tool terminal，不直接
   扫描 MCP 私有字段。
 
-### 3.4 approval 与结果投影
+### 4.4 approval 与结果投影
 
 - 第一版所有 MCP tool 默认需要 approval；不能让 `--full-auto` 自动授权远程副作用。
 - 后续若增加只读 policy，权限必须来自本地配置，不信任 server annotations 自报。
@@ -121,7 +141,7 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - 图片、resource link、embedded resource 等内容类型必须逐类登记；未登记类型不能
   通过字符串拼接静默降级。
 
-## 4. 暂不支持
+## 5. 暂不支持
 
 - Streamable HTTP、OAuth、远程 server discovery；
 - prompts、resources、sampling、roots；
@@ -131,7 +151,7 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - MCP server annotations 直接授予只读或免审批权限；
 - in-doubt MCP call 的自动 retry。
 
-## 5. Agent 接入完成门槛
+## 6. Agent 接入完成门槛
 
 在用户可见入口启用前至少需要：
 

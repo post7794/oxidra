@@ -3,6 +3,12 @@
 //! This module deliberately stops at the session kernel. Agent exposure,
 //! project trust and per-tool approval remain separate policy layers.
 
+mod config;
+mod registry;
+
+pub use config::{MCP_PROJECT_CONFIG_VERSION, McpProjectConfig};
+pub use registry::{MCP_TOOL_REGISTRY_VERSION, McpRegistry, McpToolBinding};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
