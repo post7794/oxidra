@@ -305,6 +305,6 @@ stdout 只承载 assistant 文本；工具状态、diff、确认、诊断和错�
 M4 与 M5 的完整实施契约见 [`m4-m5-roadmap.md`](m4-m5-roadmap.md)。
 
 1. M5 checkpoint 核心、真实 Provider `compact_once`、受控历史回查、model-aware 配置、prepared-request usage-anchor 测量、Provider context-limit retry/abandon、compaction request-boundary v1-v5、不可变版本 policy、版本化 request-slot reducer、旧 budget terminal 兼容迁移、bound Provider 调用、session-open 恢复、Agent/CLI pending 管理、projection/history abandon 语义，以及默认关闭的自动 compaction preflight 实验入口已经实现。legacy budget migration 和 no-checkpoint resolution 都有 fsync 后强杀、由新 CLI 进程继续同一 prompt 的测试，恢复不会重复追加 intent、resolution、checkpoint 或原 user message。
-2. 已加入 `examples/compaction_drift.rs`、不可变 fixture/metric 版本和 production-validated rescore。`Kimi-K2.7-Code` prompt-v3 的 live source artifact 与 boundary-aware metric-v7 派生 artifact 保存在 `docs/artifacts/`；3/5/10 轮均为 17/17，十轮注入执行均为 false。v7 会验证字段/数值关联与 Unicode-aware 数值 token 边界，拒绝局部状态反转、否定约束取消和安全证据的 trusted/active 极性提升，并以最小变异测试锁定反例；rescore 会从 raw Provider response 重新提取 summary 并核对 usage。未测模型不继承该结果。
+2. 已加入 `examples/compaction_drift.rs`、不可变 fixture/metric 版本和 production-validated rescore。`Kimi-K2.7-Code` prompt-v3 的 live source artifact 与 boundary-aware metric-v8 派生 artifact 保存在 `docs/artifacts/`；3/5/10 轮均为 17/17，十轮注入执行均为 false。v8 会验证字段/数值关联与 Unicode-aware 数值 token 边界，拒绝局部状态反转、否定约束取消和安全证据的 trusted/active 极性提升；安全关系的全部合法 witness 共享一个全局有界矛盾检查，第三 segment 或额外正向 witness 不能隐藏反转。rescore 会从 raw Provider response 重新提取 summary 并核对 usage。未测模型不继承该结果。
 3. M4：每会话 token/执行时间预算按实际使用数据推迟，后续作为独立里程碑。
 4. 只有实际高频需要时才重新评估子 agent；它必须使用独立子会话，并受父级预算约束。
