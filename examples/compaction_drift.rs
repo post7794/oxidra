@@ -9,7 +9,11 @@ use oxidra::compaction::{
     SOURCE_DIGEST_VERSION, SUMMARY_ENVELOPE_VERSION, USAGE_CONTRACT_VERSION,
     compacted_history_item, compaction_instructions,
 };
-use oxidra::config::ProviderConfig;
+use oxidra::config::{ContextLimits, ProviderConfig};
+use oxidra::context::{
+    AUTOMATIC_COMPACTION_PLANNING_VERSION, CONTEXT_ESTIMATOR_VERSION, CONTEXT_MEASUREMENT_VERSION,
+    ContextRuntime, REQUEST_SHAPE_VERSION,
+};
 use oxidra::projection::SOURCE_PROJECTION_VERSION;
 use oxidra::provider::{
     OpenAiResponsesProvider, ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver,
@@ -21,8 +25,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-const FIXTURE_BYTES: &[u8] = include_bytes!("../tests/fixtures/compaction_drift_v1.json");
+const FIXTURE_BYTES: &[u8] = include_bytes!("../tests/fixtures/compaction_drift_v4.json");
 const REQUIRED_SNAPSHOTS: [u32; 3] = [3, 5, 10];
+const METRIC_VERSION: u32 = 4;
 
 #[derive(Debug, Parser)]
 #[command(about = "Run the live 3/5/10-round recursive compaction drift baseline")]
@@ -30,6 +35,12 @@ struct Args {
     /// Acknowledge that this benchmark makes at least ten live Provider calls.
     #[arg(long)]
     confirm_live_calls: bool,
+
+    /// Re-score a completed artifact without making Provider calls. The
+    /// source request chain must match the current prompt/envelope and frozen
+    /// input corpus exactly.
+    #[arg(long, value_name = "ARTIFACT")]
+    rescore: Option<PathBuf>,
 
     /// Override the configured model for this benchmark run.
     #[arg(long)]
@@ -61,10 +72,13 @@ struct DriftFixture {
 struct FactSpec {
     id: String,
     category: String,
-    must_contain: Vec<String>,
+    /// Every group must have at least one normalized substring present. This
+    /// keeps identifiers and values ordered while ignoring Markdown, case,
+    /// spacing and equivalent wording listed by the fixture.
+    required_groups: Vec<Vec<String>>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ProtocolVersions {
     prompt: u32,
     summary_envelope: u32,
@@ -73,6 +87,10 @@ struct ProtocolVersions {
     source_digest: u32,
     usage_contract: u32,
     compaction_boundary: u32,
+    context_measurement: u32,
+    context_estimator: u32,
+    request_shape: u32,
+    automatic_compaction_planning: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -80,7 +98,7 @@ struct FactResult {
     id: String,
     category: String,
     retained: bool,
-    missing_tokens: Vec<String>,
+    missing_groups: Vec<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,16 +132,52 @@ struct RoundArtifact {
 #[derive(Clone, Debug, Serialize)]
 struct DriftArtifact {
     artifact_version: u32,
+    metric_version: u32,
     status: String,
     started_at: DateTime<Utc>,
     completed_at: Option<DateTime<Utc>>,
     model: String,
+    provider_protocol: String,
+    provider_usage_domain: String,
     fixture_version: u32,
     fixture_sha256: String,
+    prompt_sha256: String,
+    summary_envelope_template_sha256: String,
     requested_rounds: u32,
     protocol_versions: ProtocolVersions,
+    live_provider_calls: bool,
+    source_artifact_sha256: Option<String>,
     rounds: Vec<RoundArtifact>,
     error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecordedArtifact {
+    artifact_version: u32,
+    metric_version: u32,
+    status: String,
+    started_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+    model: String,
+    provider_protocol: String,
+    provider_usage_domain: String,
+    fixture_version: u32,
+    fixture_sha256: String,
+    prompt_sha256: String,
+    summary_envelope_template_sha256: String,
+    requested_rounds: u32,
+    protocol_versions: ProtocolVersions,
+    rounds: Vec<RecordedRound>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecordedRound {
+    round: u32,
+    input_sha256: String,
+    summary_sha256: String,
+    summary: String,
+    raw_response: Value,
+    usage: oxidra::types::Usage,
 }
 
 struct SilentObserver;
@@ -144,6 +198,11 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let args = Args::parse();
+    let fixture: DriftFixture = serde_json::from_slice(FIXTURE_BYTES)?;
+    validate_fixture(&fixture)?;
+    if let Some(source) = args.rescore.as_deref() {
+        return rescore_artifact(&args, &fixture, source);
+    }
     if !args.confirm_live_calls {
         return Err(OxidraError::ApprovalRequired(format!(
             "pass --confirm-live-calls to acknowledge {} live Provider calls",
@@ -157,9 +216,8 @@ async fn run() -> Result<()> {
         )));
     }
 
-    let fixture: DriftFixture = serde_json::from_slice(FIXTURE_BYTES)?;
-    validate_fixture(&fixture)?;
     let config = ProviderConfig::resolve(None, args.api_base_url, args.model)?;
+    let context_runtime = ContextRuntime::from_provider(&config, ContextLimits::default())?;
     let provider = OpenAiResponsesProvider::new(config.clone())?;
     let output = args
         .output
@@ -172,13 +230,24 @@ async fn run() -> Result<()> {
     }
 
     let mut artifact = DriftArtifact {
-        artifact_version: 1,
+        artifact_version: 4,
+        metric_version: METRIC_VERSION,
         status: "running".to_owned(),
         started_at: Utc::now(),
         completed_at: None,
         model: config.model.clone(),
+        provider_protocol: context_runtime.provider_protocol,
+        provider_usage_domain: context_runtime.provider_usage_domain,
         fixture_version: fixture.fixture_version,
         fixture_sha256: sha256_hex(FIXTURE_BYTES),
+        prompt_sha256: sha256_hex(
+            compaction_instructions(COMPACTION_PROMPT_VERSION)
+                .expect("current prompt is registered")
+                .as_bytes(),
+        ),
+        summary_envelope_template_sha256: sha256_hex(&serde_json::to_vec(
+            &compacted_history_item(SUMMARY_ENVELOPE_VERSION, "")?,
+        )?),
         requested_rounds: args.rounds,
         protocol_versions: ProtocolVersions {
             prompt: COMPACTION_PROMPT_VERSION,
@@ -188,7 +257,13 @@ async fn run() -> Result<()> {
             source_digest: SOURCE_DIGEST_VERSION,
             usage_contract: USAGE_CONTRACT_VERSION,
             compaction_boundary: COMPACTION_BOUNDARY_VERSION,
+            context_measurement: CONTEXT_MEASUREMENT_VERSION,
+            context_estimator: CONTEXT_ESTIMATOR_VERSION,
+            request_shape: REQUEST_SHAPE_VERSION,
+            automatic_compaction_planning: AUTOMATIC_COMPACTION_PLANNING_VERSION,
         },
+        live_provider_calls: true,
+        source_artifact_sha256: None,
         rounds: Vec::with_capacity(args.rounds as usize),
         error: None,
     };
@@ -256,6 +331,117 @@ async fn run() -> Result<()> {
     artifact.status = "completed".to_owned();
     artifact.completed_at = Some(Utc::now());
     write_artifact(&output, &artifact)?;
+    print_snapshots(&output, &artifact);
+    Ok(())
+}
+
+fn rescore_artifact(args: &Args, fixture: &DriftFixture, source_path: &Path) -> Result<()> {
+    if args.confirm_live_calls || args.model.is_some() || args.api_base_url.is_some() {
+        return Err(OxidraError::Config(
+            "--rescore does not accept live-call confirmation or Provider overrides".to_owned(),
+        ));
+    }
+    let source_bytes = fs::read(source_path)?;
+    let source: RecordedArtifact = serde_json::from_slice(&source_bytes)?;
+    if source.status != "completed"
+        || source.completed_at.is_none()
+        || source.artifact_version < 3
+        || source.metric_version == 0
+        || source.fixture_version == 0
+        || source.fixture_sha256.len() != 64
+        || source.requested_rounds < *REQUIRED_SNAPSHOTS.last().expect("snapshots are non-empty")
+        || source.rounds.len() != source.requested_rounds as usize
+    {
+        return Err(OxidraError::Config(
+            "source drift artifact is incomplete or unsupported".to_owned(),
+        ));
+    }
+    let prompt = compaction_instructions(COMPACTION_PROMPT_VERSION).ok_or_else(|| {
+        OxidraError::Session("current compaction prompt is unregistered".to_owned())
+    })?;
+    let prompt_sha256 = sha256_hex(prompt.as_bytes());
+    let envelope_sha256 = sha256_hex(&serde_json::to_vec(&compacted_history_item(
+        SUMMARY_ENVELOPE_VERSION,
+        "",
+    )?)?);
+    if source.protocol_versions.prompt != COMPACTION_PROMPT_VERSION
+        || source.protocol_versions.summary_envelope != SUMMARY_ENVELOPE_VERSION
+        || source.prompt_sha256 != prompt_sha256
+        || source.summary_envelope_template_sha256 != envelope_sha256
+        || source.provider_protocol.trim().is_empty()
+        || source.provider_usage_domain.len() != 64
+    {
+        return Err(OxidraError::Config(
+            "source artifact was not produced by the current prompt/envelope protocol".to_owned(),
+        ));
+    }
+
+    let mut expected_input = fixture.input.clone();
+    let mut rounds = Vec::with_capacity(source.rounds.len());
+    for (index, recorded) in source.rounds.into_iter().enumerate() {
+        let expected_round = index as u32 + 1;
+        let expected_input_sha256 = sha256_hex(&serde_json::to_vec(&expected_input)?);
+        if recorded.round != expected_round
+            || recorded.input_sha256 != expected_input_sha256
+            || recorded.summary_sha256 != sha256_hex(recorded.summary.as_bytes())
+        {
+            return Err(OxidraError::Config(format!(
+                "source artifact round {expected_round} does not match the frozen request chain"
+            )));
+        }
+        let summary = recorded.summary;
+        rounds.push(RoundArtifact {
+            round: recorded.round,
+            registered_snapshot: REQUIRED_SNAPSHOTS.contains(&recorded.round),
+            input_sha256: recorded.input_sha256,
+            summary_sha256: recorded.summary_sha256,
+            metrics: measure_summary(fixture, &summary),
+            summary: summary.clone(),
+            raw_response: recorded.raw_response,
+            usage: recorded.usage,
+        });
+        expected_input = vec![compacted_history_item(SUMMARY_ENVELOPE_VERSION, &summary)?];
+    }
+
+    let output = args.output.clone().unwrap_or_else(|| {
+        let stem = source_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("compaction-drift");
+        source_path.with_file_name(format!("{stem}-metric-v{METRIC_VERSION}.json"))
+    });
+    if output.exists() {
+        return Err(OxidraError::Config(format!(
+            "refusing to overwrite existing drift artifact {}",
+            output.display()
+        )));
+    }
+    let artifact = DriftArtifact {
+        artifact_version: 4,
+        metric_version: METRIC_VERSION,
+        status: "completed".to_owned(),
+        started_at: source.started_at,
+        completed_at: source.completed_at,
+        model: source.model,
+        provider_protocol: source.provider_protocol,
+        provider_usage_domain: source.provider_usage_domain,
+        fixture_version: fixture.fixture_version,
+        fixture_sha256: sha256_hex(FIXTURE_BYTES),
+        prompt_sha256,
+        summary_envelope_template_sha256: envelope_sha256,
+        requested_rounds: source.requested_rounds,
+        protocol_versions: source.protocol_versions,
+        live_provider_calls: false,
+        source_artifact_sha256: Some(sha256_hex(&source_bytes)),
+        rounds,
+        error: None,
+    };
+    write_artifact(&output, &artifact)?;
+    print_snapshots(&output, &artifact);
+    Ok(())
+}
+
+fn print_snapshots(output: &Path, artifact: &DriftArtifact) {
     println!("{}", output.display());
     for round in artifact
         .rounds
@@ -270,20 +456,22 @@ async fn run() -> Result<()> {
             round.metrics.retention_ratio
         );
     }
-    Ok(())
 }
 
 fn validate_fixture(fixture: &DriftFixture) -> Result<()> {
-    if fixture.fixture_version != 1 || fixture.input.is_empty() || fixture.facts.is_empty() {
+    if fixture.fixture_version != 4 || fixture.input.is_empty() || fixture.facts.is_empty() {
         return Err(OxidraError::Config(
-            "compaction drift fixture v1 is empty or has an unsupported version".to_owned(),
+            "compaction drift fixture v4 is empty or has an unsupported version".to_owned(),
         ));
     }
     for fact in &fixture.facts {
         if fact.id.trim().is_empty()
             || fact.category.trim().is_empty()
-            || fact.must_contain.is_empty()
-            || fact.must_contain.iter().any(|token| token.is_empty())
+            || fact.required_groups.is_empty()
+            || fact
+                .required_groups
+                .iter()
+                .any(|group| group.is_empty() || group.iter().any(|token| token.trim().is_empty()))
         {
             return Err(OxidraError::Config(format!(
                 "compaction drift fact {:?} is incomplete",
@@ -295,21 +483,26 @@ fn validate_fixture(fixture: &DriftFixture) -> Result<()> {
 }
 
 fn measure_summary(fixture: &DriftFixture, summary: &str) -> RoundMetrics {
+    let normalized_summary = normalize_for_matching(summary);
     let facts = fixture
         .facts
         .iter()
         .map(|fact| {
-            let missing_tokens = fact
-                .must_contain
+            let missing_groups = fact
+                .required_groups
                 .iter()
-                .filter(|token| !summary.contains(token.as_str()))
+                .filter(|group| {
+                    !group.iter().any(|token| {
+                        normalized_summary.contains(normalize_for_matching(token).as_str())
+                    })
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             FactResult {
                 id: fact.id.clone(),
                 category: fact.category.clone(),
-                retained: missing_tokens.is_empty(),
-                missing_tokens,
+                retained: missing_groups.is_empty(),
+                missing_groups,
             }
         })
         .collect::<Vec<_>>();
@@ -334,6 +527,13 @@ fn measure_summary(fixture: &DriftFixture, summary: &str) -> RoundMetrics {
         categories,
         facts,
     }
+}
+
+fn normalize_for_matching(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .filter(|character| character.is_alphanumeric())
+        .collect()
 }
 
 fn finish_failed<T>(output: &Path, artifact: &mut DriftArtifact, message: &str) -> Result<T> {
@@ -384,8 +584,11 @@ mod tests {
         let summary = fixture
             .facts
             .iter()
-            .flat_map(|fact| fact.must_contain.iter())
-            .cloned()
+            .flat_map(|fact| {
+                fact.required_groups
+                    .iter()
+                    .map(|group| group.first().unwrap().clone())
+            })
             .collect::<Vec<_>>()
             .join(" | ");
         let metrics = measure_summary(&fixture, &summary);
@@ -394,7 +597,15 @@ mod tests {
         assert!(!metrics.exact_attack_execution);
         assert_eq!(
             sha256_hex(FIXTURE_BYTES),
-            "e1451d20a1e72d2c275b65700d591581ee53ae0628d72f33b5fc4b26ce77d2ce"
+            "2c6baa35dc6d37f64053204a60e70f9b7c97954e13e97c303b70e5c223378b37"
+        );
+        assert_eq!(
+            normalize_for_matching("**禁止**删除 `audit.log`"),
+            "禁止删除auditlog"
+        );
+        assert_eq!(
+            normalize_for_matching("Service_Port = 43,127"),
+            "serviceport43127"
         );
     }
 }

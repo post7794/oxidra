@@ -1,6 +1,6 @@
 # Oxidra M4/M5 实施规划
 
-状态：设计与部分实现。M4 按实际使用数据推迟。M5 的显式 turn 边界、原始 projection、checkpoint 数据模型与 reducer、低权限 summary envelope、不可变格式版本注册表、checkpoint + tail projection、真实 Responses Provider `compact_once`、boundary-bound Provider 调用、8192 输出上限、Provider 完成到 checkpoint 落盘窗口的生产路径故障注入、连续父子 checkpoint 与失败 child 重试内核测试、三个受控历史回查工具、model-aware context 配置、prepared-request usage-anchor 测量/审计、Provider context 超限后的显式 retry/abandon 恢复，以及默认关闭的 `--experimental-auto-compact` preflight 已经实现。session-open 会把 boundary 的三个崩溃窗口确定地恢复为 failed 或 checkpointed；Agent/CLI 已消费 boundary pending/retry/abandon，当前 Provider projection 与 history 会排除已验证的 abandoned turn，并有跨进程恢复 E2E。自动触发、retry/replan、no-checkpoint resolution、legacy budget migration 与跨进程 CLI 恢复已经闭环，source projection v4 也可安全跨越已验证 abandoned turn。尚未完成的是执行一次明确授权的 live 3/5/10 漂移 run、审阅其 artifact 并记录默认启用决策；在此之前自动 compaction 必须保持默认关闭。
+状态：设计与实现基本完成。M4 按实际使用数据推迟。M5 的显式 turn 边界、原始 projection、checkpoint 数据模型与 reducer、低权限 summary envelope、不可变格式版本注册表、checkpoint + tail projection、真实 Responses Provider `compact_once`、boundary-bound Provider 调用、8192 输出上限、Provider 完成到 checkpoint 落盘窗口的生产路径故障注入、连续父子 checkpoint 与失败 child 重试内核测试、三个受控历史回查工具、model-aware context 配置、prepared-request usage-anchor 测量/审计、Provider context 超限后的显式 retry/abandon 恢复，以及 `--experimental-auto-compact` preflight 已经实现。自动触发、retry/replan、no-checkpoint resolution、legacy budget migration、abandoned-turn source projection 与跨进程 CLI 恢复已经闭环。2026-08-07 的 `Kimi-K2.7-Code` live 3/5/10 baseline 证明 prompt v3 在该 Provider usage domain 上连续十轮保留 17/17 事实且未执行注入文本。该结论只绑定记录的 model/backend；默认/当前其他模型尚未通过相同 gate，因此自动 compaction 继续显式 opt-in，而不是把单模型结果外推为全局默认。
 
 本文只规划两个后续里程碑：
 
@@ -200,7 +200,7 @@ M5 不实现：
 
 ### 3.2 Context 测量、触发与发布门
 
-自动触发实现后先默认关闭，只通过测试或显式实验入口启用。真实 `compact_once`、受控历史回查、崩溃与连续压缩闭环测试、漂移测量基线全部完成后，才能根据数据另行确定默认启用门槛；不能在实现前预设“摘要质量应该足够好”。
+自动触发实现后先默认关闭，只通过测试或显式实验入口启用。真实 `compact_once`、受控历史回查、崩溃与连续压缩闭环测试、漂移测量基线全部完成后，才能根据数据另行确定默认启用门槛；不能在实现前预设“摘要质量应该足够好”。发布 gate 按 Provider usage domain、model、prompt 和 envelope 分别判定，某个模型通过不能授权未测模型。
 
 基于当前解析出的 `context_window` 与 `reserve_tokens`：
 
@@ -366,11 +366,11 @@ fn validate_compaction_usage(version: u32, usage: &Value) -> Result<()>;
 5. parent cutoff 已由 checkpoint chain 按 parent 自己的历史版本验证。child validator 只能处理 `seq > parent.covers_through_seq` 的未压缩后缀，不能用新版本重新审判旧 parent cutoff。
 6. reducer 重建历史 source 并校验 checkpoint usage 时按事件版本执行，不能调用当前默认 renderer、turn reducer、digest、输出上限或 usage 规则。未知、缺失、已撤销或 started/checkpoint 不一致的版本全部 fail closed，不回退最新版本或全量历史。
 
-六类基础协议的首个可执行版本都是 v1，并由独立字面量、frozen JSONL、golden source digest 和 usage 边界测试锁定；测试不能通过调用当前实现生成自己的期望值。当前新 compaction attempt 使用的版本组合是 `prompt=2`、`summary envelope=1`、`source projection=4`、`turn validator=5`、`source digest=1`、`usage contract=1`。prompt v1 保持 Oxidra 最初的事实清单字节；prompt v2 逐字采用 OpenAI Codex 公开的 context-checkpoint handoff prompt，不追加 Oxidra 专属段落。source 的低权限与不可信身份继续由 `role: "user"` 的版本化 summary envelope、角色校验和 projection 边界保证，而不是由 prompt 文本声称。turn validator v1-v4、Provider request-slot reducer v1 和 compaction boundary v1-v4 均已冻结；turn v4 修正 legacy completion evidence 的时间，turn v5 只为严格引用的 legacy Provider-budget migration neutralize 对应 `agent.limit_reached`。boundary v2 首次绑定 turn v4 与独立 slot v1，boundary v3 新增 session epoch 与退出连续性，boundary v4 固定绑定 turn v5 与 slot v2、承载旧 checkpointed budget terminal 的兼容迁移；当前 writer boundary v5 继承 turn v5/slot v2 与 metadata ceiling v5，并新增严格证据绑定的 `resolved_without_checkpoint`。source projection v1/v2/v3 保持冻结；source projection v4 首次消费已验证 boundary chain 并排除 abandoned turn。历史 turn/slot/boundary reducer 都必须按首次登记时的字面语义重建，不能吸收后续修正。此前仅存在于未接 Provider 的开发代码/测试夹具中的无版本 developer envelope 从未成为可用发布格式，不注册为可投影的 legacy 版本；对应 frozen fixture 必须证明它会 fail closed。若存在手工构造的此类 journal，只允许审计或从完整原文显式重做 checkpoint，不能为了兼容而重新发送 developer summary。
+六类基础协议的首个可执行版本都是 v1，并由独立字面量、frozen JSONL、golden source digest 和 usage 边界测试锁定；测试不能通过调用当前实现生成自己的期望值。当前新 compaction attempt 使用的版本组合是 `prompt=3`、`summary envelope=1`、`source projection=4`、`turn validator=5`、`source digest=1`、`usage contract=1`。prompt v1 保持 Oxidra 最初的事实清单字节；prompt v2 逐字采用 OpenAI Codex 公开的 context-checkpoint handoff prompt；prompt v3 保留完整 v2 前缀，并根据 live recursive-drift 失败新增事实保留契约，禁止把低权限历史递归压成泛化警告、等待状态或“请用户重述任务”。source 的低权限与不可信身份继续由 `role: "user"` 的版本化 summary envelope、角色校验和 projection 边界保证，而不是由 prompt 文本声称。turn validator v1-v4、Provider request-slot reducer v1 和 compaction boundary v1-v4 均已冻结；turn v4 修正 legacy completion evidence 的时间，turn v5 只为严格引用的 legacy Provider-budget migration neutralize 对应 `agent.limit_reached`。boundary v2 首次绑定 turn v4 与独立 slot v1，boundary v3 新增 session epoch 与退出连续性，boundary v4 固定绑定 turn v5 与 slot v2、承载旧 checkpointed budget terminal 的兼容迁移；当前 writer boundary v5 继承 turn v5/slot v2 与 metadata ceiling v5，并新增严格证据绑定的 `resolved_without_checkpoint`。source projection v1/v2/v3 保持冻结；source projection v4 首次消费已验证 boundary chain 并排除 abandoned turn。历史 prompt/turn/slot/boundary reducer 都必须按首次登记时的字面语义重建，不能吸收后续修正。此前仅存在于未接 Provider 的开发代码/测试夹具中的无版本 developer envelope 从未成为可用发布格式，不注册为可投影的 legacy 版本；对应 frozen fixture 必须证明它会 fail closed。若存在手工构造的此类 journal，只允许审计或从完整原文显式重做 checkpoint，不能为了兼容而重新发送 developer summary。
 
 ### 3.5 调用与提交协议
 
-compaction 使用同一个 Responses Provider、当前 model、`store: false`，但不暴露任何 tools。Provider 请求固定设置 `max_output_tokens = 8192`；checkpoint reducer 还必须独立校验 `raw_response.usage.output_tokens <= 8192`，即使兼容 Provider 忽略请求参数，也不能提交超限 summary。raw usage 必须原样保存并满足 Responses 计数关系：`total_tokens == input_tokens + output_tokens`，若 Provider 报告 cached/reasoning 子计数，则还必须分别满足 `cached_tokens <= input_tokens` 与 `reasoning_tokens <= output_tokens`；缺失的可选子计数保持缺失，不能补成 0。新 attempt 使用注册表中的固定 prompt v2；读取历史 attempt 时使用事件自己的受支持版本。Codex 原始 prompt 要求生成简洁、结构化、可供另一个 LLM 继续工作的 handoff，内容包括：
+compaction 使用同一个 Responses Provider、当前 model、`store: false`，但不暴露任何 tools。Provider 请求固定设置 `max_output_tokens = 8192`；checkpoint reducer 还必须独立校验 `raw_response.usage.output_tokens <= 8192`，即使兼容 Provider 忽略请求参数，也不能提交超限 summary。raw usage 必须原样保存并满足 Responses 计数关系：`total_tokens == input_tokens + output_tokens`，若 Provider 报告 cached/reasoning 子计数，则还必须分别满足 `cached_tokens <= input_tokens` 与 `reasoning_tokens <= output_tokens`；缺失的可选子计数保持缺失，不能补成 0。新 attempt 使用注册表中的固定 prompt v3；读取历史 attempt 时使用事件自己的受支持版本。prompt v3 以 Codex 原始 handoff prompt 为完整前缀，并补充 Oxidra 的递归事实保留规则。Codex 前缀要求生成简洁、结构化、可供另一个 LLM 继续工作的 handoff，内容包括：
 
 - 用户目标、明确约束和已经拍板的决定。
 - 重要上下文、约束和用户偏好。
@@ -530,18 +530,18 @@ source projection v1-v3 保持原始字节与接受/拒绝语义；source projec
 3. 已实现 model-aware context 配置、prepared-request 精确 request-shape 测量、`context.configured` / `context.tools` / `response.started` / `context.limit_reached` 审计、真实 usage 差分锚点，以及 Provider context-limit 的 retry/abandon E2E。估算只用于 telemetry 和显式 opt-in compaction planning；普通请求不再被 heuristic 伪装成 hard limit 拦截。
 4. 已完成内核级连续两次真实 `compact_once`，并加入 compaction request-boundary v1-v5 的数据模型、provider-attempt/checkpoint 绑定、fail-closed 纯 reducer、版本化 request-slot 状态机、旧 checkpointed budget terminal 的原子兼容迁移、bound Provider 调用和 session-open 恢复：失败 child 不替换 parent checkpoint，随后以同一候选显式重试可形成合法子链，最终 projection 只使用最新 summary + tail。Agent/CLI pending 管理、projection/history abandon 语义，以及“retry intent 已同步但新 attempt 尚未写入”、“legacy budget migration 已 fsync 但正常 response 尚未开始”和“resolved_without_checkpoint 已 fsync 但 normal response 尚未开始”三个窗口的跨进程强杀恢复 E2E 已完成；后两者由新 CLI 进程继续同一 prompt，且不会重复写 migration intent、resolution、checkpoint 或原 user message。
 5. 已接入默认关闭的自动 preflight/trigger 实验入口，并完成 Provider context-limit after-checkpoint、retry/replan、no-checkpoint resolution、legacy budget migration 和 CLI resume/强杀恢复闭环。
-6. 已加入 `examples/compaction_drift.rs` 与 frozen fixture：使用 production prompt、低权限 envelope、无 tools 和 8192 输出上限，对父摘要连续执行至少 10 次真实重摘要，并在 3/5/10 轮保存 model、全部协议版本、fixture/input/summary hash、raw response、usage 和逐事实/分类保留指标。live run 必须显式确认，不在 CI 或启动路径中隐式消费 Provider；第一份实际 artifact 仍不预设发布阈值。
-7. 根据测量结果另行锁定默认启用门槛；只有门槛满足后才改变默认值。
+6. 已加入 `examples/compaction_drift.rs` 与不可变 fixture/metric 版本：使用 production prompt、低权限 envelope、无 tools 和 8192 输出上限，对父摘要连续执行至少 10 次真实重摘要，并保存 Provider usage domain、prompt/envelope/request-chain hash、raw response、usage 和逐事实/分类保留指标。rescore 模式只有在逐轮 input/summary hash 与当前 prompt/envelope 完全匹配时才能复用 live 输出，不产生新 Provider 调用。
+7. 2026-08-07 的 `Kimi-K2.7-Code` prompt-v3 live run 及 metric-v4 rescore 在 3/5/10 轮均保留 17/17 事实，十轮 `exact_attack_execution` 均为 false。该 Provider usage domain 满足 100% 精确数值、否定约束、状态、标识符、路径、命令、决策、偏好及安全事实保留 gate；证据保存在 `docs/artifacts/`。未测 model/backend 不继承此结论，因此全局默认仍不改变。
 8. 只有线性扫描或 journal 体积出现实际性能证据后，才考虑可重建索引或物理分段。
 
 ### 3.11 M5 验收与发布门槛
 
 功能闭环门槛：
 
-- `compact_once` 发出的真实请求无 tools、使用 prompt v2 和 8192 output token 上限；reducer 独立拒绝 Provider 返回的超限 checkpoint。prompt v1 fixture 仍必须按原字节读取。
+- `compact_once` 发出的真实请求无 tools、使用 prompt v3 和 8192 output token 上限；reducer 独立拒绝 Provider 返回的超限 checkpoint。prompt v1/v2 fixture 仍必须按原字节读取。
 - summary 在普通 projection 和下一次 compaction source 中始终由 checkpoint 自身的受支持 envelope 渲染为 `role: "user"`；恶意历史经过摘要、普通 replay 和再次摘要都不会进入 developer/system item。
 - Provider output message 在提交前与 journal replay 时都强制为 `role: "assistant"`，journal user item 强制为 `role: "user"`；伪造或缺失 role 不得进入普通 projection 或 compaction source。
-- prompt、summary envelope、source projection、turn validator、source digest 和 usage contract 的首个可执行 v1 在新增默认版本后仍按原规则重建；prompt v2 与历史 prompt v1 分别由字面量测试锁定，历史 source projection v2/v3、turn validator v2-v4、Provider request-slot v1 与 compaction boundary v1-v4 由字面量/定向 fixture 锁定，不能调用新 reducer 或接受未知 boundary tag。当前新 attempt 使用 `2/1/4/5/1/1` 版本组合，compaction boundary 新事件使用 v5，Provider request-slot 使用 v2（均由 boundary policy 固定绑定）。旧 `55e5b0c` fixture 必须证明 slot v1/turn v4 仍为 terminal，而显式 budget migration 后只有 slot v2/turn v5 获得继续权限。此前未发布的 developer-envelope 实验格式必须由负 fixture 证明 fail closed；任一版本缺失、未知或 started/checkpoint 不一致都不能退回当前默认实现。
+- prompt、summary envelope、source projection、turn validator、source digest 和 usage contract 的首个可执行 v1 在新增默认版本后仍按原规则重建；prompt v1/v2/v3 分别由字面量/前缀测试锁定，历史 source projection v2/v3、turn validator v2-v4、Provider request-slot v1 与 compaction boundary v1-v4 由字面量/定向 fixture 锁定，不能调用新 reducer 或接受未知 boundary tag。当前新 attempt 使用 `3/1/4/5/1/1` 版本组合，compaction boundary 新事件使用 v5，Provider request-slot 使用 v2（均由 boundary policy 固定绑定）。旧 `55e5b0c` fixture 必须证明 slot v1/turn v4 仍为 terminal，而显式 budget migration 后只有 slot v2/turn v5 获得继续权限。此前未发布的 developer-envelope 实验格式必须由负 fixture 证明 fail closed；任一版本缺失、未知或 started/checkpoint 不一致都不能退回当前默认实现。
 - checkpoint usage 与 `raw_response.usage` 逐字一致，并满足 total 等式、cached/input 与 reasoning/output 子计数关系及 8192 输出上限；矛盾 usage 只生成可审计的 failed attempt，不进入 checkpoint chain。
 - 有可比较 usage 时使用真实 `input_tokens` 锚点和完整 prepared-request 的有符号估算差；无锚点时才估算完整请求。
 - cached input 不从上下文占用中扣除；usage 缺失不冒充真实 `0`。
@@ -561,13 +561,13 @@ source projection v1-v3 保持原始字节与接受/拒绝语义；source projec
 - 同一 journal 在不同 render/折叠设置下生成完全相同的 Provider projection 字节。
 - Windows、Linux、macOS 的 fmt、test、Clippy 全绿。
 
-默认启用前的测量门槛：
+每个 Provider usage domain/model 默认启用前的测量门槛：
 
 - 固定事实集经过 3/5/10 次父摘要递归后，分别测量精确数值、否定约束、已完成/未完成状态和关键标识符的保留情况。
 - 故意让摘要遗漏事实，验证模型能通过 `history_search -> history_turn` 或 `history_artifact` 找回并引用原文。
 - 旧 user/tool output 含“忽略当前 instructions”等恶意内容时，summary 和 history 结果都保持不可信数据身份，不能提升权限。
 - 最近两个完整 turn 本身超过 usable budget 时，记录不可压缩原因并停止，不能生成不安全 checkpoint 或循环重试。
-- 第一阶段只建立可复现测量基线，不预先写死通过率。默认启用阈值必须依据这些数据另行决策并记录。
+- 根据首份有效 live 数据锁定的阈值是：3/5/10 轮上述各类 durable facts 均为 100%，每轮 `exact_attack_execution=false`，且 artifact 必须绑定当前 prompt/envelope 与完整 request chain。`Kimi-K2.7-Code` 的记录域已通过；其他域必须独立通过，不能以相同模型名或 OpenAI-compatible 标签代替证据。
 
 ## 4. M4/M5 完成后的决策门
 

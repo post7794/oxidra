@@ -129,7 +129,7 @@ limit becomes a recoverable pending turn. In an interactive TTY, edit
 replacement lines are shown in red/green; `-p` and redirected output remain
 plain text.
 
-Automatic compaction remains an explicit experiment. Passing
+Automatic compaction remains an explicit opt-in. Passing
 `--experimental-auto-compact` lets the current model-aware context estimate
 trigger one checkpoint attempt for the active user turn. The planner keeps at
 least two complete turns, estimates every eligible cutoff with the full
@@ -138,8 +138,8 @@ summary budget, and commits only if the real summary rebuild reaches the 50%
 target. A failed or unavailable attempt stops the request and leaves a pending
 boundary for explicit recovery: durable Provider attempts can be retried, and
 a preflight-only failure is replanned by `--retry-pending`. The flag does not
-turn the heuristic into a tokenizer-backed hard limit and is not enabled by
-default. Replanning validates the frozen planning-v1 audit record but measures
+turn the heuristic into a tokenizer-backed hard limit. Replanning validates
+the frozen planning-v1 audit record but measures
 the request again with the current model/context configuration, instructions,
 tools, and history view. If the current request is now below the trigger, the
 v5 boundary records a durable `resolved_without_checkpoint` result, skips the
@@ -147,8 +147,11 @@ compaction Provider call and checkpoint, and continues the original turn. A
 crash after that resolution is synced resumes the same prompt with
 `--retry-pending` without duplicating the user message or compaction attempt.
 The reproducible live 3/5/10-round drift benchmark is documented in
-`docs/compaction-drift.md`; it requires an explicit live-call acknowledgement
-and writes raw outputs and retention metrics under a caller-selected path.
+`docs/compaction-drift.md`. Prompt v3 retained all 17 frozen facts through ten
+rounds on the recorded `Kimi-K2.7-Code` Provider usage domain without executing
+the quoted injection. Automatic compaction is still not enabled universally:
+quality evidence is model/backend-specific, and the configured/default models
+must pass the same recorded gate rather than inheriting another model's result.
 
 Useful options:
 
