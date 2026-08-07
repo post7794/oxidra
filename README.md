@@ -142,8 +142,10 @@ turn the heuristic into a tokenizer-backed hard limit and is not enabled by
 default. Replanning validates the frozen planning-v1 audit record but measures
 the request again with the current model/context configuration, instructions,
 tools, and history view. If the current request is now below the trigger, the
-recovery fails closed and asks for an explicit abandon because the current
-boundary protocol has no lossless `resolved_without_checkpoint` terminal.
+v5 boundary records a durable `resolved_without_checkpoint` result, skips the
+compaction Provider call and checkpoint, and continues the original turn. A
+crash after that resolution is synced resumes the same prompt with
+`--retry-pending` without duplicating the user message or compaction attempt.
 
 Useful options:
 

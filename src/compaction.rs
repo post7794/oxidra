@@ -41,13 +41,15 @@ pub const COMPACTION_ABORTED_KIND: &str = "compaction.aborted";
 // boundary events are the durable intent/state machine for that larger
 // request boundary.  They deliberately live in `extra`/open journal kinds so
 // the already-published checkpoint protocol remains byte-for-byte compatible.
-pub const COMPACTION_BOUNDARY_VERSION: u32 = 4;
+pub const COMPACTION_BOUNDARY_VERSION: u32 = 5;
 pub const COMPACTION_BOUNDARY_STARTED_KIND: &str = "compaction.boundary.started";
 pub const COMPACTION_BOUNDARY_CHECKPOINTED_KIND: &str = "compaction.boundary.checkpointed";
 pub const COMPACTION_BOUNDARY_FAILED_KIND: &str = "compaction.boundary.failed";
 pub const COMPACTION_BOUNDARY_RETRY_STARTED_KIND: &str = "compaction.boundary.retry_started";
 pub const COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND: &str =
     "compaction.boundary.budget_retry_started";
+pub const COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND: &str =
+    "compaction.boundary.resolved_without_checkpoint";
 pub const COMPACTION_BOUNDARY_ABANDONED_KIND: &str = "compaction.boundary.abandoned";
 // Boundary protocol v1 was introduced against the already frozen turn
 // validator v3.  Future turn-validator changes must not silently change which
@@ -59,6 +61,7 @@ const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1: u32 = 3;
 const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2: u32 = 4;
 const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V3: u32 = 4;
 const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4: u32 = 5;
+const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V5: u32 = 5;
 // Boundary v2/v3 were published against slot reducer v1. Keep this literal
 // binding stable even if the current writer later adopts a newer slot policy.
 const COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1: u32 = 1;
@@ -68,11 +71,13 @@ const COMPACTION_BOUNDARY_VERSION_V1: u32 = 1;
 const COMPACTION_BOUNDARY_VERSION_V2: u32 = 2;
 const COMPACTION_BOUNDARY_VERSION_V3: u32 = 3;
 const COMPACTION_BOUNDARY_VERSION_V4: u32 = 4;
-const SUPPORTED_COMPACTION_BOUNDARY_VERSIONS: [u32; 4] = [
+const COMPACTION_BOUNDARY_VERSION_V5: u32 = 5;
+const SUPPORTED_COMPACTION_BOUNDARY_VERSIONS: [u32; 5] = [
     COMPACTION_BOUNDARY_VERSION_V1,
     COMPACTION_BOUNDARY_VERSION_V2,
     COMPACTION_BOUNDARY_VERSION_V3,
     COMPACTION_BOUNDARY_VERSION_V4,
+    COMPACTION_BOUNDARY_VERSION_V5,
 ];
 
 #[derive(Clone, Copy)]
@@ -85,6 +90,7 @@ struct CompactionBoundaryPolicy {
     enforces_session_protocol_epoch: bool,
     requires_attempt_resolution_before_abandon: bool,
     requires_settled_slot_before_abandon: bool,
+    supports_resolved_without_checkpoint: bool,
 }
 
 /// Immutable policy registry for every persisted boundary protocol. Add a new
@@ -100,6 +106,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
             enforces_session_protocol_epoch: false,
             requires_attempt_resolution_before_abandon: false,
             requires_settled_slot_before_abandon: false,
+            supports_resolved_without_checkpoint: false,
         }),
         COMPACTION_BOUNDARY_VERSION_V2 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2,
@@ -112,6 +119,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
             enforces_session_protocol_epoch: false,
             requires_attempt_resolution_before_abandon: false,
             requires_settled_slot_before_abandon: false,
+            supports_resolved_without_checkpoint: false,
         }),
         COMPACTION_BOUNDARY_VERSION_V3 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V3,
@@ -126,6 +134,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
             enforces_session_protocol_epoch: true,
             requires_attempt_resolution_before_abandon: true,
             requires_settled_slot_before_abandon: true,
+            supports_resolved_without_checkpoint: false,
         }),
         COMPACTION_BOUNDARY_VERSION_V4 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4,
@@ -138,6 +147,20 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
             enforces_session_protocol_epoch: true,
             requires_attempt_resolution_before_abandon: true,
             requires_settled_slot_before_abandon: true,
+            supports_resolved_without_checkpoint: false,
+        }),
+        COMPACTION_BOUNDARY_VERSION_V5 => Ok(CompactionBoundaryPolicy {
+            turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V5,
+            turn_metadata_ceiling: Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V5),
+            provider_budget_retry_overlay_version: None,
+            provider_request_slot_validator_version: Some(
+                COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V2,
+            ),
+            legacy_completion_uses_next_user: true,
+            enforces_session_protocol_epoch: true,
+            requires_attempt_resolution_before_abandon: true,
+            requires_settled_slot_before_abandon: true,
+            supports_resolved_without_checkpoint: true,
         }),
         _ => session_error(format!("unsupported compaction boundary version {version}")),
     }
@@ -403,6 +426,25 @@ impl CompactionBoundary {
             user_message_seq,
         }
     }
+
+    /// Construct the frozen boundary-v4 successor used only by the literal
+    /// provider-budget migration registered as overlay v1.
+    ///
+    /// This must not follow `COMPACTION_BOUNDARY_VERSION`: the compatibility
+    /// event is permanently defined as `checkpointed v3 -> checkpointed v4`,
+    /// even after the current writer advances to later boundary protocols.
+    pub(crate) fn provider_budget_retry_v1(
+        boundary_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        user_message_seq: u64,
+    ) -> Self {
+        Self {
+            version: COMPACTION_BOUNDARY_VERSION_V4,
+            boundary_id: boundary_id.into(),
+            turn_id: turn_id.into(),
+            user_message_seq,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -461,6 +503,20 @@ pub struct CompactionBoundaryBudgetRetryStarted {
     pub extra: Map<String, Value>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionBoundaryResolvedWithoutCheckpoint {
+    pub resolution_version: u32,
+    pub boundary_id: String,
+    pub turn_id: String,
+    pub user_message_seq: u64,
+    pub measured_request_through_seq: u64,
+    pub estimated_input_tokens: u64,
+    pub trigger_tokens: u64,
+    pub reason: String,
+    #[serde(default, flatten)]
+    pub extra: Map<String, Value>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ValidatedProviderBudgetRetry {
     pub retry_seq: u64,
@@ -489,6 +545,7 @@ pub struct CompactionBoundaryAbandoned {
 pub enum CompactionBoundaryState {
     Started,
     Checkpointed,
+    ResolvedWithoutCheckpoint,
     Failed,
     Superseded,
     Abandoned,
@@ -499,6 +556,7 @@ pub enum CompactionBoundaryState {
 enum CompactionBoundaryTransition {
     ProviderAttemptStarted,
     Checkpointed,
+    ResolvedWithoutCheckpoint,
     Failed,
     Abandoned,
     RetryStarted,
@@ -521,16 +579,22 @@ fn require_compaction_boundary_transition(
         CompactionBoundaryTransition::ProviderAttemptStarted
         | CompactionBoundaryTransition::Checkpointed
         | CompactionBoundaryTransition::Failed => state == CompactionBoundaryState::Started,
+        CompactionBoundaryTransition::ResolvedWithoutCheckpoint => {
+            state == CompactionBoundaryState::Started
+        }
         CompactionBoundaryTransition::Abandoned => matches!(
             state,
             CompactionBoundaryState::Started
                 | CompactionBoundaryState::Checkpointed
+                | CompactionBoundaryState::ResolvedWithoutCheckpoint
                 | CompactionBoundaryState::Failed
         ),
         CompactionBoundaryTransition::RetryStarted => state == CompactionBoundaryState::Failed,
         CompactionBoundaryTransition::TurnCompleted => matches!(
             state,
-            CompactionBoundaryState::Started | CompactionBoundaryState::Checkpointed
+            CompactionBoundaryState::Started
+                | CompactionBoundaryState::Checkpointed
+                | CompactionBoundaryState::ResolvedWithoutCheckpoint
         ),
     };
     if !allowed {
@@ -569,6 +633,7 @@ impl CompactionBoundaryChain {
                     boundary.state,
                     CompactionBoundaryState::Started
                         | CompactionBoundaryState::Checkpointed
+                        | CompactionBoundaryState::ResolvedWithoutCheckpoint
                         | CompactionBoundaryState::Failed
                 )
             })
@@ -664,6 +729,7 @@ impl CompactionBoundaryChain {
                 }
                 CompactionBoundaryState::Abandoned => {}
                 CompactionBoundaryState::Checkpointed
+                | CompactionBoundaryState::ResolvedWithoutCheckpoint
                 | CompactionBoundaryState::Superseded
                 | CompactionBoundaryState::CompletedTurn => {}
             }
@@ -688,6 +754,21 @@ pub(crate) fn ensure_checkpointed_boundary_request_ready(
     if boundary.state != CompactionBoundaryState::Checkpointed {
         return session_error(format!(
             "compaction boundary {} is {:?}, not checkpointed",
+            boundary.boundary.boundary_id, boundary.state
+        ));
+    }
+    ensure_compaction_boundary_turn_request_ready(events, &boundary.boundary)
+}
+
+/// Require a boundary that deliberately skipped compaction to remain at the
+/// same durable Provider request boundary measured by its resolution event.
+pub(crate) fn ensure_resolved_without_checkpoint_boundary_request_ready(
+    events: &[JournalEvent],
+    boundary: &ValidatedCompactionBoundary,
+) -> Result<()> {
+    if boundary.state != CompactionBoundaryState::ResolvedWithoutCheckpoint {
+        return session_error(format!(
+            "compaction boundary {} is {:?}, not resolved without checkpoint",
             boundary.boundary.boundary_id, boundary.state
         ));
     }
@@ -749,6 +830,7 @@ pub fn compaction_boundary_recovery_actions(
                 | COMPACTION_BOUNDARY_FAILED_KIND
                 | COMPACTION_BOUNDARY_RETRY_STARTED_KIND
                 | COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND
+                | COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND
                 | COMPACTION_BOUNDARY_ABANDONED_KIND
         ) || (event.kind == COMPACTION_STARTED_KIND && event.data.get("boundary").is_some())
     });
@@ -1546,7 +1628,11 @@ pub fn validate_compaction_boundary_chain(
                 if policy.provider_request_slot_validator_version.is_some()
                     && record.started_seq < event.seq
                 {
-                    if record.state == CompactionBoundaryState::Checkpointed {
+                    if matches!(
+                        record.state,
+                        CompactionBoundaryState::Checkpointed
+                            | CompactionBoundaryState::ResolvedWithoutCheckpoint
+                    ) {
                         let slot_version = policy
                             .provider_request_slot_validator_version
                             .expect("slot policy checked above");
@@ -1818,6 +1904,115 @@ pub fn validate_compaction_boundary_chain(
                 record.state_seq = event.seq;
                 record.failed_code = Some(payload.code);
             }
+            COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND => {
+                let payload =
+                    parse_event_data::<CompactionBoundaryResolvedWithoutCheckpoint>(event)?;
+                let index = *by_id.get(&payload.boundary_id).ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "boundary resolution at seq {} references unknown boundary {}",
+                        event.seq, payload.boundary_id
+                    ))
+                })?;
+                let record = &mut records[index];
+                require_compaction_boundary_transition(
+                    &payload.boundary_id,
+                    record.state,
+                    record.state_seq,
+                    CompactionBoundaryTransition::ResolvedWithoutCheckpoint,
+                    event.seq,
+                )?;
+                let policy = compaction_boundary_policy(record.boundary.version)?;
+                if !policy.supports_resolved_without_checkpoint {
+                    return session_error(format!(
+                        "compaction boundary {} uses v{} which does not support resolved-without-checkpoint",
+                        record.boundary.boundary_id, record.boundary.version
+                    ));
+                }
+                if payload.resolution_version != 1
+                    || payload.turn_id != record.boundary.turn_id
+                    || payload.user_message_seq != record.boundary.user_message_seq
+                    || payload.reason.trim().is_empty()
+                    || payload.trigger_tokens == 0
+                    || payload.estimated_input_tokens >= payload.trigger_tokens
+                    || payload.measured_request_through_seq.checked_add(1) != Some(event.seq)
+                {
+                    return session_error(format!(
+                        "boundary resolution at seq {} has invalid version, binding, measurement, or reason",
+                        event.seq
+                    ));
+                }
+                if attempt_by_boundary_id.contains_key(&record.boundary.boundary_id) {
+                    return session_error(format!(
+                        "compaction boundary {} cannot resolve without checkpoint after starting a Provider attempt",
+                        record.boundary.boundary_id
+                    ));
+                }
+                let retry_event = events
+                    .iter()
+                    .find(|candidate| candidate.seq == record.started_seq)
+                    .filter(|candidate| candidate.kind == COMPACTION_BOUNDARY_RETRY_STARTED_KIND)
+                    .ok_or_else(|| {
+                        OxidraError::Session(format!(
+                            "compaction boundary {} can resolve without checkpoint only from a durable retry intent",
+                            record.boundary.boundary_id
+                        ))
+                    })?;
+                let retry = parse_event_data::<CompactionBoundaryRetryStarted>(retry_event)?;
+                let planning_version = retry.extra.get("planning_version").and_then(Value::as_u64);
+                let context = retry.extra.get("context").and_then(Value::as_object);
+                let measured_seq = context
+                    .and_then(|context| context.get("request_journal_through_seq"))
+                    .and_then(Value::as_u64);
+                let estimated = context
+                    .and_then(|context| context.get("estimated_next_input_tokens"))
+                    .and_then(Value::as_u64);
+                let trigger = context
+                    .and_then(|context| context.get("trigger_tokens"))
+                    .and_then(Value::as_u64);
+                if planning_version != Some(1)
+                    || measured_seq != Some(record.started_seq)
+                    || payload.measured_request_through_seq != record.started_seq
+                    || estimated != Some(payload.estimated_input_tokens)
+                    || trigger != Some(payload.trigger_tokens)
+                {
+                    return session_error(format!(
+                        "compaction boundary {} resolution does not match its frozen planning-v1 retry evidence",
+                        record.boundary.boundary_id
+                    ));
+                }
+                let slot_version = policy
+                    .provider_request_slot_validator_version
+                    .expect("resolved-without-checkpoint policy requires a slot validator");
+                let slot = provider_request_slot_state_for_version(
+                    slot_version,
+                    &events[..event_index],
+                    &payload.turn_id,
+                )?;
+                if slot != ProviderRequestSlotState::Ready {
+                    return session_error(format!(
+                        "compaction boundary {} cannot resolve without checkpoint from Provider request-slot state {slot:?}",
+                        record.boundary.boundary_id
+                    ));
+                }
+                let facts = boundary_turn_facts_for_version(
+                    &mut facts_by_version,
+                    record.boundary.version,
+                    events,
+                )?;
+                if facts
+                    .completion_seq_by_turn
+                    .get(&payload.turn_id)
+                    .is_some_and(|completion_seq| *completion_seq < event.seq)
+                {
+                    return session_error(format!(
+                        "boundary resolution at seq {} targets a completed turn",
+                        event.seq
+                    ));
+                }
+                record.state = CompactionBoundaryState::ResolvedWithoutCheckpoint;
+                record.state_seq = event.seq;
+                record.failed_code = None;
+            }
             COMPACTION_BOUNDARY_ABANDONED_KIND => {
                 let payload = parse_event_data::<CompactionBoundaryAbandoned>(event)?;
                 let index = *by_id.get(&payload.boundary_id).ok_or_else(|| {
@@ -1854,7 +2049,11 @@ pub fn validate_compaction_boundary_chain(
                     ));
                 }
                 if policy.requires_settled_slot_before_abandon
-                    && record.state == CompactionBoundaryState::Checkpointed
+                    && matches!(
+                        record.state,
+                        CompactionBoundaryState::Checkpointed
+                            | CompactionBoundaryState::ResolvedWithoutCheckpoint
+                    )
                 {
                     let slot_version = policy
                         .provider_request_slot_validator_version
@@ -2241,6 +2440,7 @@ pub fn validate_compaction_boundary_chain(
             boundary.state,
             CompactionBoundaryState::Started
                 | CompactionBoundaryState::Checkpointed
+                | CompactionBoundaryState::ResolvedWithoutCheckpoint
                 | CompactionBoundaryState::Failed
         )
     }) {
@@ -2815,6 +3015,21 @@ fn validate_boundary_version_transition(
         ) | (
             COMPACTION_BOUNDARY_VERSION_V4,
             COMPACTION_BOUNDARY_VERSION_V4
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V1,
+            COMPACTION_BOUNDARY_VERSION_V5
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V2,
+            COMPACTION_BOUNDARY_VERSION_V5
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V3,
+            COMPACTION_BOUNDARY_VERSION_V5
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V4,
+            COMPACTION_BOUNDARY_VERSION_V5
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V5,
+            COMPACTION_BOUNDARY_VERSION_V5
         )
     );
     if !allowed {
@@ -6847,7 +7062,7 @@ mod tests {
         let completed = validate_compaction_boundary_chain(&events).unwrap();
         assert!(completed.pending().is_empty());
         assert_eq!(
-            completed.boundaries()[0].state,
+            completed.boundaries().last().unwrap().state,
             CompactionBoundaryState::CompletedTurn
         );
     }
@@ -7296,6 +7511,161 @@ mod tests {
             Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4),
             "boundary v4 must retain a frozen turn-v5 compatibility ceiling"
         );
+        let v5 =
+            compaction_boundary_policy(COMPACTION_BOUNDARY_VERSION_V5).expect("boundary v5 policy");
+        assert_eq!(
+            v5.provider_request_slot_validator_version,
+            Some(COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V2)
+        );
+        assert_eq!(
+            v5.turn_metadata_ceiling,
+            Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V5)
+        );
+        assert!(v5.supports_resolved_without_checkpoint);
+    }
+
+    #[test]
+    fn boundary_v5_resolves_below_trigger_without_discarding_the_turn() {
+        let mut events = vec![
+            open_user(1, "turn-1", "prompt"),
+            boundary_started_with_version(2, "boundary-1", "turn-1", 1, 5),
+            event(
+                3,
+                None,
+                COMPACTION_BOUNDARY_FAILED_KIND,
+                serde_json::to_value(CompactionBoundaryFailed {
+                    boundary_id: "boundary-1".to_owned(),
+                    code: "preflight_failed".to_owned(),
+                    message: "retry with current configuration".to_owned(),
+                    attempt_id: None,
+                    extra: Map::new(),
+                })
+                .unwrap(),
+            ),
+            event(
+                4,
+                None,
+                COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+                serde_json::to_value(CompactionBoundaryRetryStarted {
+                    retry_id: "retry-1".to_owned(),
+                    previous_boundary_id: "boundary-1".to_owned(),
+                    boundary: CompactionBoundary {
+                        version: 5,
+                        boundary_id: "boundary-2".to_owned(),
+                        turn_id: "turn-1".to_owned(),
+                        user_message_seq: 1,
+                    },
+                    extra: json!({
+                        "planning_version":1,
+                        "context":{
+                            "request_journal_through_seq":4,
+                            "estimated_next_input_tokens":10,
+                            "trigger_tokens":20,
+                        },
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                })
+                .unwrap(),
+            ),
+            event(
+                5,
+                None,
+                COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
+                serde_json::to_value(CompactionBoundaryResolvedWithoutCheckpoint {
+                    resolution_version: 1,
+                    boundary_id: "boundary-2".to_owned(),
+                    turn_id: "turn-1".to_owned(),
+                    user_message_seq: 1,
+                    measured_request_through_seq: 4,
+                    estimated_input_tokens: 10,
+                    trigger_tokens: 20,
+                    reason: "current request is below trigger".to_owned(),
+                    extra: Map::new(),
+                })
+                .unwrap(),
+            ),
+        ];
+        let chain = validate_compaction_boundary_chain(&events)
+            .expect("v5 can retain the original turn without a checkpoint");
+        assert_eq!(chain.pending().len(), 1);
+        assert_eq!(
+            chain.latest_pending().unwrap().state,
+            CompactionBoundaryState::ResolvedWithoutCheckpoint
+        );
+        assert!(chain.projection_excluded_turn_ids().unwrap().is_empty());
+
+        events.extend([
+            event(
+                6,
+                Some("turn-1"),
+                "response.started",
+                json!({"response_attempt_id":"attempt-1"}),
+            ),
+            event(
+                7,
+                Some("turn-1"),
+                "response.completed",
+                json!({
+                    "response_attempt_id":"attempt-1",
+                    "output_items":[{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[{"type":"output_text","text":"done"}],
+                    }],
+                    "turn_completion":{
+                        "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                        "covers_from_seq":1,
+                        "final_response_seq":7,
+                        "covers_through_seq":7,
+                    },
+                }),
+            ),
+            event(
+                8,
+                Some("turn-1"),
+                "turn.completed",
+                json!({
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                    "covers_from_seq":1,
+                    "final_response_seq":7,
+                    "covers_through_seq":8,
+                }),
+            ),
+        ]);
+        let completed = validate_compaction_boundary_chain(&events)
+            .expect("normal response completes the retained turn");
+        assert!(completed.pending().is_empty());
+        assert_eq!(
+            completed.boundaries().last().unwrap().state,
+            CompactionBoundaryState::CompletedTurn
+        );
+
+        let mut frozen_v4 = events[..4].to_vec();
+        frozen_v4[1].data["boundary"]["version"] = json!(4);
+        frozen_v4[3].data["boundary"]["version"] = json!(4);
+        frozen_v4.push(event(
+            5,
+            None,
+            COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
+            serde_json::to_value(CompactionBoundaryResolvedWithoutCheckpoint {
+                resolution_version: 1,
+                boundary_id: "boundary-2".to_owned(),
+                turn_id: "turn-1".to_owned(),
+                user_message_seq: 1,
+                measured_request_through_seq: 4,
+                estimated_input_tokens: 10,
+                trigger_tokens: 20,
+                reason: "must be rejected by v4".to_owned(),
+                extra: Map::new(),
+            })
+            .unwrap(),
+        ));
+        let error = validate_compaction_boundary_chain(&frozen_v4)
+            .expect_err("frozen boundary v4 must not gain the new terminal")
+            .to_string();
+        assert!(error.contains("does not support resolved-without-checkpoint"));
     }
 
     #[test]

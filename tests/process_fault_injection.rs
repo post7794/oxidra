@@ -15,13 +15,13 @@ use chrono::Utc;
 use oxidra::agent::{Agent, AgentObserver, DenyApproval};
 use oxidra::compaction::{
     COMPACTION_ABORTED_KIND, COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
-    COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
-    COMPACTION_BOUNDARY_STARTED_KIND, COMPACTION_CHECKPOINT_KIND, COMPACTION_PROMPT_VERSION,
-    COMPACTION_STARTED_KIND, CompactionBoundary, CompactionBoundaryFailed,
-    CompactionBoundaryStarted, CompactionCandidate, CompactionStarted,
-    MAX_COMPACTION_OUTPUT_TOKENS, SOURCE_DIGEST_VERSION, SUMMARY_ENVELOPE_VERSION,
-    USAGE_CONTRACT_VERSION, build_compaction_source, compact_once, compaction_instructions,
-    validate_checkpoint_chain, validate_compaction_boundary_chain,
+    COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
+    COMPACTION_BOUNDARY_RETRY_STARTED_KIND, COMPACTION_BOUNDARY_STARTED_KIND,
+    COMPACTION_CHECKPOINT_KIND, COMPACTION_PROMPT_VERSION, COMPACTION_STARTED_KIND,
+    CompactionBoundary, CompactionBoundaryFailed, CompactionBoundaryStarted, CompactionCandidate,
+    CompactionStarted, MAX_COMPACTION_OUTPUT_TOKENS, SOURCE_DIGEST_VERSION,
+    SUMMARY_ENVELOPE_VERSION, USAGE_CONTRACT_VERSION, build_compaction_source, compact_once,
+    compaction_instructions, validate_checkpoint_chain, validate_compaction_boundary_chain,
 };
 use oxidra::config::{ContextLimits, ContextValueSource};
 use oxidra::context::AUTOMATIC_COMPACTION_PLANNING_VERSION;
@@ -45,6 +45,8 @@ const SESSION_ID: &str = "process-fault-session";
 const RETRY_SESSION_ID: &str = "retry-fault-session";
 const COMPACTION_REPLAN_SESSION_ID: &str = "compaction-replan-fault-session";
 const COMPACTION_REPLAN_SYNC_LABEL: &str = "compaction.boundary.retry_started";
+const COMPACTION_RESOLUTION_SESSION_ID: &str = "compaction-resolution-fault-session";
+const COMPACTION_RESOLUTION_SYNC_LABEL: &str = "compaction.boundary.resolved_without_checkpoint";
 const BUDGET_MIGRATION_SESSION_ID: &str = "budget-migration-fault-session";
 const BUDGET_MIGRATION_SYNC_LABEL: &str = "compaction.boundary.budget_retry_started";
 const PROJECT_ROOT_ENV: &str = "OXIDRA_FAULT_INJECTION_PROJECT_ROOT";
@@ -440,6 +442,125 @@ fn force_kill_after_compaction_recovery_intent_can_retry_after_reopen() {
     assert!(
         validate_compaction_boundary_chain(&completed)
             .expect("completed recovery boundary chain is valid")
+            .pending()
+            .is_empty()
+    );
+}
+
+#[test]
+fn force_kill_after_no_checkpoint_resolution_resumes_via_cli() {
+    let temp = tempfile::tempdir().expect("create compaction resolution fault directory");
+    let project_root = temp.path().join("project");
+    std::fs::create_dir_all(&project_root).expect("create compaction resolution project root");
+    let data_dir = isolated_cli_data_dir(temp.path());
+    let child = spawn_compaction_resolution_fault_child(&data_dir, &project_root);
+    stop_child_at_label(
+        child,
+        COMPACTION_RESOLUTION_SYNC_LABEL,
+        &[COMPACTION_RESOLUTION_SYNC_LABEL],
+    );
+
+    let store = SessionStore::new(&data_dir).expect("open compaction resolution fault store");
+    let persisted = store
+        .inspect(COMPACTION_RESOLUTION_SESSION_ID)
+        .expect("inspect synced no-checkpoint resolution before CLI resume");
+    assert_eq!(
+        count_kind(&persisted, COMPACTION_BOUNDARY_RETRY_STARTED_KIND),
+        1
+    );
+    assert_eq!(
+        count_kind(
+            &persisted,
+            COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND
+        ),
+        1
+    );
+    assert_eq!(count_kind(&persisted, COMPACTION_STARTED_KIND), 0);
+    assert_eq!(count_kind(&persisted, COMPACTION_CHECKPOINT_KIND), 0);
+    assert_eq!(count_kind(&persisted, "response.started"), 0);
+    let persisted_chain = validate_compaction_boundary_chain(&persisted)
+        .expect("synced no-checkpoint resolution has a valid boundary lineage");
+    assert_eq!(persisted_chain.pending().len(), 1);
+    assert_eq!(
+        persisted_chain.pending()[0].state,
+        oxidra::compaction::CompactionBoundaryState::ResolvedWithoutCheckpoint
+    );
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind no-checkpoint resume server");
+    let address = listener
+        .local_addr()
+        .expect("read no-checkpoint resume server address");
+    let server =
+        thread::spawn(move || serve_one_final_response(listener, "resumed without a checkpoint"));
+
+    let local_data = temp.path().join("local");
+    let roaming_data = temp.path().join("roaming");
+    let xdg_config = temp.path().join("config");
+    let xdg_state = temp.path().join("state");
+    let home = temp.path().join("home");
+    for directory in [&local_data, &roaming_data, &xdg_config, &xdg_state, &home] {
+        std::fs::create_dir_all(directory).expect("create isolated CLI directory");
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_oxidra"))
+        .arg("--resume")
+        .arg(COMPACTION_RESOLUTION_SESSION_ID)
+        .arg("--retry-pending")
+        .arg("--cwd")
+        .arg(&project_root)
+        .env("API_KEY", "fake")
+        .env("API_BASE_URL", format!("http://{address}/v1/"))
+        .env("MODEL", "fault-injection-model")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_MODEL")
+        .env("LOCALAPPDATA", &local_data)
+        .env("APPDATA", &roaming_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .expect("resume no-checkpoint resolution through the CLI");
+
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("CLI stderr is UTF-8");
+    let server_result = server.join().expect("no-checkpoint resume server panicked");
+    assert!(
+        output.status.success(),
+        "CLI resume failed with {}\nstdout:\n{}\nstderr:\n{}\nserver: {:?}",
+        output.status,
+        stdout,
+        stderr,
+        server_result
+    );
+    let request = server_result.expect("no-checkpoint resume server failed");
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "resumed without a checkpoint\n"
+    );
+    let request_input =
+        serde_json::to_string(&request["input"]).expect("serialize resumed Provider input");
+    assert!(request_input.contains("retry compaction after config change"));
+
+    let completed = store
+        .inspect(COMPACTION_RESOLUTION_SESSION_ID)
+        .expect("inspect completed no-checkpoint recovery");
+    assert_eq!(
+        count_kind(
+            &completed,
+            COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND
+        ),
+        1,
+        "CLI resume must reuse the durable no-checkpoint resolution"
+    );
+    assert_eq!(count_kind(&completed, COMPACTION_STARTED_KIND), 0);
+    assert_eq!(count_kind(&completed, COMPACTION_CHECKPOINT_KIND), 0);
+    assert_eq!(count_kind(&completed, "response.started"), 1);
+    assert!(
+        validate_compaction_boundary_chain(&completed)
+            .expect("completed no-checkpoint recovery has a valid boundary lineage")
             .pending()
             .is_empty()
     );
@@ -902,7 +1023,113 @@ fn compaction_replan_fault_injection_child() {
     panic!("compaction replan child unexpectedly resumed: {error}");
 }
 
+#[test]
+#[ignore = "launched by force_kill_after_no_checkpoint_resolution_resumes_via_cli"]
+fn compaction_resolution_fault_injection_child() {
+    if env::var_os(CHILD_MODE_ENV).is_none() {
+        return;
+    }
+    let data_dir = env::var_os(DATA_DIR_ENV).expect("compaction resolution data directory is set");
+    let project_root = env::var_os(PROJECT_ROOT_ENV)
+        .map(PathBuf::from)
+        .expect("compaction resolution project root is set");
+    std::fs::create_dir_all(&project_root).expect("create compaction resolution project root");
+    let project_root = std::fs::canonicalize(&project_root)
+        .expect("canonicalize compaction resolution project root");
+    let store = SessionStore::new(&data_dir).expect("create compaction resolution child store");
+    let mut journal = store
+        .create_with_id(
+            COMPACTION_RESOLUTION_SESSION_ID,
+            SessionHeader::new(&project_root, "fault-injection-model"),
+        )
+        .expect("create compaction resolution child journal");
+    for index in 0..3 {
+        append_large_replan_turn(&mut journal, index);
+    }
+    let user = journal
+        .append_and_sync(
+            "user.message",
+            Some(TURN_ID),
+            json!({
+                "item":{"role":"user","content":"retry compaction after config change"},
+                "turn_boundary_version":TURN_BOUNDARY_VERSION,
+            }),
+        )
+        .expect("append compaction resolution user message");
+    let boundary = CompactionBoundary::new("initial-resolution-boundary", TURN_ID, user.seq);
+    let extra = json!({
+        "planning_version": AUTOMATIC_COMPACTION_PLANNING_VERSION,
+        "context": planning_context_v1(user.seq),
+    })
+    .as_object()
+    .expect("planning extra is an object")
+    .clone();
+    journal
+        .append_and_sync(
+            COMPACTION_BOUNDARY_STARTED_KIND,
+            None,
+            serde_json::to_value(CompactionBoundaryStarted {
+                boundary: boundary.clone(),
+                trigger: "estimated_context_threshold".to_owned(),
+                extra,
+            })
+            .expect("encode initial compaction resolution boundary"),
+        )
+        .expect("append initial compaction resolution boundary");
+    journal
+        .append_and_sync(
+            COMPACTION_BOUNDARY_FAILED_KIND,
+            None,
+            serde_json::to_value(CompactionBoundaryFailed {
+                boundary_id: boundary.boundary_id,
+                code: "cancelled".to_owned(),
+                message: "injected preflight-only failure".to_owned(),
+                attempt_id: None,
+                extra: Default::default(),
+            })
+            .expect("encode initial compaction resolution failure"),
+        )
+        .expect("append initial compaction resolution failure");
+
+    let tools = BuiltinTools::new(
+        &project_root,
+        journal.artifact_dir(),
+        Path::new(&data_dir).join("memory"),
+        false,
+        false,
+    )
+    .expect("create compaction resolution child tools");
+    let mut agent = Agent::new(
+        std::sync::Arc::new(UnexpectedRecoveryProvider),
+        journal,
+        tools,
+        "fault recovery instructions",
+        ContextLimits {
+            context_window: Some(10_000_000),
+            reserve_tokens: 0,
+            context_window_source: ContextValueSource::Cli,
+            reserve_tokens_source: ContextValueSource::Cli,
+        },
+        None,
+        None,
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create compaction resolution child runtime");
+    let error = runtime
+        .block_on(agent.retry_pending_turn(
+            CancellationToken::new(),
+            &mut CompactionResolutionSyncObserver,
+            &mut DenyApproval,
+        ))
+        .expect_err("parent should kill the child after resolution fsync");
+    panic!("compaction resolution child unexpectedly resumed: {error}");
+}
+
 struct CompactionRecoverySyncObserver;
+
+struct CompactionResolutionSyncObserver;
 
 struct BudgetMigrationSyncObserver;
 
@@ -948,6 +1175,29 @@ impl AgentObserver for CompactionRecoverySyncObserver {
 
     fn on_compaction_recovery_intent_synced(&mut self) -> Result<()> {
         sync_barrier_label(COMPACTION_REPLAN_SYNC_LABEL);
+        Ok(())
+    }
+}
+
+impl AgentObserver for CompactionResolutionSyncObserver {
+    fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_message(&mut self, _message: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_compaction_resolution_synced(&mut self) -> Result<()> {
+        sync_barrier_label(COMPACTION_RESOLUTION_SYNC_LABEL);
         Ok(())
     }
 }
@@ -1647,6 +1897,27 @@ fn spawn_compaction_replan_fault_child(data_dir: &Path) -> Child {
     command
         .spawn()
         .expect("spawn compaction replan fault-injection child")
+}
+
+fn spawn_compaction_resolution_fault_child(data_dir: &Path, project_root: &Path) -> Child {
+    let mut command = Command::new(env::current_exe().expect("locate integration-test binary"));
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            "compaction_resolution_fault_injection_child",
+            "--nocapture",
+        ])
+        .env(CHILD_MODE_ENV, "1")
+        .env(DATA_DIR_ENV, data_dir)
+        .env(PROJECT_ROOT_ENV, project_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    suppress_windows_console(&mut command);
+    command
+        .spawn()
+        .expect("spawn compaction resolution fault-injection child")
 }
 
 fn spawn_budget_migration_fault_child(data_dir: &Path, project_root: &Path) -> Child {

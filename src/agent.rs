@@ -16,17 +16,19 @@ use uuid::Uuid;
 
 use crate::compaction::{
     COMPACTION_BOUNDARY_ABANDONED_KIND, COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
-    COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
-    COMPACTION_BOUNDARY_STARTED_KIND, COMPACTION_STARTED_KIND, CandidateEstimate,
-    CompactionBoundary, CompactionBoundaryAbandoned, CompactionBoundaryBudgetRetryStarted,
-    CompactionBoundaryChain, CompactionBoundaryFailed, CompactionBoundaryRetryStarted,
+    COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
+    COMPACTION_BOUNDARY_RETRY_STARTED_KIND, COMPACTION_BOUNDARY_STARTED_KIND,
+    COMPACTION_STARTED_KIND, CandidateEstimate, CompactionBoundary, CompactionBoundaryAbandoned,
+    CompactionBoundaryBudgetRetryStarted, CompactionBoundaryChain, CompactionBoundaryFailed,
+    CompactionBoundaryResolvedWithoutCheckpoint, CompactionBoundaryRetryStarted,
     CompactionBoundaryStarted, CompactionBoundaryState, CompactionCandidate, CompactionContext,
     CompactionSelection, CompactionStarted, MAX_COMPACTION_OUTPUT_TOKENS,
     MIN_RECENT_COMPLETE_TURNS, SUMMARY_ENVELOPE_VERSION, ValidatedCompactionBoundary,
     attempt_boundary, compact_once_for_boundary, compact_replay_once_for_boundary,
     ensure_checkpointed_boundary_request_ready, ensure_compaction_boundary_turn_request_ready,
-    rebuild_failed_boundary_candidate, select_compaction_candidate, validate_checkpoint_chain,
-    validate_compaction_boundary_chain, validate_replay_compaction_candidate,
+    ensure_resolved_without_checkpoint_boundary_request_ready, rebuild_failed_boundary_candidate,
+    select_compaction_candidate, validate_checkpoint_chain, validate_compaction_boundary_chain,
+    validate_replay_compaction_candidate,
 };
 use crate::config::ContextLimits;
 use crate::context::{
@@ -93,6 +95,13 @@ pub trait AgentObserver: Send {
     /// is durable but before the original turn starts another Provider
     /// request. Process fault-injection tests block here and kill the writer.
     fn on_compaction_budget_recovery_intent_synced(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Observability hook after a below-trigger recovery has durably retained
+    /// the original turn without committing a checkpoint. Process tests stop
+    /// here to prove a new process can resume the normal Provider request.
+    fn on_compaction_resolution_synced(&mut self) -> Result<()> {
         Ok(())
     }
 }
@@ -296,6 +305,7 @@ enum RecoveryActionV1 {
         retry_intent: Option<Value>,
     },
     ResumeCheckpointed(ValidatedCompactionBoundary),
+    ResumeResolvedWithoutCheckpoint(ValidatedCompactionBoundary),
     ResumeBudgetLimitedCheckpoint {
         retry: CompactionBoundaryBudgetRetryStarted,
     },
@@ -309,6 +319,11 @@ enum RecoveryActionV1 {
         context_retry_intent: Option<Value>,
         retry: CompactionBoundaryRetryStarted,
         current_context: Box<ContextDecision>,
+    },
+    ResolveFailedBoundaryWithoutCheckpoint {
+        context_retry_intent: Option<Value>,
+        retry: CompactionBoundaryRetryStarted,
+        resolution: CompactionBoundaryResolvedWithoutCheckpoint,
     },
 }
 
@@ -896,6 +911,12 @@ impl Agent {
                         self.plan_checkpointed_boundary_resume_v1(&snapshot, boundary)?
                     }
                 }
+                CompactionBoundaryState::ResolvedWithoutCheckpoint => {
+                    ensure_resolved_without_checkpoint_boundary_request_ready(
+                        &snapshot, &boundary,
+                    )?;
+                    RecoveryActionV1::ResumeResolvedWithoutCheckpoint(boundary)
+                }
                 CompactionBoundaryState::Started => {
                     return Err(OxidraError::ApprovalRequired(
                         "compaction is still marked started; reopen the session to recover it before retrying"
@@ -972,7 +993,7 @@ impl Agent {
             )));
         }
 
-        let replacement = CompactionBoundary::new(
+        let replacement = CompactionBoundary::provider_budget_retry_v1(
             Uuid::now_v7().to_string(),
             boundary.boundary.turn_id.clone(),
             boundary.boundary.user_message_seq,
@@ -1222,13 +1243,6 @@ impl Agent {
                 "automatic compaction recovery requires a current target token count".to_owned(),
             )
         })?;
-        if current_context.estimated_next_input_tokens < trigger {
-            return Err(OxidraError::ApprovalRequired(format!(
-                "current request estimate {} is below the current automatic compaction trigger {trigger}; the failed boundary cannot be replayed safely without a resolved-without-checkpoint protocol, so abandon it before continuing",
-                current_context.estimated_next_input_tokens
-            )));
-        }
-
         retry.extra.insert(
             "planning_version".to_owned(),
             json!(AUTOMATIC_COMPACTION_PLANNING_VERSION),
@@ -1241,6 +1255,45 @@ impl Agent {
             .last_mut()
             .ok_or_else(|| OxidraError::Session("prospective retry journal is empty".to_owned()))?;
         retry_event.data = serde_json::to_value(&retry)?;
+        if current_context.estimated_next_input_tokens < trigger {
+            let measured_request_through_seq =
+                current_context.request_journal_through_seq.ok_or_else(|| {
+                    OxidraError::Session(
+                        "resolved-without-checkpoint measurement has no journal prefix".to_owned(),
+                    )
+                })?;
+            if prospective.last().map(|event| event.seq) != Some(measured_request_through_seq) {
+                return Err(OxidraError::Session(
+                    "resolved-without-checkpoint measurement does not match the prospective retry prefix"
+                        .to_owned(),
+                ));
+            }
+            let resolution = CompactionBoundaryResolvedWithoutCheckpoint {
+                resolution_version: 1,
+                boundary_id: retry.boundary.boundary_id.clone(),
+                turn_id: retry.boundary.turn_id.clone(),
+                user_message_seq: retry.boundary.user_message_seq,
+                measured_request_through_seq,
+                estimated_input_tokens: current_context.estimated_next_input_tokens,
+                trigger_tokens: trigger,
+                reason:
+                    "current request is below the automatic compaction trigger after remeasurement"
+                        .to_owned(),
+                extra: Map::new(),
+            };
+            append_prospective_event(
+                &mut prospective,
+                COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
+                None,
+                serde_json::to_value(&resolution)?,
+            )?;
+            validate_compaction_boundary_chain(&prospective)?;
+            return Ok(RecoveryActionV1::ResolveFailedBoundaryWithoutCheckpoint {
+                context_retry_intent,
+                retry,
+                resolution,
+            });
+        }
         validate_compaction_boundary_chain(&prospective)?;
 
         Ok(RecoveryActionV1::ReplanFailedBoundary {
@@ -1326,6 +1379,16 @@ impl Agent {
                 .await
             }
             RecoveryActionV1::ResumeCheckpointed(boundary) => {
+                self.run_existing_turn(
+                    &boundary.boundary.turn_id,
+                    boundary.boundary.user_message_seq,
+                    cancellation,
+                    observer,
+                    approval,
+                )
+                .await
+            }
+            RecoveryActionV1::ResumeResolvedWithoutCheckpoint(boundary) => {
                 self.run_existing_turn(
                     &boundary.boundary.turn_id,
                     boundary.boundary.user_message_seq,
@@ -1515,6 +1578,63 @@ impl Agent {
                     observer,
                     approval,
                     usage,
+                )
+                .await
+            }
+            RecoveryActionV1::ResolveFailedBoundaryWithoutCheckpoint {
+                context_retry_intent,
+                retry,
+                resolution,
+            } => {
+                let replacement = retry.boundary.clone();
+                self.ensure_provider_call_budget(&replacement.turn_id)?;
+                if let Some(intent) = context_retry_intent {
+                    self.journal.append_and_sync(
+                        "turn.retry_started",
+                        Some(&replacement.turn_id),
+                        intent,
+                    )?;
+                }
+                self.journal.append_and_sync(
+                    COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+                    None,
+                    serde_json::to_value(&retry)?,
+                )?;
+                let events = self.journal.read_events()?;
+                if events.last().map(|event| event.seq)
+                    != Some(resolution.measured_request_through_seq)
+                {
+                    self.append_automatic_compaction_preflight_failure(
+                        &replacement,
+                        "snapshot_changed",
+                        "journal changed before resolved-without-checkpoint commit",
+                    )?;
+                    return Err(OxidraError::Session(
+                        "journal changed before resolved-without-checkpoint commit".to_owned(),
+                    ));
+                }
+                let data = serde_json::to_value(&resolution)?;
+                validate_next_compaction_boundary_event(
+                    &events,
+                    COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
+                    data.clone(),
+                )?;
+                self.journal.append_and_sync(
+                    COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
+                    None,
+                    data,
+                )?;
+                observer.on_compaction_resolution_synced()?;
+                observer.on_compaction(&format!(
+                    "compaction skipped after remeasurement: context {} below trigger {}",
+                    resolution.estimated_input_tokens, resolution.trigger_tokens
+                ))?;
+                self.run_existing_turn(
+                    &replacement.turn_id,
+                    replacement.user_message_seq,
+                    cancellation,
+                    observer,
+                    approval,
                 )
                 .await
             }
@@ -2122,7 +2242,11 @@ impl Agent {
         if boundary_chain.pending().iter().any(|record| {
             record.boundary.turn_id == turn_id
                 && record.boundary.user_message_seq == user_message_seq
-                && record.state == CompactionBoundaryState::Checkpointed
+                && matches!(
+                    record.state,
+                    CompactionBoundaryState::Checkpointed
+                        | CompactionBoundaryState::ResolvedWithoutCheckpoint
+                )
         }) {
             // A checkpointed boundary already spent this user turn's single
             // automatic compaction attempt. The Provider remains the hard
@@ -2908,10 +3032,22 @@ fn ensure_compaction_boundaries_allow_request(
 ) -> Result<()> {
     let mut blocked = Vec::new();
     for boundary in chain.pending() {
-        if boundary.state == CompactionBoundaryState::Checkpointed
-            && current_turn_id == Some(boundary.boundary.turn_id.as_str())
+        if current_turn_id == Some(boundary.boundary.turn_id.as_str())
+            && matches!(
+                boundary.state,
+                CompactionBoundaryState::Checkpointed
+                    | CompactionBoundaryState::ResolvedWithoutCheckpoint
+            )
         {
-            ensure_checkpointed_boundary_request_ready(events, boundary)?;
+            match boundary.state {
+                CompactionBoundaryState::Checkpointed => {
+                    ensure_checkpointed_boundary_request_ready(events, boundary)?;
+                }
+                CompactionBoundaryState::ResolvedWithoutCheckpoint => {
+                    ensure_resolved_without_checkpoint_boundary_request_ready(events, boundary)?;
+                }
+                _ => unreachable!("state filtered above"),
+            }
         } else {
             blocked.push(boundary);
         }
@@ -5076,12 +5212,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replan_uses_current_config_and_refuses_unneeded_compaction_without_mutation() {
+    async fn replan_uses_current_config_and_resolves_unneeded_compaction_losslessly() {
         let (_temp, provider, mut agent) = automatic_compaction_test_agent(
             "automatic-compaction-current-config-below-trigger",
             6,
             40_000,
-            [compaction_summary_turn()],
+            [final_turn("continued without compaction")],
             true,
         );
         append_preflight_only_automatic_compaction_failure(
@@ -5090,31 +5226,35 @@ mod tests {
             "current-config-turn",
             "current prompt",
         );
-        let before = agent.journal().read_events().unwrap();
-
         agent.context_runtime.limits = ContextLimits {
             context_window: Some(10_000_000),
             reserve_tokens: 0,
             context_window_source: ContextValueSource::Cli,
             reserve_tokens_source: ContextValueSource::Cli,
         };
-        let error = agent
+        let outcome = agent
             .retry_pending_turn(
                 CancellationToken::new(),
                 &mut NoopObserver,
                 &mut DenyApproval,
             )
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(error, OxidraError::ApprovalRequired(_)));
-        assert!(
-            error
-                .to_string()
-                .contains("below the current automatic compaction trigger")
+        assert_eq!(outcome.text, "continued without compaction");
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(provider.requests()[0].max_output_tokens, None);
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(
+            count_events(
+                &events,
+                COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND
+            ),
+            1
         );
-        assert!(provider.requests().is_empty());
-        assert_eq!(agent.journal().read_events().unwrap(), before);
+        assert_eq!(count_events(&events, COMPACTION_STARTED_KIND), 0);
+        assert_eq!(count_events(&events, COMPACTION_CHECKPOINT_KIND), 0);
+        assert!(agent.pending_compaction_boundaries().unwrap().is_empty());
     }
 
     #[tokio::test]
