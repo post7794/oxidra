@@ -1,29 +1,38 @@
+use std::collections::VecDeque;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use oxidra::agent::{Agent, AgentObserver, DenyApproval};
 use oxidra::compaction::{
-    COMPACTION_ABORTED_KIND, COMPACTION_CHECKPOINT_KIND, COMPACTION_PROMPT_VERSION,
-    COMPACTION_STARTED_KIND, CompactionCandidate, CompactionStarted, MAX_COMPACTION_OUTPUT_TOKENS,
-    SOURCE_DIGEST_VERSION, SUMMARY_ENVELOPE_VERSION, USAGE_CONTRACT_VERSION,
-    build_compaction_source, compact_once, compaction_instructions, validate_checkpoint_chain,
+    COMPACTION_ABORTED_KIND, COMPACTION_BOUNDARY_FAILED_KIND,
+    COMPACTION_BOUNDARY_RETRY_STARTED_KIND, COMPACTION_BOUNDARY_STARTED_KIND,
+    COMPACTION_CHECKPOINT_KIND, COMPACTION_PROMPT_VERSION, COMPACTION_STARTED_KIND,
+    CompactionBoundary, CompactionBoundaryFailed, CompactionBoundaryStarted, CompactionCandidate,
+    CompactionStarted, MAX_COMPACTION_OUTPUT_TOKENS, SOURCE_DIGEST_VERSION,
+    SUMMARY_ENVELOPE_VERSION, USAGE_CONTRACT_VERSION, build_compaction_source, compact_once,
+    compaction_instructions, validate_checkpoint_chain, validate_compaction_boundary_chain,
 };
+use oxidra::config::{ContextLimits, ContextValueSource};
+use oxidra::context::AUTOMATIC_COMPACTION_PLANNING_VERSION;
 use oxidra::error::Result;
 use oxidra::projection::SOURCE_PROJECTION_VERSION;
 use oxidra::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
 use oxidra::session::{JOURNAL_SCHEMA, JournalEvent, SessionHeader, SessionJournal, SessionStore};
+use oxidra::tools::BuiltinTools;
 use oxidra::turn::{
     CompletePrefix, CompletionEvidence, TURN_BOUNDARY_VALIDATOR_VERSION, TURN_BOUNDARY_VERSION,
     TurnState, complete_prefix_candidates, segment_turns,
 };
-use oxidra::types::{AssistantTurn, Usage};
+use oxidra::types::{AssistantTurn, ToolCall, ToolResult, Usage};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +41,8 @@ const DATA_DIR_ENV: &str = "OXIDRA_FAULT_INJECTION_DATA_DIR";
 const COMPACTION_SCENARIO_ENV: &str = "OXIDRA_COMPACTION_FAULT_SCENARIO";
 const SESSION_ID: &str = "process-fault-session";
 const RETRY_SESSION_ID: &str = "retry-fault-session";
+const COMPACTION_REPLAN_SESSION_ID: &str = "compaction-replan-fault-session";
+const COMPACTION_REPLAN_SYNC_LABEL: &str = "compaction.boundary.retry_started";
 const TURN_ID: &str = "turn-1";
 const RESPONSE_ATTEMPT_ID: &str = "attempt-1";
 const SYNC_PREFIX: &str = "OXIDRA_FAULT_SYNC:";
@@ -334,6 +345,101 @@ fn force_kill_during_retry_preserves_the_original_prompt_and_intent() {
     }
 }
 
+#[test]
+fn force_kill_after_compaction_recovery_intent_can_retry_after_reopen() {
+    let temp = tempfile::tempdir().expect("create compaction replan fault data directory");
+    let child = spawn_compaction_replan_fault_child(temp.path());
+    stop_child_at_label(
+        child,
+        COMPACTION_REPLAN_SYNC_LABEL,
+        &[COMPACTION_REPLAN_SYNC_LABEL],
+    );
+
+    let store = SessionStore::new(temp.path()).expect("open compaction replan fault store");
+    let persisted = store
+        .inspect(COMPACTION_REPLAN_SESSION_ID)
+        .expect("inspect compaction replan journal before recovery");
+    assert_eq!(count_kind(&persisted, "user.message"), 7);
+    assert_eq!(count_kind(&persisted, COMPACTION_BOUNDARY_STARTED_KIND), 1);
+    assert_eq!(
+        count_kind(&persisted, COMPACTION_BOUNDARY_RETRY_STARTED_KIND),
+        1
+    );
+    assert_eq!(count_kind(&persisted, COMPACTION_BOUNDARY_FAILED_KIND), 1);
+    assert_eq!(count_kind(&persisted, COMPACTION_STARTED_KIND), 0);
+
+    let journal = store
+        .open(COMPACTION_REPLAN_SESSION_ID)
+        .expect("recover replacement compaction boundary after forced exit");
+    let recovered = journal
+        .read_events()
+        .expect("read recovered compaction replan journal");
+    assert_eq!(count_kind(&recovered, COMPACTION_BOUNDARY_FAILED_KIND), 2);
+    let recovered_chain = validate_compaction_boundary_chain(&recovered)
+        .expect("recovered boundary lineage remains valid");
+    assert_eq!(recovered_chain.pending().len(), 1);
+    assert_eq!(
+        recovered_chain.pending()[0].state,
+        oxidra::compaction::CompactionBoundaryState::Failed
+    );
+
+    let project_root = temp.path().join("project");
+    let tools = BuiltinTools::new(
+        &project_root,
+        journal.artifact_dir(),
+        temp.path().join("memory"),
+        false,
+        false,
+    )
+    .expect("create recovery tools");
+    let provider = std::sync::Arc::new(RecoveryProvider::new([
+        recovery_compaction_summary(),
+        recovery_final_turn(),
+    ]));
+    let mut agent = Agent::new(
+        provider.clone(),
+        journal,
+        tools,
+        "fault recovery instructions",
+        compaction_replan_context_limits(),
+        None,
+        None,
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create recovery runtime");
+    let outcome = runtime
+        .block_on(agent.retry_pending_turn(
+            CancellationToken::new(),
+            &mut NoopAgentObserver,
+            &mut DenyApproval,
+        ))
+        .expect("retry recovered compaction boundary");
+    assert_eq!(outcome.text, "recovered answer");
+    assert_eq!(provider.requests().len(), 2);
+    assert_eq!(provider.requests()[0].max_output_tokens, Some(8_192));
+    assert_eq!(provider.requests()[1].max_output_tokens, None);
+
+    let completed = agent
+        .journal()
+        .read_events()
+        .expect("read completed compaction replan journal");
+    assert_eq!(count_kind(&completed, "user.message"), 7);
+    assert_eq!(
+        count_kind(&completed, COMPACTION_BOUNDARY_RETRY_STARTED_KIND),
+        2
+    );
+    assert_eq!(count_kind(&completed, COMPACTION_STARTED_KIND), 1);
+    assert_eq!(count_kind(&completed, COMPACTION_CHECKPOINT_KIND), 1);
+    assert!(
+        validate_compaction_boundary_chain(&completed)
+            .expect("completed recovery boundary chain is valid")
+            .pending()
+            .is_empty()
+    );
+}
+
 // This ignored test is a helper process, not a standalone test. The parent
 // launches this same integration-test binary and kills it while a synced
 // journal writer is deliberately blocked on stdin.
@@ -516,6 +622,202 @@ fn retry_fault_injection_child() {
         )
         .expect("append retry completion marker");
     sync_barrier_label(RetrySyncPoint::TurnCompleted.label());
+}
+
+#[test]
+#[ignore = "launched by force_kill_after_compaction_recovery_intent_can_retry_after_reopen"]
+fn compaction_replan_fault_injection_child() {
+    if env::var_os(CHILD_MODE_ENV).is_none() {
+        return;
+    }
+    let data_dir = env::var_os(DATA_DIR_ENV).expect("compaction replan data directory is set");
+    let project_root = Path::new(&data_dir).join("project");
+    std::fs::create_dir_all(&project_root).expect("create compaction replan project root");
+    let store = SessionStore::new(&data_dir).expect("create compaction replan child store");
+    let mut journal = store
+        .create_with_id(
+            COMPACTION_REPLAN_SESSION_ID,
+            SessionHeader::new(&project_root, "fault-injection-model"),
+        )
+        .expect("create compaction replan child journal");
+    for index in 0..6 {
+        append_large_replan_turn(&mut journal, index);
+    }
+    let user = journal
+        .append_and_sync(
+            "user.message",
+            Some(TURN_ID),
+            json!({
+                "item":{"role":"user","content":"retry compaction after a crash"},
+                "turn_boundary_version":TURN_BOUNDARY_VERSION,
+            }),
+        )
+        .expect("append compaction replan user message");
+    let boundary = CompactionBoundary::new("initial-replan-boundary", TURN_ID, user.seq);
+    let extra = json!({
+        "planning_version": AUTOMATIC_COMPACTION_PLANNING_VERSION,
+        "context": planning_context_v1(user.seq),
+    })
+    .as_object()
+    .expect("planning extra is an object")
+    .clone();
+    journal
+        .append_and_sync(
+            COMPACTION_BOUNDARY_STARTED_KIND,
+            None,
+            serde_json::to_value(CompactionBoundaryStarted {
+                boundary: boundary.clone(),
+                trigger: "estimated_context_threshold".to_owned(),
+                extra,
+            })
+            .expect("encode initial compaction boundary"),
+        )
+        .expect("append initial compaction boundary");
+    journal
+        .append_and_sync(
+            COMPACTION_BOUNDARY_FAILED_KIND,
+            None,
+            serde_json::to_value(CompactionBoundaryFailed {
+                boundary_id: boundary.boundary_id,
+                code: "cancelled".to_owned(),
+                message: "injected preflight-only failure".to_owned(),
+                attempt_id: None,
+                extra: Default::default(),
+            })
+            .expect("encode initial compaction boundary failure"),
+        )
+        .expect("append initial compaction boundary failure");
+
+    let tools = BuiltinTools::new(
+        &project_root,
+        journal.artifact_dir(),
+        Path::new(&data_dir).join("memory"),
+        false,
+        false,
+    )
+    .expect("create compaction replan child tools");
+    let mut agent = Agent::new(
+        std::sync::Arc::new(UnexpectedRecoveryProvider),
+        journal,
+        tools,
+        "fault recovery instructions",
+        compaction_replan_context_limits(),
+        None,
+        None,
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create compaction replan child runtime");
+    let error = runtime
+        .block_on(agent.retry_pending_turn(
+            CancellationToken::new(),
+            &mut CompactionRecoverySyncObserver,
+            &mut DenyApproval,
+        ))
+        .expect_err("parent should kill the child at the durable retry intent");
+    panic!("compaction replan child unexpectedly resumed: {error}");
+}
+
+struct CompactionRecoverySyncObserver;
+
+impl AgentObserver for CompactionRecoverySyncObserver {
+    fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_message(&mut self, _message: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_compaction_recovery_intent_synced(&mut self) -> Result<()> {
+        sync_barrier_label(COMPACTION_REPLAN_SYNC_LABEL);
+        Ok(())
+    }
+}
+
+struct NoopAgentObserver;
+
+impl AgentObserver for NoopAgentObserver {
+    fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_message(&mut self, _message: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct UnexpectedRecoveryProvider;
+
+#[async_trait]
+impl ResponseProvider for UnexpectedRecoveryProvider {
+    async fn respond(
+        &self,
+        _request: ResponseRequest,
+        _observer: &mut dyn StreamObserver,
+        _cancellation: CancellationToken,
+    ) -> Result<AssistantTurn> {
+        panic!("Provider dispatch occurred before the recovery intent sync hook")
+    }
+}
+
+struct RecoveryProvider {
+    responses: Mutex<VecDeque<AssistantTurn>>,
+    requests: Mutex<Vec<ResponseRequest>>,
+}
+
+impl RecoveryProvider {
+    fn new(responses: impl IntoIterator<Item = AssistantTurn>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into_iter().collect()),
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<ResponseRequest> {
+        self.requests
+            .lock()
+            .expect("lock recovery requests")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl ResponseProvider for RecoveryProvider {
+    async fn respond(
+        &self,
+        request: ResponseRequest,
+        _observer: &mut dyn StreamObserver,
+        _cancellation: CancellationToken,
+    ) -> Result<AssistantTurn> {
+        self.requests
+            .lock()
+            .expect("lock recovery requests")
+            .push(request);
+        Ok(self
+            .responses
+            .lock()
+            .expect("lock recovery responses")
+            .pop_front()
+            .expect("scripted recovery response"))
+    }
 }
 
 struct FaultCompactionProvider {
@@ -771,6 +1073,144 @@ fn append_completed_compaction_turn(
         .expect("append compaction fixture turn marker")
 }
 
+fn append_large_replan_turn(journal: &mut SessionJournal, index: usize) {
+    let turn_id = format!("large-replan-turn-{index}");
+    let user = journal
+        .append_and_sync(
+            "user.message",
+            Some(&turn_id),
+            json!({
+                "item": {
+                    "role": "user",
+                    "content": format!("old question {index}:{}", "q".repeat(40_000)),
+                },
+                "turn_boundary_version": TURN_BOUNDARY_VERSION,
+            }),
+        )
+        .expect("append large replan user message");
+    let response_seq = journal.next_seq();
+    let text = format!("old answer {index}:{}", "a".repeat(40_000));
+    let item = json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type":"output_text","text":text}],
+    });
+    let response = journal
+        .append_and_sync(
+            "response.completed",
+            Some(&turn_id),
+            json!({
+                "response_attempt_id": format!("large-replan-response-{index}"),
+                "raw_response": {
+                    "id": format!("large-replan-response-{index}"),
+                    "output": [item.clone()],
+                },
+                "output_items": [item],
+                "text": text,
+                "turn_completion": {
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                    "covers_from_seq": user.seq,
+                    "final_response_seq": response_seq,
+                    "covers_through_seq": response_seq,
+                },
+            }),
+        )
+        .expect("append large replan response");
+    let marker_seq = journal.next_seq();
+    journal
+        .append_and_sync(
+            "turn.completed",
+            Some(&turn_id),
+            json!({
+                "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                "covers_from_seq": user.seq,
+                "final_response_seq": response.seq,
+                "covers_through_seq": marker_seq,
+            }),
+        )
+        .expect("append large replan turn marker");
+}
+
+fn planning_context_v1(request_journal_through_seq: u64) -> serde_json::Value {
+    json!({
+        "measurement": {
+            "measurement_version": 2,
+            "estimator_version": 1,
+            "request_shape_version": 1,
+            "request_digest": "fault-replan-recorded-request",
+            "estimated_input_tokens": 120_000,
+            "serialized_request_bytes": 480_000,
+        },
+        "provider_usage_domain": "fault-injection-provider",
+        "method": "full_request",
+        "anchor_response_seq": null,
+        "anchor_response_attempt_id": null,
+        "anchor_reported_input_tokens": null,
+        "anchor_estimated_input_tokens": null,
+        "estimate_delta_tokens": null,
+        "anchor_rejection_reason": null,
+        "estimated_next_input_tokens": 120_000,
+        "context_window": 130_000,
+        "reserve_tokens": 10_000,
+        "usable_tokens": 120_000,
+        "trigger_tokens": 96_000,
+        "target_tokens": 60_000,
+        "request_journal_through_seq": request_journal_through_seq,
+        "checkpoint_id": null,
+        "checkpoint_covers_through_seq": null,
+        "instructions_event_seq": null,
+        "configured_event_seq": null,
+        "tools_event_seq": 0,
+    })
+}
+
+fn compaction_replan_context_limits() -> ContextLimits {
+    ContextLimits {
+        context_window: Some(130_000),
+        reserve_tokens: 10_000,
+        context_window_source: ContextValueSource::Cli,
+        reserve_tokens_source: ContextValueSource::Cli,
+    }
+}
+
+fn recovery_compaction_summary() -> AssistantTurn {
+    recovery_turn("recovery-compaction", "recovered checkpoint summary", 20)
+}
+
+fn recovery_final_turn() -> AssistantTurn {
+    recovery_turn("recovery-final", "recovered answer", 10)
+}
+
+fn recovery_turn(id: &str, text: &str, output_tokens: u64) -> AssistantTurn {
+    let output_items = vec![json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type":"output_text","text":text}],
+    })];
+    AssistantTurn {
+        raw_response: json!({
+            "id": id,
+            "status": "completed",
+            "output": output_items,
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": output_tokens,
+                "total_tokens": 100 + output_tokens,
+            },
+        }),
+        output_items,
+        text: text.to_owned(),
+        tool_calls: Vec::new(),
+        usage: Usage {
+            input_tokens: 100,
+            output_tokens,
+            total_tokens: 100 + output_tokens,
+            ..Usage::default()
+        },
+        unknown_stream_events: Vec::new(),
+    }
+}
+
 fn spawn_fault_child(data_dir: &std::path::Path) -> Child {
     let mut command = Command::new(env::current_exe().expect("locate integration-test binary"));
     command
@@ -805,6 +1245,26 @@ fn spawn_retry_fault_child(data_dir: &Path) -> Child {
         .stderr(Stdio::piped());
     suppress_windows_console(&mut command);
     command.spawn().expect("spawn retry fault-injection child")
+}
+
+fn spawn_compaction_replan_fault_child(data_dir: &Path) -> Child {
+    let mut command = Command::new(env::current_exe().expect("locate integration-test binary"));
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            "compaction_replan_fault_injection_child",
+            "--nocapture",
+        ])
+        .env(CHILD_MODE_ENV, "1")
+        .env(DATA_DIR_ENV, data_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    suppress_windows_console(&mut command);
+    command
+        .spawn()
+        .expect("spawn compaction replan fault-injection child")
 }
 
 fn spawn_compaction_fault_child(data_dir: &Path, scenario: CompactionSyncPoint) -> Child {

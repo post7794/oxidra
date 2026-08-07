@@ -9,24 +9,27 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::compaction::{
     COMPACTION_BOUNDARY_ABANDONED_KIND, COMPACTION_BOUNDARY_FAILED_KIND,
-    COMPACTION_BOUNDARY_RETRY_STARTED_KIND, COMPACTION_BOUNDARY_STARTED_KIND, CandidateEstimate,
-    CompactionBoundary, CompactionBoundaryAbandoned, CompactionBoundaryChain,
-    CompactionBoundaryFailed, CompactionBoundaryRetryStarted, CompactionBoundaryStarted,
-    CompactionBoundaryState, CompactionCandidate, CompactionContext, CompactionSelection,
-    MAX_COMPACTION_OUTPUT_TOKENS, MIN_RECENT_COMPLETE_TURNS, SUMMARY_ENVELOPE_VERSION,
-    ValidatedCompactionBoundary, compact_once_for_boundary, compact_replay_once_for_boundary,
+    COMPACTION_BOUNDARY_RETRY_STARTED_KIND, COMPACTION_BOUNDARY_STARTED_KIND,
+    COMPACTION_STARTED_KIND, CandidateEstimate, CompactionBoundary, CompactionBoundaryAbandoned,
+    CompactionBoundaryChain, CompactionBoundaryFailed, CompactionBoundaryRetryStarted,
+    CompactionBoundaryStarted, CompactionBoundaryState, CompactionCandidate, CompactionContext,
+    CompactionSelection, CompactionStarted, MAX_COMPACTION_OUTPUT_TOKENS,
+    MIN_RECENT_COMPLETE_TURNS, SUMMARY_ENVELOPE_VERSION, ValidatedCompactionBoundary,
+    attempt_boundary, compact_once_for_boundary, compact_replay_once_for_boundary,
     ensure_checkpointed_boundary_request_ready, ensure_compaction_boundary_turn_request_ready,
     rebuild_failed_boundary_candidate, select_compaction_candidate, validate_checkpoint_chain,
     validate_compaction_boundary_chain, validate_replay_compaction_candidate,
 };
 use crate::config::ContextLimits;
 use crate::context::{
+    AUTOMATIC_COMPACTION_PLANNING_VERSION, AUTOMATIC_COMPACTION_PLANNING_VERSION_V1,
     ContextDecision, ContextRuntime, decide_context, measure_prepared_request, snapshot_tools,
 };
 use crate::error::{OxidraError, Result};
@@ -41,8 +44,10 @@ use crate::history::{
 use crate::history_artifact::{HistoryArtifactReader, HistoryArtifactRequest};
 pub use crate::projection::project_events;
 use crate::projection::{
+    project_checkpoint_and_tail_for_recovery_planning,
     project_checkpoint_and_tail_with_boundary_chain, project_compaction_summary_and_tail,
-    project_events_with_boundary_chain, validate_response_output_items,
+    project_events_for_recovery_planning, project_events_with_boundary_chain,
+    validate_response_output_items,
 };
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{JournalEvent, SessionJournal};
@@ -56,7 +61,10 @@ use crate::turn::{
 use crate::types::{ToolCall, ToolDefinition, ToolResult, Usage};
 
 const MAX_PROJECT_INSTRUCTIONS: usize = 32 * 1024;
-const AUTOMATIC_COMPACTION_PLANNING_VERSION: u32 = 1;
+const AUTOMATIC_COMPACTION_PLANNING_CONTEXT_MEASUREMENT_VERSION_V1: u32 = 2;
+const AUTOMATIC_COMPACTION_PLANNING_CONTEXT_ESTIMATOR_VERSION_V1: u32 = 1;
+const AUTOMATIC_COMPACTION_PLANNING_CONTEXT_REQUEST_SHAPE_VERSION_V1: u32 = 1;
+const PROVIDER_CALL_BUDGET_VERSION_V1: u32 = 1;
 
 /// Events emitted to the UI.  Streaming provider events are forwarded through
 /// [`AgentObserver::on_provider_event`]; tool lifecycle events are committed before/after the
@@ -71,6 +79,13 @@ pub trait AgentObserver: Send {
     fn on_message(&mut self, message: &str) -> Result<()>;
     fn on_compaction(&mut self, message: &str) -> Result<()> {
         self.on_message(message)
+    }
+
+    /// Observability hook after a replacement compaction boundary is durable
+    /// but before its candidate is planned. The default remains silent; process
+    /// fault-injection tests block here and kill the writer.
+    fn on_compaction_recovery_intent_synced(&mut self) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -223,6 +238,48 @@ struct AutomaticCompactionPlanV1 {
     current_context: ContextDecision,
     selection: CompactionSelection,
     continuations: HashMap<u64, PlannedCompactionContinuationV1>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct AutomaticCompactionPlanningMeasurementV1 {
+    measurement_version: u32,
+    estimator_version: u32,
+    request_shape_version: u32,
+    request_digest: String,
+    estimated_input_tokens: u64,
+}
+
+/// Frozen reader for `planning_version = 1` metadata.
+///
+/// The journal currently stores the larger [`ContextDecision`] audit object,
+/// but recovery only depends on this immutable subset. Future fields added to
+/// `ContextDecision` therefore cannot silently change v1 replay semantics.
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct AutomaticCompactionPlanningContextV1 {
+    measurement: AutomaticCompactionPlanningMeasurementV1,
+    provider_usage_domain: String,
+    estimated_next_input_tokens: u64,
+    context_window: Option<u64>,
+    reserve_tokens: u64,
+    usable_tokens: Option<u64>,
+    trigger_tokens: Option<u64>,
+    target_tokens: Option<u64>,
+    request_journal_through_seq: Option<u64>,
+    checkpoint_id: Option<String>,
+    checkpoint_covers_through_seq: Option<u64>,
+    instructions_event_seq: Option<u64>,
+    configured_event_seq: Option<u64>,
+    tools_event_seq: u64,
+}
+
+struct PreparedRequestMaterials {
+    request: ResponseRequest,
+    definitions: Vec<ToolDefinition>,
+    history: HistorySnapshot,
+    history_quota: HistoryQuota,
+    history_exposed: bool,
+    checkpoint_id: Option<String>,
+    checkpoint_covers_through_seq: Option<u64>,
 }
 
 enum RecoveryActionV1 {
@@ -398,7 +455,6 @@ impl Agent {
             cancellation,
             observer,
             approval,
-            0,
             Usage::default(),
         )
         .await
@@ -412,7 +468,6 @@ impl Agent {
         cancellation: CancellationToken,
         observer: &mut dyn AgentObserver,
         approval: &mut dyn ApprovalHandler,
-        mut provider_calls: usize,
         initial_usage: Usage,
     ) -> Result<TurnOutcome> {
         let mut outcome = TurnOutcome {
@@ -426,25 +481,12 @@ impl Agent {
                 self.append_turn_cancelled(turn_id, "cancelled before response started")?;
                 return Err(OxidraError::Interrupted);
             }
-            if self
-                .max_responses
-                .is_some_and(|limit| outcome.responses >= limit)
-            {
-                self.journal.append_and_sync(
-                    "agent.limit_reached",
-                    Some(turn_id),
-                    json!({ "kind": "responses", "limit": self.max_responses }),
-                )?;
-                return Err(OxidraError::Limit("max responses reached".to_owned()));
-            }
-
             let (request, mut prepared_tools) = self
                 .prepare_request_with_automatic_compaction(
                     turn_id,
                     turn_start_seq,
                     cancellation.clone(),
                     observer,
-                    &mut provider_calls,
                     &mut outcome.usage,
                 )
                 .await?;
@@ -454,18 +496,7 @@ impl Agent {
             }
             let context = self.context_estimate(&prepared_tools.context);
             outcome.context = Some(context.clone());
-            if self
-                .max_responses
-                .is_some_and(|limit| provider_calls >= limit)
-            {
-                self.journal.append_and_sync(
-                    "agent.limit_reached",
-                    Some(turn_id),
-                    json!({ "kind": "responses", "limit": self.max_responses }),
-                )?;
-                return Err(OxidraError::Limit("max responses reached".to_owned()));
-            }
-            provider_calls = provider_calls.saturating_add(1);
+            self.ensure_provider_call_budget(turn_id)?;
             let response_attempt_id = Uuid::now_v7().to_string();
             self.journal.append_and_sync(
                 "response.started",
@@ -1009,7 +1040,10 @@ impl Agent {
         boundary: &ValidatedCompactionBoundary,
         context: Option<&PendingContextTurn>,
     ) -> Result<RecoveryActionV1> {
-        let current_context = rebuild_automatic_compaction_planning_context_v1(
+        // The historical planning object proves that this lineage was created
+        // by a supported automatic preflight protocol. It is audit evidence,
+        // not the runtime decision used after resume.
+        let _recorded_context = rebuild_automatic_compaction_planning_context_v1(
             snapshot,
             &boundary.boundary.boundary_id,
         )?;
@@ -1023,17 +1057,11 @@ impl Agent {
             boundary.boundary.turn_id.clone(),
             boundary.boundary.user_message_seq,
         );
-        let mut retry_extra = Map::new();
-        retry_extra.insert(
-            "planning_version".to_owned(),
-            json!(AUTOMATIC_COMPACTION_PLANNING_VERSION),
-        );
-        retry_extra.insert("context".to_owned(), current_context.audit_value()?);
-        let retry = CompactionBoundaryRetryStarted {
+        let mut retry = CompactionBoundaryRetryStarted {
             retry_id: Uuid::now_v7().to_string(),
             previous_boundary_id: boundary.boundary.boundary_id.clone(),
             boundary: replacement,
-            extra: retry_extra,
+            extra: Map::new(),
         };
 
         let mut prospective = snapshot.to_vec();
@@ -1069,6 +1097,42 @@ impl Agent {
             )));
         }
         ensure_compaction_boundary_turn_request_ready(&prospective, &retry.boundary)?;
+
+        let current_context = self.measure_replan_context_v1(
+            &prospective,
+            &prospective_boundaries,
+            &retry.boundary.turn_id,
+        )?;
+        let trigger = current_context.trigger_tokens.ok_or_else(|| {
+            OxidraError::Config(
+                "automatic compaction recovery requires a current trigger token count".to_owned(),
+            )
+        })?;
+        current_context.target_tokens.ok_or_else(|| {
+            OxidraError::Config(
+                "automatic compaction recovery requires a current target token count".to_owned(),
+            )
+        })?;
+        if current_context.estimated_next_input_tokens < trigger {
+            return Err(OxidraError::ApprovalRequired(format!(
+                "current request estimate {} is below the current automatic compaction trigger {trigger}; the failed boundary cannot be replayed safely without a resolved-without-checkpoint protocol, so abandon it before continuing",
+                current_context.estimated_next_input_tokens
+            )));
+        }
+
+        retry.extra.insert(
+            "planning_version".to_owned(),
+            json!(AUTOMATIC_COMPACTION_PLANNING_VERSION),
+        );
+        retry.extra.insert(
+            "context".to_owned(),
+            automatic_compaction_planning_context_value_v1(&current_context)?,
+        );
+        let retry_event = prospective
+            .last_mut()
+            .ok_or_else(|| OxidraError::Session("prospective retry journal is empty".to_owned()))?;
+        retry_event.data = serde_json::to_value(&retry)?;
+        validate_compaction_boundary_chain(&prospective)?;
 
         Ok(RecoveryActionV1::ReplanFailedBoundary {
             context_retry_intent,
@@ -1141,6 +1205,7 @@ impl Agent {
                 retry,
                 retry_intent,
             } => {
+                self.ensure_provider_call_budget(&retry.turn_id)?;
                 self.retry_pending_context_turn_from_snapshot(
                     &snapshot,
                     &retry,
@@ -1168,6 +1233,7 @@ impl Agent {
                 continuation,
             } => {
                 let replacement = retry.boundary.clone();
+                self.ensure_provider_call_budget(&replacement.turn_id)?;
                 if let Some(intent) = context_retry_intent {
                     self.journal.append_and_sync(
                         "turn.retry_started",
@@ -1200,7 +1266,6 @@ impl Agent {
                     cancellation,
                     observer,
                     approval,
-                    1,
                     usage,
                 )
                 .await
@@ -1211,6 +1276,7 @@ impl Agent {
                 current_context,
             } => {
                 let replacement = retry.boundary.clone();
+                self.ensure_provider_call_budget(&replacement.turn_id)?;
                 if let Some(intent) = context_retry_intent {
                     self.journal.append_and_sync(
                         "turn.retry_started",
@@ -1223,6 +1289,15 @@ impl Agent {
                     None,
                     serde_json::to_value(&retry)?,
                 )?;
+
+                if let Err(error) = observer.on_compaction_recovery_intent_synced() {
+                    self.append_automatic_compaction_preflight_failure(
+                        &replacement,
+                        "observer_failed",
+                        &error.to_string(),
+                    )?;
+                    return Err(error);
+                }
 
                 if cancellation.is_cancelled() {
                     self.append_automatic_compaction_preflight_failure(
@@ -1310,7 +1385,6 @@ impl Agent {
                     cancellation,
                     observer,
                     approval,
-                    1,
                     usage,
                 )
                 .await
@@ -1341,6 +1415,7 @@ impl Agent {
                     .to_owned(),
             ));
         };
+        self.ensure_provider_call_budget(&retry.turn_id)?;
         self.retry_pending_context_turn_from_snapshot(
             &snapshot,
             &retry,
@@ -1781,13 +1856,107 @@ impl Agent {
         Ok(())
     }
 
+    /// Enforce the response-call insurance limit from durable dispatch intents,
+    /// not process-local counters. Both normal `response.started` and bound
+    /// `compaction.started` rows consume the turn's budget, including attempts
+    /// that later fail, abort, or are recovered after a crash.
+    fn ensure_provider_call_budget(&mut self, turn_id: &str) -> Result<()> {
+        let Some(limit) = self.max_responses else {
+            return Ok(());
+        };
+        let events = self.journal.read_events()?;
+        let boundary_chain = validate_compaction_boundary_chain(&events)?;
+        let boundary_owns_recovery = boundary_chain
+            .pending()
+            .iter()
+            .any(|boundary| boundary.boundary.turn_id == turn_id);
+        let consumed = durable_provider_call_intents_for_turn(&events, turn_id)?;
+        let latest_retry_seq = events
+            .iter()
+            .filter(|event| {
+                event.kind == "turn.retry_started" && event.turn_id.as_deref() == Some(turn_id)
+            })
+            .map(|event| event.seq)
+            .max()
+            .unwrap_or(0);
+        let limit_u64 = u64::try_from(limit)
+            .map_err(|_| OxidraError::Config("max responses exceeds u64".to_owned()))?;
+        let consumed_u64 = u64::try_from(consumed).map_err(|_| {
+            OxidraError::Session("provider call intent count exceeds u64".to_owned())
+        })?;
+        let mut already_recorded = false;
+        for event in events.iter().filter(|event| {
+            event.seq > latest_retry_seq
+                && event.kind == "agent.limit_reached"
+                && event.turn_id.as_deref() == Some(turn_id)
+                && event.data.get("kind").and_then(Value::as_str) == Some("responses")
+        }) {
+            let recorded_version = event
+                .data
+                .get("provider_call_budget_version")
+                .map(|version| {
+                    version.as_u64().ok_or_else(|| {
+                        OxidraError::Session(format!(
+                            "agent.limit_reached at seq {} has a non-integer Provider call budget version",
+                            event.seq
+                        ))
+                    })
+                })
+                .transpose()?;
+            if recorded_version
+                .is_some_and(|version| version != u64::from(PROVIDER_CALL_BUDGET_VERSION_V1))
+            {
+                return Err(OxidraError::Session(format!(
+                    "agent.limit_reached at seq {} uses unsupported Provider call budget version {:?}",
+                    event.seq, recorded_version
+                )));
+            }
+            if event.data.get("limit").and_then(Value::as_u64) != Some(limit_u64) {
+                continue;
+            }
+            // Pre-v1 limit events did not record the durable consumed count.
+            // Treat the matching current limit as already terminal rather than
+            // appending a second terminal event into the same retry epoch.
+            if recorded_version.is_none()
+                || event
+                    .data
+                    .get("consumed_provider_call_intents")
+                    .and_then(Value::as_u64)
+                    == Some(consumed_u64)
+            {
+                already_recorded = true;
+            }
+        }
+        if consumed < limit {
+            return Ok(());
+        }
+        // `agent.limit_reached` is a terminal turn event. A pending compaction
+        // boundary is itself the durable recovery owner, so writing that turn
+        // terminal here would make the boundary impossible to resume after the
+        // user raises `--max-responses`. The durable dispatch intents already
+        // provide the cross-process budget fact; leave the boundary pending and
+        // re-evaluate the current runtime limit on the next retry.
+        if !already_recorded && !boundary_owns_recovery {
+            self.journal.append_and_sync(
+                "agent.limit_reached",
+                Some(turn_id),
+                json!({
+                    "kind": "responses",
+                    "limit": limit,
+                    "consumed_provider_call_intents": consumed,
+                    "provider_call_budget_version": PROVIDER_CALL_BUDGET_VERSION_V1,
+                }),
+            )?;
+        }
+        Err(OxidraError::Limit("max responses reached".to_owned()))
+    }
+
     async fn prepare_request_with_automatic_compaction(
         &mut self,
         turn_id: &str,
         user_message_seq: u64,
         cancellation: CancellationToken,
         observer: &mut dyn AgentObserver,
-        provider_calls: &mut usize,
         usage: &mut Usage,
     ) -> Result<(ResponseRequest, PreparedToolSet)> {
         let (request, prepared) = self.prepare_request(Some(turn_id))?;
@@ -1808,6 +1977,11 @@ impl Agent {
         if prepared.context.estimated_next_input_tokens < trigger_tokens {
             return Ok((request, prepared));
         }
+
+        // Reserve budget before the boundary intent is durable. If no Provider
+        // slot remains, terminate the turn without creating a pending boundary
+        // that could never legally dispatch its compaction attempt.
+        self.ensure_provider_call_budget(turn_id)?;
 
         let snapshot = self.journal.read_events()?;
         if snapshot.last().map(|event| event.seq) != prepared.context.request_journal_through_seq {
@@ -1834,7 +2008,10 @@ impl Agent {
             "planning_version".to_owned(),
             json!(AUTOMATIC_COMPACTION_PLANNING_VERSION),
         );
-        extra.insert("context".to_owned(), prepared.context.audit_value()?);
+        extra.insert(
+            "context".to_owned(),
+            automatic_compaction_planning_context_value_v1(&prepared.context)?,
+        );
         extra.insert("trigger_tokens".to_owned(), json!(trigger_tokens));
         extra.insert("target_tokens".to_owned(), json!(target_tokens));
         extra.insert(
@@ -1968,19 +2145,7 @@ impl Agent {
             return Err(OxidraError::Interrupted);
         }
 
-        *provider_calls = (*provider_calls).saturating_add(1);
         accumulate_usage_value(usage, &checkpoint.usage)?;
-        if self
-            .max_responses
-            .is_some_and(|limit| *provider_calls >= limit)
-        {
-            self.journal.append_and_sync(
-                "agent.limit_reached",
-                Some(turn_id),
-                json!({ "kind": "responses", "limit": self.max_responses }),
-            )?;
-            return Err(OxidraError::Limit("max responses reached".to_owned()));
-        }
 
         let _ = self.prepare_request(Some(turn_id))?;
         let (request, prepared) = self.prepare_request(Some(turn_id))?;
@@ -2116,29 +2281,40 @@ impl Agent {
         Ok(())
     }
 
-    fn prepare_request(
-        &mut self,
+    fn build_prepared_request_materials(
+        &self,
+        events: &[JournalEvent],
+        boundary_chain: &CompactionBoundaryChain,
         turn_id: Option<&str>,
-    ) -> Result<(ResponseRequest, PreparedToolSet)> {
-        let events = self.journal.read_events()?;
-        let boundary_chain = validate_compaction_boundary_chain(&events)?;
-        ensure_compaction_boundaries_allow_request(&events, &boundary_chain, turn_id)?;
-        let chain = validate_checkpoint_chain(&events)?;
+        recovery_planning: bool,
+    ) -> Result<PreparedRequestMaterials> {
+        let chain = validate_checkpoint_chain(events)?;
         let checkpoint_id = chain
             .latest()
             .map(|checkpoint| checkpoint.checkpoint_id.clone());
         let checkpoint_covers_through_seq = chain
             .latest()
             .map(|checkpoint| checkpoint.covers_through_seq);
-        let input = if chain.latest().is_some() {
-            project_checkpoint_and_tail_with_boundary_chain(&events, &chain, &boundary_chain)?
+        let input = if recovery_planning && chain.latest().is_some() {
+            project_checkpoint_and_tail_for_recovery_planning(events, &chain, boundary_chain)?
+        } else if recovery_planning {
+            project_events_for_recovery_planning(events, boundary_chain)?
+        } else if chain.latest().is_some() {
+            project_checkpoint_and_tail_with_boundary_chain(events, &chain, boundary_chain)?
         } else {
-            project_events_with_boundary_chain(&events, &boundary_chain)?
+            project_events_with_boundary_chain(events, boundary_chain)?
         };
-        let history = HistorySnapshot::build_with_boundary_chain(&events, &chain, &boundary_chain)?;
+        let history = if recovery_planning {
+            HistorySnapshot::build_for_recovery_planning(events, &chain, boundary_chain)?
+        } else {
+            HistorySnapshot::build_with_boundary_chain(events, &chain, boundary_chain)?
+        };
         let history_quota = match turn_id {
+            Some(turn_id) if recovery_planning => {
+                rebuild_history_quota_for_compaction_preview(events, turn_id, boundary_chain)?
+            }
             Some(turn_id) => {
-                rebuild_history_quota_with_boundary_chain(&events, turn_id, &boundary_chain)?
+                rebuild_history_quota_with_boundary_chain(events, turn_id, boundary_chain)?
             }
             None => HistoryQuota {
                 used_bytes: 0,
@@ -2161,8 +2337,89 @@ impl Agent {
             model: None,
             max_output_tokens: None,
         };
-        let measurement = measure_prepared_request(&request, &self.context_runtime)?;
-        let tool_snapshot = snapshot_tools(&definitions)?;
+        Ok(PreparedRequestMaterials {
+            request,
+            definitions,
+            history,
+            history_quota,
+            history_exposed,
+            checkpoint_id,
+            checkpoint_covers_through_seq,
+        })
+    }
+
+    fn finish_prepared_request(
+        &self,
+        events: &[JournalEvent],
+        materials: PreparedRequestMaterials,
+        tools_event_seq: u64,
+    ) -> Result<(ResponseRequest, PreparedToolSet)> {
+        let measurement = measure_prepared_request(&materials.request, &self.context_runtime)?;
+        let instructions_event_seq = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "context.instructions")
+            .map(|event| event.seq);
+        let configured_event_seq = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "context.configured")
+            .map(|event| event.seq);
+        let context = decide_context(
+            events,
+            &self.context_runtime,
+            measurement,
+            events.last().map(|event| event.seq),
+            materials.checkpoint_id,
+            materials.checkpoint_covers_through_seq,
+            instructions_event_seq,
+            configured_event_seq,
+            tools_event_seq,
+        )?;
+        Ok((
+            materials.request,
+            PreparedToolSet {
+                definitions: materials.definitions,
+                history: materials.history,
+                history_quota: materials.history_quota,
+                history_exposed: materials.history_exposed,
+                context,
+            },
+        ))
+    }
+
+    fn measure_replan_context_v1(
+        &self,
+        events: &[JournalEvent],
+        boundary_chain: &CompactionBoundaryChain,
+        turn_id: &str,
+    ) -> Result<ContextDecision> {
+        let materials =
+            self.build_prepared_request_materials(events, boundary_chain, Some(turn_id), true)?;
+        let tool_snapshot = snapshot_tools(&materials.definitions)?;
+        let tools_event_seq = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.kind == "context.tools"
+                    && event.data.get("digest").and_then(Value::as_str)
+                        == Some(tool_snapshot.digest.as_str())
+            })
+            .map_or(0, |event| event.seq);
+        let (_, prepared) = self.finish_prepared_request(events, materials, tools_event_seq)?;
+        Ok(prepared.context)
+    }
+
+    fn prepare_request(
+        &mut self,
+        turn_id: Option<&str>,
+    ) -> Result<(ResponseRequest, PreparedToolSet)> {
+        let events = self.journal.read_events()?;
+        let boundary_chain = validate_compaction_boundary_chain(&events)?;
+        ensure_compaction_boundaries_allow_request(&events, &boundary_chain, turn_id)?;
+        let materials =
+            self.build_prepared_request_materials(&events, &boundary_chain, turn_id, false)?;
+        let tool_snapshot = snapshot_tools(&materials.definitions)?;
         let tools_event_seq = match &self.tools_epoch {
             Some((digest, seq)) if digest == &tool_snapshot.digest => *seq,
             _ => {
@@ -2175,37 +2432,7 @@ impl Agent {
                 event.seq
             }
         };
-        let instructions_event_seq = events
-            .iter()
-            .rev()
-            .find(|event| event.kind == "context.instructions")
-            .map(|event| event.seq);
-        let configured_event_seq = events
-            .iter()
-            .rev()
-            .find(|event| event.kind == "context.configured")
-            .map(|event| event.seq);
-        let context = decide_context(
-            &events,
-            &self.context_runtime,
-            measurement,
-            events.last().map(|event| event.seq),
-            checkpoint_id,
-            checkpoint_covers_through_seq,
-            instructions_event_seq,
-            configured_event_seq,
-            tools_event_seq,
-        )?;
-        Ok((
-            request,
-            PreparedToolSet {
-                definitions,
-                history,
-                history_quota,
-                history_exposed,
-                context,
-            },
-        ))
+        self.finish_prepared_request(&events, materials, tools_event_seq)
     }
 
     fn context_estimate(&self, decision: &ContextDecision) -> ContextEstimate {
@@ -2261,10 +2488,41 @@ fn planned_context_retry_intent(
     }))
 }
 
+fn durable_provider_call_intents_for_turn(events: &[JournalEvent], turn_id: &str) -> Result<usize> {
+    // Validate the boundary/attempt graph before interpreting its bindings as
+    // budget facts. Raw `extra["boundary"]` fields are not authority by
+    // themselves.
+    validate_compaction_boundary_chain(events)?;
+    let normal = events
+        .iter()
+        .filter(|event| {
+            event.kind == "response.started" && event.turn_id.as_deref() == Some(turn_id)
+        })
+        .count();
+    let mut compaction = 0usize;
+    for event in events
+        .iter()
+        .filter(|event| event.kind == COMPACTION_STARTED_KIND)
+    {
+        let started: CompactionStarted = serde_json::from_value(event.data.clone())?;
+        if attempt_boundary(&started.extra)?
+            .as_ref()
+            .is_some_and(|boundary| boundary.turn_id == turn_id)
+        {
+            compaction = compaction.checked_add(1).ok_or_else(|| {
+                OxidraError::Session("provider call intent count overflow".to_owned())
+            })?;
+        }
+    }
+    normal
+        .checked_add(compaction)
+        .ok_or_else(|| OxidraError::Session("provider call intent count overflow".to_owned()))
+}
+
 fn rebuild_automatic_compaction_planning_context_v1(
     events: &[JournalEvent],
     boundary_id: &str,
-) -> Result<ContextDecision> {
+) -> Result<AutomaticCompactionPlanningContextV1> {
     let mut current_boundary_id = boundary_id.to_owned();
     let mut visited = HashSet::new();
     loop {
@@ -2317,7 +2575,7 @@ fn rebuild_automatic_compaction_planning_context_v1(
 fn automatic_compaction_planning_context_v1(
     extra: &Map<String, Value>,
     boundary_id: &str,
-) -> Result<Option<ContextDecision>> {
+) -> Result<Option<AutomaticCompactionPlanningContextV1>> {
     let planning_version = extra.get("planning_version");
     let context = extra.get("context");
     match (planning_version, context) {
@@ -2328,17 +2586,92 @@ fn automatic_compaction_planning_context_v1(
                     "automatic compaction boundary {boundary_id} has a non-integer planning version"
                 ))
             })?;
-            if version != u64::from(AUTOMATIC_COMPACTION_PLANNING_VERSION) {
-                return Err(OxidraError::ApprovalRequired(format!(
-                    "automatic compaction boundary {boundary_id} uses unsupported planning version {version}; abandon it"
-                )));
-            }
-            Ok(Some(serde_json::from_value(context.clone())?))
+            let parsed = match u32::try_from(version).ok() {
+                Some(AUTOMATIC_COMPACTION_PLANNING_VERSION_V1) => {
+                    serde_json::from_value::<AutomaticCompactionPlanningContextV1>(context.clone())?
+                }
+                _ => {
+                    return Err(OxidraError::ApprovalRequired(format!(
+                        "automatic compaction boundary {boundary_id} uses unsupported planning version {version}; abandon it"
+                    )));
+                }
+            };
+            validate_automatic_compaction_planning_context_v1(&parsed, boundary_id)?;
+            Ok(Some(parsed))
         }
         _ => Err(OxidraError::Session(format!(
             "automatic compaction boundary {boundary_id} has incomplete durable planning metadata"
         ))),
     }
+}
+
+fn validate_automatic_compaction_planning_context_v1(
+    context: &AutomaticCompactionPlanningContextV1,
+    boundary_id: &str,
+) -> Result<()> {
+    let measurement = &context.measurement;
+    if measurement.measurement_version
+        != AUTOMATIC_COMPACTION_PLANNING_CONTEXT_MEASUREMENT_VERSION_V1
+        || measurement.estimator_version
+            != AUTOMATIC_COMPACTION_PLANNING_CONTEXT_ESTIMATOR_VERSION_V1
+        || measurement.request_shape_version
+            != AUTOMATIC_COMPACTION_PLANNING_CONTEXT_REQUEST_SHAPE_VERSION_V1
+    {
+        return Err(OxidraError::ApprovalRequired(format!(
+            "automatic compaction boundary {boundary_id} uses unsupported planning v1 context measurement versions; abandon it"
+        )));
+    }
+    if measurement.request_digest.trim().is_empty()
+        || context.provider_usage_domain.trim().is_empty()
+    {
+        return Err(OxidraError::Session(format!(
+            "automatic compaction boundary {boundary_id} has incomplete planning v1 identity"
+        )));
+    }
+    let expected_usable = context
+        .context_window
+        .map(|window| window.saturating_sub(context.reserve_tokens));
+    let expected_trigger = expected_usable.map(|usable| ((u128::from(usable) * 80) / 100) as u64);
+    let expected_target = expected_usable.map(|usable| usable / 2);
+    if context.usable_tokens != expected_usable
+        || context.trigger_tokens != expected_trigger
+        || context.target_tokens != expected_target
+    {
+        return Err(OxidraError::Session(format!(
+            "automatic compaction boundary {boundary_id} has internally inconsistent planning v1 limits"
+        )));
+    }
+    Ok(())
+}
+
+fn automatic_compaction_planning_context_value_v1(context: &ContextDecision) -> Result<Value> {
+    if context.measurement.measurement_version
+        != AUTOMATIC_COMPACTION_PLANNING_CONTEXT_MEASUREMENT_VERSION_V1
+        || context.measurement.estimator_version
+            != AUTOMATIC_COMPACTION_PLANNING_CONTEXT_ESTIMATOR_VERSION_V1
+        || context.measurement.request_shape_version
+            != AUTOMATIC_COMPACTION_PLANNING_CONTEXT_REQUEST_SHAPE_VERSION_V1
+    {
+        return Err(OxidraError::Config(
+            "current context measurement versions require a new automatic compaction planning protocol version"
+                .to_owned(),
+        ));
+    }
+    let value = context.audit_value()?;
+    let frozen = serde_json::from_value::<AutomaticCompactionPlanningContextV1>(value.clone())
+        .map_err(|error| {
+            OxidraError::Config(format!(
+                "current context decision cannot be written as automatic compaction planning v1: {error}"
+            ))
+        })?;
+    validate_automatic_compaction_planning_context_v1(&frozen, "current-writer").map_err(
+        |error| {
+            OxidraError::Config(format!(
+                "current context decision requires a new automatic compaction planning protocol version: {error}"
+            ))
+        },
+    )?;
+    Ok(value)
 }
 
 fn append_prospective_event(
@@ -2850,6 +3183,9 @@ mod tests {
         compact_once_for_boundary, compact_replay_once_for_boundary, select_compaction_candidate,
     };
     use crate::config::ContextValueSource;
+    use crate::context::{
+        CONTEXT_ESTIMATOR_VERSION, CONTEXT_MEASUREMENT_VERSION, REQUEST_SHAPE_VERSION,
+    };
     use crate::history::UNTRUSTED_HISTORY_NOTICE;
     use crate::session::{JournalEvent, SessionHeader, SessionStore};
     use crate::turn::{CompletionEvidence, TurnState, segment_turns};
@@ -3272,6 +3608,66 @@ mod tests {
         (temp, agent)
     }
 
+    fn append_preflight_only_automatic_compaction_failure(
+        agent: &mut Agent,
+        boundary_id: &str,
+        turn_id: &str,
+        prompt: &str,
+    ) -> CompactionBoundary {
+        let user = agent
+            .journal_mut()
+            .append_and_sync(
+                "user.message",
+                Some(turn_id),
+                json!({
+                    "item":{"role":"user","content":prompt},
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let (_, prepared) = agent.prepare_request(Some(turn_id)).unwrap();
+        let boundary = CompactionBoundary::new(boundary_id, turn_id, user.seq);
+        let mut extra = Map::new();
+        extra.insert(
+            "planning_version".to_owned(),
+            json!(AUTOMATIC_COMPACTION_PLANNING_VERSION),
+        );
+        extra.insert(
+            "context".to_owned(),
+            automatic_compaction_planning_context_value_v1(&prepared.context).unwrap(),
+        );
+        agent
+            .journal_mut()
+            .append_and_sync(
+                COMPACTION_BOUNDARY_STARTED_KIND,
+                None,
+                serde_json::to_value(CompactionBoundaryStarted {
+                    boundary: boundary.clone(),
+                    trigger: "estimated_context_threshold".to_owned(),
+                    extra,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        agent
+            .journal_mut()
+            .append_and_sync(
+                COMPACTION_BOUNDARY_FAILED_KIND,
+                None,
+                serde_json::to_value(CompactionBoundaryFailed {
+                    boundary_id: boundary.boundary_id.clone(),
+                    code: "cancelled".to_owned(),
+                    message: "automatic compaction was cancelled before candidate planning"
+                        .to_owned(),
+                    attempt_id: None,
+                    extra: Default::default(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        boundary
+    }
+
     fn append_complete_turn(
         journal: &mut SessionJournal,
         turn_id: &str,
@@ -3657,6 +4053,8 @@ mod tests {
 
     struct FailingStartObserver;
 
+    struct FailingCompactionRecoveryIntentObserver;
+
     struct CancelAfterCheckpointObserver {
         cancellation: CancellationToken,
     }
@@ -3724,6 +4122,30 @@ mod tests {
         }
     }
 
+    impl AgentObserver for FailingCompactionRecoveryIntentObserver {
+        fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_message(&mut self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_compaction_recovery_intent_synced(&mut self) -> Result<()> {
+            Err(OxidraError::Config(
+                "injected recovery observer failure".to_owned(),
+            ))
+        }
+    }
+
     impl AgentObserver for CancelAfterCheckpointObserver {
         fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
             Ok(())
@@ -3747,6 +4169,69 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn automatic_compaction_planning_v1_fixture_is_frozen_and_extensible() {
+        let context = serde_json::from_str::<Value>(include_str!(
+            "../tests/fixtures/automatic_compaction_planning_v1.json"
+        ))
+        .unwrap();
+        let mut extra = Map::new();
+        extra.insert(
+            "planning_version".to_owned(),
+            json!(AUTOMATIC_COMPACTION_PLANNING_VERSION_V1),
+        );
+        extra.insert("context".to_owned(), context.clone());
+
+        let parsed = automatic_compaction_planning_context_v1(&extra, "fixture-boundary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.estimated_next_input_tokens, 100_000);
+        assert_eq!(parsed.trigger_tokens, Some(96_000));
+        assert_eq!(parsed.target_tokens, Some(60_000));
+        assert_eq!(parsed.measurement.measurement_version, 2);
+        assert_eq!(parsed.measurement.estimator_version, 1);
+        assert_eq!(parsed.measurement.request_shape_version, 1);
+
+        let mut unknown = extra.clone();
+        unknown.insert("planning_version".to_owned(), json!(2));
+        let error =
+            automatic_compaction_planning_context_v1(&unknown, "future-boundary").unwrap_err();
+        assert!(matches!(error, OxidraError::ApprovalRequired(_)));
+
+        let mut unsupported_nested = extra;
+        unsupported_nested["context"]["measurement"]["measurement_version"] = json!(3);
+        let error = automatic_compaction_planning_context_v1(
+            &unsupported_nested,
+            "unsupported-measurement-boundary",
+        )
+        .unwrap_err();
+        assert!(matches!(error, OxidraError::ApprovalRequired(_)));
+
+        let current = serde_json::from_value::<ContextDecision>(context).unwrap();
+        automatic_compaction_planning_context_value_v1(&current).unwrap();
+        let mut changed = current;
+        changed.measurement.measurement_version = 3;
+        let error = automatic_compaction_planning_context_value_v1(&changed).unwrap_err();
+        assert!(matches!(error, OxidraError::Config(_)));
+    }
+
+    #[test]
+    fn automatic_compaction_planning_v1_writer_dependencies_are_explicit() {
+        assert_eq!(AUTOMATIC_COMPACTION_PLANNING_VERSION, 1);
+        assert_eq!(
+            CONTEXT_MEASUREMENT_VERSION,
+            AUTOMATIC_COMPACTION_PLANNING_CONTEXT_MEASUREMENT_VERSION_V1
+        );
+        assert_eq!(
+            CONTEXT_ESTIMATOR_VERSION,
+            AUTOMATIC_COMPACTION_PLANNING_CONTEXT_ESTIMATOR_VERSION_V1
+        );
+        assert_eq!(
+            REQUEST_SHAPE_VERSION,
+            AUTOMATIC_COMPACTION_PLANNING_CONTEXT_REQUEST_SHAPE_VERSION_V1
+        );
     }
 
     #[tokio::test]
@@ -4054,7 +4539,21 @@ mod tests {
         let events = agent.journal().read_events().unwrap();
         assert_eq!(count_events(&events, COMPACTION_CHECKPOINT_KIND), 1);
         assert_eq!(count_events(&events, "response.started"), 0);
-        assert_eq!(count_events(&events, "agent.limit_reached"), 1);
+        assert_eq!(count_events(&events, "agent.limit_reached"), 0);
+
+        agent.max_responses = Some(2);
+        let outcome = agent
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "should not run");
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "response.started"), 1);
+        assert!(agent.pending_compaction_boundaries().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4191,6 +4690,15 @@ mod tests {
         );
         assert_eq!(count_events(&failed_events, COMPACTION_STARTED_KIND), 0);
 
+        // Resume configuration is runtime truth. The durable v1 context only
+        // proves how the original preflight was planned.
+        agent.context_runtime.limits = ContextLimits {
+            context_window: Some(124_000),
+            reserve_tokens: 0,
+            context_window_source: ContextValueSource::Cli,
+            reserve_tokens_source: ContextValueSource::Cli,
+        };
+
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         let error = agent
@@ -4227,8 +4735,96 @@ mod tests {
             2
         );
         assert_eq!(count_events(&events, COMPACTION_STARTED_KIND), 1);
+        let latest_retry = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == COMPACTION_BOUNDARY_RETRY_STARTED_KIND)
+            .unwrap();
+        assert_eq!(latest_retry.data["planning_version"], 1);
+        assert_eq!(latest_retry.data["context"]["context_window"], 124_000);
+        assert_eq!(latest_retry.data["context"]["reserve_tokens"], 0);
+        assert_eq!(latest_retry.data["context"]["target_tokens"], 62_000);
         assert_eq!(count_events(&events, COMPACTION_CHECKPOINT_KIND), 1);
         assert!(agent.pending_compaction_boundaries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn replan_uses_current_config_and_refuses_unneeded_compaction_without_mutation() {
+        let (_temp, provider, mut agent) = automatic_compaction_test_agent(
+            "automatic-compaction-current-config-below-trigger",
+            6,
+            40_000,
+            [compaction_summary_turn()],
+            true,
+        );
+        append_preflight_only_automatic_compaction_failure(
+            &mut agent,
+            "old-config-failed-boundary",
+            "current-config-turn",
+            "current prompt",
+        );
+        let before = agent.journal().read_events().unwrap();
+
+        agent.context_runtime.limits = ContextLimits {
+            context_window: Some(10_000_000),
+            reserve_tokens: 0,
+            context_window_source: ContextValueSource::Cli,
+            reserve_tokens_source: ContextValueSource::Cli,
+        };
+        let error = agent
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OxidraError::ApprovalRequired(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("below the current automatic compaction trigger")
+        );
+        assert!(provider.requests().is_empty());
+        assert_eq!(agent.journal().read_events().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn recovery_observer_failure_settles_the_replacement_boundary() {
+        let (_temp, provider, mut agent) = automatic_compaction_test_agent(
+            "automatic-compaction-recovery-observer-failure",
+            6,
+            40_000,
+            [compaction_summary_turn()],
+            true,
+        );
+        append_preflight_only_automatic_compaction_failure(
+            &mut agent,
+            "observer-failed-boundary",
+            "observer-failed-turn",
+            "current prompt",
+        );
+
+        let error = agent
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut FailingCompactionRecoveryIntentObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::Config(_)));
+        assert!(provider.requests().is_empty());
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(
+            count_events(&events, COMPACTION_BOUNDARY_RETRY_STARTED_KIND),
+            1
+        );
+        assert_eq!(count_events(&events, COMPACTION_BOUNDARY_FAILED_KIND), 2);
+        let pending = agent.pending_compaction_boundaries().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].state, CompactionBoundaryState::Failed);
     }
 
     #[tokio::test]
@@ -4804,6 +5400,90 @@ mod tests {
         assert_eq!(count_events(&events, COMPACTION_BOUNDARY_FAILED_KIND), 1);
         assert_eq!(count_events(&events, "compaction.checkpoint"), 1);
         assert_eq!(count_events(&events, "user.message"), 4);
+        assert!(agent.pending_compaction_boundaries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_attempt_consumes_the_durable_provider_call_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "failed-boundary-budget-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let (boundary, candidate) =
+            boundary_candidate(&mut journal, "budget-turn", "retry original prompt");
+        let error = compact_once_for_boundary(
+            &ProviderFailureProvider,
+            &mut journal,
+            &boundary,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, OxidraError::Provider(_)));
+
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([
+            compaction_summary_turn(),
+            final_turn("must not dispatch"),
+        ]));
+        let mut agent = Agent::new_with_runtime(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextRuntime::for_tests("test-model", ContextLimits::default()),
+            Some(1),
+            None,
+        );
+
+        let error = agent
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::Limit(_)));
+        assert!(provider.requests().is_empty());
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, COMPACTION_STARTED_KIND), 1);
+        assert_eq!(count_events(&events, "agent.limit_reached"), 0);
+        assert_eq!(
+            count_events(&events, COMPACTION_BOUNDARY_RETRY_STARTED_KIND),
+            0
+        );
+        agent.max_responses = Some(3);
+        let outcome = agent
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "must not dispatch");
+        assert_eq!(provider.requests().len(), 2);
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, COMPACTION_STARTED_KIND), 2);
+        assert_eq!(count_events(&events, "response.started"), 1);
         assert!(agent.pending_compaction_boundaries().unwrap().is_empty());
     }
 
@@ -5583,7 +6263,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_limited_retry_can_be_retried_successfully() {
+    async fn response_limited_retry_requires_a_larger_current_budget() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -5613,7 +6293,7 @@ mod tests {
             final_turn("done"),
         ]));
         let mut agent = Agent::new(
-            provider,
+            provider.clone(),
             journal,
             tools,
             "instructions",
@@ -5632,6 +6312,18 @@ mod tests {
                 .await,
             Err(OxidraError::Limit(_))
         ));
+        assert!(matches!(
+            agent
+                .retry_pending_context_turn(
+                    CancellationToken::new(),
+                    &mut NoopObserver,
+                    &mut DenyApproval,
+                )
+                .await,
+            Err(OxidraError::Limit(_))
+        ));
+        assert_eq!(provider.requests().len(), 1);
+        agent.max_responses = Some(2);
         let outcome = agent
             .retry_pending_context_turn(
                 CancellationToken::new(),
@@ -5645,6 +6337,68 @@ mod tests {
         assert_eq!(count_events(&events, "agent.limit_reached"), 1);
         assert_eq!(count_events(&events, "turn.retry_started"), 2);
         assert_eq!(count_events(&events, "turn.completed"), 1);
+    }
+
+    #[test]
+    fn legacy_response_limit_is_not_duplicated_in_the_same_retry_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "legacy-response-budget-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "user.message",
+                Some("legacy-budget-turn"),
+                json!({
+                    "item":{"role":"user","content":"legacy budget"},
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "response.started",
+                Some("legacy-budget-turn"),
+                json!({"response_attempt_id":"legacy-attempt","response_index":1}),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "agent.limit_reached",
+                Some("legacy-budget-turn"),
+                json!({"kind":"responses","limit":1}),
+            )
+            .unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            Arc::new(FinalResponseProvider),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            Some(1),
+            None,
+        );
+        let before = agent.journal().read_events().unwrap();
+
+        let error = agent
+            .ensure_provider_call_budget("legacy-budget-turn")
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::Limit(_)));
+        assert_eq!(agent.journal().read_events().unwrap(), before);
     }
 
     #[tokio::test]

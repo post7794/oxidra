@@ -181,6 +181,33 @@ impl HistorySnapshot {
         chain: &CheckpointChain,
         boundary_chain: &CompactionBoundaryChain,
     ) -> Result<Self> {
+        let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+        Self::build_with_exclusions(events, chain, boundary_chain, &excluded_turn_ids)
+    }
+
+    /// Build the same checkpoint history view for recovery planning while the
+    /// replacement boundary is deliberately still pending. This bypasses only
+    /// the dispatch gate; checkpoint safety and abandoned-turn exclusions are
+    /// unchanged.
+    pub(crate) fn build_for_recovery_planning(
+        events: &[JournalEvent],
+        chain: &CheckpointChain,
+        boundary_chain: &CompactionBoundaryChain,
+    ) -> Result<Self> {
+        Self::build_with_exclusions(
+            events,
+            chain,
+            boundary_chain,
+            &boundary_chain.abandoned_turn_ids(),
+        )
+    }
+
+    fn build_with_exclusions(
+        events: &[JournalEvent],
+        chain: &CheckpointChain,
+        boundary_chain: &CompactionBoundaryChain,
+        excluded_turn_ids: &HashSet<String>,
+    ) -> Result<Self> {
         chain.ensure_matches(events)?;
         boundary_chain.ensure_checkpoint_projection_safe(chain)?;
         let session_id = validate_journal_envelopes(events)?;
@@ -194,8 +221,7 @@ impl HistorySnapshot {
                 )
             })
             .collect::<Vec<_>>();
-        let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
-        Self::build_from_views(events, session_id, &excluded_turn_ids, &views)
+        Self::build_from_views(events, session_id, excluded_turn_ids, &views)
     }
 
     fn build_from_views(

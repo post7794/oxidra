@@ -1,0 +1,34 @@
+{
+  "measurement": {
+    "measurement_version": 2,
+    "estimator_version": 1,
+    "request_shape_version": 1,
+    "request_digest": "planning-v1-request-digest",
+    "estimated_input_tokens": 100000,
+    "serialized_request_bytes": 320000,
+    "future_measurement_field": "ignored"
+  },
+  "provider_usage_domain": "https://provider.example/v1/responses",
+  "method": "usage_anchor",
+  "anchor_response_seq": 42,
+  "anchor_response_attempt_id": "anchor-attempt",
+  "anchor_reported_input_tokens": 95000,
+  "anchor_estimated_input_tokens": 94000,
+  "estimate_delta_tokens": 5000,
+  "anchor_rejection_reason": null,
+  "estimated_next_input_tokens": 100000,
+  "context_window": 130000,
+  "reserve_tokens": 10000,
+  "usable_tokens": 120000,
+  "trigger_tokens": 96000,
+  "target_tokens": 60000,
+  "request_journal_through_seq": 77,
+  "checkpoint_id": "checkpoint-parent",
+  "checkpoint_covers_through_seq": 30,
+  "instructions_event_seq": 2,
+  "configured_event_seq": 3,
+  "tools_event_seq": 4,
+  "future_context_field": {
+    "ignored": true
+  }
+}

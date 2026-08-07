@@ -139,7 +139,11 @@ target. A failed or unavailable attempt stops the request and leaves a pending
 boundary for explicit recovery: durable Provider attempts can be retried, and
 a preflight-only failure is replanned by `--retry-pending`. The flag does not
 turn the heuristic into a tokenizer-backed hard limit and is not enabled by
-default.
+default. Replanning validates the frozen planning-v1 audit record but measures
+the request again with the current model/context configuration, instructions,
+tools, and history view. If the current request is now below the trigger, the
+recovery fails closed and asks for an explicit abandon because the current
+boundary protocol has no lossless `resolved_without_checkpoint` terminal.
 
 Useful options:
 
@@ -159,12 +163,16 @@ Useful options:
     --abandon-pending      abandon pending context-limit/compaction requests
 ```
 
-`--max-responses` limits Provider calls made by the turn. When automatic
-compaction is enabled, the compaction Provider call consumes one slot before
-the visible assistant response; the reported assistant-response count still
-excludes that internal summary call. The usage line includes usage returned by
-an automatic compaction checkpoint when the turn completes in the same
-process.
+`--max-responses` is a journal-derived, per-logical-turn Provider dispatch
+budget. Durable `response.started` and bound `compaction.started` intents count
+across crashes and explicit retries, including attempts that later fail or
+abort. Raising the option on resume can permit further calls; retrying with the
+same exhausted limit cannot reset it. When a compaction boundary owns recovery,
+budget exhaustion leaves that boundary pending instead of writing a conflicting
+turn-terminal event, so a later higher limit can resume it. The reported
+assistant-response count still excludes an internal summary call. The usage line includes usage
+returned by an automatic compaction checkpoint when the turn completes in the
+same process.
 
 Both pending-turn options require `--resume` and never append a second copy of
 the original prompt. Context-limit retries sync `turn.retry_started`; failed

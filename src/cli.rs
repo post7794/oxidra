@@ -57,7 +57,7 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
 
-    /// Stop a turn after this many Responses API calls.
+    /// Stop a logical turn after this many durable Provider dispatch intents.
     #[arg(long, value_name = "COUNT", value_parser = parse_positive_usize)]
     max_responses: Option<usize>,
 

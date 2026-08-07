@@ -36,6 +36,20 @@ pub(crate) fn project_events_with_boundary_chain(
     project_events_current(events, &excluded_turn_ids)
 }
 
+/// Rebuild the current input shape while a validated recovery boundary is
+/// intentionally still pending.
+///
+/// This is measurement-only: normal Provider dispatch must continue to use
+/// [`project_events_with_boundary_chain`] so a pending boundary remains a hard
+/// gate. Compaction management events are projection-neutral, while validated
+/// abandoned boundary turns still have to stay excluded.
+pub(crate) fn project_events_for_recovery_planning(
+    events: &[JournalEvent],
+    boundary_chain: &CompactionBoundaryChain,
+) -> Result<Vec<Value>> {
+    project_events_current(events, &boundary_chain.abandoned_turn_ids())
+}
+
 /// Rebuild the exact event projection recorded by a compaction attempt.
 /// Published match arms are immutable; new formats must add a new version.
 pub fn project_events_for_compaction(version: u32, events: &[JournalEvent]) -> Result<Vec<Value>> {
@@ -283,9 +297,18 @@ pub(crate) fn project_checkpoint_and_tail_with_boundary_chain(
     chain: &CheckpointChain,
     boundary_chain: &CompactionBoundaryChain,
 ) -> Result<Vec<Value>> {
+    let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+    project_checkpoint_and_tail_with_exclusions(events, chain, boundary_chain, &excluded_turn_ids)
+}
+
+fn project_checkpoint_and_tail_with_exclusions(
+    events: &[JournalEvent],
+    chain: &CheckpointChain,
+    boundary_chain: &CompactionBoundaryChain,
+    excluded_turn_ids: &HashSet<String>,
+) -> Result<Vec<Value>> {
     chain.ensure_matches(events)?;
     boundary_chain.ensure_checkpoint_projection_safe(chain)?;
-    let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
     let Some(checkpoint) = chain.latest() else {
         if events
             .iter()
@@ -295,7 +318,7 @@ pub(crate) fn project_checkpoint_and_tail_with_boundary_chain(
                 "checkpoint events are present but the validated chain is empty".to_owned(),
             ));
         }
-        return project_events_current(events, &excluded_turn_ids);
+        return project_events_current(events, excluded_turn_ids);
     };
 
     let mut projected = vec![compacted_history_item(
@@ -308,9 +331,21 @@ pub(crate) fn project_checkpoint_and_tail_with_boundary_chain(
     projected.extend(project_tail_after_validated_cutoff(
         events,
         checkpoint.covers_through_seq,
-        &excluded_turn_ids,
+        excluded_turn_ids,
     )?);
     Ok(projected)
+}
+
+/// Checkpoint-aware counterpart to [`project_events_for_recovery_planning`].
+/// It preserves every checkpoint safety check while bypassing only the runtime
+/// pending-boundary dispatch gate for a non-dispatching context measurement.
+pub(crate) fn project_checkpoint_and_tail_for_recovery_planning(
+    events: &[JournalEvent],
+    chain: &CheckpointChain,
+    boundary_chain: &CompactionBoundaryChain,
+) -> Result<Vec<Value>> {
+    let excluded_turn_ids = boundary_chain.abandoned_turn_ids();
+    project_checkpoint_and_tail_with_exclusions(events, chain, boundary_chain, &excluded_turn_ids)
 }
 
 /// Build the normal Provider input that would exist if `summary` were

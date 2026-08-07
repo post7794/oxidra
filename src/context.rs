@@ -15,6 +15,8 @@ pub const CONTEXT_ESTIMATOR_VERSION: u32 = 1;
 pub const REQUEST_SHAPE_VERSION: u32 = 1;
 pub const TOOL_SNAPSHOT_VERSION: u32 = 1;
 pub const PROVIDER_PROTOCOL_OPENAI_RESPONSES: &str = "openai_responses";
+pub const AUTOMATIC_COMPACTION_PLANNING_VERSION_V1: u32 = 1;
+pub const AUTOMATIC_COMPACTION_PLANNING_VERSION: u32 = AUTOMATIC_COMPACTION_PLANNING_VERSION_V1;
 
 #[derive(Clone, Debug)]
 pub struct ContextRuntime {
@@ -70,7 +72,7 @@ impl ContextRuntime {
         data["automatic_compaction"] = json!({
             "enabled": automatic_compaction,
             "source": if automatic_compaction { "experimental_cli" } else { "default_off" },
-            "planning_version": 1,
+            "planning_version": AUTOMATIC_COMPACTION_PLANNING_VERSION,
         });
         data
     }
