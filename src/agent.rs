@@ -5,22 +5,25 @@
 //! are supplied through traits so the core remains usable from tests and a
 //! future TUI.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::compaction::{
-    COMPACTION_BOUNDARY_ABANDONED_KIND, COMPACTION_BOUNDARY_RETRY_STARTED_KIND, CompactionBoundary,
-    CompactionBoundaryAbandoned, CompactionBoundaryChain, CompactionBoundaryRetryStarted,
-    CompactionBoundaryState, CompactionCandidate, ValidatedCompactionBoundary,
-    compact_replay_once_for_boundary, ensure_checkpointed_boundary_request_ready,
-    ensure_compaction_boundary_turn_request_ready, rebuild_failed_boundary_candidate,
-    validate_checkpoint_chain, validate_compaction_boundary_chain,
-    validate_replay_compaction_candidate,
+    COMPACTION_BOUNDARY_ABANDONED_KIND, COMPACTION_BOUNDARY_FAILED_KIND,
+    COMPACTION_BOUNDARY_RETRY_STARTED_KIND, COMPACTION_BOUNDARY_STARTED_KIND, CandidateEstimate,
+    CompactionBoundary, CompactionBoundaryAbandoned, CompactionBoundaryChain,
+    CompactionBoundaryFailed, CompactionBoundaryRetryStarted, CompactionBoundaryStarted,
+    CompactionBoundaryState, CompactionCandidate, CompactionContext, CompactionSelection,
+    MAX_COMPACTION_OUTPUT_TOKENS, MIN_RECENT_COMPLETE_TURNS, SUMMARY_ENVELOPE_VERSION,
+    ValidatedCompactionBoundary, compact_once_for_boundary, compact_replay_once_for_boundary,
+    ensure_checkpointed_boundary_request_ready, ensure_compaction_boundary_turn_request_ready,
+    rebuild_failed_boundary_candidate, select_compaction_candidate, validate_checkpoint_chain,
+    validate_compaction_boundary_chain, validate_replay_compaction_candidate,
 };
 use crate::config::ContextLimits;
 use crate::context::{
@@ -45,12 +48,15 @@ use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamOb
 use crate::session::{JournalEvent, SessionJournal};
 use crate::tools::{BuiltinTools, ToolContext};
 use crate::turn::{
-    PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION, ProviderRequestSlotState, TURN_BOUNDARY_VERSION,
-    TurnState, provider_request_slot_state_for_version, segment_turns, validate_turn_recovery,
+    PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION, ProviderRequestSlotState,
+    TURN_BOUNDARY_VALIDATOR_VERSION, TURN_BOUNDARY_VERSION, TurnState,
+    complete_prefix_candidates_for_version, provider_request_slot_state_for_version, segment_turns,
+    validate_turn_recovery,
 };
 use crate::types::{ToolCall, ToolDefinition, ToolResult, Usage};
 
 const MAX_PROJECT_INSTRUCTIONS: usize = 32 * 1024;
+const AUTOMATIC_COMPACTION_PLANNING_VERSION: u32 = 1;
 
 /// Events emitted to the UI.  Streaming provider events are forwarded through
 /// [`AgentObserver::on_provider_event`]; tool lifecycle events are committed before/after the
@@ -63,6 +69,9 @@ pub trait AgentObserver: Send {
     fn on_tool_started(&mut self, call: &ToolCall) -> Result<()>;
     fn on_tool_completed(&mut self, call: &ToolCall, result: &ToolResult) -> Result<()>;
     fn on_message(&mut self, message: &str) -> Result<()>;
+    fn on_compaction(&mut self, message: &str) -> Result<()> {
+        self.on_message(message)
+    }
 }
 
 /// The CLI implements this to keep shell authorization separate from project
@@ -137,8 +146,8 @@ pub struct AbandonedPending {
 
 #[derive(Clone)]
 struct PlannedCompactionContinuationV1 {
-    events: Vec<JournalEvent>,
-    boundary_chain: CompactionBoundaryChain,
+    events: Arc<Vec<JournalEvent>>,
+    boundary_chain: Arc<CompactionBoundaryChain>,
     instructions: Option<String>,
     tools: Vec<ToolDefinition>,
     context_runtime: ContextRuntime,
@@ -147,13 +156,13 @@ struct PlannedCompactionContinuationV1 {
 }
 
 impl PlannedCompactionContinuationV1 {
-    fn validate_summary(&self, summary: &str) -> Result<()> {
+    fn context_for_summary(&self, summary: &str) -> Result<ContextDecision> {
         let input = project_compaction_summary_and_tail(
-            &self.events,
+            self.events.as_slice(),
             self.covers_through_seq,
             self.summary_envelope_version,
             summary,
-            &self.boundary_chain,
+            self.boundary_chain.as_ref(),
         )?;
         let request = ResponseRequest {
             instructions: self.instructions.clone(),
@@ -163,16 +172,57 @@ impl PlannedCompactionContinuationV1 {
             max_output_tokens: None,
         };
         let measured = measure_prepared_request(&request, &self.context_runtime)?;
+        let instructions_event_seq = self
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "context.instructions")
+            .map(|event| event.seq);
+        let configured_event_seq = self
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "context.configured")
+            .map(|event| event.seq);
+        let tools_event_seq = self
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "context.tools")
+            .map_or(0, |event| event.seq);
+        decide_context(
+            self.events.as_slice(),
+            &self.context_runtime,
+            measured,
+            self.events.last().map(|event| event.seq),
+            Some("prospective-compaction-checkpoint".to_owned()),
+            Some(self.covers_through_seq),
+            instructions_event_seq,
+            configured_event_seq,
+            tools_event_seq,
+        )
+    }
+
+    fn validate_summary(&self, summary: &str) -> Result<()> {
+        let context = self.context_for_summary(summary)?;
         if let Some(target) = self.context_runtime.limits.target_tokens() {
-            if measured.estimated_input_tokens > target {
+            if context.estimated_next_input_tokens > target {
                 return Err(OxidraError::Limit(format!(
                     "compaction summary leaves estimated context {} above target {target}",
-                    measured.estimated_input_tokens
+                    context.estimated_next_input_tokens
                 )));
             }
         }
         Ok(())
     }
+}
+
+struct AutomaticCompactionPlanV1 {
+    snapshot: Vec<JournalEvent>,
+    boundary: CompactionBoundary,
+    current_context: ContextDecision,
+    selection: CompactionSelection,
+    continuations: HashMap<u64, PlannedCompactionContinuationV1>,
 }
 
 enum RecoveryActionV1 {
@@ -203,6 +253,7 @@ pub struct Agent {
     tools_epoch: Option<(String, u64)>,
     max_responses: Option<usize>,
     max_tools: Option<usize>,
+    automatic_compaction: bool,
 }
 
 struct PreparedToolSet {
@@ -259,7 +310,12 @@ impl Agent {
             tools_epoch: None,
             max_responses,
             max_tools,
+            automatic_compaction: false,
         }
+    }
+
+    pub(crate) fn set_automatic_compaction(&mut self, enabled: bool) {
+        self.automatic_compaction = enabled;
     }
 
     pub fn session_id(&self) -> &str {
@@ -351,7 +407,14 @@ impl Agent {
                 return Err(OxidraError::Limit("max responses reached".to_owned()));
             }
 
-            let (request, mut prepared_tools) = self.prepare_request(Some(turn_id))?;
+            let (request, mut prepared_tools) = self
+                .prepare_request_with_automatic_compaction(
+                    turn_id,
+                    turn_start_seq,
+                    cancellation.clone(),
+                    observer,
+                )
+                .await?;
             let context = self.context_estimate(&prepared_tools.context);
             outcome.context = Some(context.clone());
             let response_attempt_id = Uuid::now_v7().to_string();
@@ -855,35 +918,13 @@ impl Agent {
         ensure_compaction_boundary_turn_request_ready(&prospective, &replacement)?;
         validate_replay_compaction_candidate(&prospective, &candidate)?;
 
-        let checkpoint_chain = validate_checkpoint_chain(&prospective)?;
-        let prospective_history = validate_history_snapshot_after_compaction(
-            &prospective,
-            &checkpoint_chain,
-            &prospective_boundaries,
-            candidate.covers_through_seq,
-        )?;
-        let history_quota = rebuild_history_quota_for_compaction_preview(
-            &prospective,
+        let continuation = self.build_planned_compaction_continuation_v1(
+            Arc::new(prospective),
+            Arc::new(prospective_boundaries),
             &replacement.turn_id,
-            &prospective_boundaries,
+            candidate.covers_through_seq,
+            candidate.summary_envelope_version,
         )?;
-        let history_exposed = prospective_history.is_available()
-            && history_quota.remaining_bytes
-                >= MAX_HISTORY_CALLS_PER_RESPONSE
-                    .saturating_mul(HISTORY_CONTROL_OUTPUT_RESERVE_BYTES);
-        let mut tools = self.tools.definitions();
-        if history_exposed {
-            tools.extend(history_tool_definitions());
-        }
-        let continuation = PlannedCompactionContinuationV1 {
-            events: prospective,
-            boundary_chain: prospective_boundaries,
-            instructions: (!self.instructions.is_empty()).then(|| self.instructions.clone()),
-            tools,
-            context_runtime: self.context_runtime.clone(),
-            covers_through_seq: candidate.covers_through_seq,
-            summary_envelope_version: candidate.summary_envelope_version,
-        };
         // Exercise the same tail projection and request measurement before any
         // retry intent is durable. The real summary is checked again in the
         // pre-commit callback.
@@ -894,6 +935,45 @@ impl Agent {
             retry,
             candidate,
             continuation,
+        })
+    }
+
+    fn build_planned_compaction_continuation_v1(
+        &self,
+        events: Arc<Vec<JournalEvent>>,
+        boundary_chain: Arc<CompactionBoundaryChain>,
+        turn_id: &str,
+        covers_through_seq: u64,
+        summary_envelope_version: u32,
+    ) -> Result<PlannedCompactionContinuationV1> {
+        let checkpoint_chain = validate_checkpoint_chain(events.as_slice())?;
+        let prospective_history = validate_history_snapshot_after_compaction(
+            events.as_slice(),
+            &checkpoint_chain,
+            boundary_chain.as_ref(),
+            covers_through_seq,
+        )?;
+        let history_quota = rebuild_history_quota_for_compaction_preview(
+            events.as_slice(),
+            turn_id,
+            boundary_chain.as_ref(),
+        )?;
+        let history_exposed = prospective_history.is_available()
+            && history_quota.remaining_bytes
+                >= MAX_HISTORY_CALLS_PER_RESPONSE
+                    .saturating_mul(HISTORY_CONTROL_OUTPUT_RESERVE_BYTES);
+        let mut tools = self.tools.definitions();
+        if history_exposed {
+            tools.extend(history_tool_definitions());
+        }
+        Ok(PlannedCompactionContinuationV1 {
+            events,
+            boundary_chain,
+            instructions: (!self.instructions.is_empty()).then(|| self.instructions.clone()),
+            tools,
+            context_runtime: self.context_runtime.clone(),
+            covers_through_seq,
+            summary_envelope_version,
         })
     }
 
@@ -1448,6 +1528,318 @@ impl Agent {
         Ok(())
     }
 
+    async fn prepare_request_with_automatic_compaction(
+        &mut self,
+        turn_id: &str,
+        user_message_seq: u64,
+        cancellation: CancellationToken,
+        observer: &mut dyn AgentObserver,
+    ) -> Result<(ResponseRequest, PreparedToolSet)> {
+        let (request, prepared) = self.prepare_request(Some(turn_id))?;
+        if !self.automatic_compaction {
+            return Ok((request, prepared));
+        }
+
+        // `prepare_request` may have synchronized a new context.tools epoch.
+        // Rebuild once from the resulting durable prefix so the trigger,
+        // boundary intent and all candidate projections share one snapshot.
+        let (request, prepared) = self.prepare_request(Some(turn_id))?;
+        let Some(trigger_tokens) = prepared.context.trigger_tokens else {
+            return Ok((request, prepared));
+        };
+        let Some(target_tokens) = prepared.context.target_tokens else {
+            return Ok((request, prepared));
+        };
+        if prepared.context.estimated_next_input_tokens < trigger_tokens {
+            return Ok((request, prepared));
+        }
+
+        let snapshot = self.journal.read_events()?;
+        if snapshot.last().map(|event| event.seq) != prepared.context.request_journal_through_seq {
+            return Err(OxidraError::Session(
+                "journal changed after automatic compaction trigger measurement".to_owned(),
+            ));
+        }
+        let boundary_chain = validate_compaction_boundary_chain(&snapshot)?;
+        if boundary_chain.pending().iter().any(|record| {
+            record.boundary.turn_id == turn_id
+                && record.boundary.user_message_seq == user_message_seq
+                && record.state == CompactionBoundaryState::Checkpointed
+        }) {
+            // A checkpointed boundary already spent this user turn's single
+            // automatic compaction attempt. The Provider remains the hard
+            // context boundary for this request and any later tool round-trip.
+            return Ok((request, prepared));
+        }
+
+        let boundary =
+            CompactionBoundary::new(Uuid::now_v7().to_string(), turn_id, user_message_seq);
+        let mut extra = Map::new();
+        extra.insert(
+            "planning_version".to_owned(),
+            json!(AUTOMATIC_COMPACTION_PLANNING_VERSION),
+        );
+        extra.insert("context".to_owned(), prepared.context.audit_value()?);
+        extra.insert("trigger_tokens".to_owned(), json!(trigger_tokens));
+        extra.insert("target_tokens".to_owned(), json!(target_tokens));
+        extra.insert(
+            "max_summary_output_tokens".to_owned(),
+            json!(MAX_COMPACTION_OUTPUT_TOKENS),
+        );
+        extra.insert(
+            "context_window_source".to_owned(),
+            json!(self.context_runtime.limits.context_window_source),
+        );
+        extra.insert(
+            "reserve_tokens_source".to_owned(),
+            json!(self.context_runtime.limits.reserve_tokens_source),
+        );
+        let started = CompactionBoundaryStarted {
+            boundary: boundary.clone(),
+            trigger: "estimated_context_threshold".to_owned(),
+            extra,
+        };
+        let started_data = serde_json::to_value(&started)?;
+        validate_next_compaction_boundary_event(
+            &snapshot,
+            COMPACTION_BOUNDARY_STARTED_KIND,
+            started_data.clone(),
+        )?;
+        self.journal
+            .append_and_sync(COMPACTION_BOUNDARY_STARTED_KIND, None, started_data)?;
+
+        if cancellation.is_cancelled() {
+            self.append_automatic_compaction_preflight_failure(
+                &boundary,
+                "cancelled",
+                "automatic compaction was cancelled before candidate planning",
+            )?;
+            return Err(OxidraError::Interrupted);
+        }
+
+        let plan = match self
+            .build_automatic_compaction_plan_v1(boundary.clone(), prepared.context.clone())
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.append_automatic_compaction_preflight_failure(
+                    &boundary,
+                    "preflight_failed",
+                    &error.to_string(),
+                )?;
+                return Err(error);
+            }
+        };
+        if self.journal.read_events()? != plan.snapshot {
+            self.append_automatic_compaction_preflight_failure(
+                &boundary,
+                "snapshot_changed",
+                "journal changed after automatic compaction planning",
+            )?;
+            return Err(OxidraError::Session(
+                "journal changed after automatic compaction planning".to_owned(),
+            ));
+        }
+
+        let AutomaticCompactionPlanV1 {
+            snapshot: _,
+            boundary,
+            current_context,
+            selection,
+            mut continuations,
+        } = plan;
+        let candidate = match selection {
+            CompactionSelection::Selected(candidate) => candidate,
+            CompactionSelection::Unavailable(reason) => {
+                let message = format!("automatic compaction has no safe candidate: {reason}");
+                self.append_automatic_compaction_preflight_failure(
+                    &boundary,
+                    "no_candidate",
+                    &message,
+                )?;
+                return Err(OxidraError::Limit(message));
+            }
+        };
+        let Some(continuation) = continuations.remove(&candidate.covers_through_seq) else {
+            let error = OxidraError::Session(format!(
+                "selected compaction cutoff {} has no prepared continuation",
+                candidate.covers_through_seq
+            ));
+            self.append_automatic_compaction_preflight_failure(
+                &boundary,
+                "invalid_plan",
+                &error.to_string(),
+            )?;
+            return Err(error);
+        };
+        let usable = current_context
+            .usable_tokens
+            .map_or_else(|| "unknown".to_owned(), |value| value.to_string());
+        if let Err(error) = observer.on_compaction(&format!(
+            "context {}/{}; window {} ({}), reserve {} ({}); compacting {} completed turns",
+            current_context.estimated_next_input_tokens,
+            usable,
+            current_context
+                .context_window
+                .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+            self.context_runtime.limits.context_window_source.as_str(),
+            current_context.reserve_tokens,
+            self.context_runtime.limits.reserve_tokens_source.as_str(),
+            candidate.newly_compacted_complete_turns,
+        )) {
+            let error = OxidraError::observer(error);
+            self.append_automatic_compaction_preflight_failure(
+                &boundary,
+                "observer_error",
+                &error.to_string(),
+            )?;
+            return Err(error);
+        }
+
+        let mut compaction_observer = SilentCompactionObserver;
+        let checkpoint = compact_once_for_boundary(
+            self.provider.as_ref(),
+            &mut self.journal,
+            &boundary,
+            &candidate,
+            &self.context_runtime.model,
+            &mut compaction_observer,
+            cancellation,
+            move |summary| continuation.validate_summary(summary),
+        )
+        .await?;
+
+        let _ = self.prepare_request(Some(turn_id))?;
+        let (request, prepared) = self.prepare_request(Some(turn_id))?;
+        if prepared.context.estimated_next_input_tokens > target_tokens {
+            return Err(OxidraError::Session(format!(
+                "checkpoint {} was committed but rebuilt context {} exceeds target {target_tokens}",
+                checkpoint.checkpoint_id, prepared.context.estimated_next_input_tokens
+            )));
+        }
+        observer
+            .on_compaction(&format!(
+                "checkpoint {}; context {}/{}",
+                checkpoint.checkpoint_id,
+                prepared.context.estimated_next_input_tokens,
+                prepared
+                    .context
+                    .usable_tokens
+                    .map_or_else(|| "unknown".to_owned(), |value| value.to_string()),
+            ))
+            .map_err(OxidraError::observer)?;
+        Ok((request, prepared))
+    }
+
+    fn build_automatic_compaction_plan_v1(
+        &self,
+        boundary: CompactionBoundary,
+        current_context: ContextDecision,
+    ) -> Result<AutomaticCompactionPlanV1> {
+        let snapshot = self.journal.read_events()?;
+        let boundary_chain = validate_compaction_boundary_chain(&snapshot)?;
+        let pending = boundary_chain.latest_pending().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "automatic compaction boundary {} disappeared during planning",
+                boundary.boundary_id
+            ))
+        })?;
+        if pending.boundary != boundary || pending.state != CompactionBoundaryState::Started {
+            return Err(OxidraError::Session(format!(
+                "automatic compaction boundary {} is not the current Started boundary",
+                boundary.boundary_id
+            )));
+        }
+        let checkpoint_chain = validate_checkpoint_chain(&snapshot)?;
+        let parent_cutoff = checkpoint_chain
+            .latest()
+            .map_or(0, |checkpoint| checkpoint.covers_through_seq);
+        let uncompacted_events = snapshot
+            .iter()
+            .filter(|event| event.seq > parent_cutoff)
+            .cloned()
+            .collect::<Vec<_>>();
+        let cutoffs = complete_prefix_candidates_for_version(
+            TURN_BOUNDARY_VALIDATOR_VERSION,
+            &uncompacted_events,
+        )?;
+        let complete_turns = segment_turns(&uncompacted_events)?
+            .into_iter()
+            .filter(|turn| matches!(turn.state, TurnState::Complete(_)))
+            .count();
+        let abandoned_barrier = boundary_chain.first_abandoned_user_seq_after(parent_cutoff);
+        let events = Arc::new(snapshot.clone());
+        let boundary_chain = Arc::new(boundary_chain);
+        let planning_summary = automatic_compaction_summary_placeholder_v1()?;
+        let mut estimates = Vec::with_capacity(cutoffs.len());
+        let mut continuations = HashMap::with_capacity(cutoffs.len());
+        for cutoff in cutoffs.into_iter().filter(|cutoff| {
+            complete_turns.saturating_sub(cutoff.turn_count) >= MIN_RECENT_COMPLETE_TURNS
+                && abandoned_barrier.is_none_or(|seq| cutoff.covers_through_seq < seq)
+        }) {
+            let continuation = self.build_planned_compaction_continuation_v1(
+                Arc::clone(&events),
+                Arc::clone(&boundary_chain),
+                &boundary.turn_id,
+                cutoff.covers_through_seq,
+                SUMMARY_ENVELOPE_VERSION,
+            )?;
+            let projected = continuation.context_for_summary(&planning_summary)?;
+            estimates.push(CandidateEstimate {
+                covers_through_seq: cutoff.covers_through_seq,
+                estimated_input_tokens_after: projected.estimated_next_input_tokens,
+            });
+            continuations.insert(cutoff.covers_through_seq, continuation);
+        }
+        let target_input_tokens = current_context.target_tokens.ok_or_else(|| {
+            OxidraError::Config(
+                "automatic compaction requires a configured target token count".to_owned(),
+            )
+        })?;
+        let selection = select_compaction_candidate(
+            &snapshot,
+            &checkpoint_chain,
+            &CompactionContext {
+                current_input_tokens: current_context.estimated_next_input_tokens,
+                target_input_tokens,
+                min_recent_complete_turns: MIN_RECENT_COMPLETE_TURNS,
+                estimates,
+            },
+        )?;
+        Ok(AutomaticCompactionPlanV1 {
+            snapshot,
+            boundary,
+            current_context,
+            selection,
+            continuations,
+        })
+    }
+
+    fn append_automatic_compaction_preflight_failure(
+        &mut self,
+        boundary: &CompactionBoundary,
+        code: &str,
+        message: &str,
+    ) -> Result<()> {
+        let events = self.journal.read_events()?;
+        let payload = CompactionBoundaryFailed {
+            boundary_id: boundary.boundary_id.clone(),
+            code: code.to_owned(),
+            message: message.to_owned(),
+            attempt_id: None,
+            extra: Map::new(),
+        };
+        let data = serde_json::to_value(payload)?;
+        validate_next_compaction_boundary_event(
+            &events,
+            COMPACTION_BOUNDARY_FAILED_KIND,
+            data.clone(),
+        )?;
+        self.journal
+            .append_and_sync(COMPACTION_BOUNDARY_FAILED_KIND, None, data)?;
+        Ok(())
+    }
+
     fn prepare_request(
         &mut self,
         turn_id: Option<&str>,
@@ -1610,6 +2002,16 @@ fn append_prospective_event(
     event.data = data;
     events.push(event);
     Ok(())
+}
+
+fn automatic_compaction_summary_placeholder_v1() -> Result<String> {
+    let token_budget = usize::try_from(MAX_COMPACTION_OUTPUT_TOKENS).map_err(|_| {
+        OxidraError::Config("compaction output token limit exceeds platform capacity".to_owned())
+    })?;
+    let ascii_characters = token_budget.checked_mul(4).ok_or_else(|| {
+        OxidraError::Config("compaction planning summary size overflow".to_owned())
+    })?;
+    Ok("x".repeat(ascii_characters))
 }
 
 fn pending_context_turns(
@@ -2053,10 +2455,11 @@ mod tests {
 
     use super::*;
     use crate::compaction::{
-        COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_BOUNDARY_STARTED_KIND, CandidateEstimate,
-        Checkpoint, CompactionBoundaryStarted, CompactionContext, CompactionSelection,
-        CompactionStarted, compact_once, compact_once_for_boundary,
-        compact_replay_once_for_boundary, select_compaction_candidate,
+        COMPACTION_BOUNDARY_CHECKPOINTED_KIND, COMPACTION_BOUNDARY_FAILED_KIND,
+        COMPACTION_BOUNDARY_STARTED_KIND, COMPACTION_CHECKPOINT_KIND, COMPACTION_FAILED_KIND,
+        COMPACTION_STARTED_KIND, CandidateEstimate, Checkpoint, CompactionBoundaryStarted,
+        CompactionContext, CompactionSelection, CompactionStarted, compact_once,
+        compact_once_for_boundary, compact_replay_once_for_boundary, select_compaction_candidate,
     };
     use crate::config::ContextValueSource;
     use crate::history::UNTRUSTED_HISTORY_NOTICE;
@@ -2074,6 +2477,11 @@ mod tests {
 
     struct RecordingProvider {
         responses: Mutex<VecDeque<AssistantTurn>>,
+        requests: Mutex<Vec<ResponseRequest>>,
+    }
+
+    struct ScriptedProvider {
+        responses: Mutex<VecDeque<Result<AssistantTurn>>>,
         requests: Mutex<Vec<ResponseRequest>>,
     }
 
@@ -2096,6 +2504,19 @@ mod tests {
     }
 
     impl ContextLimitProvider {
+        fn requests(&self) -> Vec<ResponseRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl ScriptedProvider {
+        fn new(responses: impl IntoIterator<Item = Result<AssistantTurn>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
         fn requests(&self) -> Vec<ResponseRequest> {
             self.requests.lock().unwrap().clone()
         }
@@ -2198,6 +2619,27 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| OxidraError::Provider("test response queue is empty".to_owned()))
+        }
+    }
+
+    #[async_trait]
+    impl ResponseProvider for ScriptedProvider {
+        async fn respond(
+            &self,
+            request: ResponseRequest,
+            _observer: &mut dyn StreamObserver,
+            _cancellation: CancellationToken,
+        ) -> Result<AssistantTurn> {
+            self.requests.lock().unwrap().push(request);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| {
+                    Err(OxidraError::Provider(
+                        "test response queue is empty".to_owned(),
+                    ))
+                })
         }
     }
 
@@ -2307,6 +2749,114 @@ mod tests {
             usage,
             unknown_stream_events: Vec::new(),
         }
+    }
+
+    fn compaction_summary_turn_with_text(text: String) -> AssistantTurn {
+        let output_items = vec![json!({
+            "type":"message",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":text}],
+        })];
+        let usage = Usage {
+            input_tokens: 100,
+            cached_input_tokens: 10,
+            output_tokens: 8_000,
+            reasoning_output_tokens: 5,
+            total_tokens: 8_100,
+        };
+        AssistantTurn {
+            raw_response: json!({
+                "id":"compaction-large-summary",
+                "status":"completed",
+                "output":output_items,
+                "usage":{
+                    "input_tokens":100,
+                    "input_tokens_details":{"cached_tokens":10},
+                    "output_tokens":8_000,
+                    "output_tokens_details":{"reasoning_tokens":5},
+                    "total_tokens":8_100,
+                }
+            }),
+            output_items,
+            text,
+            tool_calls: Vec::new(),
+            usage,
+            unknown_stream_events: Vec::new(),
+        }
+    }
+
+    fn append_large_complete_turns(journal: &mut SessionJournal, count: usize, bytes: usize) {
+        for index in 0..count {
+            append_complete_turn(
+                journal,
+                &format!("large-old-turn-{index}"),
+                &format!("old-question-{index}:{}", "q".repeat(bytes)),
+                &format!("old-answer-{index}:{}", "a".repeat(bytes)),
+            );
+        }
+    }
+
+    fn automatic_compaction_context_limits() -> ContextLimits {
+        ContextLimits {
+            context_window: Some(130_000),
+            reserve_tokens: 10_000,
+            context_window_source: ContextValueSource::Cli,
+            reserve_tokens_source: ContextValueSource::Cli,
+        }
+    }
+
+    fn automatic_compaction_test_agent(
+        session_id: &str,
+        old_turns: usize,
+        bytes_per_item: usize,
+        responses: impl IntoIterator<Item = AssistantTurn>,
+        enabled: bool,
+    ) -> (tempfile::TempDir, Arc<RecordingProvider>, Agent) {
+        let provider = Arc::new(RecordingProvider::new(responses));
+        let (temp, agent) = automatic_compaction_test_agent_with_provider(
+            session_id,
+            old_turns,
+            bytes_per_item,
+            provider.clone(),
+            enabled,
+        );
+        (temp, provider, agent)
+    }
+
+    fn automatic_compaction_test_agent_with_provider(
+        session_id: &str,
+        old_turns: usize,
+        bytes_per_item: usize,
+        provider: Arc<dyn ResponseProvider>,
+        enabled: bool,
+    ) -> (tempfile::TempDir, Agent) {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(session_id, SessionHeader::new(&project_root, "test-model"))
+            .unwrap();
+        append_large_complete_turns(&mut journal, old_turns, bytes_per_item);
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            automatic_compaction_context_limits(),
+            None,
+            None,
+        );
+        agent.set_automatic_compaction(enabled);
+        (temp, agent)
     }
 
     fn append_complete_turn(
@@ -2889,6 +3439,312 @@ mod tests {
                 .len(),
             64
         );
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_remains_disabled_without_the_experiment_flag() {
+        let (_temp, provider, mut agent) = automatic_compaction_test_agent(
+            "automatic-compaction-disabled",
+            6,
+            40_000,
+            [final_turn("done")],
+            false,
+        );
+
+        agent
+            .run_turn(
+                "current prompt",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(provider.requests().len(), 1);
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, COMPACTION_BOUNDARY_STARTED_KIND), 0);
+        assert_eq!(count_events(&events, COMPACTION_STARTED_KIND), 0);
+        assert_eq!(count_events(&events, COMPACTION_CHECKPOINT_KIND), 0);
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_below_trigger_sends_the_normal_request() {
+        let (_temp, provider, mut agent) = automatic_compaction_test_agent(
+            "automatic-compaction-below-trigger",
+            1,
+            16,
+            [final_turn("done")],
+            true,
+        );
+
+        agent
+            .run_turn(
+                "small prompt",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(provider.requests().len(), 1);
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "context.tools"), 1);
+        assert_eq!(count_events(&events, COMPACTION_BOUNDARY_STARTED_KIND), 0);
+        assert_eq!(count_events(&events, COMPACTION_STARTED_KIND), 0);
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_commits_one_checkpoint_before_the_normal_request() {
+        let (_temp, provider, mut agent) = automatic_compaction_test_agent(
+            "automatic-compaction-success",
+            6,
+            40_000,
+            [compaction_summary_turn(), final_turn("done")],
+            true,
+        );
+
+        let outcome = agent
+            .run_turn(
+                "current prompt",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.responses, 1);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].max_output_tokens,
+            Some(MAX_COMPACTION_OUTPUT_TOKENS)
+        );
+        assert!(requests[0].tools.is_empty());
+        assert_eq!(requests[1].max_output_tokens, None);
+        assert!(
+            requests[1]
+                .tools
+                .iter()
+                .any(|tool| is_history_tool_name(&tool.name))
+        );
+        let normal_input = serde_json::to_string(&requests[1].input).unwrap();
+        assert!(normal_input.contains("oxidra_compacted_history"));
+        assert!(!normal_input.contains("old-question-0"));
+        assert!(normal_input.contains("old-question-5"));
+
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, COMPACTION_BOUNDARY_STARTED_KIND), 1);
+        assert_eq!(count_events(&events, COMPACTION_STARTED_KIND), 1);
+        assert_eq!(count_events(&events, COMPACTION_CHECKPOINT_KIND), 1);
+        assert_eq!(
+            count_events(&events, COMPACTION_BOUNDARY_CHECKPOINTED_KIND),
+            1
+        );
+        let boundary = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_BOUNDARY_STARTED_KIND)
+            .unwrap();
+        assert_eq!(boundary.data["trigger"], "estimated_context_threshold");
+        assert_eq!(
+            boundary.data["planning_version"],
+            AUTOMATIC_COMPACTION_PLANNING_VERSION
+        );
+        assert_eq!(boundary.data["context_window_source"], "cli");
+        assert_eq!(boundary.data["reserve_tokens_source"], "cli");
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_stops_when_two_recent_turns_leave_no_safe_candidate() {
+        let (_temp, provider, mut agent) = automatic_compaction_test_agent(
+            "automatic-compaction-no-candidate",
+            2,
+            80_000,
+            std::iter::empty::<AssistantTurn>(),
+            true,
+        );
+        let prompt = "p".repeat(100_000);
+
+        let error = agent
+            .run_turn(
+                &prompt,
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OxidraError::Limit(_)));
+        assert!(provider.requests().is_empty());
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, COMPACTION_BOUNDARY_STARTED_KIND), 1);
+        assert_eq!(count_events(&events, COMPACTION_BOUNDARY_FAILED_KIND), 1);
+        assert_eq!(count_events(&events, COMPACTION_STARTED_KIND), 0);
+        assert_eq!(count_events(&events, "response.started"), 0);
+        let failure = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_BOUNDARY_FAILED_KIND)
+            .unwrap();
+        assert_eq!(failure.data["code"], "no_candidate");
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_rejects_a_summary_that_misses_the_real_target() {
+        let (_temp, provider, mut agent) = automatic_compaction_test_agent(
+            "automatic-compaction-large-summary",
+            6,
+            40_000,
+            [compaction_summary_turn_with_text("s".repeat(300_000))],
+            true,
+        );
+
+        let error = agent
+            .run_turn(
+                "current prompt",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, OxidraError::Limit(_)));
+        assert_eq!(provider.requests().len(), 1);
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, COMPACTION_FAILED_KIND), 1);
+        assert_eq!(count_events(&events, COMPACTION_BOUNDARY_FAILED_KIND), 1);
+        assert_eq!(count_events(&events, COMPACTION_CHECKPOINT_KIND), 0);
+        assert_eq!(count_events(&events, "response.started"), 0);
+    }
+
+    #[tokio::test]
+    async fn automatic_compaction_runs_at_most_once_across_tool_round_trips() {
+        let read_calls = (0..6)
+            .map(|index| ToolCall {
+                id: format!("read-after-compaction-{index}"),
+                name: "read".to_owned(),
+                arguments: json!({"path":"note.txt"}),
+            })
+            .collect::<Vec<_>>();
+        let (temp, provider, mut agent) = automatic_compaction_test_agent(
+            "automatic-compaction-tool-roundtrip",
+            6,
+            40_000,
+            [
+                compaction_summary_turn(),
+                tool_turn(read_calls),
+                final_turn("done"),
+            ],
+            true,
+        );
+        std::fs::write(
+            temp.path().join("project").join("note.txt"),
+            "n".repeat(60_000),
+        )
+        .unwrap();
+
+        let outcome = agent
+            .run_turn(
+                "read note.txt",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.responses, 2);
+        assert_eq!(outcome.tools, 6);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.max_output_tokens.is_some())
+                .count(),
+            1
+        );
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, COMPACTION_STARTED_KIND), 1);
+        assert_eq!(count_events(&events, COMPACTION_CHECKPOINT_KIND), 1);
+        assert_eq!(count_events(&events, "response.started"), 2);
+        let response_starts = events
+            .iter()
+            .filter(|event| event.kind == "response.started")
+            .collect::<Vec<_>>();
+        assert!(
+            response_starts[1].data["context"]["estimated_next_input_tokens"]
+                .as_u64()
+                .unwrap()
+                >= response_starts[1].data["context"]["trigger_tokens"]
+                    .as_u64()
+                    .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_limit_after_checkpoint_retries_without_recompacting() {
+        let provider = Arc::new(ScriptedProvider::new([
+            Ok(compaction_summary_turn()),
+            Err(OxidraError::ProviderContextLimit(
+                "context_length_exceeded".to_owned(),
+            )),
+            Ok(final_turn("done after retry")),
+        ]));
+        let (_temp, mut agent) = automatic_compaction_test_agent_with_provider(
+            "automatic-compaction-provider-limit",
+            6,
+            40_000,
+            provider.clone(),
+            true,
+        );
+
+        let error = agent
+            .run_turn(
+                "current prompt",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::ProviderContextLimit(_)));
+
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, COMPACTION_CHECKPOINT_KIND), 1);
+        assert_eq!(count_events(&events, "context.limit_reached"), 1);
+        assert_eq!(agent.pending_compaction_boundaries().unwrap().len(), 1);
+        assert_eq!(agent.pending_context_turns().unwrap().len(), 1);
+
+        let outcome = agent
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "done after retry");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.max_output_tokens.is_some())
+                .count(),
+            1
+        );
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, COMPACTION_STARTED_KIND), 1);
+        assert_eq!(count_events(&events, COMPACTION_CHECKPOINT_KIND), 1);
+        assert_eq!(count_events(&events, "turn.retry_started"), 1);
+        assert_eq!(count_events(&events, "response.started"), 2);
+        assert!(agent.pending_compaction_boundaries().unwrap().is_empty());
+        assert!(agent.pending_context_turns().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -64,6 +64,16 @@ impl ContextRuntime {
             "reserve_tokens_source": self.limits.reserve_tokens_source,
         })
     }
+
+    pub fn configured_event_data_with_compaction(&self, automatic_compaction: bool) -> Value {
+        let mut data = self.configured_event_data();
+        data["automatic_compaction"] = json!({
+            "enabled": automatic_compaction,
+            "source": if automatic_compaction { "experimental_cli" } else { "default_off" },
+            "planning_version": 1,
+        });
+        data
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -431,6 +441,21 @@ mod tests {
             serde_json::to_vec(&body).unwrap().len() as u64
         );
         assert!(body["include"].as_array().is_some());
+    }
+
+    #[test]
+    fn configured_event_audits_the_explicit_compaction_switch() {
+        let enabled = runtime("domain").configured_event_data_with_compaction(true);
+        assert_eq!(enabled["automatic_compaction"]["enabled"], true);
+        assert_eq!(
+            enabled["automatic_compaction"]["source"],
+            "experimental_cli"
+        );
+        assert_eq!(enabled["automatic_compaction"]["planning_version"], 1);
+
+        let disabled = runtime("domain").configured_event_data_with_compaction(false);
+        assert_eq!(disabled["automatic_compaction"]["enabled"], false);
+        assert_eq!(disabled["automatic_compaction"]["source"], "default_off");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Oxidra 个人 CLI Agent 设计
 
-状态：M1-M3 已实现；M5 checkpoint 协议、低权限版本化 summary envelope、真实 Provider `compact_once`、checkpoint-aware Agent projection、受控历史回查、model-aware context 测量/审计，以及 Provider context 超限后的显式 retry/abandon 恢复已经实现。当前改动已通过本地 Windows 验证；推送后仍需由 Linux、macOS 和 Windows 远程 CI 重新确认。当前主线定位为个人使用的轻量 coding agent，不包含扩展系统。compaction 用户入口和自动触发尚未实现，因此终端用户当前还不能主动触发 compaction。
+状态：M1-M3 已实现；M5 checkpoint 协议、低权限版本化 summary envelope、真实 Provider `compact_once`、checkpoint-aware Agent projection、受控历史回查、model-aware context 测量/审计、Provider context 超限后的显式 retry/abandon 恢复，以及默认关闭的 `--experimental-auto-compact` preflight 已经实现。当前改动已通过本地 Windows 验证；推送后仍需由 Linux、macOS 和 Windows 远程 CI 重新确认。当前主线定位为个人使用的轻量 coding agent，不包含扩展系统。自动 compaction 在递归摘要漂移测量完成前不会默认启用。
 
 已删除的协议实验代码仅作为历史源码保存在 Git tag `archive/mcp-mvp`，主线不为其保留兼容层或扩展接口。
 
@@ -31,7 +31,7 @@
 暂不实现：
 
 - 扩展系统、插件安装器和 registry。
-- Goal mode、可用的自动 compaction、sub-agent。M5 的 checkpoint/reducer、真实 Provider 摘要调用和受控历史回查已进入主线，但尚未开放 compaction 用户入口。
+- Goal mode、默认启用的自动 compaction、sub-agent。M5 的 checkpoint/reducer、真实 Provider 摘要调用、受控历史回查和显式实验入口已进入主线，但默认开关仍关闭。
 - TUI、steering/follow-up 队列。
 - delete/move 等更多文件工具。
 
@@ -205,7 +205,7 @@ Oxidra 采用完整输入契约：journal 必须记录模型实际看到的所�
 
 ## 9. Context
 
-当前发布行为仍不提供可用 compaction。M5 已实现 turn 边界、checkpoint reducer、低权限 `role: "user"` summary envelope、六类不可变版本注册表、checkpoint + tail projection、真实 Provider `compact_once`、受控历史回查、model-aware 测量基础，以及 Provider context 超限后的恢复；尚未接入 compaction 用户入口或自动触发。
+当前发布行为提供默认关闭的实验入口 `--experimental-auto-compact`。M5 已实现 turn 边界、checkpoint reducer、低权限 `role: "user"` summary envelope、六类不可变版本注册表、checkpoint + tail projection、真实 Provider `compact_once`、受控历史回查、model-aware 测量基础，以及 Provider context 超限后的恢复。实验入口在估算达到 trigger 时为当前 user turn 最多执行一次压缩；不开启时行为与之前相同。
 
 默认：
 
@@ -218,7 +218,7 @@ reserve_tokens = 16384
 
 每次启动追加 `context.configured`，记录实际 model、Provider usage domain、window/reserve/usable/trigger/target、字段来源和测量协议版本。每个启动 epoch 与 tools schema 变化时追加 `context.tools`；每次 `response.started` 保存完整 prepared-request digest、序列化请求字节数、确定性估算、journal/checkpoint/instructions/tools 引用和 usage anchor 差分。存在可比较的上一普通 response 时，下一次输入估算使用真实 `input_tokens + E(current) - E(anchor)`；cached tokens 不扣除。无可比较 usage 时才从零估算完整请求。anchor 产生非正值或异常漂移时回退完整请求估算，不 clamp 为 `0`。
 
-当前没有 model tokenizer 或 Provider 计数接口，因此估算只用于显示、审计和未来 compaction trigger，不能作为 token hard limit。普通请求仍交给 Provider；Provider 返回受识别的结构化 context-limit 错误时，Oxidra 写入 `response.failed` + `context.limit_reached`，禁止继续追加新 prompt。`--retry-pending --resume <ID>` 从一份 journal snapshot 生成版本化恢复计划：若同 turn 同时存在 context pending 与 failed compaction boundary，先恢复 boundary；历史 durable candidate 按事件记录的协议版本重放；retry intent、compaction Provider 调用和 checkpoint commit 之前，先验证 prospective boundary/turn/slot、checkpoint chain、实际 history snapshot、quota、tools 与后续请求测量。纯 context-limit 同步版本化 `turn.retry_started`；处于 `Ready` Provider slot 的 checkpointed compaction boundary 继续原 turn；有 durable candidate 的 failed boundary 同步 `compaction.boundary.retry_started` 后重放压缩。checkpointed 后的其他 terminal outcome 尚无同 turn retry 协议，必须显式 abandon；Agent 在追加新 `response.started` 前拒绝非法重试。`--abandon-pending --resume <ID>` 同时处理两类 pending，允许用户随后提交替代 prompt；所有路径都复用原 user message，不写第二份。turn validator v3 严格校验 `user < limit < control`、response attempt 绑定、状态和唯一性，并与 source projection v3 一起 supersede latest retry 之前的完整 attempt 终态；v4 只修正 legacy completion evidence 的时序。历史 turn validator v1/v2/v3、source projection v1/v2/v3 与 compaction boundary v1/v2/v3 按首次登记语义重建，不会被新版本原地改写。boundary v2 首次用独立 request-slot reducer v1 逐事件验证 response/tool 因果顺序；当前 writer 使用 boundary v3，在同一固定 slot policy 之上建立不可降级的 session epoch，并要求 abandon 前结算普通 Provider slot 与 compaction attempt。retry 只能保持或升级协议版本，v3 durable 后不能退回 v1/v2。history extractor v4 与当前 Provider projection 会排除已验证的 compaction-boundary abandoned turn；冻结 source projection 尚不能表达该排除，因此新 checkpoint 暂不得跨过这类 turn。
+当前没有 model tokenizer 或 Provider 计数接口，因此估算只用于显示、审计和显式启用的 compaction planning，不能作为普通请求的 token hard limit。实验开关开启且估算达到 trigger 时，Agent 先同步 boundary intent，再从同一 journal/config 快照为安全 cutoff 构造完整 summary-budget + tail 请求；候选估算包含当前 instructions、实际 tools/history schema 和与 8192 输出上限对应的估算器占位预算，真实 summary 返回后还会按同一 prepared-request/usage-anchor 语义重建，只有达到 target 才提交 checkpoint。同一 user turn 最多自动压缩一次；无候选、Provider 失败或真实 summary 仍超 target 都停止当前请求，不发送原大请求。Provider attempt 已 durable 的失败可由 `--retry-pending` 重放；尚未产生 candidate/attempt 的 preflight-only failure 当前必须显式 abandon。不开启实验开关时，普通请求仍直接交给 Provider。Provider 返回受识别的结构化 context-limit 错误时，Oxidra 写入 `response.failed` + `context.limit_reached`，禁止继续追加新 prompt。`--retry-pending --resume <ID>` 从一份 journal snapshot 生成版本化恢复计划：若同 turn 同时存在 context pending 与 failed compaction boundary，先恢复 boundary；历史 durable candidate 按事件记录的协议版本重放；retry intent、compaction Provider 调用和 checkpoint commit 之前，先验证 prospective boundary/turn/slot、checkpoint chain、实际 history snapshot、quota、tools 与后续请求测量。纯 context-limit 同步版本化 `turn.retry_started`；处于 `Ready` Provider slot 的 checkpointed compaction boundary 继续原 turn；有 durable candidate 的 failed boundary 同步 `compaction.boundary.retry_started` 后重放压缩。checkpointed 后的其他 terminal outcome 尚无同 turn retry 协议，必须显式 abandon；Agent 在追加新 `response.started` 前拒绝非法重试。`--abandon-pending --resume <ID>` 同时处理两类 pending，允许用户随后提交替代 prompt；所有路径都复用原 user message，不写第二份。turn validator v3 严格校验 `user < limit < control`、response attempt 绑定、状态和唯一性，并与 source projection v3 一起 supersede latest retry 之前的完整 attempt 终态；v4 只修正 legacy completion evidence 的时序。历史 turn validator v1/v2/v3、source projection v1/v2/v3 与 compaction boundary v1/v2/v3 按首次登记语义重建，不会被新版本原地改写。boundary v2 首次用独立 request-slot reducer v1 逐事件验证 response/tool 因果顺序；当前 writer 使用 boundary v3，在同一固定 slot policy 之上建立不可降级的 session epoch，并要求 abandon 前结算普通 Provider slot 与 compaction attempt。retry 只能保持或升级协议版本，v3 durable 后不能退回 v1/v2。history extractor v4 与当前 Provider projection 会排除已验证的 compaction-boundary abandoned turn；冻结 source projection 尚不能表达该排除，因此新 checkpoint 暂不得跨过这类 turn。
 
 每次新建或 resume 都以当前解析出的 provider/model/context、当前 `AGENTS.md`/memory 和当前内置 tools 为运行真相；journal 中历史配置与 instructions 快照只供审计，不反向恢复旧配置。API key 等秘密不写 journal。
 
@@ -245,6 +245,7 @@ oxidra session delete <session-id>
 --full-auto
 --max-responses <N>
 --max-tools <N>
+--experimental-auto-compact
 ```
 
 `session delete` 永久删除对应 journal 与 artifact 目录；删除前获取 session 独占锁，因此不能删除正在使用的 session。目标不存在时返回成功并明确报告。
@@ -301,7 +302,7 @@ stdout 只承载 assistant 文本；工具状态、diff、确认、诊断和错�
 
 M4 与 M5 的完整实施契约见 [`m4-m5-roadmap.md`](m4-m5-roadmap.md)。
 
-1. M5 checkpoint 核心、真实 Provider `compact_once`、受控历史回查、model-aware 配置、prepared-request usage-anchor 测量、Provider context-limit retry/abandon，以及 compaction request-boundary v1/v2/v3、不可变版本 policy、版本化 request-slot reducer、bound Provider 调用、session-open 恢复、Agent/CLI pending 管理和 projection/history abandon 语义已经实现；下一步接默认关闭的自动 compaction preflight/trigger 实验入口。
-2. 完成崩溃/连续压缩/history 闭环后，先测量 3/5/10 次递归摘要漂移；只有数据支持时才默认启用自动 compaction。
+1. M5 checkpoint 核心、真实 Provider `compact_once`、受控历史回查、model-aware 配置、prepared-request usage-anchor 测量、Provider context-limit retry/abandon、compaction request-boundary v1/v2/v3、不可变版本 policy、版本化 request-slot reducer、bound Provider 调用、session-open 恢复、Agent/CLI pending 管理、projection/history abandon 语义，以及默认关闭的自动 compaction preflight 实验入口已经实现。
+2. 下一步补自动触发崩溃/CLI resume 的跨进程闭环测试，再测量 3/5/10 次递归摘要漂移；只有数据支持时才默认启用自动 compaction。
 3. M4：每会话 token/执行时间预算按实际使用数据推迟，后续作为独立里程碑。
 4. 只有实际高频需要时才重新评估子 agent；它必须使用独立子会话，并受父级预算约束。

@@ -129,6 +129,18 @@ limit becomes a recoverable pending turn. In an interactive TTY, edit
 replacement lines are shown in red/green; `-p` and redirected output remain
 plain text.
 
+Automatic compaction remains an explicit experiment. Passing
+`--experimental-auto-compact` lets the current model-aware context estimate
+trigger one checkpoint attempt for the active user turn. The planner keeps at
+least two complete turns, estimates every eligible cutoff with the full
+prepared-request shape and an estimator-side placeholder for the 8192-token
+summary budget, and commits only if the real summary rebuild reaches the 50%
+target. A failed or unavailable attempt stops the request and leaves a pending
+boundary for explicit recovery: durable Provider attempts can be retried,
+while a preflight-only failure must currently be abandoned. The flag does not
+turn the heuristic into a tokenizer-backed hard limit and is not enabled by
+default.
+
 Useful options:
 
 ```text
@@ -141,6 +153,8 @@ Useful options:
     --max-tools <N>        optional per-turn insurance limit
     --context-window <N>   override the effective model context window
     --reserve-tokens <N>   override the reserved token allowance
+    --experimental-auto-compact
+                            opt in to estimated-trigger automatic compaction
     --retry-pending        retry one pending context-limit or compaction request
     --abandon-pending      abandon pending context-limit/compaction requests
 ```

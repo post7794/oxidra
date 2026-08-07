@@ -73,6 +73,10 @@ struct Cli {
     #[arg(long, value_name = "TOKENS")]
     reserve_tokens: Option<u64>,
 
+    /// Experimentally compact old complete turns before an estimated context trigger.
+    #[arg(long)]
+    experimental_auto_compact: bool,
+
     /// Retry the single pending context-limit or compaction request.
     #[arg(
         long,
@@ -157,6 +161,7 @@ async fn run(cli: Cli) -> Result<()> {
         max_tools,
         context_window,
         reserve_tokens,
+        experimental_auto_compact,
         retry_pending,
         abandon_pending,
     } = cli;
@@ -193,7 +198,7 @@ async fn run(cli: Cli) -> Result<()> {
     journal.append_and_sync(
         "context.configured",
         None,
-        context_runtime.configured_event_data(),
+        context_runtime.configured_event_data_with_compaction(experimental_auto_compact),
     )?;
     journal.append_and_sync(
         "context.instructions",
@@ -217,6 +222,7 @@ async fn run(cli: Cli) -> Result<()> {
         max_responses,
         max_tools,
     );
+    agent.set_automatic_compaction(experimental_auto_compact);
 
     eprintln!(
         "Oxidra session {} (root: {})",
@@ -1178,6 +1184,11 @@ impl AgentObserver for CliObserver {
         writeln!(io::stderr().lock(), "[agent] {message}")?;
         Ok(())
     }
+
+    fn on_compaction(&mut self, message: &str) -> Result<()> {
+        writeln!(io::stderr().lock(), "[compaction] {message}")?;
+        Ok(())
+    }
 }
 
 fn write_completed_text(text: &str) -> Result<()> {
@@ -1293,6 +1304,7 @@ mod tests {
             "1000000",
             "--reserve-tokens",
             "64000",
+            "--experimental-auto-compact",
         ])
         .unwrap();
         assert_eq!(cli.prompt.as_deref(), Some("fix it"));
@@ -1300,6 +1312,7 @@ mod tests {
         assert_eq!(cli.max_tools, Some(8));
         assert_eq!(cli.context_window, Some(1_000_000));
         assert_eq!(cli.reserve_tokens, Some(64_000));
+        assert!(cli.experimental_auto_compact);
     }
 
     #[test]
