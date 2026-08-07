@@ -304,7 +304,7 @@ stdout 只承载 assistant 文本；工具状态、diff、确认、诊断和错�
 
 M4 与 M5 的完整实施契约见 [`m4-m5-roadmap.md`](m4-m5-roadmap.md)。
 
-1. M5 checkpoint 核心、真实 Provider `compact_once`、受控历史回查、model-aware 配置、prepared-request usage-anchor 测量、Provider context-limit retry/abandon、compaction request-boundary v1-v4、不可变版本 policy、版本化 request-slot reducer、旧 budget terminal 兼容迁移、bound Provider 调用、session-open 恢复、Agent/CLI pending 管理、projection/history abandon 语义，以及默认关闭的自动 compaction preflight 实验入口已经实现。
+1. M5 checkpoint 核心、真实 Provider `compact_once`、受控历史回查、model-aware 配置、prepared-request usage-anchor 测量、Provider context-limit retry/abandon、compaction request-boundary v1-v4、不可变版本 policy、版本化 request-slot reducer、旧 budget terminal 兼容迁移、bound Provider 调用、session-open 恢复、Agent/CLI pending 管理、projection/history abandon 语义，以及默认关闭的自动 compaction preflight 实验入口已经实现。legacy budget migration 在 fsync 后、正常 response 前被强杀的窗口已有跨进程 CLI resume 测试，恢复不会重复追加 migration intent 或原 user message。
 2. 下一步补自动触发崩溃/CLI resume 的跨进程闭环测试，再测量 3/5/10 次递归摘要漂移；只有数据支持时才默认启用自动 compaction。
 3. M4：每会话 token/执行时间预算按实际使用数据推迟，后续作为独立里程碑。
 4. 只有实际高频需要时才重新评估子 agent；它必须使用独立子会话，并受父级预算约束。

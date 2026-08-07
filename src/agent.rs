@@ -88,6 +88,13 @@ pub trait AgentObserver: Send {
     fn on_compaction_recovery_intent_synced(&mut self) -> Result<()> {
         Ok(())
     }
+
+    /// Observability hook after the atomic legacy Provider-budget migration
+    /// is durable but before the original turn starts another Provider
+    /// request. Process fault-injection tests block here and kill the writer.
+    fn on_compaction_budget_recovery_intent_synced(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// The CLI implements this to keep shell authorization separate from project
@@ -1336,6 +1343,9 @@ impl Agent {
                     None,
                     serde_json::to_value(retry)?,
                 )?;
+                if let Err(error) = observer.on_compaction_budget_recovery_intent_synced() {
+                    return Err(OxidraError::observer(error));
+                }
                 self.run_existing_turn(
                     &replacement.turn_id,
                     replacement.user_message_seq,

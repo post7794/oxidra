@@ -2,24 +2,26 @@ use std::collections::VecDeque;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use oxidra::agent::{Agent, AgentObserver, DenyApproval};
 use oxidra::compaction::{
-    COMPACTION_ABORTED_KIND, COMPACTION_BOUNDARY_FAILED_KIND,
-    COMPACTION_BOUNDARY_RETRY_STARTED_KIND, COMPACTION_BOUNDARY_STARTED_KIND,
-    COMPACTION_CHECKPOINT_KIND, COMPACTION_PROMPT_VERSION, COMPACTION_STARTED_KIND,
-    CompactionBoundary, CompactionBoundaryFailed, CompactionBoundaryStarted, CompactionCandidate,
-    CompactionStarted, MAX_COMPACTION_OUTPUT_TOKENS, SOURCE_DIGEST_VERSION,
-    SUMMARY_ENVELOPE_VERSION, USAGE_CONTRACT_VERSION, build_compaction_source, compact_once,
-    compaction_instructions, validate_checkpoint_chain, validate_compaction_boundary_chain,
+    COMPACTION_ABORTED_KIND, COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
+    COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+    COMPACTION_BOUNDARY_STARTED_KIND, COMPACTION_CHECKPOINT_KIND, COMPACTION_PROMPT_VERSION,
+    COMPACTION_STARTED_KIND, CompactionBoundary, CompactionBoundaryFailed,
+    CompactionBoundaryStarted, CompactionCandidate, CompactionStarted,
+    MAX_COMPACTION_OUTPUT_TOKENS, SOURCE_DIGEST_VERSION, SUMMARY_ENVELOPE_VERSION,
+    USAGE_CONTRACT_VERSION, build_compaction_source, compact_once, compaction_instructions,
+    validate_checkpoint_chain, validate_compaction_boundary_chain,
 };
 use oxidra::config::{ContextLimits, ContextValueSource};
 use oxidra::context::AUTOMATIC_COMPACTION_PLANNING_VERSION;
@@ -33,7 +35,7 @@ use oxidra::turn::{
     TurnState, complete_prefix_candidates, segment_turns,
 };
 use oxidra::types::{AssistantTurn, ToolCall, ToolResult, Usage};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 const CHILD_MODE_ENV: &str = "OXIDRA_FAULT_INJECTION_CHILD";
@@ -43,6 +45,9 @@ const SESSION_ID: &str = "process-fault-session";
 const RETRY_SESSION_ID: &str = "retry-fault-session";
 const COMPACTION_REPLAN_SESSION_ID: &str = "compaction-replan-fault-session";
 const COMPACTION_REPLAN_SYNC_LABEL: &str = "compaction.boundary.retry_started";
+const BUDGET_MIGRATION_SESSION_ID: &str = "budget-migration-fault-session";
+const BUDGET_MIGRATION_SYNC_LABEL: &str = "compaction.boundary.budget_retry_started";
+const PROJECT_ROOT_ENV: &str = "OXIDRA_FAULT_INJECTION_PROJECT_ROOT";
 const TURN_ID: &str = "turn-1";
 const RESPONSE_ATTEMPT_ID: &str = "attempt-1";
 const SYNC_PREFIX: &str = "OXIDRA_FAULT_SYNC:";
@@ -440,6 +445,123 @@ fn force_kill_after_compaction_recovery_intent_can_retry_after_reopen() {
     );
 }
 
+#[test]
+fn force_kill_after_budget_migration_sync_resumes_via_cli() {
+    let temp = tempfile::tempdir().expect("create budget migration fault directory");
+    let project_root = temp.path().join("project");
+    std::fs::create_dir_all(&project_root).expect("create budget migration project root");
+    let data_dir = isolated_cli_data_dir(temp.path());
+    let child = spawn_budget_migration_fault_child(&data_dir, &project_root);
+    stop_child_at_label(
+        child,
+        BUDGET_MIGRATION_SYNC_LABEL,
+        &[BUDGET_MIGRATION_SYNC_LABEL],
+    );
+
+    let store = SessionStore::new(&data_dir).expect("open budget migration fault store");
+    let persisted = store
+        .inspect(BUDGET_MIGRATION_SESSION_ID)
+        .expect("inspect synced budget migration before CLI resume");
+    assert_eq!(
+        count_kind(&persisted, COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND),
+        1
+    );
+    assert_eq!(count_kind(&persisted, "response.started"), 0);
+    let persisted_chain = validate_compaction_boundary_chain(&persisted)
+        .expect("synced migration has a valid boundary lineage");
+    assert_eq!(persisted_chain.pending().len(), 1);
+    assert_eq!(persisted_chain.pending()[0].boundary.version, 4);
+
+    let listener =
+        TcpListener::bind(("127.0.0.1", 0)).expect("bind budget migration resume server");
+    let address = listener
+        .local_addr()
+        .expect("read budget migration resume server address");
+    let server = thread::spawn(move || {
+        serve_one_final_response(listener, "resumed after forced migration crash")
+    });
+
+    let local_data = temp.path().join("local");
+    let roaming_data = temp.path().join("roaming");
+    let xdg_config = temp.path().join("config");
+    let xdg_state = temp.path().join("state");
+    let home = temp.path().join("home");
+    for directory in [&local_data, &roaming_data, &xdg_config, &xdg_state, &home] {
+        std::fs::create_dir_all(directory).expect("create isolated CLI directory");
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_oxidra"))
+        .arg("--resume")
+        .arg(BUDGET_MIGRATION_SESSION_ID)
+        .arg("--retry-pending")
+        .arg("--max-responses")
+        .arg("2")
+        .arg("--cwd")
+        .arg(&project_root)
+        .env("API_KEY", "fake")
+        .env("API_BASE_URL", format!("http://{address}/v1/"))
+        .env("MODEL", "test-model")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_MODEL")
+        .env("LOCALAPPDATA", &local_data)
+        .env("APPDATA", &roaming_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .expect("resume budget migration through the CLI");
+
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("CLI stderr is UTF-8");
+    let server_result = server
+        .join()
+        .expect("budget migration resume server panicked");
+    assert!(
+        output.status.success(),
+        "CLI resume failed with {}\nstdout:\n{}\nstderr:\n{}\nserver: {:?}",
+        output.status,
+        stdout,
+        stderr,
+        server_result
+    );
+    let request = server_result.expect("budget migration resume server failed");
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "resumed after forced migration crash\n"
+    );
+    let request_input =
+        serde_json::to_string(&request["input"]).expect("serialize resumed Provider input");
+    assert!(request_input.contains("summary v2"));
+    assert!(request_input.contains("prompt"));
+
+    let completed = store
+        .inspect(BUDGET_MIGRATION_SESSION_ID)
+        .expect("inspect completed CLI recovery");
+    assert_eq!(
+        count_kind(&completed, COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND),
+        1,
+        "CLI resume must not duplicate the durable migration intent"
+    );
+    assert_eq!(count_kind(&completed, "user.message"), 2);
+    assert_eq!(count_kind(&completed, "response.started"), 1);
+    assert!(
+        validate_compaction_boundary_chain(&completed)
+            .expect("completed CLI recovery has a valid boundary lineage")
+            .pending()
+            .is_empty()
+    );
+    assert!(matches!(
+        segment_turns(&completed)
+            .expect("segment completed CLI recovery")
+            .last()
+            .map(|turn| turn.state),
+        Some(TurnState::Complete(_))
+    ));
+}
+
 // This ignored test is a helper process, not a standalone test. The parent
 // launches this same integration-test binary and kills it while a synced
 // journal writer is deliberately blocked on stdin.
@@ -625,6 +747,67 @@ fn retry_fault_injection_child() {
 }
 
 #[test]
+#[ignore = "launched by force_kill_after_budget_migration_sync_resumes_via_cli"]
+fn budget_migration_fault_injection_child() {
+    if env::var_os(CHILD_MODE_ENV).is_none() {
+        return;
+    }
+    let data_dir = PathBuf::from(
+        env::var_os(DATA_DIR_ENV).expect("budget migration child data directory is set"),
+    );
+    let project_root = PathBuf::from(
+        env::var_os(PROJECT_ROOT_ENV).expect("budget migration child project root is set"),
+    );
+    let project_root = std::fs::canonicalize(&project_root)
+        .expect("canonicalize budget migration child project root");
+    let fixture = include_str!("fixtures/checkpointed_budget_limit_55e5b0c.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str::<JournalEvent>(line).expect("literal 55e5b0c JSONL"))
+        .collect::<Vec<_>>();
+    let store = SessionStore::new(&data_dir).expect("create budget migration child store");
+    let mut journal = store
+        .create_with_id(
+            BUDGET_MIGRATION_SESSION_ID,
+            SessionHeader::new(&project_root, "test-model"),
+        )
+        .expect("create budget migration child journal");
+    for event in fixture.into_iter().skip(1) {
+        journal
+            .append_and_sync(&event.kind, event.turn_id.as_deref(), event.data)
+            .expect("append literal legacy budget event");
+    }
+    let tools = BuiltinTools::new(
+        &project_root,
+        journal.artifact_dir(),
+        data_dir.join("memory"),
+        false,
+        false,
+    )
+    .expect("create budget migration child tools");
+    let mut agent = Agent::new(
+        std::sync::Arc::new(UnexpectedRecoveryProvider),
+        journal,
+        tools,
+        "instructions",
+        ContextLimits::default(),
+        Some(2),
+        None,
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create budget migration child runtime");
+    let error = runtime
+        .block_on(agent.retry_pending_turn(
+            CancellationToken::new(),
+            &mut BudgetMigrationSyncObserver,
+            &mut DenyApproval,
+        ))
+        .expect_err("parent should kill the child after migration fsync");
+    panic!("budget migration child unexpectedly resumed: {error}");
+}
+
+#[test]
 #[ignore = "launched by force_kill_after_compaction_recovery_intent_can_retry_after_reopen"]
 fn compaction_replan_fault_injection_child() {
     if env::var_os(CHILD_MODE_ENV).is_none() {
@@ -720,6 +903,31 @@ fn compaction_replan_fault_injection_child() {
 }
 
 struct CompactionRecoverySyncObserver;
+
+struct BudgetMigrationSyncObserver;
+
+impl AgentObserver for BudgetMigrationSyncObserver {
+    fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_message(&mut self, _message: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_compaction_budget_recovery_intent_synced(&mut self) -> Result<()> {
+        sync_barrier_label(BUDGET_MIGRATION_SYNC_LABEL);
+        Ok(())
+    }
+}
 
 impl AgentObserver for CompactionRecoverySyncObserver {
     fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
@@ -1211,6 +1419,180 @@ fn recovery_turn(id: &str, text: &str, output_tokens: u64) -> AssistantTurn {
     }
 }
 
+fn isolated_cli_data_dir(root: &Path) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        return root.join("local").join("oxidra");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return root
+            .join("home")
+            .join("Library")
+            .join("Application Support")
+            .join("oxidra");
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        return root.join("state").join("oxidra");
+    }
+    #[allow(unreachable_code)]
+    root.join("oxidra")
+}
+
+fn serve_one_final_response(
+    listener: TcpListener,
+    text: &str,
+) -> std::result::Result<Value, String> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("set resume listener nonblocking: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err("timed out waiting for CLI resume request".to_owned());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("accept CLI resume request: {error}")),
+        }
+    };
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("set CLI resume stream blocking: {error}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| format!("set CLI resume request timeout: {error}"))?;
+    let request = read_json_http_request(&mut stream)?;
+    let body = final_text_sse("budget-migration-resume", text);
+    write_http_response(&mut stream, &body)?;
+    Ok(request)
+}
+
+fn read_json_http_request(stream: &mut TcpStream) -> std::result::Result<Value, String> {
+    let mut bytes = Vec::new();
+    let header_end = loop {
+        if let Some(index) = find_bytes(&bytes, b"\r\n\r\n") {
+            break index;
+        }
+        let mut buffer = [0_u8; 8 * 1024];
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("read CLI request headers: {error}"))?;
+        if count == 0 {
+            return Err("CLI closed before request headers completed".to_owned());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        if bytes.len() > 128 * 1024 {
+            return Err("CLI request headers exceeded 128 KiB".to_owned());
+        }
+    };
+    let headers = std::str::from_utf8(&bytes[..header_end])
+        .map_err(|error| format!("CLI request headers were not UTF-8: {error}"))?;
+    let content_length = headers
+        .split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .ok_or_else(|| "CLI request has no valid Content-Length".to_owned())?;
+    let body_start = header_end + 4;
+    let body_end = body_start
+        .checked_add(content_length)
+        .ok_or_else(|| "CLI request body length overflowed".to_owned())?;
+    while bytes.len() < body_end {
+        let mut buffer = [0_u8; 8 * 1024];
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|error| format!("read CLI request body: {error}"))?;
+        if count == 0 {
+            return Err("CLI closed before request body completed".to_owned());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    serde_json::from_slice(&bytes[body_start..body_end])
+        .map_err(|error| format!("parse CLI request JSON: {error}"))
+}
+
+fn final_text_sse(response_id: &str, text: &str) -> String {
+    let item = json!({
+        "type":"message",
+        "id":"message_final",
+        "role":"assistant",
+        "status":"completed",
+        "content":[{"type":"output_text","text":text,"annotations":[]}],
+    });
+    let completed = json!({
+        "id":response_id,
+        "object":"response",
+        "status":"completed",
+        "output":[item.clone()],
+        "usage":{
+            "input_tokens":1,
+            "input_tokens_details":{"cached_tokens":0},
+            "output_tokens":1,
+            "output_tokens_details":{"reasoning_tokens":0},
+            "total_tokens":2,
+        },
+    });
+    let mut body = String::new();
+    push_sse(
+        &mut body,
+        "response.created",
+        json!({"type":"response.created","response":{"id":response_id}}),
+    );
+    push_sse(
+        &mut body,
+        "response.output_text.delta",
+        json!({
+            "type":"response.output_text.delta",
+            "output_index":0,
+            "content_index":0,
+            "delta":text,
+        }),
+    );
+    push_sse(
+        &mut body,
+        "response.output_item.done",
+        json!({"type":"response.output_item.done","output_index":0,"item":item}),
+    );
+    push_sse(
+        &mut body,
+        "response.completed",
+        json!({"type":"response.completed","response":completed}),
+    );
+    body
+}
+
+fn push_sse(body: &mut String, event: &str, payload: Value) {
+    body.push_str("event: ");
+    body.push_str(event);
+    body.push('\n');
+    body.push_str("data: ");
+    body.push_str(&serde_json::to_string(&payload).expect("serialize SSE payload"));
+    body.push_str("\n\n");
+}
+
+fn write_http_response(stream: &mut TcpStream, body: &str) -> std::result::Result<(), String> {
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .and_then(|()| stream.write_all(body.as_bytes()))
+        .and_then(|()| stream.flush())
+        .map_err(|error| format!("write CLI resume response: {error}"))
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 fn spawn_fault_child(data_dir: &std::path::Path) -> Child {
     let mut command = Command::new(env::current_exe().expect("locate integration-test binary"));
     command
@@ -1265,6 +1647,27 @@ fn spawn_compaction_replan_fault_child(data_dir: &Path) -> Child {
     command
         .spawn()
         .expect("spawn compaction replan fault-injection child")
+}
+
+fn spawn_budget_migration_fault_child(data_dir: &Path, project_root: &Path) -> Child {
+    let mut command = Command::new(env::current_exe().expect("locate integration-test binary"));
+    command
+        .args([
+            "--ignored",
+            "--exact",
+            "budget_migration_fault_injection_child",
+            "--nocapture",
+        ])
+        .env(CHILD_MODE_ENV, "1")
+        .env(DATA_DIR_ENV, data_dir)
+        .env(PROJECT_ROOT_ENV, project_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    suppress_windows_console(&mut command);
+    command
+        .spawn()
+        .expect("spawn budget migration fault-injection child")
 }
 
 fn spawn_compaction_fault_child(data_dir: &Path, scenario: CompactionSyncPoint) -> Child {
