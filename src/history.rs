@@ -184,7 +184,27 @@ impl HistorySnapshot {
         chain.ensure_matches(events)?;
         boundary_chain.ensure_checkpoint_projection_safe(chain)?;
         let session_id = validate_journal_envelopes(events)?;
-        let Some(latest) = chain.latest() else {
+        let views = chain
+            .checkpoints()
+            .iter()
+            .map(|checkpoint| {
+                (
+                    checkpoint.checkpoint_id.clone(),
+                    checkpoint.covers_through_seq,
+                )
+            })
+            .collect::<Vec<_>>();
+        let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+        Self::build_from_views(events, session_id, &excluded_turn_ids, &views)
+    }
+
+    fn build_from_views(
+        events: &[JournalEvent],
+        session_id: Option<String>,
+        excluded_turn_ids: &HashSet<String>,
+        views: &[(String, u64)],
+    ) -> Result<Self> {
+        let Some((_, latest_cutoff)) = views.last() else {
             return Ok(Self {
                 session_id,
                 records: Vec::new(),
@@ -192,29 +212,23 @@ impl HistorySnapshot {
             });
         };
 
-        let boundary_excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
-        let records = extract_records_with_exclusions(
-            events,
-            latest.covers_through_seq,
-            &boundary_excluded_turn_ids,
-        )?;
+        let records = extract_records_with_exclusions(events, *latest_cutoff, excluded_turn_ids)?;
         validate_artifact_grants(&records)?;
         let session_id = session_id.ok_or_else(|| {
             OxidraError::Session("checkpoint chain belongs to an empty journal".to_owned())
         })?;
-        let mut views = Vec::with_capacity(chain.len());
-        for checkpoint in chain.checkpoints() {
-            let record_end =
-                records.partition_point(|record| record.seq <= checkpoint.covers_through_seq);
+        let mut snapshot_views = Vec::with_capacity(views.len());
+        for (checkpoint_id, covers_through_seq) in views {
+            let record_end = records.partition_point(|record| record.seq <= *covers_through_seq);
             let digest = snapshot_digest(
                 &session_id,
-                &checkpoint.checkpoint_id,
-                checkpoint.covers_through_seq,
+                checkpoint_id,
+                *covers_through_seq,
                 &records[..record_end],
             )?;
-            views.push(SnapshotView {
-                checkpoint_id: checkpoint.checkpoint_id.clone(),
-                covers_through_seq: checkpoint.covers_through_seq,
+            snapshot_views.push(SnapshotView {
+                checkpoint_id: checkpoint_id.clone(),
+                covers_through_seq: *covers_through_seq,
                 record_end,
                 digest,
             });
@@ -223,7 +237,7 @@ impl HistorySnapshot {
         Ok(Self {
             session_id: Some(session_id),
             records,
-            views,
+            views: snapshot_views,
         })
     }
 
@@ -494,6 +508,61 @@ impl HistorySnapshot {
         }
         Ok(encoded)
     }
+}
+
+/// Prove that the history view required by the normal request will remain
+/// constructible if a checkpoint is committed at `covers_through_seq`.
+///
+/// This runs against the same pre-dispatch journal snapshot as compaction
+/// recovery. The owning boundary may still be `Started`, so only validated
+/// abandoned-turn exclusions are applied; compaction management events are
+/// not history records. Existing checkpoint views and the prospective newest
+/// view are both digested to exercise the same extractor/provenance path as
+/// [`HistorySnapshot::build_with_boundary_chain`].
+pub(crate) fn validate_history_snapshot_after_compaction(
+    events: &[JournalEvent],
+    chain: &CheckpointChain,
+    boundary_chain: &CompactionBoundaryChain,
+    covers_through_seq: u64,
+) -> Result<HistorySnapshot> {
+    chain.ensure_matches(events)?;
+    boundary_chain.ensure_checkpoint_projection_safe(chain)?;
+    let parent_cutoff = chain
+        .latest()
+        .map_or(0, |checkpoint| checkpoint.covers_through_seq);
+    if covers_through_seq <= parent_cutoff {
+        return Err(OxidraError::Session(format!(
+            "prospective history cutoff {covers_through_seq} does not advance beyond {parent_cutoff}"
+        )));
+    }
+    if let Some(user_message_seq) = boundary_chain.first_abandoned_user_seq_after(parent_cutoff) {
+        if covers_through_seq >= user_message_seq {
+            return Err(OxidraError::Session(format!(
+                "prospective history cutoff {covers_through_seq} crosses abandoned compaction-boundary turn at user.message seq {user_message_seq}"
+            )));
+        }
+    }
+
+    let mut views = chain
+        .checkpoints()
+        .iter()
+        .map(|checkpoint| {
+            (
+                checkpoint.checkpoint_id.clone(),
+                checkpoint.covers_through_seq,
+            )
+        })
+        .collect::<Vec<_>>();
+    views.push((
+        "prospective-compaction-checkpoint".to_owned(),
+        covers_through_seq,
+    ));
+    HistorySnapshot::build_from_views(
+        events,
+        validate_journal_envelopes(events)?,
+        &boundary_chain.abandoned_turn_ids(),
+        &views,
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

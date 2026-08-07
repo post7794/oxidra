@@ -626,7 +626,16 @@ pub(crate) fn ensure_checkpointed_boundary_request_ready(
             boundary.boundary.boundary_id, boundary.state
         ));
     }
-    let policy = compaction_boundary_policy(boundary.boundary.version)?;
+    ensure_compaction_boundary_turn_request_ready(events, &boundary.boundary)
+}
+
+/// Prospective write-safety check for the normal Provider request that will
+/// follow a successful compaction attempt.
+pub(crate) fn ensure_compaction_boundary_turn_request_ready(
+    events: &[JournalEvent],
+    boundary: &CompactionBoundary,
+) -> Result<()> {
+    let policy = compaction_boundary_policy(boundary.version)?;
     // Frozen boundary v1 did not use this reducer to decide historical
     // validity. The Agent still applies the pinned v1 slot machine as a
     // prospective write-safety check so a legacy session cannot append an
@@ -634,12 +643,11 @@ pub(crate) fn ensure_checkpointed_boundary_request_ready(
     let slot_version = policy
         .provider_request_slot_validator_version
         .unwrap_or(COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1);
-    let slot =
-        provider_request_slot_state_for_version(slot_version, events, &boundary.boundary.turn_id)?;
+    let slot = provider_request_slot_state_for_version(slot_version, events, &boundary.turn_id)?;
     if slot != ProviderRequestSlotState::Ready {
         return Err(OxidraError::ApprovalRequired(format!(
-            "checkpointed compaction boundary {} cannot resume turn {} from Provider request-slot state {slot:?}; use the validated context-limit retry when available, otherwise abandon the pending turn",
-            boundary.boundary.boundary_id, boundary.boundary.turn_id
+            "compaction boundary {} cannot dispatch the normal request for turn {} from Provider request-slot state {slot:?}; use the validated context-limit retry when available, otherwise abandon the pending turn",
+            boundary.boundary_id, boundary.turn_id
         )));
     }
     Ok(())
@@ -983,6 +991,12 @@ pub enum CompactionSelection {
     Unavailable(NoCompactionCandidate),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateDispatchPolicy {
+    CurrentWriter,
+    RecordedReplay,
+}
+
 /// Rebuild the last durable candidate in a failed boundary's retry lineage.
 ///
 /// A crash may occur after `compaction.boundary.retry_started` is synced but
@@ -1070,7 +1084,11 @@ pub fn rebuild_failed_boundary_candidate(
                 source: started.source,
                 source_digest: started.source_digest,
             };
-            validate_dispatch_candidate(events, &candidate)?;
+            validate_dispatch_candidate(
+                events,
+                &candidate,
+                CandidateDispatchPolicy::RecordedReplay,
+            )?;
             return Ok(candidate);
         }
 
@@ -2498,6 +2516,7 @@ where
         None,
         observer,
         cancellation,
+        CandidateDispatchPolicy::CurrentWriter,
         validate_summary_before_commit,
     )
     .await
@@ -2532,6 +2551,41 @@ where
         Some(boundary),
         observer,
         cancellation,
+        CandidateDispatchPolicy::CurrentWriter,
+        validate_summary_before_commit,
+    )
+    .await
+}
+
+/// Replay a candidate reconstructed from a durable historical
+/// `compaction.started` event.
+///
+/// The recorded protocol versions remain part of the auditable Provider
+/// source. Supported historical versions are revalidated by their own
+/// reducers instead of being silently upgraded to the current writer tuple.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn compact_replay_once_for_boundary<F>(
+    provider: &dyn ResponseProvider,
+    journal: &mut SessionJournal,
+    boundary: &CompactionBoundary,
+    candidate: &CompactionCandidate,
+    model: &str,
+    observer: &mut dyn StreamObserver,
+    cancellation: CancellationToken,
+    validate_summary_before_commit: F,
+) -> Result<Checkpoint>
+where
+    F: FnOnce(&str) -> Result<()>,
+{
+    compact_once_impl(
+        provider,
+        journal,
+        candidate,
+        model,
+        Some(boundary),
+        observer,
+        cancellation,
+        CandidateDispatchPolicy::RecordedReplay,
         validate_summary_before_commit,
     )
     .await
@@ -2546,6 +2600,7 @@ async fn compact_once_impl<F>(
     boundary: Option<&CompactionBoundary>,
     observer: &mut dyn StreamObserver,
     cancellation: CancellationToken,
+    candidate_policy: CandidateDispatchPolicy,
     validate_summary_before_commit: F,
 ) -> Result<Checkpoint>
 where
@@ -2577,7 +2632,7 @@ where
         return Err(OxidraError::Interrupted);
     }
 
-    if let Err(error) = validate_dispatch_candidate(&events, candidate) {
+    if let Err(error) = validate_dispatch_candidate(&events, candidate, candidate_policy) {
         append_boundary_failure_if_bound(
             journal,
             boundary,
@@ -2903,18 +2958,21 @@ fn append_boundary_failure_if_bound(
 fn validate_dispatch_candidate(
     events: &[JournalEvent],
     candidate: &CompactionCandidate,
+    policy: CandidateDispatchPolicy,
 ) -> Result<()> {
-    if candidate.prompt_version != COMPACTION_PROMPT_VERSION
-        || candidate.summary_envelope_version != SUMMARY_ENVELOPE_VERSION
-        || candidate.source_projection_version != SOURCE_PROJECTION_VERSION
-        || candidate.turn_boundary_validator_version != TURN_BOUNDARY_VALIDATOR_VERSION
-        || candidate.source_digest_version != SOURCE_DIGEST_VERSION
-        || candidate.usage_contract_version != USAGE_CONTRACT_VERSION
+    if policy == CandidateDispatchPolicy::CurrentWriter
+        && (candidate.prompt_version != COMPACTION_PROMPT_VERSION
+            || candidate.summary_envelope_version != SUMMARY_ENVELOPE_VERSION
+            || candidate.source_projection_version != SOURCE_PROJECTION_VERSION
+            || candidate.turn_boundary_validator_version != TURN_BOUNDARY_VALIDATOR_VERSION
+            || candidate.source_digest_version != SOURCE_DIGEST_VERSION
+            || candidate.usage_contract_version != USAGE_CONTRACT_VERSION)
     {
         return session_error(
             "a new compaction attempt must use all current protocol versions".to_owned(),
         );
     }
+    validate_candidate_protocol_versions(candidate)?;
 
     let chain = validate_checkpoint_chain(events)?;
     let boundary_chain = validate_compaction_boundary_chain(events)?;
@@ -2972,15 +3030,56 @@ fn validate_dispatch_candidate(
         ));
     }
 
-    let expected_source =
-        build_compaction_source(events, expected_parent, candidate.covers_through_seq)?;
+    let expected_source = build_compaction_source_with_versions(
+        events,
+        expected_parent,
+        candidate.covers_through_seq,
+        candidate.turn_boundary_validator_version,
+        candidate.source_projection_version,
+    )?;
     if candidate.source != expected_source {
         return session_error("compaction candidate source is stale or invalid".to_owned());
     }
-    let expected_digest = expected_source.digest()?;
+    let expected_digest = expected_source.digest_with_version(candidate.source_digest_version)?;
     if candidate.source_digest != expected_digest {
         return session_error("compaction candidate source digest is invalid".to_owned());
     }
+    Ok(())
+}
+
+/// Validate a durable historical candidate against the exact prospective
+/// journal prefix that will own its replacement Provider attempt.
+///
+/// Unlike a new writer candidate, replay keeps every recorded protocol
+/// version. This wrapper exists so recovery planning can prove the attempt is
+/// dispatchable before appending `turn.retry_started` or
+/// `compaction.boundary.retry_started`.
+pub(crate) fn validate_replay_compaction_candidate(
+    events: &[JournalEvent],
+    candidate: &CompactionCandidate,
+) -> Result<()> {
+    validate_dispatch_candidate(events, candidate, CandidateDispatchPolicy::RecordedReplay)
+}
+
+fn validate_candidate_protocol_versions(candidate: &CompactionCandidate) -> Result<()> {
+    compaction_instructions(candidate.prompt_version).ok_or_else(|| {
+        OxidraError::Session(format!(
+            "unsupported compaction prompt version {}",
+            candidate.prompt_version
+        ))
+    })?;
+    compacted_history_item(candidate.summary_envelope_version, "")?;
+    project_events_for_compaction(candidate.source_projection_version, &[])?;
+    complete_prefix_candidates_for_version(candidate.turn_boundary_validator_version, &[])?;
+    candidate
+        .source
+        .digest_with_version(candidate.source_digest_version)?;
+    max_compaction_output_tokens(candidate.usage_contract_version).ok_or_else(|| {
+        OxidraError::Session(format!(
+            "unsupported compaction usage contract version {}",
+            candidate.usage_contract_version
+        ))
+    })?;
     Ok(())
 }
 
