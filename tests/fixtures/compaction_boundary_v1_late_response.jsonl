@@ -1,0 +1,5 @@
+{"schema":1,"seq":1,"ts":"1970-01-01T00:00:00Z","kind":"user.message","session_id":"session","turn_id":"legacy-turn","data":{"item":{"content":"legacy prompt","role":"user"}}}
+{"schema":1,"seq":2,"ts":"1970-01-01T00:00:00Z","kind":"compaction.boundary.started","session_id":"session","turn_id":null,"data":{"boundary":{"boundary_id":"boundary-v1","turn_id":"legacy-turn","user_message_seq":1,"version":1},"trigger":"test"}}
+{"schema":1,"seq":3,"ts":"1970-01-01T00:00:00Z","kind":"compaction.boundary.abandoned","session_id":"session","turn_id":null,"data":{"boundary_id":"boundary-v1","reason":"abandon","turn_id":"legacy-turn","user_message_seq":1}}
+{"schema":1,"seq":4,"ts":"1970-01-01T00:00:00Z","kind":"response.completed","session_id":"session","turn_id":"legacy-turn","data":{"output_items":[{"content":[{"text":"late response","type":"output_text"}],"role":"assistant","type":"message"}]}}
+{"schema":1,"seq":5,"ts":"1970-01-01T00:00:00Z","kind":"user.message","session_id":"session","turn_id":"next-turn","data":{"item":{"content":"next prompt","role":"user"}}}

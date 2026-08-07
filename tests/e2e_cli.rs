@@ -9,11 +9,23 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
-use oxidra::session::{SessionHeader, SessionStore};
+use oxidra::compaction::{
+    COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+    COMPACTION_BOUNDARY_STARTED_KIND, CandidateEstimate, CompactionBoundary,
+    CompactionBoundaryFailed, CompactionBoundaryRetryStarted, CompactionBoundaryStarted,
+    CompactionContext, CompactionSelection, compact_once_for_boundary, select_compaction_candidate,
+    validate_checkpoint_chain,
+};
+use oxidra::error::OxidraError;
+use oxidra::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
+use oxidra::session::{SessionHeader, SessionJournal, SessionStore};
 use oxidra::turn::TURN_BOUNDARY_VERSION;
+use oxidra::types::AssistantTurn;
 
 const INITIAL_CALC: &str = "def add(a, b):\n    return a - b\n\nprint(add(3, 5))\n";
 const FIXED_CALC: &str = "def add(a, b):\n    return a + b\n\nprint(add(3, 5))\n";
@@ -28,6 +40,30 @@ struct CapturedRequest {
     target: String,
     headers: BTreeMap<String, String>,
     body: Value,
+}
+
+struct FailingCompactionProvider;
+
+struct NoopCompactionObserver;
+
+#[async_trait]
+impl ResponseProvider for FailingCompactionProvider {
+    async fn respond(
+        &self,
+        _request: ResponseRequest,
+        _observer: &mut dyn StreamObserver,
+        _cancellation: CancellationToken,
+    ) -> oxidra::Result<AssistantTurn> {
+        Err(OxidraError::Provider(
+            "injected pre-resume compaction failure".to_owned(),
+        ))
+    }
+}
+
+impl StreamObserver for NoopCompactionObserver {
+    fn on_event(&mut self, _event: ProviderEvent) -> oxidra::Result<()> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -473,6 +509,226 @@ fn context_limited_session_blocks_new_prompts_and_can_retry_explicitly() {
             .filter(|event| event["kind"] == "turn.abandoned")
             .count(),
         0
+    );
+}
+
+#[test]
+fn compaction_boundary_abandon_and_retry_survive_process_resume() {
+    let project = tempfile::tempdir().expect("create temporary project");
+    let user_home = tempfile::tempdir().expect("create isolated user directory");
+    let local_data = user_home.path().join("local");
+    let roaming_data = user_home.path().join("roaming");
+    let xdg_config = user_home.path().join("config");
+    let xdg_state = user_home.path().join("state");
+    for directory in [&local_data, &roaming_data, &xdg_config, &xdg_state] {
+        fs::create_dir_all(directory).expect("create isolated user directory");
+    }
+    let data_dir = if cfg!(windows) {
+        local_data.join("oxidra")
+    } else if cfg!(target_os = "macos") {
+        user_home
+            .path()
+            .join("Library")
+            .join("Application Support")
+            .join("oxidra")
+    } else {
+        xdg_state.join("oxidra")
+    };
+    let store = SessionStore::new(&data_dir).expect("create isolated session store");
+    let project_root = project
+        .path()
+        .canonicalize()
+        .expect("canonical project root");
+
+    let mut abandoned_journal = store
+        .create_with_id(
+            "boundary-abandon-session",
+            SessionHeader::new(&project_root, "gpt-5.6-sol"),
+        )
+        .expect("create boundary abandon session");
+    let abandoned_boundary = append_open_boundary(
+        &mut abandoned_journal,
+        "abandon-boundary",
+        "abandoned-turn",
+        "obsolete cross-process prompt",
+    );
+    abandoned_journal
+        .append_and_sync(
+            COMPACTION_BOUNDARY_FAILED_KIND,
+            None,
+            serde_json::to_value(CompactionBoundaryFailed {
+                boundary_id: abandoned_boundary.boundary_id,
+                code: "no_candidate".to_owned(),
+                message: "injected preflight failure".to_owned(),
+                attempt_id: None,
+                extra: Default::default(),
+            })
+            .expect("serialize preflight failure"),
+        )
+        .expect("append preflight failure");
+    drop(abandoned_journal);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind abandon server");
+    let address = listener.local_addr().expect("read abandon server address");
+    let abandon_server = thread::spawn(move || -> Result<CapturedRequest, String> {
+        let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+        let request = read_http_request(&mut stream)?;
+        write_http_response(
+            &mut stream,
+            "200 OK",
+            "text/event-stream",
+            &final_text_sse("resp_boundary_abandon", "replacement done"),
+        )?;
+        Ok(request)
+    });
+    let abandoned = Command::new(env!("CARGO_BIN_EXE_oxidra"))
+        .arg("-p")
+        .arg("replacement cross-process prompt")
+        .arg("--cwd")
+        .arg(project.path())
+        .arg("--resume")
+        .arg("boundary-abandon-session")
+        .arg("--abandon-pending")
+        .env("API_KEY", "fake")
+        .env("API_BASE_URL", format!("http://{address}/v1/"))
+        .env_remove("MODEL")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_MODEL")
+        .env("LOCALAPPDATA", &local_data)
+        .env("APPDATA", &roaming_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .expect("abandon pending compaction boundary");
+    let abandon_request = abandon_server
+        .join()
+        .expect("abandon server panicked")
+        .expect("abandon server failed");
+    assert!(
+        abandoned.status.success(),
+        "boundary abandon failed: {}",
+        String::from_utf8_lossy(&abandoned.stderr)
+    );
+    let abandon_input = serde_json::to_string(&abandon_request.body["input"])
+        .expect("serialize abandon request input");
+    assert!(!abandon_input.contains("obsolete cross-process prompt"));
+    assert!(abandon_input.contains("replacement cross-process prompt"));
+
+    let mut retry_journal = store
+        .create_with_id(
+            "boundary-retry-session",
+            SessionHeader::new(&project_root, "gpt-5.6-sol"),
+        )
+        .expect("create boundary retry session");
+    let failed_boundary = seed_failed_compaction_boundary(
+        &mut retry_journal,
+        "original cross-process compaction prompt",
+    );
+    let interrupted_retry = CompactionBoundary::new(
+        "interrupted-retry-boundary",
+        failed_boundary.turn_id,
+        failed_boundary.user_message_seq,
+    );
+    retry_journal
+        .append_and_sync(
+            COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+            None,
+            serde_json::to_value(CompactionBoundaryRetryStarted {
+                retry_id: "interrupted-retry-intent".to_owned(),
+                previous_boundary_id: failed_boundary.boundary_id,
+                boundary: interrupted_retry,
+                extra: Default::default(),
+            })
+            .expect("serialize interrupted retry intent"),
+        )
+        .expect("append interrupted retry intent");
+    drop(retry_journal);
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind retry server");
+    let address = listener.local_addr().expect("read retry server address");
+    let retry_server = thread::spawn(move || -> Result<Vec<CapturedRequest>, String> {
+        let mut requests = Vec::new();
+        for (response_id, text) in [
+            ("resp_boundary_compaction", "recovered checkpoint"),
+            ("resp_boundary_normal", "retried request done"),
+        ] {
+            let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            requests.push(read_http_request(&mut stream)?);
+            write_http_response(
+                &mut stream,
+                "200 OK",
+                "text/event-stream",
+                &final_text_sse(response_id, text),
+            )?;
+        }
+        Ok(requests)
+    });
+    let retried = Command::new(env!("CARGO_BIN_EXE_oxidra"))
+        .arg("--cwd")
+        .arg(project.path())
+        .arg("--resume")
+        .arg("boundary-retry-session")
+        .arg("--retry-pending")
+        .env("API_KEY", "fake")
+        .env("API_BASE_URL", format!("http://{address}/v1/"))
+        .env_remove("MODEL")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env_remove("OPENAI_MODEL")
+        .env("LOCALAPPDATA", &local_data)
+        .env("APPDATA", &roaming_data)
+        .env("XDG_CONFIG_HOME", &xdg_config)
+        .env("XDG_STATE_HOME", &xdg_state)
+        .env("HOME", user_home.path())
+        .env("USERPROFILE", user_home.path())
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .expect("retry pending compaction boundary");
+    let retry_requests = retry_server
+        .join()
+        .expect("retry server panicked")
+        .expect("retry server failed");
+    assert!(
+        retried.status.success(),
+        "boundary retry failed: {}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&retried.stdout).trim(),
+        "retried request done"
+    );
+    assert_eq!(retry_requests.len(), 2);
+    assert_eq!(retry_requests[0].body["max_output_tokens"], 8_192);
+    assert_eq!(retry_requests[0].body["tools"], json!([]));
+    let resumed_input = serde_json::to_string(&retry_requests[1].body["input"])
+        .expect("serialize retried normal input");
+    assert!(resumed_input.contains("recovered checkpoint"));
+    assert!(resumed_input.contains("original cross-process compaction prompt"));
+
+    let retry_events = store
+        .inspect("boundary-retry-session")
+        .expect("inspect retried boundary session");
+    assert_eq!(
+        retry_events
+            .iter()
+            .filter(|event| event.kind == COMPACTION_BOUNDARY_RETRY_STARTED_KIND)
+            .count(),
+        2,
+        "resume should preserve the interrupted intent and append a fresh retry"
+    );
+    assert_eq!(
+        retry_events
+            .iter()
+            .filter(|event| event.kind == "user.message")
+            .count(),
+        4,
+        "retry must reuse the original user message"
     );
 }
 
@@ -1261,6 +1517,151 @@ fn full_auto_does_not_approve_persistent_memory() {
             .next()
             .is_none()
     );
+}
+
+fn append_completed_turn(
+    journal: &mut SessionJournal,
+    turn_id: &str,
+    prompt: &str,
+    answer: &str,
+) -> u64 {
+    let user = journal
+        .append_and_sync(
+            "user.message",
+            Some(turn_id),
+            json!({
+                "item":{"role":"user","content":prompt},
+                "turn_boundary_version":TURN_BOUNDARY_VERSION,
+            }),
+        )
+        .expect("append completed-turn user");
+    let response_seq = journal.next_seq();
+    let output_items = vec![json!({
+        "type":"message",
+        "role":"assistant",
+        "content":[{"type":"output_text","text":answer}],
+    })];
+    journal
+        .append_and_sync(
+            "response.completed",
+            Some(turn_id),
+            json!({
+                "raw_response":{"output":output_items},
+                "output_items":output_items,
+                "text":answer,
+                "usage":{
+                    "input_tokens":1,
+                    "output_tokens":1,
+                    "total_tokens":2
+                },
+                "turn_completion":{
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                    "covers_from_seq":user.seq,
+                    "final_response_seq":response_seq,
+                    "covers_through_seq":response_seq,
+                }
+            }),
+        )
+        .expect("append completed-turn response");
+    let marker_seq = journal.next_seq();
+    journal
+        .append_and_sync(
+            "turn.completed",
+            Some(turn_id),
+            json!({
+                "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                "covers_from_seq":user.seq,
+                "final_response_seq":response_seq,
+                "covers_through_seq":marker_seq,
+            }),
+        )
+        .expect("append completed-turn marker");
+    marker_seq
+}
+
+fn append_open_boundary(
+    journal: &mut SessionJournal,
+    boundary_id: &str,
+    turn_id: &str,
+    prompt: &str,
+) -> CompactionBoundary {
+    let user = journal
+        .append_and_sync(
+            "user.message",
+            Some(turn_id),
+            json!({
+                "item":{"role":"user","content":prompt},
+                "turn_boundary_version":TURN_BOUNDARY_VERSION,
+            }),
+        )
+        .expect("append boundary owner");
+    let boundary = CompactionBoundary::new(boundary_id, turn_id, user.seq);
+    journal
+        .append_and_sync(
+            COMPACTION_BOUNDARY_STARTED_KIND,
+            None,
+            serde_json::to_value(CompactionBoundaryStarted {
+                boundary: boundary.clone(),
+                trigger: "e2e".to_owned(),
+                extra: Default::default(),
+            })
+            .expect("serialize boundary start"),
+        )
+        .expect("append boundary start");
+    boundary
+}
+
+fn seed_failed_compaction_boundary(
+    journal: &mut SessionJournal,
+    prompt: &str,
+) -> CompactionBoundary {
+    let cutoff = append_completed_turn(journal, "old-turn-1", "old one", "answer one");
+    append_completed_turn(journal, "old-turn-2", "old two", "answer two");
+    append_completed_turn(journal, "old-turn-3", "old three", "answer three");
+    let boundary = append_open_boundary(
+        journal,
+        "failed-boundary",
+        "pending-compaction-turn",
+        prompt,
+    );
+    let events = journal.read_events().expect("read compaction seed events");
+    let chain = validate_checkpoint_chain(&events).expect("validate empty checkpoint chain");
+    let candidate = match select_compaction_candidate(
+        &events,
+        &chain,
+        &CompactionContext {
+            current_input_tokens: 100,
+            target_input_tokens: 10,
+            min_recent_complete_turns: 2,
+            estimates: vec![CandidateEstimate {
+                covers_through_seq: cutoff,
+                estimated_input_tokens_after: 5,
+            }],
+        },
+    )
+    .expect("select compaction candidate")
+    {
+        CompactionSelection::Selected(candidate) => candidate,
+        other => panic!("expected selected compaction candidate, got {other:?}"),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build compaction seed runtime");
+    let error = runtime
+        .block_on(compact_once_for_boundary(
+            &FailingCompactionProvider,
+            journal,
+            &boundary,
+            &candidate,
+            "gpt-5.6-sol",
+            &mut NoopCompactionObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        ))
+        .expect_err("seed compaction must fail");
+    assert!(matches!(error, OxidraError::Provider(_)));
+    boundary
 }
 
 fn find_python() -> Option<String> {

@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::compaction::CheckpointChain;
+use crate::compaction::{
+    CheckpointChain, CompactionBoundaryChain, validate_compaction_boundary_chain,
+};
 use crate::error::{OxidraError, Result};
 use crate::event_kind::is_tool_terminal;
 use crate::projection::validate_response_output_items;
@@ -21,7 +23,7 @@ use crate::types::ToolDefinition;
 
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
 /// Increment when the recovery/provenance semantics change; old cursors fail closed.
-pub const HISTORY_EXTRACTOR_VERSION: u32 = 3;
+pub const HISTORY_EXTRACTOR_VERSION: u32 = 4;
 pub const HISTORY_CURSOR_VERSION: u32 = 1;
 pub const MAX_HISTORY_QUERY_BYTES: usize = 512;
 pub const MAX_HISTORY_CURSOR_BYTES: usize = 2_048;
@@ -170,7 +172,17 @@ pub struct HistorySnapshot {
 
 impl HistorySnapshot {
     pub fn build(events: &[JournalEvent], chain: &CheckpointChain) -> Result<Self> {
+        let boundary_chain = validate_compaction_boundary_chain(events)?;
+        Self::build_with_boundary_chain(events, chain, &boundary_chain)
+    }
+
+    pub(crate) fn build_with_boundary_chain(
+        events: &[JournalEvent],
+        chain: &CheckpointChain,
+        boundary_chain: &CompactionBoundaryChain,
+    ) -> Result<Self> {
         chain.ensure_matches(events)?;
+        boundary_chain.ensure_checkpoint_projection_safe(chain)?;
         let session_id = validate_journal_envelopes(events)?;
         let Some(latest) = chain.latest() else {
             return Ok(Self {
@@ -180,7 +192,12 @@ impl HistorySnapshot {
             });
         };
 
-        let records = extract_records(events, latest.covers_through_seq)?;
+        let boundary_excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+        let records = extract_records_with_exclusions(
+            events,
+            latest.covers_through_seq,
+            &boundary_excluded_turn_ids,
+        )?;
         validate_artifact_grants(&records)?;
         let session_id = session_id.ok_or_else(|| {
             OxidraError::Session("checkpoint chain belongs to an empty journal".to_owned())
@@ -554,17 +571,29 @@ fn validate_journal_envelopes(events: &[JournalEvent]) -> Result<Option<String>>
     Ok(Some(session_id))
 }
 
+#[cfg(test)]
 fn extract_records(events: &[JournalEvent], cutoff: u64) -> Result<Vec<HistoryRecord>> {
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    let boundary_excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+    extract_records_with_exclusions(events, cutoff, &boundary_excluded_turn_ids)
+}
+
+fn extract_records_with_exclusions(
+    events: &[JournalEvent],
+    cutoff: u64,
+    boundary_excluded_turn_ids: &HashSet<String>,
+) -> Result<Vec<HistoryRecord>> {
     let scoped_len = events
         .iter()
         .take_while(|event| event.seq <= cutoff)
         .count();
     let scoped = &events[..scoped_len];
     // 已放弃回合仍保留在 journal 中，但不应通过 history 工具重新灌回模型。
-    let abandoned_turns = validate_turn_recovery(scoped)?
+    let mut abandoned_turns = validate_turn_recovery(scoped)?
         .abandons
         .into_keys()
         .collect::<HashSet<_>>();
+    abandoned_turns.extend(boundary_excluded_turn_ids.iter().cloned());
     let searchable = scoped
         .iter()
         .filter(|event| {
@@ -1337,9 +1366,49 @@ pub struct HistoryQuota {
     pub exhausted: bool,
 }
 
+fn empty_history_quota() -> HistoryQuota {
+    HistoryQuota {
+        used_bytes: 0,
+        remaining_bytes: MAX_HISTORY_TURN_OUTPUT_BYTES,
+        exhausted: false,
+    }
+}
+
 /// Rebuild the current turn's committed history-output usage. This deliberately
 /// does not reserve space for calls in the response currently being dispatched.
 pub fn rebuild_history_quota(events: &[JournalEvent], turn_id: &str) -> Result<HistoryQuota> {
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    rebuild_history_quota_with_boundary_chain(events, turn_id, &boundary_chain)
+}
+
+pub(crate) fn rebuild_history_quota_with_boundary_chain(
+    events: &[JournalEvent],
+    turn_id: &str,
+    boundary_chain: &CompactionBoundaryChain,
+) -> Result<HistoryQuota> {
+    let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+    rebuild_history_quota_with_exclusions(events, turn_id, &excluded_turn_ids)
+}
+
+/// Rebuild quota for the post-summary request preview while its owning
+/// boundary is still `Started`. The normal projection pending gate cannot run
+/// yet, but validated abandoned turns must still be excluded.
+pub(crate) fn rebuild_history_quota_for_compaction_preview(
+    events: &[JournalEvent],
+    turn_id: &str,
+    boundary_chain: &CompactionBoundaryChain,
+) -> Result<HistoryQuota> {
+    rebuild_history_quota_with_exclusions(events, turn_id, &boundary_chain.abandoned_turn_ids())
+}
+
+fn rebuild_history_quota_with_exclusions(
+    events: &[JournalEvent],
+    turn_id: &str,
+    excluded_turn_ids: &HashSet<String>,
+) -> Result<HistoryQuota> {
+    if excluded_turn_ids.contains(turn_id) {
+        return Ok(empty_history_quota());
+    }
     let calls = collect_function_calls(
         events
             .iter()
@@ -1427,7 +1496,10 @@ mod tests {
     use chrono::{DateTime, Utc};
 
     use super::*;
-    use crate::compaction::validate_checkpoint_chain;
+    use crate::compaction::{
+        COMPACTION_BOUNDARY_ABANDONED_KIND, COMPACTION_BOUNDARY_STARTED_KIND, CompactionBoundary,
+        CompactionBoundaryAbandoned, CompactionBoundaryStarted, validate_checkpoint_chain,
+    };
 
     fn event(seq: u64, turn_id: Option<&str>, kind: &str, data: Value) -> JournalEvent {
         JournalEvent {
@@ -1586,6 +1658,108 @@ mod tests {
         ];
         let error = extract_records(&events, 4).expect_err("forged abandon must fail closed");
         assert!(error.to_string().contains("cannot be abandoned"));
+    }
+
+    #[test]
+    fn compaction_boundary_abandon_removes_the_turn_from_history_records() {
+        let boundary = CompactionBoundary {
+            version: 1,
+            boundary_id: "history-boundary".to_owned(),
+            turn_id: "old-turn".to_owned(),
+            user_message_seq: 1,
+        };
+        let events = vec![
+            event(
+                1,
+                Some("old-turn"),
+                "user.message",
+                json!({
+                    "turn_boundary_version":3,
+                    "item":{"role":"user","content":"obsolete historical prompt"},
+                }),
+            ),
+            event(
+                2,
+                None,
+                COMPACTION_BOUNDARY_STARTED_KIND,
+                serde_json::to_value(CompactionBoundaryStarted {
+                    boundary: boundary.clone(),
+                    trigger: "test".to_owned(),
+                    extra: Default::default(),
+                })
+                .unwrap(),
+            ),
+            event(
+                3,
+                Some("old-turn"),
+                "response.completed",
+                json!({"output_items":[{
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"obsolete historical answer"}]
+                }]}),
+            ),
+            event(
+                4,
+                None,
+                COMPACTION_BOUNDARY_ABANDONED_KIND,
+                serde_json::to_value(CompactionBoundaryAbandoned {
+                    boundary_id: boundary.boundary_id,
+                    turn_id: boundary.turn_id,
+                    user_message_seq: boundary.user_message_seq,
+                    reason: "replace prompt".to_owned(),
+                    extra: Default::default(),
+                })
+                .unwrap(),
+            ),
+            event(
+                5,
+                Some("replacement-turn"),
+                "user.message",
+                json!({
+                    "turn_boundary_version":4,
+                    "item":{"role":"user","content":"replacement historical prompt"},
+                }),
+            ),
+        ];
+
+        let records = extract_records(&events, 5).expect("validated abandon filters history");
+        assert!(records.iter().all(|record| record.turn_id != "old-turn"));
+        assert!(
+            records
+                .iter()
+                .any(|record| record.text == "replacement historical prompt")
+        );
+    }
+
+    #[test]
+    fn pending_compaction_boundary_fails_closed_for_history_extraction() {
+        let events = vec![
+            event(
+                1,
+                Some("pending-turn"),
+                "user.message",
+                json!({
+                    "turn_boundary_version":4,
+                    "item":{"role":"user","content":"pending prompt"},
+                }),
+            ),
+            event(
+                2,
+                None,
+                COMPACTION_BOUNDARY_STARTED_KIND,
+                serde_json::to_value(CompactionBoundaryStarted {
+                    boundary: CompactionBoundary::new("pending-boundary", "pending-turn", 1),
+                    trigger: "test".to_owned(),
+                    extra: Default::default(),
+                })
+                .unwrap(),
+            ),
+        ];
+        let error = extract_records(&events, 2)
+            .expect_err("pending compaction boundary must not expose history")
+            .to_string();
+        assert!(error.contains("remains pending"));
     }
 
     #[test]

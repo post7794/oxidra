@@ -7,7 +7,10 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 
-use crate::compaction::{COMPACTION_CHECKPOINT_KIND, CheckpointChain, compacted_history_item};
+use crate::compaction::{
+    COMPACTION_CHECKPOINT_KIND, CheckpointChain, CompactionBoundaryChain, compacted_history_item,
+    validate_compaction_boundary_chain,
+};
 use crate::error::{OxidraError, Result};
 use crate::session::JournalEvent;
 use crate::turn::{
@@ -21,7 +24,16 @@ pub const SOURCE_PROJECTION_VERSION: u32 = 3;
 /// Project only committed events into the stateless Responses `input` array.
 /// Partial deltas and aborted responses are intentionally absent.
 pub fn project_events(events: &[JournalEvent]) -> Result<Vec<Value>> {
-    project_events_v3(events)
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    project_events_with_boundary_chain(events, &boundary_chain)
+}
+
+pub(crate) fn project_events_with_boundary_chain(
+    events: &[JournalEvent],
+    boundary_chain: &CompactionBoundaryChain,
+) -> Result<Vec<Value>> {
+    let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+    project_events_current(events, &excluded_turn_ids)
 }
 
 /// Rebuild the exact event projection recorded by a compaction attempt.
@@ -38,25 +50,37 @@ pub fn project_events_for_compaction(version: u32, events: &[JournalEvent]) -> R
 }
 
 fn project_events_v1(events: &[JournalEvent]) -> Result<Vec<Value>> {
-    project_events_impl(events, None, false)
+    project_events_impl(events, None, false, None)
 }
 
 fn project_events_v2(events: &[JournalEvent]) -> Result<Vec<Value>> {
     // v2 新增显式 abandon 语义；v1 必须保持历史 checkpoint 的原始字节行为。
     let recovery = validate_turn_recovery_v2(events)?;
-    project_events_impl(events, Some(&recovery), false)
+    project_events_impl(events, Some(&recovery), false, None)
 }
 
 fn project_events_v3(events: &[JournalEvent]) -> Result<Vec<Value>> {
     // v3 将较早 retry attempt 的取消终态从当前 projection 中移除。
     let recovery = validate_turn_recovery_v3(events)?;
-    project_events_impl(events, Some(&recovery), true)
+    project_events_impl(events, Some(&recovery), true, None)
+}
+
+/// Build the current runtime projection after applying the separately
+/// versioned compaction-boundary state machine. Historical source projection
+/// versions intentionally bypass this wrapper and remain byte-frozen.
+fn project_events_current(
+    events: &[JournalEvent],
+    excluded_turn_ids: &HashSet<String>,
+) -> Result<Vec<Value>> {
+    let recovery = validate_turn_recovery_v3(events)?;
+    project_events_impl(events, Some(&recovery), true, Some(excluded_turn_ids))
 }
 
 fn project_events_impl(
     events: &[JournalEvent],
     recovery: Option<&ValidatedTurnRecovery>,
     supports_retry_supersession: bool,
+    boundary_excluded_turn_ids: Option<&HashSet<String>>,
 ) -> Result<Vec<Value>> {
     let latest_retry_by_turn = if supports_retry_supersession {
         recovery
@@ -92,11 +116,14 @@ fn project_events_impl(
         .filter_map(|event| event.turn_id.clone())
         .filter(|turn_id| !completed_turns.contains(turn_id))
         .collect::<HashSet<_>>();
-    let explicitly_abandoned_turns = if let Some(recovery) = recovery {
+    let mut explicitly_abandoned_turns = if let Some(recovery) = recovery {
         recovery.abandons.keys().cloned().collect::<HashSet<_>>()
     } else {
         HashSet::new()
     };
+    if let Some(boundary_excluded_turn_ids) = boundary_excluded_turn_ids {
+        explicitly_abandoned_turns.extend(boundary_excluded_turn_ids.iter().cloned());
+    }
     let mut projected = Vec::new();
     let mut marked_cancelled_turns = HashSet::new();
     for event in events {
@@ -232,7 +259,9 @@ pub fn project_tail(events: &[JournalEvent], covers_through_seq: u64) -> Result<
         )));
     }
 
-    project_tail_after_validated_cutoff(events, covers_through_seq)
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+    project_tail_after_validated_cutoff(events, covers_through_seq, &excluded_turn_ids)
 }
 
 /// Project the latest validated checkpoint followed by its uncompacted tail.
@@ -245,7 +274,18 @@ pub fn project_checkpoint_and_tail(
     events: &[JournalEvent],
     chain: &CheckpointChain,
 ) -> Result<Vec<Value>> {
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    project_checkpoint_and_tail_with_boundary_chain(events, chain, &boundary_chain)
+}
+
+pub(crate) fn project_checkpoint_and_tail_with_boundary_chain(
+    events: &[JournalEvent],
+    chain: &CheckpointChain,
+    boundary_chain: &CompactionBoundaryChain,
+) -> Result<Vec<Value>> {
     chain.ensure_matches(events)?;
+    boundary_chain.ensure_checkpoint_projection_safe(chain)?;
+    let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
     let Some(checkpoint) = chain.latest() else {
         if events
             .iter()
@@ -255,7 +295,7 @@ pub fn project_checkpoint_and_tail(
                 "checkpoint events are present but the validated chain is empty".to_owned(),
             ));
         }
-        return project_events(events);
+        return project_events_current(events, &excluded_turn_ids);
     };
 
     let mut projected = vec![compacted_history_item(
@@ -268,6 +308,32 @@ pub fn project_checkpoint_and_tail(
     projected.extend(project_tail_after_validated_cutoff(
         events,
         checkpoint.covers_through_seq,
+        &excluded_turn_ids,
+    )?);
+    Ok(projected)
+}
+
+/// Build the normal Provider input that would exist if `summary` were
+/// committed for `covers_through_seq`.
+///
+/// This is used only for post-summary measurement before the checkpoint is
+/// durable. The owning compaction boundary is necessarily still `Started`, so
+/// it deliberately consumes only validated abandon exclusions rather than the
+/// runtime pending gate. Compaction management events remain projection
+/// neutral and need not be synthesized into the preview.
+pub(crate) fn project_compaction_summary_and_tail(
+    events: &[JournalEvent],
+    covers_through_seq: u64,
+    summary_envelope_version: u32,
+    summary: &str,
+    boundary_chain: &CompactionBoundaryChain,
+) -> Result<Vec<Value>> {
+    let excluded_turn_ids = boundary_chain.abandoned_turn_ids();
+    let mut projected = vec![compacted_history_item(summary_envelope_version, summary)?];
+    projected.extend(project_tail_after_validated_cutoff(
+        events,
+        covers_through_seq,
+        &excluded_turn_ids,
     )?);
     Ok(projected)
 }
@@ -275,13 +341,14 @@ pub fn project_checkpoint_and_tail(
 fn project_tail_after_validated_cutoff(
     events: &[JournalEvent],
     covers_through_seq: u64,
+    excluded_turn_ids: &HashSet<String>,
 ) -> Result<Vec<Value>> {
     let tail = events
         .iter()
         .filter(|event| event.seq > covers_through_seq)
         .cloned()
         .collect::<Vec<_>>();
-    project_events(&tail)
+    project_events_current(&tail, excluded_turn_ids)
 }
 
 fn is_tool_terminal_v1(kind: &str) -> bool {
@@ -324,7 +391,9 @@ fn tool_output_item_v1(data: &Value) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::compaction::{
-        COMPACTION_PROMPT_VERSION, COMPACTION_STARTED_KIND, Checkpoint, CompactionSource,
+        COMPACTION_BOUNDARY_ABANDONED_KIND, COMPACTION_BOUNDARY_STARTED_KIND,
+        COMPACTION_PROMPT_VERSION, COMPACTION_STARTED_KIND, Checkpoint, CompactionBoundary,
+        CompactionBoundaryAbandoned, CompactionBoundaryStarted, CompactionSource,
         CompactionStarted, SOURCE_DIGEST_VERSION, SUMMARY_ENVELOPE_VERSION, USAGE_CONTRACT_VERSION,
         build_compaction_source, compaction_instructions, validate_checkpoint_chain,
     };
@@ -349,6 +418,18 @@ mod tests {
             .map(|(index, line)| {
                 serde_json::from_str(line).unwrap_or_else(|error| {
                     panic!("retry_recovery_v2 fixture line {}: {error}", index + 1)
+                })
+            })
+            .collect()
+    }
+
+    fn boundary_v2_fixture() -> Vec<JournalEvent> {
+        include_str!("../tests/fixtures/compaction_boundary_v2.jsonl")
+            .lines()
+            .enumerate()
+            .map(|(index, line)| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("compaction_boundary_v2 fixture line {}: {error}", index + 1)
                 })
             })
             .collect()
@@ -564,6 +645,131 @@ mod tests {
         )
         .expect("serialize projection");
         assert_eq!(enriched_bytes, base_bytes);
+    }
+
+    #[test]
+    fn current_projection_excludes_every_item_from_an_abandoned_compaction_boundary() {
+        let boundary = CompactionBoundary {
+            version: 1,
+            boundary_id: "boundary-v1".to_owned(),
+            turn_id: "old-turn".to_owned(),
+            user_message_seq: 1,
+        };
+        let events = vec![
+            event(
+                1,
+                Some("old-turn"),
+                "user.message",
+                json!({
+                    "turn_boundary_version":3,
+                    "item":{"role":"user","content":"obsolete prompt"},
+                }),
+            ),
+            event(
+                2,
+                None,
+                COMPACTION_BOUNDARY_STARTED_KIND,
+                serde_json::to_value(CompactionBoundaryStarted {
+                    boundary: boundary.clone(),
+                    trigger: "test".to_owned(),
+                    extra: Default::default(),
+                })
+                .unwrap(),
+            ),
+            event(
+                3,
+                Some("old-turn"),
+                "response.completed",
+                json!({"output_items":[{
+                    "type":"function_call",
+                    "call_id":"old-call",
+                    "name":"read",
+                    "arguments":"{}"
+                }]}),
+            ),
+            event(
+                4,
+                Some("old-turn"),
+                "tool.completed",
+                json!({
+                    "call_id":"old-call",
+                    "tool":"read",
+                    "output":{"text":"obsolete tool output"}
+                }),
+            ),
+            event(
+                5,
+                Some("old-turn"),
+                "response.completed",
+                json!({"output_items":[{
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"obsolete answer"}]
+                }]}),
+            ),
+            event(
+                6,
+                None,
+                COMPACTION_BOUNDARY_ABANDONED_KIND,
+                serde_json::to_value(CompactionBoundaryAbandoned {
+                    boundary_id: boundary.boundary_id,
+                    turn_id: boundary.turn_id,
+                    user_message_seq: boundary.user_message_seq,
+                    reason: "replace prompt".to_owned(),
+                    extra: Default::default(),
+                })
+                .unwrap(),
+            ),
+            user(7, "replacement-turn"),
+        ];
+
+        let projected = project_events(&events).expect("validated abandon is projectable");
+        let serialized = serde_json::to_string(&projected).unwrap();
+        assert!(!serialized.contains("obsolete prompt"));
+        assert!(!serialized.contains("old-call"));
+        assert!(!serialized.contains("obsolete tool output"));
+        assert!(!serialized.contains("obsolete answer"));
+        assert!(serialized.contains("replacement-turn"));
+    }
+
+    #[test]
+    fn current_boundary_projection_does_not_rewrite_frozen_source_v3() {
+        let events = boundary_v2_fixture();
+        let current = project_events(&events).expect("current boundary view is valid");
+        let frozen = project_events_for_compaction(3, &events).expect("v3 stays registered");
+        let current = serde_json::to_string(&current).unwrap();
+        let frozen = serde_json::to_string(&frozen).unwrap();
+        assert!(!current.contains("\"content\":\"prompt\""));
+        assert!(current.contains("replacement"));
+        assert!(frozen.contains("\"content\":\"prompt\""));
+    }
+
+    #[test]
+    fn pending_boundary_fails_closed_but_checkpointed_owner_can_continue() {
+        let pending = vec![
+            user(1, "pending-turn"),
+            event(
+                2,
+                None,
+                COMPACTION_BOUNDARY_STARTED_KIND,
+                serde_json::to_value(CompactionBoundaryStarted {
+                    boundary: CompactionBoundary::new("pending-boundary", "pending-turn", 1),
+                    trigger: "test".to_owned(),
+                    extra: Default::default(),
+                })
+                .unwrap(),
+            ),
+        ];
+        assert!(project_events(&pending).is_err());
+        assert!(project_events_for_compaction(3, &pending).is_ok());
+
+        let checkpointed = boundary_v2_fixture()[..8].to_vec();
+        let chain = validate_checkpoint_chain(&checkpointed).unwrap();
+        let projected = project_checkpoint_and_tail(&checkpointed, &chain)
+            .expect("checkpointed owner remains in the normal tail");
+        let serialized = serde_json::to_string(&projected).unwrap();
+        assert!(serialized.contains("summary v2"));
+        assert!(serialized.contains("\"content\":\"prompt\""));
     }
 
     #[test]

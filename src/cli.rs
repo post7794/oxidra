@@ -73,7 +73,7 @@ struct Cli {
     #[arg(long, value_name = "TOKENS")]
     reserve_tokens: Option<u64>,
 
-    /// Retry the newest context-limited prompt after abandoning all pending limit turns.
+    /// Retry the single pending context-limit or compaction request.
     #[arg(
         long,
         requires = "resume",
@@ -81,7 +81,7 @@ struct Cli {
     )]
     retry_pending: bool,
 
-    /// Abandon context-limited turns before accepting a new prompt.
+    /// Abandon pending context-limit and compaction requests before a new prompt.
     #[arg(long, requires = "resume", conflicts_with = "retry_pending")]
     abandon_pending: bool,
 }
@@ -229,8 +229,11 @@ async fn run(cli: Cli) -> Result<()> {
     };
 
     if abandon_pending {
-        let count = agent.abandon_pending_context_turns("abandoned by explicit CLI request")?;
-        eprintln!("[session] abandoned {count} context-limited turn(s)");
+        let abandoned = agent.abandon_pending_turns("abandoned by explicit CLI request")?;
+        eprintln!(
+            "[session] abandoned {} context-limited turn(s) and {} compaction boundary/boundaries",
+            abandoned.context_turns, abandoned.compaction_boundaries
+        );
     }
     if retry_pending {
         if prompt.is_some() {
@@ -879,7 +882,9 @@ async fn run_repl(
                 eprintln!("[session] {message}");
                 if !agent.journal().in_doubt()?.is_empty() {
                     resolve_in_doubt_or_stay(agent.journal_mut(), &mut input).await?;
-                } else if !agent.pending_context_turns()?.is_empty() {
+                } else if !agent.pending_context_turns()?.is_empty()
+                    || !agent.pending_compaction_boundaries()?.is_empty()
+                {
                     eprintln!(
                         "[session] restart with --retry-pending, or use --abandon-pending before a replacement prompt"
                     );
@@ -922,11 +927,7 @@ async fn run_one_turn(
                 }
                 TurnInvocation::RetryPending => {
                     agent
-                        .retry_pending_context_turn(
-                            cancellation.clone(),
-                            &mut observer,
-                            &mut approval,
-                        )
+                        .retry_pending_turn(cancellation.clone(), &mut observer, &mut approval)
                         .await
                 }
             }

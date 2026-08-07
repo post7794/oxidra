@@ -73,6 +73,7 @@ struct CompactionBoundaryPolicy {
     turn_validator_version: u32,
     downgrade_current_turn_metadata: bool,
     provider_request_slot_validator_version: Option<u32>,
+    legacy_completion_uses_next_user: bool,
     enforces_session_protocol_epoch: bool,
     requires_attempt_resolution_before_abandon: bool,
     requires_settled_slot_before_abandon: bool,
@@ -86,6 +87,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1,
             downgrade_current_turn_metadata: true,
             provider_request_slot_validator_version: None,
+            legacy_completion_uses_next_user: false,
             enforces_session_protocol_epoch: false,
             requires_attempt_resolution_before_abandon: false,
             requires_settled_slot_before_abandon: false,
@@ -96,6 +98,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
             provider_request_slot_validator_version: Some(
                 COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1,
             ),
+            legacy_completion_uses_next_user: true,
             enforces_session_protocol_epoch: false,
             requires_attempt_resolution_before_abandon: false,
             requires_settled_slot_before_abandon: false,
@@ -106,6 +109,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
             provider_request_slot_validator_version: Some(
                 COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1,
             ),
+            legacy_completion_uses_next_user: true,
             enforces_session_protocol_epoch: true,
             requires_attempt_resolution_before_abandon: true,
             requires_settled_slot_before_abandon: true,
@@ -513,6 +517,132 @@ impl CompactionBoundaryChain {
             .into_iter()
             .max_by_key(|boundary| boundary.started_seq)
     }
+
+    /// Return turns explicitly removed from the current model-visible view.
+    ///
+    /// The latest boundary for a turn is authoritative. An abandoned older
+    /// attempt must not hide a later retry of the same original prompt.
+    pub fn abandoned_turn_ids(&self) -> HashSet<String> {
+        let mut latest_by_turn = HashMap::<String, &ValidatedCompactionBoundary>::new();
+        for boundary in &self.boundaries {
+            latest_by_turn.insert(boundary.boundary.turn_id.clone(), boundary);
+        }
+        latest_by_turn
+            .into_iter()
+            .filter_map(|(turn_id, boundary)| {
+                (boundary.state == CompactionBoundaryState::Abandoned).then_some(turn_id)
+            })
+            .collect()
+    }
+
+    /// Earliest model-visible sequence that a future checkpoint must not
+    /// cross until a boundary-aware source projection version is registered.
+    pub fn first_abandoned_user_seq_after(&self, after_seq: u64) -> Option<u64> {
+        let abandoned = self.abandoned_turn_ids();
+        self.boundaries
+            .iter()
+            .filter(|boundary| abandoned.contains(&boundary.boundary.turn_id))
+            .map(|boundary| boundary.boundary.user_message_seq)
+            .filter(|user_message_seq| *user_message_seq > after_seq)
+            .min()
+    }
+
+    /// Reject a checkpoint whose opaque summary may already contain a turn
+    /// that the current boundary view explicitly abandoned.
+    ///
+    /// Source projection v1-v3 are byte-frozen and do not understand
+    /// `compaction.boundary.abandoned`. Until a new source version can encode
+    /// that exclusion without changing old digests, crossing such a turn must
+    /// fail closed rather than replaying it from inside an opaque summary.
+    pub fn ensure_checkpoint_projection_safe(&self, chain: &CheckpointChain) -> Result<()> {
+        for checkpoint in chain.checkpoints() {
+            let parent_cutoff = checkpoint
+                .parent_checkpoint_id
+                .as_deref()
+                .and_then(|parent_id| {
+                    chain
+                        .checkpoints()
+                        .iter()
+                        .find(|parent| parent.checkpoint_id == parent_id)
+                })
+                .map_or(0, |parent| parent.covers_through_seq);
+            if let Some(user_message_seq) = self.first_abandoned_user_seq_after(parent_cutoff) {
+                if checkpoint.covers_through_seq >= user_message_seq {
+                    return session_error(format!(
+                        "checkpoint {} crosses abandoned compaction-boundary turn at user.message seq {user_message_seq}; source projection v{} cannot prove that the turn was excluded",
+                        checkpoint.checkpoint_id, checkpoint.source_projection_version
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Return turns that are no longer part of the current provider view.
+    ///
+    /// Only the latest boundary for a turn controls projection. An older
+    /// abandoned/superseded attempt must not hide a newer retry of that same
+    /// turn. Started/failed boundaries are unsafe to project until the user
+    /// explicitly retries or abandons them; checkpointed boundaries may remain
+    /// visible while their normal response is still pending.
+    pub fn projection_excluded_turn_ids(&self) -> Result<HashSet<String>> {
+        let mut latest_by_turn = HashMap::<String, &ValidatedCompactionBoundary>::new();
+        for boundary in &self.boundaries {
+            latest_by_turn.insert(boundary.boundary.turn_id.clone(), boundary);
+        }
+
+        for boundary in latest_by_turn.values() {
+            match boundary.state {
+                CompactionBoundaryState::Started | CompactionBoundaryState::Failed => {
+                    return session_error(format!(
+                        "compaction boundary {} remains pending; retry or abandon it before projection",
+                        boundary.boundary.boundary_id
+                    ));
+                }
+                CompactionBoundaryState::Abandoned => {}
+                CompactionBoundaryState::Checkpointed
+                | CompactionBoundaryState::Superseded
+                | CompactionBoundaryState::CompletedTurn => {}
+            }
+        }
+        Ok(self.abandoned_turn_ids())
+    }
+}
+
+/// Require a checkpointed boundary to be at a durable Provider request
+/// boundary before the Agent appends another `response.started`.
+///
+/// A context-limit retry first records `turn.retry_started`, which returns the
+/// slot to `Ready`. Other terminal outcomes currently have no same-turn retry
+/// protocol; dispatching anyway would append an event that the canonical slot
+/// reducer rejects on the next read and poison the session.
+pub(crate) fn ensure_checkpointed_boundary_request_ready(
+    events: &[JournalEvent],
+    boundary: &ValidatedCompactionBoundary,
+) -> Result<()> {
+    if boundary.state != CompactionBoundaryState::Checkpointed {
+        return session_error(format!(
+            "compaction boundary {} is {:?}, not checkpointed",
+            boundary.boundary.boundary_id, boundary.state
+        ));
+    }
+    let policy = compaction_boundary_policy(boundary.boundary.version)?;
+    // Frozen boundary v1 did not use this reducer to decide historical
+    // validity. The Agent still applies the pinned v1 slot machine as a
+    // prospective write-safety check so a legacy session cannot append an
+    // immediately invalid second response attempt.
+    let slot_version = policy
+        .provider_request_slot_validator_version
+        .unwrap_or(COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1);
+    let slot =
+        provider_request_slot_state_for_version(slot_version, events, &boundary.boundary.turn_id)?;
+    if slot != ProviderRequestSlotState::Ready {
+        return Err(OxidraError::ApprovalRequired(format!(
+            "checkpointed compaction boundary {} cannot resume turn {} from Provider request-slot state {slot:?}; use the validated context-limit retry when available, otherwise abandon the pending turn",
+            boundary.boundary.boundary_id, boundary.boundary.turn_id
+        )));
+    }
+    Ok(())
 }
 
 /// Deterministic journal repairs that session-open recovery may append after
@@ -797,6 +927,9 @@ pub enum NoCompactionCandidate {
     MissingEstimate {
         covers_through_seq: u64,
     },
+    AbandonedTurnBarrier {
+        user_message_seq: u64,
+    },
     TargetUnreachable {
         target_input_tokens: u64,
         best_estimated_input_tokens_after: u64,
@@ -829,6 +962,10 @@ impl fmt::Display for NoCompactionCandidate {
                 formatter,
                 "no projected context estimate was supplied for cutoff {covers_through_seq}"
             ),
+            Self::AbandonedTurnBarrier { user_message_seq } => write!(
+                formatter,
+                "checkpoint advancement is blocked by an abandoned compaction-boundary turn at user.message seq {user_message_seq}"
+            ),
             Self::TargetUnreachable {
                 target_input_tokens,
                 best_estimated_input_tokens_after,
@@ -844,6 +981,116 @@ impl fmt::Display for NoCompactionCandidate {
 pub enum CompactionSelection {
     Selected(CompactionCandidate),
     Unavailable(NoCompactionCandidate),
+}
+
+/// Rebuild the last durable candidate in a failed boundary's retry lineage.
+///
+/// A crash may occur after `compaction.boundary.retry_started` is synced but
+/// before the replacement `compaction.started` is written. Walking through
+/// `previous_boundary_id` preserves the original candidate without inventing
+/// a second user message or relying on process memory. Preflight-only failures
+/// have no durable candidate and must be recomputed by the future automatic
+/// trigger or explicitly abandoned.
+pub fn rebuild_failed_boundary_candidate(
+    events: &[JournalEvent],
+    boundary_id: &str,
+) -> Result<CompactionCandidate> {
+    let chain = validate_compaction_boundary_chain(events)?;
+    let boundary = chain
+        .boundaries()
+        .iter()
+        .find(|boundary| boundary.boundary.boundary_id == boundary_id)
+        .ok_or_else(|| {
+            OxidraError::Session(format!(
+                "cannot rebuild candidate for unknown compaction boundary {boundary_id}"
+            ))
+        })?;
+    if boundary.state != CompactionBoundaryState::Failed {
+        return session_error(format!(
+            "compaction boundary {boundary_id} is {:?}, not failed",
+            boundary.state
+        ));
+    }
+
+    let mut current_boundary_id = boundary_id.to_owned();
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current_boundary_id.clone()) {
+            return session_error(format!(
+                "compaction boundary retry lineage for {boundary_id} contains a cycle"
+            ));
+        }
+
+        let mut started = None;
+        for event in events
+            .iter()
+            .filter(|event| event.kind == COMPACTION_STARTED_KIND)
+        {
+            let payload = parse_event_data::<CompactionStarted>(event)?;
+            if attempt_boundary(&payload.extra)?
+                .as_ref()
+                .is_some_and(|bound| bound.boundary_id == current_boundary_id)
+            {
+                started = Some(payload);
+            }
+        }
+        if let Some(started) = started {
+            let estimated_input_tokens_after = started
+                .extra
+                .get("estimated_input_tokens_after")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "compaction attempt {} has no replayable estimated_input_tokens_after",
+                        started.attempt_id
+                    ))
+                })?;
+            let newly_compacted_complete_turns = started
+                .extra
+                .get("newly_compacted_complete_turns")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "compaction attempt {} has no replayable complete-turn count",
+                        started.attempt_id
+                    ))
+                })?;
+            let candidate = CompactionCandidate {
+                parent_checkpoint_id: started.parent_checkpoint_id,
+                covers_through_seq: started.covers_through_seq,
+                newly_compacted_complete_turns,
+                estimated_input_tokens_after,
+                prompt_version: started.prompt_version,
+                summary_envelope_version: started.summary_envelope_version,
+                source_projection_version: started.source_projection_version,
+                turn_boundary_validator_version: started.turn_boundary_validator_version,
+                source_digest_version: started.source_digest_version,
+                usage_contract_version: started.usage_contract_version,
+                source: started.source,
+                source_digest: started.source_digest,
+            };
+            validate_dispatch_candidate(events, &candidate)?;
+            return Ok(candidate);
+        }
+
+        let mut previous_boundary_id = None;
+        for event in events
+            .iter()
+            .filter(|event| event.kind == COMPACTION_BOUNDARY_RETRY_STARTED_KIND)
+        {
+            let retry = parse_event_data::<CompactionBoundaryRetryStarted>(event)?;
+            if retry.boundary.boundary_id == current_boundary_id {
+                previous_boundary_id = Some(retry.previous_boundary_id);
+            }
+        }
+        let previous_boundary_id = previous_boundary_id.ok_or_else(|| {
+            OxidraError::ApprovalRequired(format!(
+                "compaction boundary {boundary_id} failed before recording a replayable candidate; abandon it or rerun compaction preflight"
+            ))
+        })?;
+        current_boundary_id = previous_boundary_id;
+    }
 }
 
 /// Rebuild and validate every committed checkpoint as a strict single chain.
@@ -1653,6 +1900,7 @@ pub fn validate_compaction_boundary_chain(
             let record = &mut records[index];
             let policy = compaction_boundary_policy(record.boundary.version)?;
             if matches!(evidence, CompletionEvidence::LegacyNextUser)
+                && policy.legacy_completion_uses_next_user
                 && matches!(
                     record.state,
                     CompactionBoundaryState::Abandoned | CompactionBoundaryState::Superseded
@@ -2091,6 +2339,8 @@ pub fn select_compaction_candidate(
     context: &CompactionContext,
 ) -> Result<CompactionSelection> {
     chain.ensure_matches(events)?;
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    boundary_chain.ensure_checkpoint_projection_safe(chain)?;
     if context.current_input_tokens <= context.target_input_tokens {
         return Ok(CompactionSelection::Unavailable(
             NoCompactionCandidate::NotNeeded {
@@ -2130,17 +2380,33 @@ pub fn select_compaction_candidate(
     let required_recent_turns = context
         .min_recent_complete_turns
         .max(MIN_RECENT_COMPLETE_TURNS);
-    let eligible = candidates
+    let recent_eligible = candidates
         .iter()
         .filter(|candidate| {
             complete_turns.saturating_sub(candidate.turn_count) >= required_recent_turns
         })
         .collect::<Vec<_>>();
-    if eligible.is_empty() {
+    if recent_eligible.is_empty() {
         return Ok(CompactionSelection::Unavailable(
             NoCompactionCandidate::RecentTurnsMustBeRetained {
                 complete_turns,
                 required_recent_turns,
+            },
+        ));
+    }
+    let abandoned_barrier = boundary_chain.first_abandoned_user_seq_after(parent_cutoff);
+    let eligible = recent_eligible
+        .into_iter()
+        .filter(|candidate| {
+            abandoned_barrier
+                .is_none_or(|user_message_seq| candidate.covers_through_seq < user_message_seq)
+        })
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        return Ok(CompactionSelection::Unavailable(
+            NoCompactionCandidate::AbandonedTurnBarrier {
+                user_message_seq: abandoned_barrier
+                    .expect("empty barrier-filtered candidates require a barrier"),
             },
         ));
     }
@@ -2651,6 +2917,8 @@ fn validate_dispatch_candidate(
     }
 
     let chain = validate_checkpoint_chain(events)?;
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    boundary_chain.ensure_checkpoint_projection_safe(&chain)?;
     let expected_parent = chain.latest();
     if candidate.parent_checkpoint_id.as_deref()
         != expected_parent.map(|checkpoint| checkpoint.checkpoint_id.as_str())
@@ -2661,6 +2929,14 @@ fn validate_dispatch_candidate(
     }
 
     let parent_cutoff = expected_parent.map_or(0, |checkpoint| checkpoint.covers_through_seq);
+    if let Some(user_message_seq) = boundary_chain.first_abandoned_user_seq_after(parent_cutoff) {
+        if candidate.covers_through_seq >= user_message_seq {
+            return session_error(format!(
+                "compaction candidate cutoff {} crosses abandoned compaction-boundary turn at user.message seq {user_message_seq}",
+                candidate.covers_through_seq
+            ));
+        }
+    }
     let uncompacted_events = events
         .iter()
         .filter(|event| event.seq > parent_cutoff)
@@ -5390,6 +5666,69 @@ mod tests {
     }
 
     #[test]
+    fn candidate_selection_never_summarizes_across_an_abandoned_boundary_turn() {
+        let legacy_boundary = CompactionBoundary {
+            version: COMPACTION_BOUNDARY_VERSION_V1,
+            boundary_id: "abandoned-boundary".to_owned(),
+            turn_id: "abandoned-turn".to_owned(),
+            user_message_seq: 1,
+        };
+        let mut events = vec![
+            open_user_with_boundary_version(1, "abandoned-turn", "obsolete", 3),
+            event(
+                2,
+                None,
+                COMPACTION_BOUNDARY_STARTED_KIND,
+                serde_json::to_value(CompactionBoundaryStarted {
+                    boundary: legacy_boundary.clone(),
+                    trigger: "test".to_owned(),
+                    extra: Map::new(),
+                })
+                .unwrap(),
+            ),
+            event(
+                3,
+                None,
+                COMPACTION_BOUNDARY_ABANDONED_KIND,
+                serde_json::to_value(CompactionBoundaryAbandoned {
+                    boundary_id: legacy_boundary.boundary_id,
+                    turn_id: legacy_boundary.turn_id,
+                    user_message_seq: legacy_boundary.user_message_seq,
+                    reason: "replace prompt".to_owned(),
+                    extra: Map::new(),
+                })
+                .unwrap(),
+            ),
+        ];
+        events.extend(complete_turn(4, "turn-2"));
+        events.extend(complete_turn(7, "turn-3"));
+        events.extend(complete_turn(10, "turn-4"));
+        events.push(open_user(13, "current-turn", "current"));
+
+        let chain = validate_checkpoint_chain(&events).unwrap();
+        let selection = select_compaction_candidate(
+            &events,
+            &chain,
+            &CompactionContext {
+                current_input_tokens: 1_000,
+                target_input_tokens: 500,
+                min_recent_complete_turns: 2,
+                estimates: vec![CandidateEstimate {
+                    covers_through_seq: 6,
+                    estimated_input_tokens_after: 400,
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            selection,
+            CompactionSelection::Unavailable(NoCompactionCandidate::AbandonedTurnBarrier {
+                user_message_seq: 1,
+            })
+        );
+    }
+
+    #[test]
     fn candidate_selection_after_checkpoint_counts_only_the_uncompacted_suffix() {
         let mut events = completed_turns(6);
         append_checkpoint_attempt(
@@ -6160,6 +6499,22 @@ mod tests {
             .to_string();
         assert!(
             error.contains("reserves turn legacy-turn until checkpointed"),
+            "unexpected boundary error: {error}"
+        );
+    }
+
+    #[test]
+    fn frozen_boundary_v1_does_not_ignore_late_response_completion_after_abandon() {
+        let events = include_str!("../tests/fixtures/compaction_boundary_v1_late_response.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<JournalEvent>(line).expect("literal v1 JSONL"))
+            .collect::<Vec<_>>();
+
+        let error = validate_compaction_boundary_chain(&events)
+            .expect_err("frozen boundary v1 must not ignore its response evidence")
+            .to_string();
+        assert!(
+            error.contains("cannot apply TurnCompleted") || error.contains("cannot complete turn"),
             "unexpected boundary error: {error}"
         );
     }

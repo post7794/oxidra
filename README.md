@@ -141,14 +141,18 @@ Useful options:
     --max-tools <N>        optional per-turn insurance limit
     --context-window <N>   override the effective model context window
     --reserve-tokens <N>   override the reserved token allowance
-    --retry-pending        retry the newest context-limited prompt on resume
-    --abandon-pending      abandon context-limited turns before a replacement prompt
+    --retry-pending        retry one pending context-limit or compaction request
+    --abandon-pending      abandon pending context-limit/compaction requests
 ```
 
-Both pending-turn options require `--resume`. `--retry-pending` first syncs a
-versioned retry intent and then continues the original turn without appending a
-second user message; `--abandon-pending` can be combined with `-p` to submit a
-replacement prompt.
+Both pending-turn options require `--resume` and never append a second copy of
+the original prompt. Context-limit retries sync `turn.retry_started`; failed
+compaction retries sync `compaction.boundary.retry_started` and replay the last
+durable candidate. A checkpointed boundary resumes only from a validated
+`Ready` Provider slot; another terminal outcome must use its own validated
+retry protocol (currently context-limit) or be explicitly abandoned.
+`--abandon-pending` can be combined with `-p` to submit a replacement prompt;
+the original journal bytes remain available for audit.
 
 Local management commands do not require an API key:
 

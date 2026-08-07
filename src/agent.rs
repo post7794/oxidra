@@ -13,7 +13,13 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::compaction::validate_checkpoint_chain;
+use crate::compaction::{
+    COMPACTION_BOUNDARY_ABANDONED_KIND, COMPACTION_BOUNDARY_RETRY_STARTED_KIND, CompactionBoundary,
+    CompactionBoundaryAbandoned, CompactionBoundaryChain, CompactionBoundaryRetryStarted,
+    CompactionBoundaryState, ValidatedCompactionBoundary, compact_once_for_boundary,
+    ensure_checkpointed_boundary_request_ready, rebuild_failed_boundary_candidate,
+    validate_checkpoint_chain, validate_compaction_boundary_chain,
+};
 use crate::config::ContextLimits;
 use crate::context::{
     ContextDecision, ContextRuntime, decide_context, measure_prepared_request, snapshot_tools,
@@ -23,16 +29,19 @@ use crate::history::{
     HISTORY_ARTIFACT_TOOL, HISTORY_CONTROL_OUTPUT_RESERVE_BYTES, HISTORY_SEARCH_TOOL,
     HISTORY_TURN_TOOL, HistoryQuota, HistorySearchRequest, HistorySnapshot, HistoryTurnRequest,
     MAX_HISTORY_CALLS_PER_RESPONSE, MAX_HISTORY_TOOL_OUTPUT_BYTES, MAX_HISTORY_TURN_OUTPUT_BYTES,
-    history_tool_definitions, is_history_tool_name, rebuild_history_quota,
-    serialized_history_tool_output_bytes,
+    history_tool_definitions, is_history_tool_name, rebuild_history_quota_for_compaction_preview,
+    rebuild_history_quota_with_boundary_chain, serialized_history_tool_output_bytes,
 };
 use crate::history_artifact::{HistoryArtifactReader, HistoryArtifactRequest};
 pub use crate::projection::project_events;
-use crate::projection::{project_checkpoint_and_tail, validate_response_output_items};
+use crate::projection::{
+    project_checkpoint_and_tail_with_boundary_chain, project_compaction_summary_and_tail,
+    project_events_with_boundary_chain, validate_response_output_items,
+};
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::SessionJournal;
 use crate::tools::{BuiltinTools, ToolContext};
-use crate::turn::{TURN_BOUNDARY_VERSION, validate_turn_recovery};
+use crate::turn::{TURN_BOUNDARY_VERSION, TurnState, segment_turns, validate_turn_recovery};
 use crate::types::{ToolCall, ToolDefinition, ToolResult, Usage};
 
 const MAX_PROJECT_INSTRUCTIONS: usize = 32 * 1024;
@@ -112,6 +121,12 @@ pub struct PendingContextTurn {
     pub user_message_seq: u64,
     pub context_limit_seq: u64,
     pub prompt: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AbandonedPending {
+    pub context_turns: usize,
+    pub compaction_boundaries: usize,
 }
 
 pub struct Agent {
@@ -213,7 +228,10 @@ impl Agent {
                 in_doubt.len()
             )));
         }
-        let pending = self.pending_context_turns()?;
+        let events = self.journal.read_events()?;
+        let boundary_chain = validate_compaction_boundary_chain(&events)?;
+        ensure_compaction_boundaries_allow_request(&events, &boundary_chain, None)?;
+        let pending = pending_context_turns(&events)?;
         if !pending.is_empty() {
             return Err(OxidraError::ApprovalRequired(format!(
                 "session contains {} context-limited turn(s); retry or abandon them before adding a new prompt",
@@ -515,6 +533,17 @@ impl Agent {
         pending_context_turns(&self.journal.read_events()?)
     }
 
+    /// Return validated compaction boundaries that still own the original
+    /// user request. Callers must resolve them before appending a new prompt.
+    pub fn pending_compaction_boundaries(&self) -> Result<Vec<ValidatedCompactionBoundary>> {
+        let events = self.journal.read_events()?;
+        Ok(validate_compaction_boundary_chain(&events)?
+            .pending()
+            .into_iter()
+            .cloned()
+            .collect())
+    }
+
     /// 以 append-only 事件放弃全部 pending 回合，不删除原始 journal 内容。
     pub fn abandon_pending_context_turns(&mut self, reason: &str) -> Result<usize> {
         let pending = self.pending_context_turns()?;
@@ -529,6 +558,198 @@ impl Agent {
             )?;
         }
         Ok(pending.len())
+    }
+
+    /// Resolve every pending recovery protocol without deleting journal data.
+    ///
+    /// Context-limit and compaction-boundary events are both appended because
+    /// a checkpointed request can subsequently hit the Provider context limit.
+    /// Each compaction abandon is dry-run through the canonical reducer before
+    /// durable append so a control event can never poison the session merely
+    /// because the CLI offered an invalid transition.
+    pub fn abandon_pending_turns(&mut self, reason: &str) -> Result<AbandonedPending> {
+        let context_turns = self.abandon_pending_context_turns(reason)?;
+        let mut compaction_boundaries = 0usize;
+        loop {
+            let events = self.journal.read_events()?;
+            let chain = validate_compaction_boundary_chain(&events)?;
+            let Some(boundary) = chain.latest_pending().cloned() else {
+                break;
+            };
+            let payload = CompactionBoundaryAbandoned {
+                boundary_id: boundary.boundary.boundary_id,
+                turn_id: boundary.boundary.turn_id,
+                user_message_seq: boundary.boundary.user_message_seq,
+                reason: reason.to_owned(),
+                extra: Default::default(),
+            };
+            validate_next_compaction_boundary_event(
+                &events,
+                COMPACTION_BOUNDARY_ABANDONED_KIND,
+                serde_json::to_value(&payload)?,
+            )?;
+            self.journal.append_and_sync(
+                COMPACTION_BOUNDARY_ABANDONED_KIND,
+                None,
+                serde_json::to_value(payload)?,
+            )?;
+            compaction_boundaries = compaction_boundaries.saturating_add(1);
+        }
+        Ok(AbandonedPending {
+            context_turns,
+            compaction_boundaries,
+        })
+    }
+
+    /// Retry the single pending user request, regardless of which recovery
+    /// protocol owns it.
+    ///
+    /// A context-limit retry keeps its existing `turn.retry_started` intent.
+    /// A checkpointed compaction boundary resumes the normal Provider request.
+    /// A failed compaction boundary first persists a new boundary retry intent,
+    /// replays the last durable candidate in its lineage, then resumes the
+    /// original user turn after the replacement checkpoint is synced.
+    pub async fn retry_pending_turn(
+        &mut self,
+        cancellation: CancellationToken,
+        observer: &mut dyn AgentObserver,
+        approval: &mut dyn ApprovalHandler,
+    ) -> Result<TurnOutcome> {
+        let events = self.journal.read_events()?;
+        if !pending_context_turns(&events)?.is_empty() {
+            return self
+                .retry_pending_context_turn(cancellation, observer, approval)
+                .await;
+        }
+
+        let chain = validate_compaction_boundary_chain(&events)?;
+        let pending = chain.pending();
+        let boundary = pending.last().ok_or_else(|| {
+            OxidraError::Config("session has no pending turn to retry".to_owned())
+        })?;
+        if pending.len() != 1 {
+            return Err(OxidraError::ApprovalRequired(format!(
+                "session has {} pending compaction boundaries; abandon the backlog before retrying",
+                pending.len()
+            )));
+        }
+        let boundary = (*boundary).clone();
+        match boundary.state {
+            CompactionBoundaryState::Checkpointed => {
+                ensure_checkpointed_boundary_request_ready(&events, &boundary)?;
+                self.run_existing_turn(
+                    &boundary.boundary.turn_id,
+                    boundary.boundary.user_message_seq,
+                    cancellation,
+                    observer,
+                    approval,
+                )
+                .await
+            }
+            CompactionBoundaryState::Failed => {
+                let candidate = rebuild_failed_boundary_candidate(
+                    &events,
+                    &boundary.boundary.boundary_id,
+                )?;
+                let replacement = CompactionBoundary::new(
+                    Uuid::now_v7().to_string(),
+                    boundary.boundary.turn_id.clone(),
+                    boundary.boundary.user_message_seq,
+                );
+                let retry = CompactionBoundaryRetryStarted {
+                    retry_id: Uuid::now_v7().to_string(),
+                    previous_boundary_id: boundary.boundary.boundary_id,
+                    boundary: replacement.clone(),
+                    extra: Default::default(),
+                };
+                validate_next_compaction_boundary_event(
+                    &events,
+                    COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+                    serde_json::to_value(&retry)?,
+                )?;
+                self.journal.append_and_sync(
+                    COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+                    None,
+                    serde_json::to_value(retry)?,
+                )?;
+
+                let preview_events = self.journal.read_events()?;
+                let preview_boundaries = validate_compaction_boundary_chain(&preview_events)?;
+                let mut preview_tools = self.tools.definitions();
+                let preview_history_quota = rebuild_history_quota_for_compaction_preview(
+                    &preview_events,
+                    &replacement.turn_id,
+                    &preview_boundaries,
+                )?;
+                let preview_history_exposed = preview_history_quota.remaining_bytes
+                    >= MAX_HISTORY_CALLS_PER_RESPONSE
+                        .saturating_mul(HISTORY_CONTROL_OUTPUT_RESERVE_BYTES);
+                if preview_history_exposed {
+                    preview_tools.extend(history_tool_definitions());
+                }
+                let preview_instructions = self.instructions.clone();
+                let preview_runtime = self.context_runtime.clone();
+                let preview_cutoff = candidate.covers_through_seq;
+                let preview_envelope_version = candidate.summary_envelope_version;
+
+                let mut compaction_observer = SilentCompactionObserver;
+                compact_once_for_boundary(
+                    self.provider.as_ref(),
+                    &mut self.journal,
+                    &replacement,
+                    &candidate,
+                    &self.context_runtime.model,
+                    &mut compaction_observer,
+                    cancellation.clone(),
+                    move |summary| {
+                        let input = project_compaction_summary_and_tail(
+                            &preview_events,
+                            preview_cutoff,
+                            preview_envelope_version,
+                            summary,
+                            &preview_boundaries,
+                        )?;
+                        let request = ResponseRequest {
+                            instructions: (!preview_instructions.is_empty())
+                                .then(|| preview_instructions.clone()),
+                            input,
+                            tools: preview_tools.clone(),
+                            model: None,
+                            max_output_tokens: None,
+                        };
+                        let measured = measure_prepared_request(&request, &preview_runtime)?;
+                        if let Some(target) = preview_runtime.limits.target_tokens() {
+                            if measured.estimated_input_tokens > target {
+                                return Err(OxidraError::Limit(format!(
+                                    "compaction summary leaves estimated context {} above target {target}",
+                                    measured.estimated_input_tokens
+                                )));
+                            }
+                        }
+                        Ok(())
+                    },
+                )
+                .await?;
+                self.run_existing_turn(
+                    &replacement.turn_id,
+                    replacement.user_message_seq,
+                    cancellation,
+                    observer,
+                    approval,
+                )
+                .await
+            }
+            CompactionBoundaryState::Started => Err(OxidraError::ApprovalRequired(
+                "compaction is still marked started; reopen the session to recover it before retrying"
+                    .to_owned(),
+            )),
+            CompactionBoundaryState::Superseded
+            | CompactionBoundaryState::Abandoned
+            | CompactionBoundaryState::CompletedTurn => Err(OxidraError::Session(format!(
+                "resolved compaction boundary {} was returned as pending",
+                boundary.boundary.boundary_id
+            ))),
+        }
     }
 
     /// 持久化 retry intent 后在原 turn 上继续，崩溃恢复不会重复追加 prompt。
@@ -1002,6 +1223,8 @@ impl Agent {
         turn_id: Option<&str>,
     ) -> Result<(ResponseRequest, PreparedToolSet)> {
         let events = self.journal.read_events()?;
+        let boundary_chain = validate_compaction_boundary_chain(&events)?;
+        ensure_compaction_boundaries_allow_request(&events, &boundary_chain, turn_id)?;
         let chain = validate_checkpoint_chain(&events)?;
         let checkpoint_id = chain
             .latest()
@@ -1010,13 +1233,15 @@ impl Agent {
             .latest()
             .map(|checkpoint| checkpoint.covers_through_seq);
         let input = if chain.latest().is_some() {
-            project_checkpoint_and_tail(&events, &chain)?
+            project_checkpoint_and_tail_with_boundary_chain(&events, &chain, &boundary_chain)?
         } else {
-            project_events(&events)?
+            project_events_with_boundary_chain(&events, &boundary_chain)?
         };
-        let history = HistorySnapshot::build(&events, &chain)?;
+        let history = HistorySnapshot::build_with_boundary_chain(&events, &chain, &boundary_chain)?;
         let history_quota = match turn_id {
-            Some(turn_id) => rebuild_history_quota(&events, turn_id)?,
+            Some(turn_id) => {
+                rebuild_history_quota_with_boundary_chain(&events, turn_id, &boundary_chain)?
+            }
             None => HistoryQuota {
                 used_bytes: 0,
                 remaining_bytes: MAX_HISTORY_TURN_OUTPUT_BYTES,
@@ -1124,12 +1349,10 @@ fn pending_context_turns(
             },
         )?;
     let recovery = validate_turn_recovery(events)?;
-    let resolved_turns = events
-        .iter()
-        .filter(|event| {
-            event.kind == "turn.completed" || event.data.get("turn_completion").is_some()
-        })
-        .filter_map(|event| event.turn_id.clone())
+    let resolved_turns = segment_turns(events)?
+        .into_iter()
+        .filter(|turn| matches!(turn.state, TurnState::Complete(_)))
+        .map(|turn| turn.turn_id)
         .collect::<HashSet<_>>();
     let resolved_turns = resolved_turns
         .into_iter()
@@ -1168,6 +1391,59 @@ fn pending_context_turns(
         });
     }
     Ok(pending)
+}
+
+fn ensure_compaction_boundaries_allow_request(
+    events: &[crate::session::JournalEvent],
+    chain: &CompactionBoundaryChain,
+    current_turn_id: Option<&str>,
+) -> Result<()> {
+    let mut blocked = Vec::new();
+    for boundary in chain.pending() {
+        if boundary.state == CompactionBoundaryState::Checkpointed
+            && current_turn_id == Some(boundary.boundary.turn_id.as_str())
+        {
+            ensure_checkpointed_boundary_request_ready(events, boundary)?;
+        } else {
+            blocked.push(boundary);
+        }
+    }
+    if blocked.is_empty() {
+        return Ok(());
+    }
+
+    let latest = blocked
+        .iter()
+        .max_by_key(|boundary| boundary.started_seq)
+        .expect("non-empty pending boundary set");
+    Err(OxidraError::ApprovalRequired(format!(
+        "session contains {} pending compaction boundary/boundaries (latest {} is {:?}); retry or abandon before dispatching another request",
+        blocked.len(),
+        latest.boundary.boundary_id,
+        latest.state
+    )))
+}
+
+fn validate_next_compaction_boundary_event(
+    events: &[crate::session::JournalEvent],
+    kind: &str,
+    data: Value,
+) -> Result<()> {
+    let mut next = events.last().cloned().ok_or_else(|| {
+        OxidraError::Session(
+            "cannot append a compaction boundary event to an empty journal".to_owned(),
+        )
+    })?;
+    next.seq = next.seq.checked_add(1).ok_or_else(|| {
+        OxidraError::Session("journal sequence overflow while validating boundary event".to_owned())
+    })?;
+    next.kind = kind.to_owned();
+    next.turn_id = None;
+    next.data = data;
+    let mut prospective = events.to_vec();
+    prospective.push(next);
+    validate_compaction_boundary_chain(&prospective)?;
+    Ok(())
 }
 
 fn validate_history_calls_for_response(
@@ -1222,6 +1498,14 @@ fn accumulate_usage(total: &mut Usage, usage: &Usage) {
 
 struct ForwardObserver<'a> {
     observer: &'a mut dyn AgentObserver,
+}
+
+struct SilentCompactionObserver;
+
+impl StreamObserver for SilentCompactionObserver {
+    fn on_event(&mut self, _event: ProviderEvent) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl StreamObserver for ForwardObserver<'_> {
@@ -1481,8 +1765,9 @@ mod tests {
 
     use super::*;
     use crate::compaction::{
-        CandidateEstimate, CompactionContext, CompactionSelection, compact_once,
-        select_compaction_candidate,
+        COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_BOUNDARY_STARTED_KIND, CandidateEstimate,
+        CompactionBoundaryStarted, CompactionContext, CompactionSelection, compact_once,
+        compact_once_for_boundary, select_compaction_candidate,
     };
     use crate::config::ContextValueSource;
     use crate::history::UNTRUSTED_HISTORY_NOTICE;
@@ -1495,6 +1780,8 @@ mod tests {
     struct ForgedRoleProvider;
 
     struct ObserverEventProvider;
+
+    struct ProviderFailureProvider;
 
     struct RecordingProvider {
         responses: Mutex<VecDeque<AssistantTurn>>,
@@ -1591,6 +1878,20 @@ mod tests {
         ) -> Result<AssistantTurn> {
             observer.on_event(ProviderEvent::TextDelta("partial".to_owned()))?;
             panic!("failing observer should stop the Provider")
+        }
+    }
+
+    #[async_trait]
+    impl ResponseProvider for ProviderFailureProvider {
+        async fn respond(
+            &self,
+            _request: ResponseRequest,
+            _observer: &mut dyn StreamObserver,
+            _cancellation: CancellationToken,
+        ) -> Result<AssistantTurn> {
+            Err(OxidraError::Provider(
+                "injected compaction provider failure".to_owned(),
+            ))
         }
     }
 
@@ -1798,6 +2099,69 @@ mod tests {
             )
             .unwrap();
         (user.seq, limit.seq)
+    }
+
+    fn append_open_compaction_boundary(
+        journal: &mut SessionJournal,
+        turn_id: &str,
+        prompt: &str,
+    ) -> CompactionBoundary {
+        let user = journal
+            .append_and_sync(
+                "user.message",
+                Some(turn_id),
+                json!({
+                    "item":{"role":"user","content":prompt},
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let boundary = CompactionBoundary::new(format!("boundary-{turn_id}"), turn_id, user.seq);
+        journal
+            .append_and_sync(
+                COMPACTION_BOUNDARY_STARTED_KIND,
+                None,
+                serde_json::to_value(CompactionBoundaryStarted {
+                    boundary: boundary.clone(),
+                    trigger: "test".to_owned(),
+                    extra: Default::default(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        boundary
+    }
+
+    fn boundary_candidate(
+        journal: &mut SessionJournal,
+        current_turn_id: &str,
+        prompt: &str,
+    ) -> (CompactionBoundary, crate::compaction::CompactionCandidate) {
+        let cutoff = append_complete_turn(journal, "old-turn-1", "old one", "answer one");
+        append_complete_turn(journal, "old-turn-2", "old two", "answer two");
+        append_complete_turn(journal, "old-turn-3", "old three", "answer three");
+        let boundary = append_open_compaction_boundary(journal, current_turn_id, prompt);
+        let events = journal.read_events().unwrap();
+        let chain = validate_checkpoint_chain(&events).unwrap();
+        let candidate = match select_compaction_candidate(
+            &events,
+            &chain,
+            &CompactionContext {
+                current_input_tokens: 100,
+                target_input_tokens: 10,
+                min_recent_complete_turns: 2,
+                estimates: vec![CandidateEstimate {
+                    covers_through_seq: cutoff,
+                    estimated_input_tokens_after: 5,
+                }],
+            },
+        )
+        .unwrap()
+        {
+            CompactionSelection::Selected(candidate) => candidate,
+            other => panic!("expected boundary candidate, got {other:?}"),
+        };
+        (boundary, candidate)
     }
 
     fn count_events(events: &[JournalEvent], kind: &str) -> usize {
@@ -2218,6 +2582,344 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_compaction_boundary_blocks_a_new_prompt_before_journal_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "compaction-pending-gate-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        append_open_compaction_boundary(&mut journal, "pending-turn", "original prompt");
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("must not run")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let error = agent
+            .run_turn(
+                "replacement before resolution",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::ApprovalRequired(_)));
+        assert!(provider.requests().is_empty());
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "user.message"), 1);
+        assert_eq!(agent.pending_compaction_boundaries().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_compaction_boundary_removes_the_old_turn_from_the_next_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "compaction-abandon-projection-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        append_open_compaction_boundary(&mut journal, "abandoned-turn", "obsolete prompt");
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("replacement answer")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let abandoned = agent
+            .abandon_pending_turns("replace the original prompt")
+            .unwrap();
+        assert_eq!(
+            abandoned,
+            AbandonedPending {
+                context_turns: 0,
+                compaction_boundaries: 1,
+            }
+        );
+        let outcome = agent
+            .run_turn(
+                "replacement prompt",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "replacement answer");
+
+        let request = provider.requests().pop().unwrap();
+        let serialized = serde_json::to_string(&request.input).unwrap();
+        assert!(!serialized.contains("obsolete prompt"));
+        assert!(serialized.contains("replacement prompt"));
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, COMPACTION_BOUNDARY_ABANDONED_KIND), 1);
+        assert!(agent.pending_compaction_boundaries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkpointed_compaction_boundary_resumes_the_original_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "checkpointed-boundary-resume-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let (boundary, candidate) =
+            boundary_candidate(&mut journal, "current-turn", "resume original prompt");
+        compact_once_for_boundary(
+            &RecordingProvider::new([compaction_summary_turn()]),
+            &mut journal,
+            &boundary,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        drop(journal);
+
+        let journal = store.open("checkpointed-boundary-resume-test").unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("resumed answer")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let outcome = agent
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "resumed answer");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        let serialized = serde_json::to_string(&requests[0].input).unwrap();
+        assert!(serialized.contains("checkpoint summary"));
+        assert!(serialized.contains("resume original prompt"));
+        assert!(agent.pending_compaction_boundaries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkpointed_boundary_does_not_append_a_retry_from_terminal_slot() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "checkpointed-boundary-terminal-slot-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let (boundary, candidate) =
+            boundary_candidate(&mut journal, "current-turn", "resume original prompt");
+        compact_once_for_boundary(
+            &RecordingProvider::new([compaction_summary_turn()]),
+            &mut journal,
+            &boundary,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        journal
+            .append_and_sync(
+                "response.started",
+                Some(&boundary.turn_id),
+                json!({"response_attempt_id":"failed-normal-attempt"}),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "response.failed",
+                Some(&boundary.turn_id),
+                json!({
+                    "response_attempt_id":"failed-normal-attempt",
+                    "error":"injected normal Provider failure",
+                }),
+            )
+            .unwrap();
+        drop(journal);
+
+        let journal = store
+            .open("checkpointed-boundary-terminal-slot-test")
+            .unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("must not run")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let before = agent.journal().read_events().unwrap();
+        let error = agent
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::ApprovalRequired(_)));
+        assert!(error.to_string().contains("request-slot state Terminal"));
+        assert!(provider.requests().is_empty());
+        let after = agent.journal().read_events().unwrap();
+        assert_eq!(after, before, "a refused retry must not mutate the journal");
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_boundary_replays_its_candidate_before_resuming() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "failed-boundary-retry-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let (boundary, candidate) =
+            boundary_candidate(&mut journal, "current-turn", "retry original prompt");
+        let error = compact_once_for_boundary(
+            &ProviderFailureProvider,
+            &mut journal,
+            &boundary,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, OxidraError::Provider(_)));
+        drop(journal);
+
+        let journal = store.open("failed-boundary-retry-test").unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([
+            compaction_summary_turn(),
+            final_turn("retried answer"),
+        ]));
+        let mut agent = Agent::new_with_runtime(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextRuntime::for_tests("test-model", ContextLimits::default()),
+            None,
+            None,
+        );
+
+        let outcome = agent
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "retried answer");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].tools.is_empty());
+        assert_eq!(requests[0].max_output_tokens, Some(8_192));
+        let normal_input = serde_json::to_string(&requests[1].input).unwrap();
+        assert!(normal_input.contains("checkpoint summary"));
+        assert!(normal_input.contains("retry original prompt"));
+
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(
+            count_events(&events, COMPACTION_BOUNDARY_RETRY_STARTED_KIND),
+            1
+        );
+        assert_eq!(count_events(&events, COMPACTION_BOUNDARY_FAILED_KIND), 1);
+        assert_eq!(count_events(&events, "compaction.checkpoint"), 1);
+        assert_eq!(count_events(&events, "user.message"), 4);
+        assert!(agent.pending_compaction_boundaries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn explicit_retry_reuses_the_original_turn_without_deleting_history() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
@@ -2333,6 +3035,32 @@ mod tests {
             .unwrap();
         assert_eq!(follow_up.text, "follow-up");
         assert_eq!(provider.requests().len(), 2);
+    }
+
+    #[test]
+    fn unvalidated_inline_completion_cannot_clear_a_pending_context_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "forged-context-completion-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        append_pending_context_turn(&mut journal, "limited-turn", "oversized prompt");
+        journal
+            .append_and_sync("note", Some("limited-turn"), json!({"turn_completion":{}}))
+            .unwrap();
+
+        let error = pending_context_turns(&journal.read_events().unwrap())
+            .expect_err("raw payload fields must not resolve a pending turn")
+            .to_string();
+        assert!(
+            error.contains("inline completion") || error.contains("turn boundary"),
+            "unexpected reducer error: {error}"
+        );
     }
 
     #[tokio::test]
