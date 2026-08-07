@@ -15,9 +15,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::compaction::{
-    COMPACTION_BOUNDARY_ABANDONED_KIND, COMPACTION_BOUNDARY_FAILED_KIND,
-    COMPACTION_BOUNDARY_RETRY_STARTED_KIND, COMPACTION_BOUNDARY_STARTED_KIND,
-    COMPACTION_STARTED_KIND, CandidateEstimate, CompactionBoundary, CompactionBoundaryAbandoned,
+    COMPACTION_BOUNDARY_ABANDONED_KIND, COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
+    COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+    COMPACTION_BOUNDARY_STARTED_KIND, COMPACTION_STARTED_KIND, CandidateEstimate,
+    CompactionBoundary, CompactionBoundaryAbandoned, CompactionBoundaryBudgetRetryStarted,
     CompactionBoundaryChain, CompactionBoundaryFailed, CompactionBoundaryRetryStarted,
     CompactionBoundaryStarted, CompactionBoundaryState, CompactionCandidate, CompactionContext,
     CompactionSelection, CompactionStarted, MAX_COMPACTION_OUTPUT_TOKENS,
@@ -288,6 +289,9 @@ enum RecoveryActionV1 {
         retry_intent: Option<Value>,
     },
     ResumeCheckpointed(ValidatedCompactionBoundary),
+    ResumeBudgetLimitedCheckpoint {
+        retry: CompactionBoundaryBudgetRetryStarted,
+    },
     ReplayFailedBoundary {
         context_retry_intent: Option<Value>,
         retry: CompactionBoundaryRetryStarted,
@@ -882,8 +886,7 @@ impl Agent {
                     if let Some(retry) = context {
                         self.plan_context_retry_v1(&snapshot, retry, Some(&boundary))?
                     } else {
-                        ensure_checkpointed_boundary_request_ready(&snapshot, &boundary)?;
-                        RecoveryActionV1::ResumeCheckpointed(boundary)
+                        self.plan_checkpointed_boundary_resume_v1(&snapshot, boundary)?
                     }
                 }
                 CompactionBoundaryState::Started => {
@@ -904,6 +907,105 @@ impl Agent {
         };
 
         Ok(RecoveryPlanV1 { snapshot, action })
+    }
+
+    fn plan_checkpointed_boundary_resume_v1(
+        &self,
+        snapshot: &[JournalEvent],
+        boundary: ValidatedCompactionBoundary,
+    ) -> Result<RecoveryActionV1> {
+        match ensure_checkpointed_boundary_request_ready(snapshot, &boundary) {
+            Ok(()) => return Ok(RecoveryActionV1::ResumeCheckpointed(boundary)),
+            Err(error) if boundary.boundary.version != 3 => return Err(error),
+            Err(OxidraError::ApprovalRequired(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        let limit = snapshot
+            .iter()
+            .rev()
+            .find(|event| {
+                event.seq > boundary.state_seq
+                    && event.kind == "agent.limit_reached"
+                    && event.turn_id.as_deref() == Some(boundary.boundary.turn_id.as_str())
+                    && event.data.get("kind").and_then(Value::as_str) == Some("responses")
+            })
+            .ok_or_else(|| {
+                OxidraError::ApprovalRequired(format!(
+                    "checkpointed compaction boundary {} is terminal without a compatible Provider budget limit; abandon it",
+                    boundary.boundary.boundary_id
+                ))
+            })?;
+        let previous_limit = limit
+            .data
+            .get("limit")
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "agent.limit_reached at seq {} has no positive response limit",
+                    limit.seq
+                ))
+            })?;
+        let consumed =
+            durable_provider_call_intents_for_turn(snapshot, &boundary.boundary.turn_id)?;
+        let consumed_u64 = u64::try_from(consumed).map_err(|_| {
+            OxidraError::Session("Provider call intent count exceeds u64".to_owned())
+        })?;
+        let current_limit = self
+            .max_responses
+            .map(|limit| {
+                u64::try_from(limit)
+                    .map_err(|_| OxidraError::Config("max responses exceeds u64".to_owned()))
+            })
+            .transpose()?;
+        if current_limit.is_some_and(|limit| limit <= consumed_u64) {
+            return Err(OxidraError::Limit(format!(
+                "max responses reached: {consumed_u64} durable Provider calls already consumed"
+            )));
+        }
+
+        let replacement = CompactionBoundary::new(
+            Uuid::now_v7().to_string(),
+            boundary.boundary.turn_id.clone(),
+            boundary.boundary.user_message_seq,
+        );
+        let retry = CompactionBoundaryBudgetRetryStarted {
+            retry_version: 1,
+            retry_id: Uuid::now_v7().to_string(),
+            previous_boundary_id: boundary.boundary.boundary_id,
+            boundary: replacement.clone(),
+            checkpoint_id: boundary.checkpoint_id.ok_or_else(|| {
+                OxidraError::Session(
+                    "checkpointed compaction boundary has no checkpoint id".to_owned(),
+                )
+            })?,
+            limit_seq: limit.seq,
+            previous_limit,
+            current_limit,
+            budget_disabled: current_limit.is_none(),
+            consumed_provider_call_intents: consumed_u64,
+            extra: Map::new(),
+        };
+        let mut prospective = snapshot.to_vec();
+        append_prospective_event(
+            &mut prospective,
+            COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
+            None,
+            serde_json::to_value(&retry)?,
+        )?;
+        let prospective_chain = validate_compaction_boundary_chain(&prospective)?;
+        let replacement_record = prospective_chain
+            .latest_pending()
+            .filter(|record| record.boundary == replacement)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "Provider budget retry boundary {} is not the unique pending recovery owner",
+                    replacement.boundary_id
+                ))
+            })?;
+        ensure_checkpointed_boundary_request_ready(&prospective, replacement_record)?;
+        Ok(RecoveryActionV1::ResumeBudgetLimitedCheckpoint { retry })
     }
 
     fn plan_context_retry_v1(
@@ -1220,6 +1322,23 @@ impl Agent {
                 self.run_existing_turn(
                     &boundary.boundary.turn_id,
                     boundary.boundary.user_message_seq,
+                    cancellation,
+                    observer,
+                    approval,
+                )
+                .await
+            }
+            RecoveryActionV1::ResumeBudgetLimitedCheckpoint { retry } => {
+                let replacement = retry.boundary.clone();
+                self.ensure_provider_call_budget(&replacement.turn_id)?;
+                self.journal.append_and_sync(
+                    COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
+                    None,
+                    serde_json::to_value(retry)?,
+                )?;
+                self.run_existing_turn(
+                    &replacement.turn_id,
+                    replacement.user_message_seq,
                     cancellation,
                     observer,
                     approval,
@@ -4534,7 +4653,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(error, OxidraError::Limit(_)));
+        assert!(matches!(error, OxidraError::Limit(_)), "{error:?}");
         assert_eq!(provider.requests().len(), 1);
         let events = agent.journal().read_events().unwrap();
         assert_eq!(count_events(&events, COMPACTION_CHECKPOINT_KIND), 1);
@@ -4554,6 +4673,204 @@ mod tests {
         let events = agent.journal().read_events().unwrap();
         assert_eq!(count_events(&events, "response.started"), 1);
         assert!(agent.pending_compaction_boundaries().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn checkpointed_55e5b0c_budget_terminal_migrates_after_limit_increase() {
+        let fixture = include_str!("../tests/fixtures/checkpointed_budget_limit_55e5b0c.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<JournalEvent>(line).expect("literal 55e5b0c JSONL"))
+            .collect::<Vec<_>>();
+        let fixture_chain = validate_compaction_boundary_chain(&fixture).unwrap();
+        assert_eq!(fixture_chain.pending().len(), 1);
+        assert_eq!(
+            fixture_chain.pending()[0].state,
+            CompactionBoundaryState::Checkpointed
+        );
+        assert_eq!(
+            provider_request_slot_state_for_version(1, &fixture, "turn-2").unwrap(),
+            ProviderRequestSlotState::Terminal
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "legacy-checkpoint-budget-retry",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        for event in fixture.into_iter().skip(1) {
+            journal
+                .append_and_sync(&event.kind, event.turn_id.as_deref(), event.data)
+                .unwrap();
+        }
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("resumed without loss")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            Some(1),
+            None,
+        );
+        let before = agent.journal().read_events().unwrap();
+
+        let error = agent
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::Limit(_)), "{error:?}");
+        assert_eq!(agent.journal().read_events().unwrap(), before);
+        assert!(provider.requests().is_empty());
+
+        agent.max_responses = Some(2);
+        let outcome = agent
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "resumed without loss");
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1);
+        let input = serde_json::to_string(&requests[0].input).unwrap();
+        assert!(input.contains("summary v2"));
+        assert!(input.contains("prompt"));
+
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "user.message"), 2);
+        assert_eq!(
+            count_events(&events, COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND),
+            1
+        );
+        let chain = validate_compaction_boundary_chain(&events).unwrap();
+        assert!(chain.pending().is_empty());
+        assert_eq!(
+            chain.boundaries()[0].state,
+            CompactionBoundaryState::Superseded
+        );
+        assert_eq!(
+            chain.boundaries()[1].state,
+            CompactionBoundaryState::CompletedTurn
+        );
+        assert!(matches!(
+            segment_turns(&events).unwrap().last().unwrap().state,
+            TurnState::Complete(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn synced_legacy_budget_migration_survives_session_reopen() {
+        let fixture = include_str!("../tests/fixtures/checkpointed_budget_limit_55e5b0c.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<JournalEvent>(line).expect("literal 55e5b0c JSONL"))
+            .collect::<Vec<_>>();
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "legacy-budget-migration-reopen",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        for event in fixture.into_iter().skip(1) {
+            journal
+                .append_and_sync(&event.kind, event.turn_id.as_deref(), event.data)
+                .unwrap();
+        }
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut planning_agent = Agent::new(
+            Arc::new(RecordingProvider::new([final_turn("must not run")])),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            Some(2),
+            None,
+        );
+        let plan = planning_agent.build_recovery_plan_v1().unwrap();
+        let retry = match plan.action {
+            RecoveryActionV1::ResumeBudgetLimitedCheckpoint { retry } => retry,
+            _ => panic!("unexpected recovery action"),
+        };
+        planning_agent
+            .journal
+            .append_and_sync(
+                COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
+                None,
+                serde_json::to_value(retry).unwrap(),
+            )
+            .unwrap();
+        drop(planning_agent);
+
+        let journal = store.open("legacy-budget-migration-reopen").unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("resumed after reopen")]));
+        let mut resumed = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            Some(2),
+            None,
+        );
+        let outcome = resumed
+            .retry_pending_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "resumed after reopen");
+        assert_eq!(provider.requests().len(), 1);
+        let events = resumed.journal().read_events().unwrap();
+        assert_eq!(
+            count_events(&events, COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND),
+            1,
+            "reopen must reuse the durable migration instead of minting another"
+        );
+        assert!(
+            validate_compaction_boundary_chain(&events)
+                .unwrap()
+                .pending()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

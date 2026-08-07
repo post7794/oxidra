@@ -170,16 +170,22 @@ abort. Raising the option on resume can permit further calls; retrying with the
 same exhausted limit cannot reset it. When a compaction boundary owns recovery,
 budget exhaustion leaves that boundary pending instead of writing a conflicting
 turn-terminal event, so a later higher limit can resume it. The reported
-assistant-response count still excludes an internal summary call. The usage line includes usage
-returned by an automatic compaction checkpoint when the turn completes in the
-same process.
+assistant-response count still excludes an internal summary call. Journals
+written by the earlier `55e5b0c` behavior may already contain a checkpointed
+boundary followed by `agent.limit_reached`; `--retry-pending` recognizes that
+literal legacy state and, only after the current limit is raised or disabled,
+syncs a versioned `compaction.boundary.budget_retry_started` migration before
+resuming the same prompt and checkpoint. The usage line includes usage returned
+by an automatic compaction checkpoint when the turn completes in the same
+process.
 
 Both pending-turn options require `--resume` and never append a second copy of
 the original prompt. Context-limit retries sync `turn.retry_started`; failed
 compaction retries sync `compaction.boundary.retry_started` and replay the last
 durable candidate. A checkpointed boundary resumes only from a validated
-`Ready` Provider slot; another terminal outcome must use its own validated
-retry protocol (currently context-limit) or be explicitly abandoned.
+`Ready` Provider slot. The two validated terminal recovery paths are a
+context-limit `turn.retry_started` and the narrowly scoped legacy budget
+migration above; any other terminal outcome must be explicitly abandoned.
 `--abandon-pending` can be combined with `-p` to submit a replacement prompt;
 the original journal bytes remain available for audit.
 
