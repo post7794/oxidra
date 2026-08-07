@@ -9,6 +9,9 @@ use crate::session::JournalEvent;
 
 pub const TURN_BOUNDARY_VALIDATOR_VERSION: u32 = 4;
 pub const TURN_BOUNDARY_VERSION: u64 = TURN_BOUNDARY_VALIDATOR_VERSION as u64;
+/// Default slot reducer for a new writer. Persisted compaction boundary
+/// policies bind their own historical version and must not read this constant.
+#[allow(dead_code)]
 pub(crate) const PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

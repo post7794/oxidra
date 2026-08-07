@@ -23,9 +23,9 @@ use crate::projection::{
 use crate::provider::{ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{JournalEvent, SessionJournal};
 use crate::turn::{
-    CompletionEvidence, PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION, ProviderRequestSlotState,
-    TURN_BOUNDARY_VALIDATOR_VERSION, TurnState, complete_prefix_candidates_for_version,
-    provider_request_slot_state_for_version, segment_turns_for_version,
+    CompletionEvidence, ProviderRequestSlotState, TURN_BOUNDARY_VALIDATOR_VERSION, TurnState,
+    complete_prefix_candidates_for_version, provider_request_slot_state_for_version,
+    segment_turns_for_version,
 };
 use crate::types::AssistantTurn;
 
@@ -56,6 +56,9 @@ const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1: u32 = 3;
 // bindings are protocol registry entries: never retarget them in place.
 const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2: u32 = 4;
 const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V3: u32 = 4;
+// Boundary v2/v3 were published against slot reducer v1. Keep this literal
+// binding stable even if the current writer later adopts a newer slot policy.
+const COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1: u32 = 1;
 const COMPACTION_BOUNDARY_VERSION_V1: u32 = 1;
 const COMPACTION_BOUNDARY_VERSION_V2: u32 = 2;
 const COMPACTION_BOUNDARY_VERSION_V3: u32 = 3;
@@ -69,7 +72,7 @@ const SUPPORTED_COMPACTION_BOUNDARY_VERSIONS: [u32; 3] = [
 struct CompactionBoundaryPolicy {
     turn_validator_version: u32,
     downgrade_current_turn_metadata: bool,
-    owns_provider_request_slot: bool,
+    provider_request_slot_validator_version: Option<u32>,
     enforces_session_protocol_epoch: bool,
     requires_attempt_resolution_before_abandon: bool,
     requires_settled_slot_before_abandon: bool,
@@ -82,7 +85,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
         COMPACTION_BOUNDARY_VERSION_V1 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1,
             downgrade_current_turn_metadata: true,
-            owns_provider_request_slot: false,
+            provider_request_slot_validator_version: None,
             enforces_session_protocol_epoch: false,
             requires_attempt_resolution_before_abandon: false,
             requires_settled_slot_before_abandon: false,
@@ -90,7 +93,9 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
         COMPACTION_BOUNDARY_VERSION_V2 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2,
             downgrade_current_turn_metadata: false,
-            owns_provider_request_slot: true,
+            provider_request_slot_validator_version: Some(
+                COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1,
+            ),
             enforces_session_protocol_epoch: false,
             requires_attempt_resolution_before_abandon: false,
             requires_settled_slot_before_abandon: false,
@@ -98,7 +103,9 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
         COMPACTION_BOUNDARY_VERSION_V3 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V3,
             downgrade_current_turn_metadata: false,
-            owns_provider_request_slot: true,
+            provider_request_slot_validator_version: Some(
+                COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1,
+            ),
             enforces_session_protocol_epoch: true,
             requires_attempt_resolution_before_abandon: true,
             requires_settled_slot_before_abandon: true,
@@ -1160,10 +1167,15 @@ pub fn validate_compaction_boundary_chain(
             if let Some(index) = active_by_turn.get(turn_id).copied() {
                 let record = &records[index];
                 let policy = compaction_boundary_policy(record.boundary.version)?;
-                if policy.owns_provider_request_slot && record.started_seq < event.seq {
+                if policy.provider_request_slot_validator_version.is_some()
+                    && record.started_seq < event.seq
+                {
                     if record.state == CompactionBoundaryState::Checkpointed {
+                        let slot_version = policy
+                            .provider_request_slot_validator_version
+                            .expect("slot policy checked above");
                         provider_request_slot_state_for_version(
-                            PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+                            slot_version,
                             &events[..=event_index],
                             turn_id,
                         )?;
@@ -1468,8 +1480,11 @@ pub fn validate_compaction_boundary_chain(
                 if policy.requires_settled_slot_before_abandon
                     && record.state == CompactionBoundaryState::Checkpointed
                 {
+                    let slot_version = policy
+                        .provider_request_slot_validator_version
+                        .expect("settled-slot policy requires a slot validator");
                     let slot = provider_request_slot_state_for_version(
-                        PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+                        slot_version,
                         &events[..=event_index],
                         &payload.turn_id,
                     )?;
@@ -1636,9 +1651,24 @@ pub fn validate_compaction_boundary_chain(
                 ));
             }
             let record = &mut records[index];
-            if compaction_boundary_policy(record.boundary.version)?.owns_provider_request_slot {
+            let policy = compaction_boundary_policy(record.boundary.version)?;
+            if matches!(evidence, CompletionEvidence::LegacyNextUser)
+                && matches!(
+                    record.state,
+                    CompactionBoundaryState::Abandoned | CompactionBoundaryState::Superseded
+                )
+                && record.state_seq < event.seq
+            {
+                // LegacyNextUser is a derived fact whose evidence can arrive
+                // after an explicit abandon/supersession.  That later user
+                // must not resurrect the resolved boundary.  Explicit marker
+                // and inline evidence deliberately do not take this escape
+                // path; forged completion remains fail closed.
+                continue;
+            }
+            if let Some(slot_version) = policy.provider_request_slot_validator_version {
                 let slot = provider_request_slot_state_for_version(
-                    PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+                    slot_version,
                     &events[..=event_index],
                     turn_id,
                 )?;
@@ -1753,9 +1783,9 @@ fn validate_boundary_start_context(
             boundary.boundary_id, boundary.turn_id, active_turn.state
         ));
     }
-    if policy.owns_provider_request_slot {
+    if let Some(slot_version) = policy.provider_request_slot_validator_version {
         let slot = provider_request_slot_state_for_version(
-            PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+            slot_version,
             visible_events,
             &boundary.turn_id,
         )?;
@@ -6132,6 +6162,100 @@ mod tests {
             error.contains("reserves turn legacy-turn until checkpointed"),
             "unexpected boundary error: {error}"
         );
+    }
+
+    #[test]
+    fn abandoned_boundary_ignores_late_legacy_completion_but_not_explicit_marker() {
+        let mut events = include_str!("../tests/fixtures/compaction_boundary_v2.jsonl")
+            .lines()
+            .map(|line| serde_json::from_str::<JournalEvent>(line).expect("literal JSONL"))
+            .collect::<Vec<_>>();
+        events
+            .iter_mut()
+            .find(|event| event.seq == 4 && event.kind == "user.message")
+            .expect("fixture turn user")
+            .data
+            .as_object_mut()
+            .expect("user payload object")
+            .remove("turn_boundary_version");
+
+        // Finish the legacy turn after checkpointing, then abandon it before
+        // the next user message supplies LegacyNextUser evidence.
+        for event in events.iter_mut().filter(|event| event.seq >= 10) {
+            event.seq += 1;
+        }
+        events.insert(
+            9,
+            event(
+                10,
+                Some("turn-2"),
+                "response.completed",
+                json!({
+                    "response_attempt_id":"normal-attempt",
+                    "output_items":[{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[{"type":"output_text","text":"done"}],
+                    }],
+                }),
+            ),
+        );
+
+        let chain = validate_compaction_boundary_chain(&events)
+            .expect("a later legacy next-user fact must not re-settle an abandoned boundary");
+        assert_eq!(
+            chain.boundaries()[0].state,
+            CompactionBoundaryState::Abandoned
+        );
+
+        // A real explicit completion is not a derived legacy fact and must
+        // still fail closed after abandon.
+        let mut explicit = events[..events.len() - 1].to_vec();
+        explicit.push(event(
+            12,
+            Some("turn-2"),
+            "turn.completed",
+            json!({
+                "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                "covers_from_seq": 4,
+                "final_response_seq": 10,
+                "covers_through_seq": 12,
+            }),
+        ));
+        explicit.push(event(
+            13,
+            Some("turn-3"),
+            "user.message",
+            json!({
+                "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                "item":{"role":"user","content":"replacement"},
+            }),
+        ));
+        assert!(
+            validate_compaction_boundary_chain(&explicit).is_err(),
+            "explicit completion must not be ignored after abandon"
+        );
+    }
+
+    #[test]
+    fn boundary_policies_pin_their_provider_slot_reducer_version() {
+        assert_eq!(
+            compaction_boundary_policy(COMPACTION_BOUNDARY_VERSION_V1)
+                .expect("boundary v1 policy")
+                .provider_request_slot_validator_version,
+            None
+        );
+        for version in [
+            COMPACTION_BOUNDARY_VERSION_V2,
+            COMPACTION_BOUNDARY_VERSION_V3,
+        ] {
+            assert_eq!(
+                compaction_boundary_policy(version)
+                    .expect("slot-owning boundary policy")
+                    .provider_request_slot_validator_version,
+                Some(COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1)
+            );
+        }
     }
 
     #[test]
