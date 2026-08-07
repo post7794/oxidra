@@ -16,6 +16,8 @@ pub enum OxidraError {
     Observer(#[source] Box<OxidraError>),
     #[error("tool error ({code}): {message}")]
     Tool { code: String, message: String },
+    #[error("MCP error: {0}")]
+    Mcp(String),
     #[error("session error: {0}")]
     Session(String),
     #[error("approval required: {0}")]

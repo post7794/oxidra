@@ -8,6 +8,7 @@ pub mod error;
 mod event_kind;
 pub mod history;
 mod history_artifact;
+pub mod mcp;
 mod memory;
 mod process;
 pub mod projection;

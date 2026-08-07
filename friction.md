@@ -160,7 +160,7 @@
 
 ## 工具生态与扩展能力
 
-### 当前缺少 MCP 支持
+### MCP kernel 已实现，Agent policy 尚未接通
 
 实际工程需要接入外部专业工具，固定需求包括：
 
@@ -170,9 +170,15 @@
 - Tavily MCP
 - SSH MCP
 
-当前只有固定内置工具，无法方便地接入这些开发、逆向、检索和远程环境能力，已经成为实际工程推进的阻塞点。
+当前已实现有界、版本化的 MCP stdio transport/session kernel，支持 modern
+`2026-07-28` discovery 和冻结的 `2025-11-25` legacy fallback，并覆盖进程树、
+显式环境 allowlist、分页/大小限制、取消以及 `in_doubt`。它尚未进入 CLI 配置、
+Agent tool registry、approval、journal 或 context.tools，因此用户现在仍然只能使用
+固定内置工具，不能把上述 MCP server 暴露给模型。
 
-后续需要重新评估 MCP/工具扩展边界，重点考虑工具授权、项目根边界、远程副作用、session journal、恢复语义和上下文投影，而不是简单增加一个无约束的工具注册入口。
+下一步先完成项目配置/trust 和 session-scoped tool registry，再复用现有
+`tool.started/completed/in_doubt` reducer 接入 Agent。完整顺序与 release gate 见
+`docs/mcp-roadmap.md`；不能把 kernel 的存在误报为已完成用户入口。
 
 ### Skill 暂不作为当前重点
 
