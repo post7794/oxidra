@@ -415,6 +415,10 @@ impl Agent {
                     observer,
                 )
                 .await?;
+            if cancellation.is_cancelled() {
+                self.append_turn_cancelled(turn_id, "cancelled before response started")?;
+                return Err(OxidraError::Interrupted);
+            }
             let context = self.context_estimate(&prepared_tools.context);
             outcome.context = Some(context.clone());
             let response_attempt_id = Uuid::now_v7().to_string();
@@ -1704,13 +1708,20 @@ impl Agent {
             &candidate,
             &self.context_runtime.model,
             &mut compaction_observer,
-            cancellation,
+            cancellation.clone(),
             move |summary| continuation.validate_summary(summary),
         )
         .await?;
 
+        if cancellation.is_cancelled() {
+            return Err(OxidraError::Interrupted);
+        }
+
         let _ = self.prepare_request(Some(turn_id))?;
         let (request, prepared) = self.prepare_request(Some(turn_id))?;
+        if cancellation.is_cancelled() {
+            return Err(OxidraError::Interrupted);
+        }
         if prepared.context.estimated_next_input_tokens > target_tokens {
             return Err(OxidraError::Session(format!(
                 "checkpoint {} was committed but rebuilt context {} exceeds target {target_tokens}",
@@ -2475,6 +2486,11 @@ mod tests {
 
     struct ProviderFailureProvider;
 
+    #[derive(Default)]
+    struct CancellationAwareCompactionProvider {
+        requests: Mutex<Vec<ResponseRequest>>,
+    }
+
     struct RecordingProvider {
         responses: Mutex<VecDeque<AssistantTurn>>,
         requests: Mutex<Vec<ResponseRequest>>,
@@ -2602,6 +2618,26 @@ mod tests {
             Err(OxidraError::Provider(
                 "injected compaction provider failure".to_owned(),
             ))
+        }
+    }
+
+    #[async_trait]
+    impl ResponseProvider for CancellationAwareCompactionProvider {
+        async fn respond(
+            &self,
+            request: ResponseRequest,
+            _observer: &mut dyn StreamObserver,
+            cancellation: CancellationToken,
+        ) -> Result<AssistantTurn> {
+            let is_compaction = request.max_output_tokens.is_some();
+            self.requests.lock().unwrap().push(request);
+            if is_compaction {
+                Ok(compaction_summary_turn())
+            } else if cancellation.is_cancelled() {
+                Err(OxidraError::Interrupted)
+            } else {
+                Ok(final_turn("done"))
+            }
         }
     }
 
@@ -3244,6 +3280,10 @@ mod tests {
 
     struct FailingStartObserver;
 
+    struct CancelAfterCheckpointObserver {
+        cancellation: CancellationToken,
+    }
+
     impl AgentObserver for NoopObserver {
         fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
             Ok(())
@@ -3303,6 +3343,31 @@ mod tests {
         }
 
         fn on_message(&mut self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl AgentObserver for CancelAfterCheckpointObserver {
+        fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_message(&mut self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_compaction(&mut self, message: &str) -> Result<()> {
+            if message.starts_with("checkpoint ") {
+                self.cancellation.cancel();
+            }
             Ok(())
         }
     }
@@ -3554,6 +3619,38 @@ mod tests {
         );
         assert_eq!(boundary.data["context_window_source"], "cli");
         assert_eq!(boundary.data["reserve_tokens_source"], "cli");
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_compaction_checkpoint_does_not_start_normal_response() {
+        let provider = Arc::new(CancellationAwareCompactionProvider::default());
+        let (_temp, mut agent) = automatic_compaction_test_agent_with_provider(
+            "automatic-compaction-cancel-after-checkpoint",
+            6,
+            40_000,
+            provider,
+            true,
+        );
+        let cancellation = CancellationToken::new();
+        let mut observer = CancelAfterCheckpointObserver {
+            cancellation: cancellation.clone(),
+        };
+
+        let error = agent
+            .run_turn(
+                "current prompt",
+                cancellation,
+                &mut observer,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::Interrupted));
+
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, COMPACTION_CHECKPOINT_KIND), 1);
+        assert_eq!(count_events(&events, "response.started"), 0);
+        assert_eq!(count_events(&events, "turn.cancelled"), 1);
     }
 
     #[tokio::test]
