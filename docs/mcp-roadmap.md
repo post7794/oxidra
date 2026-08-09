@@ -1,7 +1,7 @@
 # Oxidra MCP 接入路线
 
 状态：MCP stdio transport/session kernel v1、显式 project-config reader v1、
-execution-plan digest v1 和 session-scoped tool registry v2 已实现，尚未接入 Agent、
+execution-plan digest v2 和 session-scoped tool registry v3 已实现，尚未接入 Agent、
 CLI 参数或 session journal。
 当前代码只能由 Rust 调用方显式加载绝对 config path 并构造 registry；它不是已经
 对用户开放的插件入口。
@@ -51,16 +51,23 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 
 - stdio 使用单个长生命周期 JSON-RPC 进程，复用已发现的工具表。
 - executable 必须是可 canonicalize 的绝对文件路径；cwd 必须是现存目录。配置加载
-  会生成不可变 prepared execution plan；canonical executable/cwd、参数、环境快照和
-  config SHA 在任何 server 启动前进入独立 execution-plan digest，spawn 不再重新解释
-  原始路径。
+  会生成不可变 prepared execution plan；canonical executable/cwd、参数、环境继承权限
+  和 config SHA 在任何 server 启动前进入独立 execution-plan digest，spawn 不再重新解释
+  原始路径。prepared plan 会冻结本次 spawn 使用的实际环境值，但公开 digest 不包含这些
+  值，避免把短 token 或低熵密码变成离线猜测 oracle。
 - 子进程先 `env_clear()`，只继承显式 allowlist 和显式配置值；环境变量名按
   ASCII 不区分大小写去重，避免同一配置在 Windows 与 Unix 上产生不同含义。
 - `ProcessTree` 在 Windows 使用 `CREATE_SUSPENDED` 启动 MCP 进程，先关联带
-  `KILL_ON_JOB_CLOSE` 的 Job Object，再恢复主线程；Unix 使用 spawn-time process
-  group。连接失败、取消、协议错误、in-doubt 或 shutdown 都不会把后代进程留在后台。
+  `KILL_ON_JOB_CLOSE` 的 Job Object，再恢复主线程。Linux 在 spawn 前启用 child
+  subreaper，并把 process group、`/proc` descendant sweep 和 adopted-child cleanup
+  组合为 MCP containment；`setsid()` 后代也有定向故障测试。其他 Unix（包括当前
+  macOS）没有等价 owner 时会在 spawn 前 fail closed，不能退回只靠 process group。
+  受支持平台上的连接失败、取消、协议错误、in-doubt 或 shutdown 不会把后代进程留在后台。
 - server stderr 使用持续 drain 的 64 KiB 有界捕获，不直接继承交互终端；诊断快照
-  带 server 来源前缀并清理终端控制字符，避免污染后续 trust/approval 界面。
+  带 server 来源前缀，并清理终端控制字符、bidi、零宽字符和 Unicode 行分隔符，
+  避免污染后续 trust/approval 界面。
+- 已经 cancelled 的 connect 在第一次 spawn 前返回；modern fallback 到 legacy 前会
+  再检查 cancellation，不会为已取消的连接执行 server 初始化代码。
 - 单条 JSONL 上限 1 MiB；工具表上限 512 KiB、512 个工具、64 页；单次工具
   result 上限 50 KiB。
 - `inputSchema` 必须声明 object root；可选 `outputSchema` 同样保留在 `McpTool`
@@ -83,23 +90,30 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - config 必须是非 symlink、UTF-8、至多 64 KiB，并声明 `version = 1`。
 - 最多 16 个 server；名称唯一，command 为绝对文件，cwd 为 project 内相对目录。
 - project config 只允许环境变量 inherit allowlist，不接受明文 `[servers.env]` secret。
-- 原始 config bytes 计算 SHA-256；effective canonical command/cwd、args、冻结的继承
-  环境值和显式环境进入启动前可得的 execution-plan digest v1。路径按平台使用无损
-  OS-native 编码，不通过 `to_string_lossy()` 生成执行身份。
+- 原始 config bytes 计算 SHA-256；effective canonical command/cwd、args、继承环境变量名
+  和显式环境变量名进入启动前可得的 execution-plan digest v2。路径按平台使用无损
+  OS-native 编码，不通过 `to_string_lossy()` 生成执行身份。冻结的 v1 算法与字面量
+  fixture 保留，但当前 writer 不再把实际环境值放入公开 SHA-256。
+- execution-plan v2 是 **path/command capability trust**，不是代码内容 attestation。
+  它批准 canonical command、cwd、args 和环境权限；不会散列解释器参数所指脚本、
+  executable 的依赖闭包或文件内容。文件在相同路径被原地替换时 digest 不变。若未来
+  需要“批准具体代码字节”，必须新增独立、版本化的 content-identity 协议，不能原地
+  扩大 v2 的含义。
 
-### 3.2 session-scoped registry v2
+### 3.2 session-scoped registry v3
 
 - 合并 server 工具后仍限制为 512 tools / 512 KiB，不把 per-server 限额误当全局限额。
 - raw identity `(server, tool)` 映射为满足 Responses function-name 约束的稳定 64-byte
   namespace；alias 带 identity hash，且仍执行实际 collision 检查。
-- input/output schema、raw/provider name、协议版本和 execution-plan digest 进入当前
-  registry-digest v2；字面量 fixture 固定其 SHA-256。旧 registry-digest v1 的 lossy-path
-  语义和字面量 SHA 仍保留为兼容 reader，不会被原地改写。
+- input/output schema、raw/provider name、协议版本和 execution-plan digest v2 进入当前
+  registry-digest v3；字面量 fixture 固定其 SHA-256。旧 registry-digest v1/v2 的
+  字面量 SHA 与算法仍保留，不会被原地改写。
 - registry 可按 provider alias 调用对应长连接 session，并统一 shutdown 全部进程。
 
 execution-plan digest 与 registry digest 是单向的两层证据：前者在启动任何不可信代码
-之前授权“执行什么”，后者只能在 discovery 之后冻结“模型能看到哪些工具”。工具表
-digest 不能反向充当 executable 的执行许可。
+之前授权“按哪些路径、参数和环境权限执行”，后者只能在 discovery 之后冻结“模型能
+看到哪些工具”。工具表 digest 不能反向充当 executable 的执行许可；path trust 也不能
+被表述成具体代码内容已经得到认证。
 
 ## 4. 尚未实现：Agent 与 CLI policy
 

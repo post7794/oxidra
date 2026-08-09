@@ -1,3 +1,5 @@
+#![cfg(any(windows, target_os = "linux"))]
+
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -56,6 +58,38 @@ async fn modern_stdio_discovers_lists_calls_and_reuses_one_process() {
     assert_eq!(
         methods(&log),
         ["server/discover", "tools/list", "tools/call", "tools/call"]
+    );
+}
+
+#[tokio::test]
+async fn pre_cancelled_connect_does_not_start_an_mcp_server() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP cancellation integration test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("pre-cancel.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let error = match McpStdioSession::connect(
+        fixture_config(&python, &script, &log, "modern"),
+        cancellation,
+    )
+    .await
+    {
+        Ok(mut session) => {
+            session.shutdown().await;
+            panic!("pre-cancelled MCP connect must fail before spawn");
+        }
+        Err(error) => error,
+    };
+    assert!(matches!(error, oxidra::error::OxidraError::Interrupted));
+    assert!(
+        !log.exists(),
+        "pre-cancelled connect must not execute the server"
     );
 }
 
@@ -240,6 +274,16 @@ async fn server_stderr_is_drained_bounded_and_terminal_safe() {
     assert!(snapshot.contains("spoofed approval"));
     assert!(!snapshot.contains('\u{1b}'));
     assert!(!snapshot.contains('\r'));
+    for character in [
+        '\u{061c}', '\u{200b}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}', '\u{202e}',
+        '\u{2060}', '\u{2066}', '\u{feff}',
+    ] {
+        assert!(
+            !snapshot.contains(character),
+            "stderr snapshot retained presentation control U+{:04X}",
+            character as u32
+        );
+    }
     assert!(
         snapshot
             .lines()
@@ -247,6 +291,30 @@ async fn server_stderr_is_drained_bounded_and_terminal_safe() {
     );
     assert!(snapshot.len() <= 64 * 1024);
     session.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_mcp_detached_setsid_child_is_terminated() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping Linux MCP containment test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("detached.log");
+    let marker = directory.path().join("detached-child.txt");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+
+    let mut config = fixture_config(&python, &script, &log, "spawn_detached_child_then_fail");
+    config.args.push(marker.to_string_lossy().into_owned());
+    let result = McpStdioSession::connect(config, CancellationToken::new()).await;
+    assert!(result.is_err(), "fixture must fail during discovery");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !marker.exists(),
+        "setsid child escaped MCP process-tree cleanup"
+    );
 }
 
 #[cfg(windows)]
@@ -343,6 +411,7 @@ with open(log_path, "a", encoding="utf-8") as log:
 
 if mode == "stderr":
     sys.stderr.write("x" * 70000 + "\n\x1b[31mspoofed approval\x1b[0m\r\nsecond line\n")
+    sys.stderr.write("bidi\u202eattack zero\u200bwidth line\u2028separator bom\ufeff\n")
     sys.stderr.flush()
 elif mode == "spawn_child_then_fail":
     marker_path = sys.argv[3]
@@ -352,6 +421,14 @@ elif mode == "spawn_child_then_fail":
         "import pathlib,sys,time; time.sleep(1.0); pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')",
         marker_path,
     ])
+elif mode == "spawn_detached_child_then_fail":
+    marker_path = sys.argv[3]
+    subprocess.Popen([
+        sys.executable,
+        "-c",
+        "import pathlib,sys,time; time.sleep(1.0); pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')",
+        marker_path,
+    ], start_new_session=True)
 
 tools = [
     {

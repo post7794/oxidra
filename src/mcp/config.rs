@@ -12,7 +12,8 @@ use crate::error::{OxidraError, Result};
 pub const MCP_PROJECT_CONFIG_VERSION_V1: u32 = 1;
 pub const MCP_PROJECT_CONFIG_VERSION: u32 = MCP_PROJECT_CONFIG_VERSION_V1;
 pub const MCP_EXECUTION_PLAN_VERSION_V1: u32 = 1;
-pub const MCP_EXECUTION_PLAN_VERSION: u32 = MCP_EXECUTION_PLAN_VERSION_V1;
+pub const MCP_EXECUTION_PLAN_VERSION_V2: u32 = 2;
+pub const MCP_EXECUTION_PLAN_VERSION: u32 = MCP_EXECUTION_PLAN_VERSION_V2;
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_SERVERS: usize = 16;
@@ -185,7 +186,7 @@ impl McpProjectConfig {
         }
 
         let source_sha256 = hex::encode(Sha256::digest(&bytes));
-        let execution_plan_digest = execution_plan_digest_v1(&source_sha256, &servers)?;
+        let execution_plan_digest = execution_plan_digest_v2(&source_sha256, &servers)?;
 
         Ok(Self {
             source_path,
@@ -212,6 +213,7 @@ impl McpProjectConfig {
     }
 }
 
+#[allow(dead_code)]
 fn execution_plan_digest_v1(
     source_sha256: &str,
     servers: &[PreparedMcpStdioConfig],
@@ -229,16 +231,54 @@ fn execution_plan_digest_v1(
     execution_plan_payload_digest_v1(&payload)
 }
 
+fn execution_plan_digest_v2(
+    source_sha256: &str,
+    servers: &[PreparedMcpStdioConfig],
+) -> Result<String> {
+    // V2 intentionally binds the permission to inherit named variables, not
+    // their values. A public SHA-256 over a low-entropy secret would be an
+    // offline guessing oracle. The prepared config still freezes the actual
+    // values used by this spawn, but secret rotation does not change the
+    // public trust identity.
+    let servers = servers
+        .iter()
+        .map(ExecutionServerDigestV2::from)
+        .collect::<Vec<_>>();
+    let payload = ExecutionPlanDigestV2 {
+        execution_plan_version: MCP_EXECUTION_PLAN_VERSION_V2,
+        project_config_version: MCP_PROJECT_CONFIG_VERSION_V1,
+        trust_model: "path-command-and-environment-capabilities",
+        source_sha256,
+        servers: &servers,
+    };
+    execution_plan_payload_digest_v2(&payload)
+}
+
+#[allow(dead_code)]
 fn execution_plan_payload_digest_v1(payload: &ExecutionPlanDigestV1<'_>) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(payload)?)))
 }
 
+fn execution_plan_payload_digest_v2(payload: &ExecutionPlanDigestV2<'_>) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(payload)?)))
+}
+
+#[allow(dead_code)]
 #[derive(Serialize)]
 struct ExecutionPlanDigestV1<'a> {
     execution_plan_version: u32,
     project_config_version: u32,
     source_sha256: &'a str,
     servers: &'a [ExecutionServerDigestV1<'a>],
+}
+
+#[derive(Serialize)]
+struct ExecutionPlanDigestV2<'a> {
+    execution_plan_version: u32,
+    project_config_version: u32,
+    trust_model: &'static str,
+    source_sha256: &'a str,
+    servers: &'a [ExecutionServerDigestV2<'a>],
 }
 
 #[derive(Serialize)]
@@ -250,6 +290,16 @@ struct ExecutionServerDigestV1<'a> {
     inherit_env: &'a [String],
     inherited_env: Vec<InheritedEnvironmentDigestV1<'a>>,
     explicit_env: &'a std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct ExecutionServerDigestV2<'a> {
+    name: &'a str,
+    command: EncodedOsValueV1,
+    args: &'a [String],
+    cwd: Option<EncodedOsValueV1>,
+    inherit_env: &'a [String],
+    explicit_env_names: Vec<&'a str>,
 }
 
 impl<'a> From<&'a PreparedMcpStdioConfig> for ExecutionServerDigestV1<'a> {
@@ -275,6 +325,21 @@ impl<'a> From<&'a PreparedMcpStdioConfig> for ExecutionServerDigestV1<'a> {
             inherit_env: server.inherit_env(),
             inherited_env,
             explicit_env: server.explicit_env(),
+        }
+    }
+}
+
+impl<'a> From<&'a PreparedMcpStdioConfig> for ExecutionServerDigestV2<'a> {
+    fn from(server: &'a PreparedMcpStdioConfig) -> Self {
+        Self {
+            name: server.name(),
+            command: encode_os_value_v1(server.command().as_os_str()),
+            args: server.args(),
+            cwd: server
+                .cwd()
+                .map(|path| encode_os_value_v1(path.as_os_str())),
+            inherit_env: server.inherit_env(),
+            explicit_env_names: server.explicit_env().keys().map(String::as_str).collect(),
         }
     }
 }
@@ -580,6 +645,96 @@ mod tests {
                 .expect("compute execution-plan fixture digest"),
             "9726e289677890bde47190b36ccf76b601c9838c0a2ce5d92af23a614f9fb228"
         );
+    }
+
+    #[test]
+    fn execution_plan_digest_v2_is_frozen_without_environment_values() {
+        let args = vec!["--stdio".to_owned()];
+        let inherit_env = vec!["HOME".to_owned()];
+        let explicit_env =
+            std::collections::BTreeMap::from([("MODE".to_owned(), "fixture".to_owned())]);
+        let server = PreparedMcpStdioConfig {
+            name: "fixture".to_owned(),
+            command: PathBuf::from("/tools/fixture"),
+            args,
+            cwd: Some(PathBuf::from("/workspace")),
+            inherit_env,
+            inherited_env: std::collections::BTreeMap::from([(
+                "HOME".to_owned(),
+                std::ffi::OsString::from("/home/fixture"),
+            )]),
+            env: explicit_env,
+        };
+        let servers = vec![ExecutionServerDigestV2::from(&server)];
+        let payload = ExecutionPlanDigestV2 {
+            execution_plan_version: MCP_EXECUTION_PLAN_VERSION_V2,
+            project_config_version: MCP_PROJECT_CONFIG_VERSION_V1,
+            trust_model: "path-command-and-environment-capabilities",
+            source_sha256: &"a".repeat(64),
+            servers: &servers,
+        };
+        assert_eq!(
+            execution_plan_payload_digest_v2(&payload)
+                .expect("compute execution-plan v2 fixture digest"),
+            "eaa68f153bbd41bf1d80f991dcd9ecc737af4b9f835b13d9d11bce7e64d6693a"
+        );
+    }
+
+    #[test]
+    fn execution_plan_v2_does_not_expose_inherited_secret_values() {
+        let temp = tempfile::tempdir().expect("create config fixture");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("create project fixture");
+        let executable = std::env::current_exe().expect("resolve test executable");
+        let variable = format!("OXIDRA_MCP_SECRET_{}", uuid::Uuid::now_v7().simple());
+        let config_path = write_config(
+            &root,
+            &format!(
+                "version = 1\n\n[[servers]]\nname = \"fixture\"\ncommand = \"{}\"\ninherit_env = [\"{variable}\"]\n",
+                quoted_path(&executable)
+            ),
+        );
+        unsafe { std::env::set_var(&variable, "first-low-entropy-secret") };
+        let first = McpProjectConfig::load(&root, &config_path).expect("load first MCP config");
+        unsafe { std::env::set_var(&variable, "second-low-entropy-secret") };
+        let second = McpProjectConfig::load(&root, &config_path).expect("load second MCP config");
+        unsafe { std::env::remove_var(&variable) };
+
+        assert_eq!(
+            first.execution_plan_digest(),
+            second.execution_plan_digest()
+        );
+        assert_ne!(
+            first.servers()[0].inherited_env().get(&variable),
+            second.servers()[0].inherited_env().get(&variable)
+        );
+    }
+
+    #[test]
+    fn execution_plan_v2_is_path_based_not_argument_file_content_identity() {
+        let temp = tempfile::tempdir().expect("create config fixture");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("create project fixture");
+        let executable = std::env::current_exe().expect("resolve test executable");
+        let script = root.join("server.py");
+        fs::write(&script, "print('first')\n").expect("write first script");
+        let config_path = write_config(
+            &root,
+            &format!(
+                "version = 1\n\n[[servers]]\nname = \"fixture\"\ncommand = \"{}\"\nargs = [\"{}\"]\n",
+                quoted_path(&executable),
+                quoted_path(&script)
+            ),
+        );
+        let first = McpProjectConfig::load(&root, &config_path).expect("load first MCP config");
+        fs::write(&script, "print('replacement')\n").expect("replace script content");
+        let second = McpProjectConfig::load(&root, &config_path).expect("reload MCP config");
+
+        assert_eq!(
+            first.execution_plan_digest(),
+            second.execution_plan_digest()
+        );
+        assert_eq!(first.source_sha256(), second.source_sha256());
     }
 
     #[cfg(unix)]

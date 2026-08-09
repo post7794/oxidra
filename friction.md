@@ -174,8 +174,11 @@
 execution plan、显式 project-config reader 和 session-scoped namespaced registry，
 支持 modern `2026-07-28` discovery
 和冻结的 `2025-11-25` legacy fallback，并覆盖进程树、显式环境 allowlist、
-分页/大小限制、取消、启动前 execution-plan digest、discovery 后 registry digest
-以及 `in_doubt`。它尚未进入 CLI 参数、Agent approval、journal 或 context.tools，
+分页/大小限制、spawn 前取消、启动前 execution-plan digest、discovery 后 registry
+digest 以及 `in_doubt`。Windows 使用 suspended Job Object；Linux 使用 subreaper 与
+descendant sweep；缺少等价 containment 的 macOS 当前在 MCP spawn 前 fail closed。
+execution trust 明确是 path/command capability trust，不是脚本或依赖内容证明；继承
+环境的秘密值也不进入公开 digest。它尚未进入 CLI 参数、Agent approval、journal 或 context.tools，
 因此用户现在仍然只能使用固定内置工具，不能把上述 MCP server 暴露给模型。
 
 下一步是 CLI execution trust 与 Agent approval：把 execution-plan digest 接入启动前

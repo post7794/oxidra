@@ -7,12 +7,12 @@ mod config;
 mod registry;
 
 pub use config::{
-    MCP_EXECUTION_PLAN_VERSION, MCP_EXECUTION_PLAN_VERSION_V1, MCP_PROJECT_CONFIG_VERSION,
-    MCP_PROJECT_CONFIG_VERSION_V1, McpProjectConfig,
+    MCP_EXECUTION_PLAN_VERSION, MCP_EXECUTION_PLAN_VERSION_V1, MCP_EXECUTION_PLAN_VERSION_V2,
+    MCP_PROJECT_CONFIG_VERSION, MCP_PROJECT_CONFIG_VERSION_V1, McpProjectConfig,
 };
 pub use registry::{
     MCP_TOOL_REGISTRY_VERSION, MCP_TOOL_REGISTRY_VERSION_V1, MCP_TOOL_REGISTRY_VERSION_V2,
-    McpRegistry, McpToolBinding,
+    MCP_TOOL_REGISTRY_VERSION_V3, McpRegistry, McpToolBinding,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -155,6 +155,9 @@ impl McpStdioConfig {
 /// The command and working directory are canonical paths, and inherited
 /// environment values are captured at preparation time. Trust presentation,
 /// execution-plan hashing and process spawning all consume this same value.
+/// The public v2 digest authorizes paths, arguments and environment
+/// capabilities; it deliberately does not claim executable/script content
+/// identity and does not hash inherited secret values.
 #[derive(Clone)]
 pub struct PreparedMcpStdioConfig {
     name: String,
@@ -249,7 +252,13 @@ impl McpStdioSession {
         config: PreparedMcpStdioConfig,
         cancellation: CancellationToken,
     ) -> Result<Self> {
+        if cancellation.is_cancelled() {
+            return Err(OxidraError::Interrupted);
+        }
         let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
+        if cancellation.is_cancelled() {
+            return Err(OxidraError::Interrupted);
+        }
         let mut transport = timeout(
             START_TIMEOUT,
             Transport::spawn(&config, Arc::clone(&stderr_capture)),
@@ -283,6 +292,9 @@ impl McpStdioSession {
             | Err(ClientError::Exited { .. })
             | Err(ClientError::Io { .. }) => {
                 transport.terminate().await;
+                if cancellation.is_cancelled() {
+                    return Err(OxidraError::Interrupted);
+                }
                 let mut legacy = timeout(
                     START_TIMEOUT,
                     Transport::spawn(&config, Arc::clone(&stderr_capture)),
@@ -358,9 +370,9 @@ impl McpStdioSession {
         &self.tools
     }
 
-    /// Return bounded, source-prefixed stderr diagnostics with terminal
-    /// control characters removed. MCP stderr is never connected directly to
-    /// the interactive terminal.
+    /// Return bounded, source-prefixed stderr diagnostics with terminal and
+    /// Unicode presentation controls removed. MCP stderr is never connected
+    /// directly to the interactive terminal.
     pub fn stderr_snapshot(&self) -> String {
         sanitized_stderr_snapshot(&self.config.name, &self.stderr_capture)
     }
@@ -863,7 +875,12 @@ impl Transport {
         }
         command.envs(&config.inherited_env);
         command.envs(&config.env);
-        ProcessTree::configure_suspended(&mut command);
+        ProcessTree::configure_suspended(&mut command).map_err(|error| {
+            OxidraError::Mcp(format!(
+                "MCP server {} cannot be started safely on this platform: {error}",
+                config.name
+            ))
+        })?;
         let mut child = command.spawn().map_err(|error| {
             OxidraError::Mcp(format!(
                 "failed to start MCP server {} at {}: {error}",
@@ -871,7 +888,7 @@ impl Transport {
                 config.command.display()
             ))
         })?;
-        let mut process_tree = match ProcessTree::attach(&child) {
+        let mut process_tree = match ProcessTree::attach_contained(&child) {
             Ok(tree) => tree,
             Err(error) => {
                 let _ = child.start_kill();
@@ -1157,7 +1174,7 @@ fn sanitized_stderr_snapshot(server: &str, capture: &Arc<Mutex<StderrCapture>>) 
                 body.push('\n');
                 body.push_str(&prefix);
             }
-            character if character.is_control() => body.push('�'),
+            character if is_stderr_presentation_control(character) => body.push('�'),
             character => body.push(character),
         }
     }
@@ -1171,6 +1188,28 @@ fn sanitized_stderr_snapshot(server: &str, capture: &Arc<Mutex<StderrCapture>>) 
     let budget = MAX_STDERR_CAPTURE_BYTES.saturating_sub(marker.len());
     let tail = prefixed_stderr_tail(&body, &prefix, budget);
     format!("{marker}{tail}")
+}
+
+/// Characters in these ranges can alter terminal/UI presentation without
+/// being rejected by `char::is_control()`. They are replaced rather than
+/// preserved so an MCP server cannot spoof a later trust or approval prompt.
+fn is_stderr_presentation_control(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{feff}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+        )
 }
 
 fn prefixed_stderr_tail<'a>(
