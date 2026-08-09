@@ -6,17 +6,27 @@
 mod config;
 mod registry;
 
-pub use config::{MCP_PROJECT_CONFIG_VERSION, McpProjectConfig};
-pub use registry::{MCP_TOOL_REGISTRY_VERSION, McpRegistry, McpToolBinding};
+pub use config::{
+    MCP_EXECUTION_PLAN_VERSION, MCP_EXECUTION_PLAN_VERSION_V1, MCP_PROJECT_CONFIG_VERSION,
+    MCP_PROJECT_CONFIG_VERSION_V1, McpProjectConfig,
+};
+pub use registry::{
+    MCP_TOOL_REGISTRY_VERSION, MCP_TOOL_REGISTRY_VERSION_V1, MCP_TOOL_REGISTRY_VERSION_V2,
+    McpRegistry, McpToolBinding,
+};
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ffi::OsString;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -38,6 +48,7 @@ const MAX_TOOL_RESULT_BYTES: usize = 50 * 1024;
 const MAX_TOOL_SURFACE_BYTES: usize = 512 * 1024;
 const MAX_TOOL_PAGES: usize = 64;
 const MAX_TOOLS: usize = 512;
+const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum McpProtocolEra {
@@ -67,7 +78,7 @@ impl McpStdioConfig {
         }
     }
 
-    fn validate(&self) -> Result<ValidatedConfig> {
+    pub fn prepare(&self) -> Result<PreparedMcpStdioConfig> {
         if self.name.is_empty()
             || self.name.len() > 64
             || !self
@@ -122,25 +133,81 @@ impl McpStdioConfig {
                 )));
             }
         }
-        Ok(ValidatedConfig {
+        let inherited_env = self
+            .inherit_env
+            .iter()
+            .filter_map(|name| std::env::var_os(name).map(|value| (name.clone(), value)))
+            .collect();
+        Ok(PreparedMcpStdioConfig {
             name: self.name.clone(),
             command,
             args: self.args.clone(),
             cwd,
             inherit_env: self.inherit_env.clone(),
+            inherited_env,
             env: self.env.clone(),
         })
     }
 }
 
-#[derive(Clone, Debug)]
-struct ValidatedConfig {
+/// Immutable execution plan produced before any MCP server code is started.
+///
+/// The command and working directory are canonical paths, and inherited
+/// environment values are captured at preparation time. Trust presentation,
+/// execution-plan hashing and process spawning all consume this same value.
+#[derive(Clone)]
+pub struct PreparedMcpStdioConfig {
     name: String,
     command: PathBuf,
     args: Vec<String>,
     cwd: Option<PathBuf>,
     inherit_env: Vec<String>,
+    inherited_env: BTreeMap<String, OsString>,
     env: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for PreparedMcpStdioConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedMcpStdioConfig")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("cwd", &self.cwd)
+            .field("inherit_env", &self.inherit_env)
+            .field("explicit_env_names", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl PreparedMcpStdioConfig {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn command(&self) -> &Path {
+        &self.command
+    }
+
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    pub fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+
+    pub fn inherit_env(&self) -> &[String] {
+        &self.inherit_env
+    }
+
+    pub(super) fn inherited_env(&self) -> &BTreeMap<String, OsString> {
+        &self.inherited_env
+    }
+
+    pub(super) fn explicit_env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,8 +231,9 @@ pub struct McpTool {
 }
 
 pub struct McpStdioSession {
-    config: ValidatedConfig,
+    config: PreparedMcpStdioConfig,
     transport: Option<Transport>,
+    stderr_capture: Arc<Mutex<StderrCapture>>,
     era: McpProtocolEra,
     server_info: Option<McpServerInfo>,
     tools: Vec<McpTool>,
@@ -174,12 +242,20 @@ pub struct McpStdioSession {
 
 impl McpStdioSession {
     pub async fn connect(config: McpStdioConfig, cancellation: CancellationToken) -> Result<Self> {
-        let config = config.validate()?;
-        let mut transport = timeout(START_TIMEOUT, Transport::spawn(&config))
-            .await
-            .map_err(|_| {
-                OxidraError::Mcp(format!("MCP server {} start timed out", config.name))
-            })??;
+        Self::connect_prepared(config.prepare()?, cancellation).await
+    }
+
+    pub async fn connect_prepared(
+        config: PreparedMcpStdioConfig,
+        cancellation: CancellationToken,
+    ) -> Result<Self> {
+        let stderr_capture = Arc::new(Mutex::new(StderrCapture::default()));
+        let mut transport = timeout(
+            START_TIMEOUT,
+            Transport::spawn(&config, Arc::clone(&stderr_capture)),
+        )
+        .await
+        .map_err(|_| OxidraError::Mcp(format!("MCP server {} start timed out", config.name)))??;
 
         let discovery = transport
             .request(
@@ -207,14 +283,17 @@ impl McpStdioSession {
             | Err(ClientError::Exited { .. })
             | Err(ClientError::Io { .. }) => {
                 transport.terminate().await;
-                let mut legacy = timeout(START_TIMEOUT, Transport::spawn(&config))
-                    .await
-                    .map_err(|_| {
-                        OxidraError::Mcp(format!(
-                            "legacy MCP server {} restart timed out",
-                            config.name
-                        ))
-                    })??;
+                let mut legacy = timeout(
+                    START_TIMEOUT,
+                    Transport::spawn(&config, Arc::clone(&stderr_capture)),
+                )
+                .await
+                .map_err(|_| {
+                    OxidraError::Mcp(format!(
+                        "legacy MCP server {} restart timed out",
+                        config.name
+                    ))
+                })??;
                 let initialized = legacy
                     .request(
                         "initialize",
@@ -259,6 +338,7 @@ impl McpStdioSession {
         Ok(Self {
             config,
             transport: Some(transport),
+            stderr_capture,
             era,
             server_info,
             tools,
@@ -276,6 +356,13 @@ impl McpStdioSession {
 
     pub fn tools(&self) -> &[McpTool] {
         &self.tools
+    }
+
+    /// Return bounded, source-prefixed stderr diagnostics with terminal
+    /// control characters removed. MCP stderr is never connected directly to
+    /// the interactive terminal.
+    pub fn stderr_snapshot(&self) -> String {
+        sanitized_stderr_snapshot(&self.config.name, &self.stderr_capture)
     }
 
     pub async fn call_tool(
@@ -755,28 +842,28 @@ struct Transport {
     process_tree: ProcessTree,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stderr_task: Option<JoinHandle<()>>,
     next_id: u64,
 }
 
 impl Transport {
-    async fn spawn(config: &ValidatedConfig) -> Result<Self> {
+    async fn spawn(
+        config: &PreparedMcpStdioConfig,
+        stderr_capture: Arc<Mutex<StderrCapture>>,
+    ) -> Result<Self> {
         let mut command = Command::new(&config.command);
         command
             .args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .env_clear();
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }
-        for name in &config.inherit_env {
-            if let Some(value) = std::env::var_os(name) {
-                command.env(name, value);
-            }
-        }
+        command.envs(&config.inherited_env);
         command.envs(&config.env);
-        ProcessTree::configure(&mut command);
+        ProcessTree::configure_suspended(&mut command);
         let mut child = command.spawn().map_err(|error| {
             OxidraError::Mcp(format!(
                 "failed to start MCP server {} at {}: {error}",
@@ -784,7 +871,7 @@ impl Transport {
                 config.command.display()
             ))
         })?;
-        let process_tree = match ProcessTree::attach(&child) {
+        let mut process_tree = match ProcessTree::attach(&child) {
             Ok(tree) => tree,
             Err(error) => {
                 let _ = child.start_kill();
@@ -795,19 +882,52 @@ impl Transport {
                 )));
             }
         };
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| OxidraError::Mcp(format!("MCP server {} has no stdin", config.name)))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| OxidraError::Mcp(format!("MCP server {} has no stdout", config.name)))?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                process_tree.terminate(&mut child).await;
+                return Err(OxidraError::Mcp(format!(
+                    "MCP server {} has no stdin",
+                    config.name
+                )));
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                process_tree.terminate(&mut child).await;
+                return Err(OxidraError::Mcp(format!(
+                    "MCP server {} has no stdout",
+                    config.name
+                )));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                process_tree.terminate(&mut child).await;
+                return Err(OxidraError::Mcp(format!(
+                    "MCP server {} has no stderr",
+                    config.name
+                )));
+            }
+        };
+        let stderr_task = tokio::spawn(drain_stderr(stderr, Arc::clone(&stderr_capture)));
+        if let Err(error) = process_tree.resume_suspended() {
+            process_tree.terminate(&mut child).await;
+            stderr_task.abort();
+            let _ = stderr_task.await;
+            return Err(OxidraError::Mcp(format!(
+                "failed to resume MCP server {} after process-tree ownership: {error}",
+                config.name
+            )));
+        }
         Ok(Self {
             child,
             process_tree,
             stdin,
             stdout: BufReader::new(stdout),
+            stderr_task: Some(stderr_task),
             next_id: 1,
         })
     }
@@ -954,11 +1074,129 @@ impl Transport {
         } else {
             self.process_tree.terminate_descendants();
         }
+        self.finish_stderr().await;
     }
 
     async fn terminate(&mut self) {
         self.process_tree.terminate(&mut self.child).await;
+        self.finish_stderr().await;
     }
+
+    async fn finish_stderr(&mut self) {
+        let Some(mut task) = self.stderr_task.take() else {
+            return;
+        };
+        if timeout(SHUTDOWN_GRACE, &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+#[derive(Default)]
+struct StderrCapture {
+    bytes: VecDeque<u8>,
+    truncated: bool,
+}
+
+impl StderrCapture {
+    fn push(&mut self, bytes: &[u8]) {
+        if bytes.len() >= MAX_STDERR_CAPTURE_BYTES {
+            self.bytes.clear();
+            self.bytes.extend(
+                bytes[bytes.len() - MAX_STDERR_CAPTURE_BYTES..]
+                    .iter()
+                    .copied(),
+            );
+            self.truncated = true;
+            return;
+        }
+        let overflow = self
+            .bytes
+            .len()
+            .saturating_add(bytes.len())
+            .saturating_sub(MAX_STDERR_CAPTURE_BYTES);
+        if overflow > 0 {
+            self.bytes.drain(..overflow);
+            self.truncated = true;
+        }
+        self.bytes.extend(bytes.iter().copied());
+    }
+}
+
+async fn drain_stderr(mut stderr: ChildStderr, capture: Arc<Mutex<StderrCapture>>) {
+    let mut buffer = [0u8; 4096];
+    loop {
+        let count = match stderr.read(&mut buffer).await {
+            Ok(0) | Err(_) => return,
+            Ok(count) => count,
+        };
+        if let Ok(mut capture) = capture.lock() {
+            capture.push(&buffer[..count]);
+        }
+    }
+}
+
+fn sanitized_stderr_snapshot(server: &str, capture: &Arc<Mutex<StderrCapture>>) -> String {
+    let Ok(capture) = capture.lock() else {
+        return format!("[mcp:{server} stderr] <capture unavailable>");
+    };
+    if capture.bytes.is_empty() && !capture.truncated {
+        return String::new();
+    }
+    let bytes = capture.bytes.iter().copied().collect::<Vec<_>>();
+    let truncated = capture.truncated;
+    drop(capture);
+
+    let prefix = format!("[mcp:{server} stderr] ");
+    let mut body = String::with_capacity(bytes.len());
+    body.push_str(&prefix);
+    for character in String::from_utf8_lossy(&bytes).chars() {
+        match character {
+            '\n' => {
+                body.push('\n');
+                body.push_str(&prefix);
+            }
+            character if character.is_control() => body.push('�'),
+            character => body.push(character),
+        }
+    }
+    body.truncate(body.trim_end_matches(prefix.as_str()).len());
+
+    let needs_truncation = truncated || body.len() > MAX_STDERR_CAPTURE_BYTES;
+    if !needs_truncation {
+        return body;
+    }
+    let marker = format!("{prefix}<truncated>\n");
+    let budget = MAX_STDERR_CAPTURE_BYTES.saturating_sub(marker.len());
+    let tail = prefixed_stderr_tail(&body, &prefix, budget);
+    format!("{marker}{tail}")
+}
+
+fn prefixed_stderr_tail<'a>(
+    body: &'a str,
+    prefix: &str,
+    budget: usize,
+) -> std::borrow::Cow<'a, str> {
+    if body.len() <= budget {
+        return std::borrow::Cow::Borrowed(body);
+    }
+    let mut target = body.len().saturating_sub(budget);
+    while target < body.len() && !body.is_char_boundary(target) {
+        target += 1;
+    }
+    if let Some(newline) = body[target..].find('\n') {
+        let start = target + newline + 1;
+        if start < body.len() && body.len().saturating_sub(start) <= budget {
+            return std::borrow::Cow::Borrowed(&body[start..]);
+        }
+    }
+    let content_budget = budget.saturating_sub(prefix.len());
+    let mut start = body.len().saturating_sub(content_budget);
+    while start < body.len() && !body.is_char_boundary(start) {
+        start += 1;
+    }
+    std::borrow::Cow::Owned(format!("{prefix}{}", &body[start..]))
 }
 
 async fn read_bounded_line(
@@ -1116,7 +1354,7 @@ mod tests {
         let relative = McpStdioConfig::new("fixture", "python");
         assert!(
             relative
-                .validate()
+                .prepare()
                 .unwrap_err()
                 .to_string()
                 .contains("absolute path")
@@ -1132,7 +1370,7 @@ mod tests {
             .insert("PATH".to_owned(), "ignored".to_owned());
         assert!(
             duplicate
-                .validate()
+                .prepare()
                 .unwrap_err()
                 .to_string()
                 .contains("configured more than once")
@@ -1148,11 +1386,23 @@ mod tests {
             .insert("PATH".to_owned(), "ignored".to_owned());
         assert!(
             cross_platform_alias
-                .validate()
+                .prepare()
                 .unwrap_err()
                 .to_string()
                 .contains("configured more than once")
         );
+
+        let mut secret = McpStdioConfig::new(
+            "fixture",
+            std::env::current_exe().expect("resolve test executable"),
+        );
+        secret
+            .env
+            .insert("TOKEN".to_owned(), "must-not-appear-in-debug".to_owned());
+        let prepared = secret.prepare().expect("prepare secret-bearing config");
+        let debug = format!("{prepared:?}");
+        assert!(debug.contains("TOKEN"));
+        assert!(!debug.contains("must-not-appear-in-debug"));
     }
 
     #[test]

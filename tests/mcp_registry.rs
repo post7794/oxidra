@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use oxidra::mcp::{McpProjectConfig, McpRegistry};
+use oxidra::mcp::{
+    MCP_EXECUTION_PLAN_VERSION, MCP_TOOL_REGISTRY_VERSION, McpProjectConfig, McpRegistry,
+};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -36,8 +38,17 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     )
     .await
     .expect("connect MCP registry");
+    assert_eq!(MCP_EXECUTION_PLAN_VERSION, 1);
+    assert_eq!(MCP_TOOL_REGISTRY_VERSION, 2);
     assert_eq!(registry.config_sha256(), config.source_sha256());
+    assert_eq!(
+        registry.execution_plan_digest(),
+        config.execution_plan_digest()
+    );
+    assert_eq!(registry.execution_plan_digest().len(), 64);
+    assert_eq!(registry.legacy_digest_v1().len(), 64);
     assert_eq!(registry.digest().len(), 64);
+    assert_ne!(registry.digest(), registry.legacy_digest_v1());
     let binding = registry.bindings().next().expect("registry binding");
     assert_eq!(binding.server_name, "fixture");
     assert_eq!(binding.raw_tool_name, "echo.v1");

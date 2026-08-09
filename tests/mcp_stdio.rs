@@ -216,6 +216,63 @@ async fn recognized_modern_unsupported_version_does_not_downgrade() {
     assert_eq!(methods(&log), ["server/discover"]);
 }
 
+#[tokio::test]
+async fn server_stderr_is_drained_bounded_and_terminal_safe() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP stderr integration test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("stderr.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+
+    let mut session = McpStdioSession::connect(
+        fixture_config(&python, &script, &log, "stderr"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("connect stderr MCP fixture");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let snapshot = session.stderr_snapshot();
+    assert!(snapshot.contains("[mcp:fixture stderr]"));
+    assert!(snapshot.contains("<truncated>"));
+    assert!(snapshot.contains("spoofed approval"));
+    assert!(!snapshot.contains('\u{1b}'));
+    assert!(!snapshot.contains('\r'));
+    assert!(
+        snapshot
+            .lines()
+            .all(|line| line.starts_with("[mcp:fixture stderr] "))
+    );
+    assert!(snapshot.len() <= 64 * 1024);
+    session.shutdown().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_mcp_child_is_owned_before_server_resume() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping Windows MCP process-tree test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("process-tree.log");
+    let marker = directory.path().join("escaped-child.txt");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+
+    let mut config = fixture_config(&python, &script, &log, "spawn_child_then_fail");
+    config.args.push(marker.to_string_lossy().into_owned());
+    let result = McpStdioSession::connect(config, CancellationToken::new()).await;
+    assert!(result.is_err(), "fixture must fail during discovery");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !marker.exists(),
+        "child created by the MCP server escaped Job Object cleanup"
+    );
+}
+
 fn fixture_config(python: &Path, script: &Path, log: &Path, mode: &str) -> McpStdioConfig {
     let mut config = McpStdioConfig::new("fixture", python);
     config.args = vec![
@@ -273,6 +330,7 @@ fn methods(log: &[String]) -> Vec<&str> {
 const PYTHON_FIXTURE: &str = r#"
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -282,6 +340,18 @@ mode = sys.argv[2]
 with open(log_path, "a", encoding="utf-8") as log:
     log.write(f"process:{os.getpid()}\n")
     log.flush()
+
+if mode == "stderr":
+    sys.stderr.write("x" * 70000 + "\n\x1b[31mspoofed approval\x1b[0m\r\nsecond line\n")
+    sys.stderr.flush()
+elif mode == "spawn_child_then_fail":
+    marker_path = sys.argv[3]
+    subprocess.Popen([
+        sys.executable,
+        "-c",
+        "import pathlib,sys,time; time.sleep(1.0); pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')",
+        marker_path,
+    ])
 
 tools = [
     {
@@ -341,7 +411,9 @@ for line in sys.stdin:
         continue
 
     if method == "server/discover":
-        if mode == "unsupported":
+        if mode == "spawn_child_then_fail":
+            print("not-json", flush=True)
+        elif mode == "unsupported":
             write_response(message, error={
                 "code": -32022,
                 "message": "Unsupported protocol version",
@@ -378,17 +450,17 @@ for line in sys.stdin:
                 "serverInfo": {"name": "fixture-legacy", "version": "1"},
             })
     elif method == "tools/list":
-        if mode == "modern" and not require_modern_meta(message):
+        if mode in ("modern", "stderr") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
         else:
             result = {"tools": tools}
-            if mode == "modern":
+            if mode in ("modern", "stderr"):
                 result["resultType"] = "complete"
                 result["ttlMs"] = 1000
                 result["cacheScope"] = "private"
             write_response(message, result=result)
     elif method == "tools/call":
-        if mode == "modern" and not require_modern_meta(message):
+        if mode in ("modern", "stderr") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
             continue
         params = message.get("params", {})
@@ -403,7 +475,7 @@ for line in sys.stdin:
         else:
             text = arguments.get("text", "")
         result = {"content": [{"type": "text", "text": text}], "isError": False}
-        if mode == "modern":
+        if mode in ("modern", "stderr"):
             result["resultType"] = "complete"
         write_response(message, result=result)
     else:

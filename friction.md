@@ -170,16 +170,19 @@
 - Tavily MCP
 - SSH MCP
 
-当前已实现有界、版本化的 MCP stdio transport/session kernel、显式 project-config
-reader 和 session-scoped namespaced registry，支持 modern `2026-07-28` discovery
+当前已实现有界、版本化的 MCP stdio transport/session kernel、不可变 prepared
+execution plan、显式 project-config reader 和 session-scoped namespaced registry，
+支持 modern `2026-07-28` discovery
 和冻结的 `2025-11-25` legacy fallback，并覆盖进程树、显式环境 allowlist、
-分页/大小限制、取消、registry digest 以及 `in_doubt`。它尚未进入 CLI 参数、Agent
-approval、journal 或 context.tools，因此用户现在仍然只能使用固定内置工具，不能
-把上述 MCP server 暴露给模型。
+分页/大小限制、取消、启动前 execution-plan digest、discovery 后 registry digest
+以及 `in_doubt`。它尚未进入 CLI 参数、Agent approval、journal 或 context.tools，
+因此用户现在仍然只能使用固定内置工具，不能把上述 MCP server 暴露给模型。
 
-下一步先完成项目配置/trust 和 session-scoped tool registry，再复用现有
-`tool.started/completed/in_doubt` reducer 接入 Agent。完整顺序与 release gate 见
-`docs/mcp-roadmap.md`；不能把 kernel 的存在误报为已完成用户入口。
+下一步是 CLI execution trust 与 Agent approval：把 execution-plan digest 接入启动前
+批准，再把 discovery 后的 registry epoch/digest 接入 `context.tools`，最后复用现有
+`tool.started/completed/in_doubt` reducer 完成 journal、崩溃恢复和 in-doubt 人工解决。
+完整顺序与 release gate 见 `docs/mcp-roadmap.md`；不能把 kernel 的存在误报为已完成
+用户入口。
 
 ### Skill 暂不作为当前重点
 

@@ -1,14 +1,18 @@
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::McpStdioConfig;
+use super::{McpStdioConfig, PreparedMcpStdioConfig};
 use crate::error::{OxidraError, Result};
 
-pub const MCP_PROJECT_CONFIG_VERSION: u32 = 1;
+pub const MCP_PROJECT_CONFIG_VERSION_V1: u32 = 1;
+pub const MCP_PROJECT_CONFIG_VERSION: u32 = MCP_PROJECT_CONFIG_VERSION_V1;
+pub const MCP_EXECUTION_PLAN_VERSION_V1: u32 = 1;
+pub const MCP_EXECUTION_PLAN_VERSION: u32 = MCP_EXECUTION_PLAN_VERSION_V1;
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_SERVERS: usize = 16;
@@ -20,7 +24,8 @@ const MAX_INHERITED_ENV: usize = 32;
 pub struct McpProjectConfig {
     source_path: PathBuf,
     source_sha256: String,
-    servers: Vec<McpStdioConfig>,
+    execution_plan_digest: String,
+    servers: Vec<PreparedMcpStdioConfig>,
 }
 
 impl McpProjectConfig {
@@ -103,9 +108,9 @@ impl McpProjectConfig {
                 error.message()
             ))
         })?;
-        if raw.version != MCP_PROJECT_CONFIG_VERSION {
+        if raw.version != MCP_PROJECT_CONFIG_VERSION_V1 {
             return Err(OxidraError::Config(format!(
-                "unsupported MCP project config version {}; expected {MCP_PROJECT_CONFIG_VERSION}",
+                "unsupported MCP project config version {}; expected {MCP_PROJECT_CONFIG_VERSION_V1}",
                 raw.version
             )));
         }
@@ -176,13 +181,16 @@ impl McpProjectConfig {
             server.args = raw_server.args;
             server.cwd = Some(cwd);
             server.inherit_env = raw_server.inherit_env;
-            server.validate()?;
-            servers.push(server);
+            servers.push(server.prepare()?);
         }
+
+        let source_sha256 = hex::encode(Sha256::digest(&bytes));
+        let execution_plan_digest = execution_plan_digest_v1(&source_sha256, &servers)?;
 
         Ok(Self {
             source_path,
-            source_sha256: hex::encode(Sha256::digest(&bytes)),
+            source_sha256,
+            execution_plan_digest,
             servers,
         })
     }
@@ -195,8 +203,115 @@ impl McpProjectConfig {
         &self.source_sha256
     }
 
-    pub fn servers(&self) -> &[McpStdioConfig] {
+    pub fn execution_plan_digest(&self) -> &str {
+        &self.execution_plan_digest
+    }
+
+    pub fn servers(&self) -> &[PreparedMcpStdioConfig] {
         &self.servers
+    }
+}
+
+fn execution_plan_digest_v1(
+    source_sha256: &str,
+    servers: &[PreparedMcpStdioConfig],
+) -> Result<String> {
+    let servers = servers
+        .iter()
+        .map(ExecutionServerDigestV1::from)
+        .collect::<Vec<_>>();
+    let payload = ExecutionPlanDigestV1 {
+        execution_plan_version: MCP_EXECUTION_PLAN_VERSION_V1,
+        project_config_version: MCP_PROJECT_CONFIG_VERSION_V1,
+        source_sha256,
+        servers: &servers,
+    };
+    execution_plan_payload_digest_v1(&payload)
+}
+
+fn execution_plan_payload_digest_v1(payload: &ExecutionPlanDigestV1<'_>) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(payload)?)))
+}
+
+#[derive(Serialize)]
+struct ExecutionPlanDigestV1<'a> {
+    execution_plan_version: u32,
+    project_config_version: u32,
+    source_sha256: &'a str,
+    servers: &'a [ExecutionServerDigestV1<'a>],
+}
+
+#[derive(Serialize)]
+struct ExecutionServerDigestV1<'a> {
+    name: &'a str,
+    command: EncodedOsValueV1,
+    args: &'a [String],
+    cwd: Option<EncodedOsValueV1>,
+    inherit_env: &'a [String],
+    inherited_env: Vec<InheritedEnvironmentDigestV1<'a>>,
+    explicit_env: &'a std::collections::BTreeMap<String, String>,
+}
+
+impl<'a> From<&'a PreparedMcpStdioConfig> for ExecutionServerDigestV1<'a> {
+    fn from(server: &'a PreparedMcpStdioConfig) -> Self {
+        let inherited_env = server
+            .inherit_env()
+            .iter()
+            .map(|name| InheritedEnvironmentDigestV1 {
+                name,
+                value: server
+                    .inherited_env()
+                    .get(name)
+                    .map(|value| encode_os_value_v1(value.as_os_str())),
+            })
+            .collect();
+        Self {
+            name: server.name(),
+            command: encode_os_value_v1(server.command().as_os_str()),
+            args: server.args(),
+            cwd: server
+                .cwd()
+                .map(|path| encode_os_value_v1(path.as_os_str())),
+            inherit_env: server.inherit_env(),
+            inherited_env,
+            explicit_env: server.explicit_env(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct InheritedEnvironmentDigestV1<'a> {
+    name: &'a str,
+    value: Option<EncodedOsValueV1>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct EncodedOsValueV1 {
+    encoding: &'static str,
+    data_hex: String,
+}
+
+#[cfg(unix)]
+fn encode_os_value_v1(value: &OsStr) -> EncodedOsValueV1 {
+    use std::os::unix::ffi::OsStrExt;
+
+    EncodedOsValueV1 {
+        encoding: "unix-bytes",
+        data_hex: hex::encode(value.as_bytes()),
+    }
+}
+
+#[cfg(windows)]
+fn encode_os_value_v1(value: &OsStr) -> EncodedOsValueV1 {
+    use std::os::windows::ffi::OsStrExt;
+
+    let bytes = value
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    EncodedOsValueV1 {
+        encoding: "windows-wtf16le",
+        data_hex: hex::encode(bytes),
     }
 }
 
@@ -255,11 +370,9 @@ mod tests {
             .join("nested")
             .canonicalize()
             .expect("canonicalize expected cwd");
-        assert_eq!(
-            config.servers()[0].cwd.as_deref(),
-            Some(expected_cwd.as_path())
-        );
+        assert_eq!(config.servers()[0].cwd(), Some(expected_cwd.as_path()));
         assert_eq!(config.source_sha256().len(), 64);
+        assert_eq!(config.execution_plan_digest().len(), 64);
         assert_eq!(config.source_path(), path);
 
         assert!(McpProjectConfig::load(&root, Path::new("mcp.toml")).is_err());
@@ -312,5 +425,170 @@ mod tests {
                 .to_string()
                 .contains("escapes the project root")
         );
+    }
+
+    #[test]
+    fn prepared_config_freezes_canonical_target_and_execution_identity() {
+        let temp = tempfile::tempdir().expect("create config fixture");
+        let root = temp.path().join("project");
+        fs::create_dir_all(root.join("nested")).expect("create project fixture");
+        let target_a = root.join("server-a.bin");
+        let target_b = root.join("server-b.bin");
+        fs::write(&target_a, b"a").expect("write first target");
+        fs::write(&target_b, b"b").expect("write second target");
+        let configured_a = root.join("nested").join("..").join("server-a.bin");
+        let config_path = write_config(
+            &root,
+            &format!(
+                "version = 1\n\n[[servers]]\nname = \"fixture\"\ncommand = \"{}\"\n",
+                quoted_path(&configured_a)
+            ),
+        );
+        let config = McpProjectConfig::load(&root, &config_path).expect("load MCP config");
+        let prepared_command = config.servers()[0].command().to_path_buf();
+        assert_eq!(
+            prepared_command,
+            target_a.canonicalize().expect("canonicalize target a")
+        );
+        let original_digest = config.execution_plan_digest().to_owned();
+
+        fs::write(
+            &config_path,
+            format!(
+                "version = 1\n\n[[servers]]\nname = \"fixture\"\ncommand = \"{}\"\n",
+                quoted_path(&target_b)
+            ),
+        )
+        .expect("rewrite MCP config");
+        assert_eq!(config.servers()[0].command(), prepared_command.as_path());
+        assert_eq!(config.execution_plan_digest(), original_digest);
+
+        let reloaded = McpProjectConfig::load(&root, &config_path).expect("reload MCP config");
+        assert_eq!(
+            reloaded.servers()[0].command(),
+            target_b.canonicalize().expect("canonicalize target b")
+        );
+        assert_ne!(reloaded.execution_plan_digest(), original_digest);
+    }
+
+    #[test]
+    fn prepared_config_is_not_retargeted_by_later_symlink_changes() {
+        let temp = tempfile::tempdir().expect("create config fixture");
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root).expect("create project fixture");
+        let target_a = root.join("server-a.bin");
+        let target_b = root.join("server-b.bin");
+        fs::write(&target_a, b"a").expect("write first target");
+        fs::write(&target_b, b"b").expect("write second target");
+        let link = root.join("server-link.bin");
+        if !make_file_link(&target_a, &link) {
+            eprintln!("skipping symlink fixture: symbolic links are unavailable");
+            return;
+        }
+        let config_path = write_config(
+            &root,
+            &format!(
+                "version = 1\n\n[[servers]]\nname = \"fixture\"\ncommand = \"{}\"\n",
+                quoted_path(&link)
+            ),
+        );
+        let config = McpProjectConfig::load(&root, &config_path).expect("load MCP config");
+        let original_digest = config.execution_plan_digest().to_owned();
+        assert_eq!(
+            config.servers()[0].command(),
+            target_a.canonicalize().expect("canonicalize target a")
+        );
+
+        fs::remove_file(&link).expect("remove first link");
+        assert!(make_file_link(&target_b, &link));
+        assert_eq!(
+            config.servers()[0].command(),
+            target_a.canonicalize().expect("canonicalize target a")
+        );
+        assert_eq!(config.execution_plan_digest(), original_digest);
+        let reloaded = McpProjectConfig::load(&root, &config_path).expect("reload MCP config");
+        assert_eq!(
+            reloaded.servers()[0].command(),
+            target_b.canonicalize().expect("canonicalize target b")
+        );
+        assert_ne!(reloaded.execution_plan_digest(), original_digest);
+    }
+
+    #[test]
+    fn lossless_os_encoding_distinguishes_lossy_path_collisions() {
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            let first = OsString::from_vec(vec![0x80]);
+            let second = OsString::from_vec(vec![0x81]);
+            assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+            assert_ne!(
+                encode_os_value_v1(first.as_os_str()),
+                encode_os_value_v1(second.as_os_str())
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            let first = OsString::from_wide(&[0xd800]);
+            let second = OsString::from_wide(&[0xd801]);
+            assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+            assert_ne!(
+                encode_os_value_v1(first.as_os_str()),
+                encode_os_value_v1(second.as_os_str())
+            );
+        }
+    }
+
+    #[test]
+    fn execution_plan_digest_v1_is_frozen() {
+        let args = vec!["--stdio".to_owned()];
+        let inherit_env = vec!["HOME".to_owned()];
+        let explicit_env =
+            std::collections::BTreeMap::from([("MODE".to_owned(), "fixture".to_owned())]);
+        let servers = vec![ExecutionServerDigestV1 {
+            name: "fixture",
+            command: EncodedOsValueV1 {
+                encoding: "unix-bytes",
+                data_hex: "2f746f6f6c732f66697874757265".to_owned(),
+            },
+            args: &args,
+            cwd: Some(EncodedOsValueV1 {
+                encoding: "unix-bytes",
+                data_hex: "2f776f726b7370616365".to_owned(),
+            }),
+            inherit_env: &inherit_env,
+            inherited_env: vec![InheritedEnvironmentDigestV1 {
+                name: &inherit_env[0],
+                value: Some(EncodedOsValueV1 {
+                    encoding: "unix-bytes",
+                    data_hex: "2f686f6d652f66697874757265".to_owned(),
+                }),
+            }],
+            explicit_env: &explicit_env,
+        }];
+        let payload = ExecutionPlanDigestV1 {
+            execution_plan_version: MCP_EXECUTION_PLAN_VERSION_V1,
+            project_config_version: MCP_PROJECT_CONFIG_VERSION_V1,
+            source_sha256: &"a".repeat(64),
+            servers: &servers,
+        };
+        assert_eq!(
+            execution_plan_payload_digest_v1(&payload)
+                .expect("compute execution-plan fixture digest"),
+            "9726e289677890bde47190b36ccf76b601c9838c0a2ce5d92af23a614f9fb228"
+        );
+    }
+
+    #[cfg(unix)]
+    fn make_file_link(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn make_file_link(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
     }
 }
