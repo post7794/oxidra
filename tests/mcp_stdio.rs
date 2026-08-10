@@ -9,7 +9,7 @@ use oxidra::mcp::{
     MCP_LEGACY_PROTOCOL_VERSION, MCP_MODERN_PROTOCOL_VERSION, MCP_STDIO_KERNEL_VERSION,
     McpProtocolEra, McpStdioConfig, McpStdioSession,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -156,6 +156,58 @@ async fn oversized_tool_arguments_are_rejected_before_schema_validation_or_dispa
 }
 
 #[tokio::test]
+async fn decimal_and_deep_arguments_fail_before_recursive_serialization_or_dispatch() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP bounded instance test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP bounded instance fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("bounded-instance.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+    let mut session = McpStdioSession::connect_trusted(
+        fixture_config(&python, &script, &log, "modern"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("connect bounded instance fixture");
+
+    let rounded_arguments: Value = serde_json::from_str(r#"{"seconds":9007199254740992.1}"#)
+        .expect("parse rounded wire arguments");
+    let error = session
+        .call_tool("sleep", rounded_arguments, &CancellationToken::new())
+        .await
+        .expect_err("f64 arguments must fail before dispatch");
+    assert_eq!(error.code, "validation_error");
+    assert!(!error.in_doubt);
+    assert!(error.message.contains("unsupported decimal/exponent"));
+
+    let mut deep = Value::Null;
+    for _ in 0..50_000 {
+        deep = Value::Array(vec![deep]);
+    }
+    let error = session
+        .call_tool("echo", deep, &CancellationToken::new())
+        .await
+        .expect_err("deep in-memory Value must fail without recursive serialization");
+    assert_eq!(error.code, "validation_error");
+    assert!(!error.in_doubt);
+    assert!(error.message.contains("validation depth"));
+    assert_eq!(methods(&read_log(&log)), ["server/discover", "tools/list"]);
+
+    let result = session
+        .call_tool(
+            "echo",
+            json!({"text":"still-open"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("pre-dispatch rejection must leave the transport usable");
+    assert_eq!(result["content"][0]["text"], "still-open");
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn invalid_tool_schema_fails_discovery_and_output_mismatch_closes_transport() {
     let Some(python) = find_python() else {
         eprintln!("skipping MCP schema result test: Python is unavailable");
@@ -194,6 +246,30 @@ async fn invalid_tool_schema_fails_discovery_and_output_mismatch_closes_transpor
         .call_tool("echo", json!({"text":"after"}), &CancellationToken::new())
         .await
         .expect_err("output protocol failure must close transport");
+    assert_eq!(closed.code, "transport_closed");
+
+    let decimal_output_log = directory.path().join("decimal-output.log");
+    let mut session = McpStdioSession::connect_trusted(
+        fixture_config(&python, &script, &decimal_output_log, "decimal_output"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("connect decimal-output fixture");
+    let error = session
+        .call_tool("typed_output", json!({}), &CancellationToken::new())
+        .await
+        .expect_err("f64 structuredContent must fail closed");
+    assert_eq!(error.code, "protocol_error");
+    assert!(error.in_doubt);
+    assert!(error.message.contains("unsupported decimal/exponent"));
+    let closed = session
+        .call_tool(
+            "echo",
+            json!({"text":"after-decimal-output"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("decimal output protocol failure must close transport");
     assert_eq!(closed.code, "transport_closed");
 }
 
@@ -886,6 +962,15 @@ tools = [
 
 if mode == "bad_schema":
     tools[0]["inputSchema"]["patternProperties"] = {}
+elif mode == "decimal_output":
+    tools[3]["outputSchema"] = {
+        "type": "object",
+        "properties": {
+            "value": {"type": "number", "maximum": 9007199254740992}
+        },
+        "required": ["value"],
+        "additionalProperties": False,
+    }
 
 def write_response(message, result=None, error=None):
     response = {"jsonrpc": "2.0", "id": message["id"]}
@@ -952,11 +1037,11 @@ for line in sys.stdin:
                 "serverInfo": {"name": "fixture-legacy", "version": "1"},
             })
     elif method == "tools/list":
-        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id") and not require_modern_meta(message):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id", "decimal_output") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
         else:
             result = {"tools": tools}
-            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id"):
+            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id", "decimal_output"):
                 result["resultType"] = "complete"
                 result["ttlMs"] = 1000
                 result["cacheScope"] = "private"
@@ -973,7 +1058,7 @@ for line in sys.stdin:
                 worker.start()
                 ctypes.CDLL(None).pthread_exit(None)
     elif method == "tools/call":
-        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id") and not require_modern_meta(message):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id", "decimal_output") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
             continue
         params = message.get("params", {})
@@ -1000,10 +1085,16 @@ for line in sys.stdin:
         elif name == "typed_output":
             result = {
                 "content": [{"type": "text", "text": "typed"}],
-                "structuredContent": {"value": 42 if mode == "bad_output" else "ok"},
+                "structuredContent": {
+                    "value": (
+                        9007199254740992.0
+                        if mode == "decimal_output"
+                        else (42 if mode == "bad_output" else "ok")
+                    )
+                },
                 "isError": False,
             }
-            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output"):
+            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "decimal_output"):
                 result["resultType"] = "complete"
             write_response(message, result=result)
             continue

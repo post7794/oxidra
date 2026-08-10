@@ -94,12 +94,15 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - `inputSchema` 与可选 `outputSchema` 必须通过固定 JSON Schema profile v1，根类型
   为 object。profile 支持登记的 type/object/array/string/number/composition 关键词，
   拒绝 `$ref` 和所有未知关键词。为避免 serde_json 默认 f64 在 wire 解析时先舍入，
-  schema 内所有 decimal/exponent/f64 数字字面量 fail closed；profile v1 的 schema
-  数字只接受无损的 i64/u64 表示。JSON Schema 数值相等使用数学值比较（因此实例中
-  `1` 与 `1.0` 相等），对象值递归且键序无关；`enum`、`const`、`uniqueItems`
-  共用同一规范化 identity。调用参数先以有界 JSON writer 检查至多 256 KiB，再进入
-  验证；实例最多 16,384 个节点、65,536 次验证访问，`uniqueItems` 数组最多 4,096
-  项并使用规范化 identity 的有界判重，避免 O(n²) 回扫。超限均 fail closed。
+  schema 和 instance 内所有 decimal/exponent/f64 数字 fail closed；profile v1 只接受
+  serde_json 可无损保存的 i64/u64 数字。对象相等递归且键序无关；`enum`、`const`、
+  `uniqueItems` 共用同一规范化 identity。实例先以迭代式结构扫描验证深度、节点数和
+  数字表示，之后才进入任何递归 serializer/evaluator；调用参数随后以有界 JSON writer
+  检查至多 256 KiB。实例最多 16,384 个节点、65,536 次验证访问，`uniqueItems`
+  数组最多 4,096 项并使用规范化 identity 的有界判重，避免 O(n²) 回扫。
+  evaluator 使用 typed outcome 区分 schema mismatch、resource limit、unsupported value
+  和 internal failure；`anyOf`/`oneOf`/`not` 只能吞掉真正的 mismatch，其余错误必须
+  传播。超限或无法精确表示的数字均 fail closed。
   调用参数在序列化 `tools/call` 前验证；失败返回
   `validation_error`、`in_doubt=false` 且 server 收不到请求。声明 output schema 时，
   complete result 必须包含满足 schema 的 `structuredContent`；失败按已写出协议错误
@@ -163,7 +166,10 @@ durable execution trust
 → per-call approval
 → tool.started fsync
 → dispatch
-→ exactly one tool.completed / tool.in_doubt terminal
+→ exactly one immediate outcome: tool.completed | tool.in_doubt
+
+tool.in_doubt
+→ eventual tool.in_doubt_resolved terminal
 ```
 
 `ApprovedMcpProjectConfig` 只是启动 capability 的类型约束，不是 durable approval 的

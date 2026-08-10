@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
+use std::fmt;
 
 use serde_json::{Map, Value};
 
@@ -12,6 +13,47 @@ const MAX_SCHEMA_NODES: usize = 2048;
 const MAX_INSTANCE_NODES: usize = 16_384;
 const MAX_VALIDATION_VISITS: usize = 65_536;
 const MAX_UNIQUE_ITEMS: usize = 4_096;
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum ValidationError {
+    Mismatch(String),
+    ResourceLimit(String),
+    UnsupportedValue(String),
+    Internal(String),
+}
+
+impl ValidationError {
+    fn mismatch(message: impl Into<String>) -> Self {
+        Self::Mismatch(message.into())
+    }
+
+    fn resource_limit(message: impl Into<String>) -> Self {
+        Self::ResourceLimit(message.into())
+    }
+
+    fn unsupported_value(message: impl Into<String>) -> Self {
+        Self::UnsupportedValue(message.into())
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::Internal(message.into())
+    }
+
+    fn is_mismatch(&self) -> bool {
+        matches!(self, Self::Mismatch(_))
+    }
+}
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mismatch(message)
+            | Self::ResourceLimit(message)
+            | Self::UnsupportedValue(message)
+            | Self::Internal(message) => formatter.write_str(message),
+        }
+    }
+}
 
 const ALLOWED_KEYWORDS: &[&str] = &[
     "$schema",
@@ -60,9 +102,12 @@ pub(super) fn validate_tool_schema(schema: &Value, label: &str) -> Result<(), St
     validate_schema(schema, label, 0, &mut nodes)
 }
 
-pub(super) fn validate_instance(schema: &Value, instance: &Value) -> Result<(), String> {
-    let mut budget = ValidationBudget::new();
-    count_instance_nodes(instance, 0, &mut budget)?;
+pub(super) fn preflight_instance(instance: &Value) -> Result<(), ValidationError> {
+    preflight_instance_budget(instance).map(|_| ())
+}
+
+pub(super) fn validate_instance(schema: &Value, instance: &Value) -> Result<(), ValidationError> {
+    let mut budget = preflight_instance_budget(instance)?;
     validate_value(schema, instance, "$", 0, &mut budget)
 }
 
@@ -126,7 +171,8 @@ fn validate_schema(
             .ok_or_else(|| format!("{path}.enum must be a non-empty array"))?;
         let mut identities = BTreeSet::new();
         for (index, value) in values.iter().enumerate() {
-            let identity = schema_value_identity(value, &mut UnlimitedVisits)?;
+            let identity = schema_value_identity(value, &mut UnlimitedVisits)
+                .map_err(|error| error.to_string())?;
             if !identities.insert(identity) {
                 return Err(format!("{path}.enum contains duplicate values"));
             }
@@ -362,7 +408,6 @@ fn validate_nonnegative_pair(
 struct ValidationBudget {
     nodes: usize,
     visits: usize,
-    exhausted: bool,
 }
 
 impl ValidationBudget {
@@ -370,50 +415,51 @@ impl ValidationBudget {
         Self {
             nodes: 0,
             visits: 0,
-            exhausted: false,
         }
     }
 
-    fn consume_visit(&mut self, path: &str) -> Result<(), String> {
+    fn consume_visit(&mut self, path: &str) -> Result<(), ValidationError> {
         self.visits = self.visits.saturating_add(1);
         if self.visits > MAX_VALIDATION_VISITS {
-            self.exhausted = true;
-            return Err(format!(
+            return Err(ValidationError::resource_limit(format!(
                 "{path} exceeds validation visit budget {MAX_VALIDATION_VISITS}"
-            ));
+            )));
         }
         Ok(())
     }
 }
 
-fn count_instance_nodes(
-    value: &Value,
-    depth: usize,
-    budget: &mut ValidationBudget,
-) -> Result<(), String> {
-    if depth > MAX_SCHEMA_DEPTH {
-        return Err(format!(
-            "instance exceeds validation depth {MAX_SCHEMA_DEPTH}"
-        ));
-    }
-    budget.nodes = budget.nodes.saturating_add(1);
-    if budget.nodes > MAX_INSTANCE_NODES {
-        return Err(format!("instance exceeds node budget {MAX_INSTANCE_NODES}"));
-    }
-    match value {
-        Value::Array(values) => {
-            for child in values {
-                count_instance_nodes(child, depth + 1, budget)?;
-            }
+fn preflight_instance_budget(value: &Value) -> Result<ValidationBudget, ValidationError> {
+    let mut budget = ValidationBudget::new();
+    let mut pending = vec![(value, 0usize)];
+    while let Some((value, depth)) = pending.pop() {
+        if depth > MAX_SCHEMA_DEPTH {
+            return Err(ValidationError::resource_limit(format!(
+                "instance exceeds validation depth {MAX_SCHEMA_DEPTH}"
+            )));
         }
-        Value::Object(values) => {
-            for child in values.values() {
-                count_instance_nodes(child, depth + 1, budget)?;
-            }
+        budget.nodes = budget.nodes.saturating_add(1);
+        if budget.nodes > MAX_INSTANCE_NODES {
+            return Err(ValidationError::resource_limit(format!(
+                "instance exceeds node budget {MAX_INSTANCE_NODES}"
+            )));
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        match value {
+            Value::Number(number) if number.is_f64() => {
+                return Err(ValidationError::unsupported_value(
+                    "instance uses an unsupported decimal/exponent number; schema profile v1 only accepts i64/u64 numbers",
+                ));
+            }
+            Value::Array(values) => {
+                pending.extend(values.iter().rev().map(|child| (child, depth + 1)));
+            }
+            Value::Object(values) => {
+                pending.extend(values.values().rev().map(|child| (child, depth + 1)));
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
     }
-    Ok(())
+    Ok(budget)
 }
 
 fn validate_value(
@@ -422,24 +468,24 @@ fn validate_value(
     path: &str,
     depth: usize,
     budget: &mut ValidationBudget,
-) -> Result<(), String> {
+) -> Result<(), ValidationError> {
     budget.consume_visit(path)?;
     if depth > MAX_SCHEMA_DEPTH {
-        return Err(format!(
+        return Err(ValidationError::resource_limit(format!(
             "{path} exceeds validation depth {MAX_SCHEMA_DEPTH}"
-        ));
+        )));
     }
     if let Some(allowed) = schema.as_bool() {
-        return allowed
-            .then_some(())
-            .ok_or_else(|| format!("{path} is rejected by a false schema"));
+        return allowed.then_some(()).ok_or_else(|| {
+            ValidationError::mismatch(format!("{path} is rejected by a false schema"))
+        });
     }
     let object = schema
         .as_object()
-        .ok_or_else(|| format!("{path} uses an invalid schema"))?;
+        .ok_or_else(|| ValidationError::internal(format!("{path} uses an invalid schema")))?;
     if let Some(kind) = object.get("type").and_then(Value::as_str) {
         if !matches_type(instance, kind) {
-            return Err(format!("{path} must be {kind}"));
+            return Err(ValidationError::mismatch(format!("{path} must be {kind}")));
         }
     }
     if let Some(values) = object.get("enum").and_then(Value::as_array) {
@@ -451,12 +497,16 @@ fn validate_value(
             }
         }
         if !matched {
-            return Err(format!("{path} is not one of the allowed enum values"));
+            return Err(ValidationError::mismatch(format!(
+                "{path} is not one of the allowed enum values"
+            )));
         }
     }
     if let Some(expected) = object.get("const") {
         if !schema_values_equal(expected, instance, budget)? {
-            return Err(format!("{path} does not match const"));
+            return Err(ValidationError::mismatch(format!(
+                "{path} does not match const"
+            )));
         }
     }
     validate_composition(object, instance, path, depth, budget)?;
@@ -475,7 +525,7 @@ fn validate_composition(
     path: &str,
     depth: usize,
     budget: &mut ValidationBudget,
-) -> Result<(), String> {
+) -> Result<(), ValidationError> {
     if let Some(schemas) = schema.get("allOf").and_then(Value::as_array) {
         for child in schemas {
             validate_value(child, instance, path, depth + 1, budget)?;
@@ -489,12 +539,14 @@ fn validate_composition(
                     matched = true;
                     break;
                 }
-                Err(error) if budget.exhausted => return Err(error),
-                Err(_) => {}
+                Err(error) if error.is_mismatch() => {}
+                Err(error) => return Err(error),
             }
         }
         if !matched {
-            return Err(format!("{path} does not satisfy anyOf"));
+            return Err(ValidationError::mismatch(format!(
+                "{path} does not satisfy anyOf"
+            )));
         }
     }
     if let Some(schemas) = schema.get("oneOf").and_then(Value::as_array) {
@@ -502,19 +554,25 @@ fn validate_composition(
         for child in schemas {
             match validate_value(child, instance, path, depth + 1, budget) {
                 Ok(()) => matches = matches.saturating_add(1),
-                Err(error) if budget.exhausted => return Err(error),
-                Err(_) => {}
+                Err(error) if error.is_mismatch() => {}
+                Err(error) => return Err(error),
             }
         }
         if matches != 1 {
-            return Err(format!("{path} must satisfy exactly one oneOf branch"));
+            return Err(ValidationError::mismatch(format!(
+                "{path} must satisfy exactly one oneOf branch"
+            )));
         }
     }
     if let Some(child) = schema.get("not") {
         match validate_value(child, instance, path, depth + 1, budget) {
-            Ok(()) => return Err(format!("{path} satisfies a forbidden not schema")),
-            Err(error) if budget.exhausted => return Err(error),
-            Err(_) => {}
+            Ok(()) => {
+                return Err(ValidationError::mismatch(format!(
+                    "{path} satisfies a forbidden not schema"
+                )));
+            }
+            Err(error) if error.is_mismatch() => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(())
@@ -526,7 +584,7 @@ fn validate_object_value(
     path: &str,
     depth: usize,
     budget: &mut ValidationBudget,
-) -> Result<(), String> {
+) -> Result<(), ValidationError> {
     check_size_bounds(
         schema,
         instance.len(),
@@ -537,7 +595,9 @@ fn validate_object_value(
     if let Some(required) = schema.get("required").and_then(Value::as_array) {
         for name in required.iter().filter_map(Value::as_str) {
             if !instance.contains_key(name) {
-                return Err(format!("{path} is missing required property {name:?}"));
+                return Err(ValidationError::mismatch(format!(
+                    "{path} is missing required property {name:?}"
+                )));
             }
         }
     }
@@ -560,19 +620,21 @@ fn validate_array_value(
     path: &str,
     depth: usize,
     budget: &mut ValidationBudget,
-) -> Result<(), String> {
+) -> Result<(), ValidationError> {
     check_size_bounds(schema, instance.len(), path, "minItems", "maxItems")?;
     if schema.get("uniqueItems").and_then(Value::as_bool) == Some(true) {
         if instance.len() > MAX_UNIQUE_ITEMS {
-            return Err(format!(
+            return Err(ValidationError::resource_limit(format!(
                 "{path} exceeds uniqueItems limit {MAX_UNIQUE_ITEMS}"
-            ));
+            )));
         }
         let mut identities = BTreeSet::new();
         for value in instance {
             let identity = schema_value_identity(value, budget)?;
             if !identities.insert(identity) {
-                return Err(format!("{path} contains duplicate array items"));
+                return Err(ValidationError::mismatch(format!(
+                    "{path} contains duplicate array items"
+                )));
             }
         }
     }
@@ -588,7 +650,7 @@ fn validate_string_value(
     schema: &Map<String, Value>,
     instance: &str,
     path: &str,
-) -> Result<(), String> {
+) -> Result<(), ValidationError> {
     check_size_bounds(
         schema,
         instance.chars().count(),
@@ -602,7 +664,7 @@ fn validate_number_value(
     schema: &Map<String, Value>,
     instance: &serde_json::Number,
     path: &str,
-) -> Result<(), String> {
+) -> Result<(), ValidationError> {
     check_number_bound(schema, instance, path, "minimum", |ordering| {
         ordering != Ordering::Less
     })?;
@@ -624,12 +686,15 @@ fn check_number_bound(
     path: &str,
     keyword: &str,
     accepts: impl FnOnce(Ordering) -> bool,
-) -> Result<(), String> {
+) -> Result<(), ValidationError> {
     let Some(limit) = schema.get(keyword).and_then(Value::as_number) else {
         return Ok(());
     };
-    if !accepts(compare_numbers(instance, limit)?) {
-        return Err(format!("{path} violates {keyword}"));
+    let ordering = compare_numbers(instance, limit).map_err(ValidationError::internal)?;
+    if !accepts(ordering) {
+        return Err(ValidationError::mismatch(format!(
+            "{path} violates {keyword}"
+        )));
     }
     Ok(())
 }
@@ -640,15 +705,19 @@ fn check_size_bounds(
     path: &str,
     minimum: &str,
     maximum: &str,
-) -> Result<(), String> {
+) -> Result<(), ValidationError> {
     if let Some(limit) = schema.get(minimum).and_then(Value::as_u64) {
         if (size as u64) < limit {
-            return Err(format!("{path} violates {minimum}"));
+            return Err(ValidationError::mismatch(format!(
+                "{path} violates {minimum}"
+            )));
         }
     }
     if let Some(limit) = schema.get(maximum).and_then(Value::as_u64) {
         if (size as u64) > limit {
-            return Err(format!("{path} violates {maximum}"));
+            return Err(ValidationError::mismatch(format!(
+                "{path} violates {maximum}"
+            )));
         }
     }
     Ok(())
@@ -663,8 +732,7 @@ fn matches_type(value: &Value, kind: &str) -> bool {
         "number" => value.is_number(),
         "integer" => value
             .as_number()
-            .and_then(|number| DecimalNumber::parse(&number.to_string()).ok())
-            .is_some_and(|number| number.is_integer()),
+            .is_some_and(|number| number.is_i64() || number.is_u64()),
         "string" => value.is_string(),
         _ => false,
     }
@@ -704,30 +772,31 @@ fn validate_semantic_string_surface(value: &Value, path: &str) -> Result<(), Str
 }
 
 trait ValueVisitMeter {
-    fn visit(&mut self) -> Result<(), String>;
+    fn visit(&mut self) -> Result<(), ValidationError>;
 }
 
 struct UnlimitedVisits;
 
 impl ValueVisitMeter for UnlimitedVisits {
-    fn visit(&mut self) -> Result<(), String> {
+    fn visit(&mut self) -> Result<(), ValidationError> {
         Ok(())
     }
 }
 
 impl ValueVisitMeter for ValidationBudget {
-    fn visit(&mut self) -> Result<(), String> {
+    fn visit(&mut self) -> Result<(), ValidationError> {
         self.consume_visit("instance equality")
     }
 }
 
 /// Canonical identity for the JSON Schema value-equality relation. In
-/// particular, numeric values compare by mathematical value, so `1`, `1.0`
-/// and `1e0` are identical even though serde_json stores them differently.
+/// particular, numeric values compare by mathematical value. Profile v1
+/// rejects f64 instances before this point, but the identity remains explicit
+/// rather than inheriting serde_json's representation equality.
 fn schema_value_identity<M: ValueVisitMeter>(
     value: &Value,
     meter: &mut M,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, ValidationError> {
     let mut output = Vec::new();
     append_schema_value_identity(value, meter, &mut output)?;
     Ok(output)
@@ -737,7 +806,7 @@ fn schema_values_equal<M: ValueVisitMeter>(
     left: &Value,
     right: &Value,
     meter: &mut M,
-) -> Result<bool, String> {
+) -> Result<bool, ValidationError> {
     Ok(schema_value_identity(left, meter)? == schema_value_identity(right, meter)?)
 }
 
@@ -745,7 +814,7 @@ fn append_schema_value_identity<M: ValueVisitMeter>(
     value: &Value,
     meter: &mut M,
     output: &mut Vec<u8>,
-) -> Result<(), String> {
+) -> Result<(), ValidationError> {
     meter.visit()?;
     match value {
         Value::Null => output.push(b'n'),
@@ -753,7 +822,8 @@ fn append_schema_value_identity<M: ValueVisitMeter>(
         Value::Bool(true) => output.push(b't'),
         Value::Number(number) => {
             output.push(b'd');
-            let number = DecimalNumber::parse(&number.to_string())?;
+            let number =
+                DecimalNumber::parse(&number.to_string()).map_err(ValidationError::internal)?;
             output.push(u8::from(number.negative));
             output.extend_from_slice(&number.exponent.to_be_bytes());
             append_length(output, number.digits.len());
@@ -863,10 +933,6 @@ impl DecimalNumber {
         })
     }
 
-    fn is_integer(&self) -> bool {
-        self.digits == [0] || self.exponent >= 0
-    }
-
     fn cmp(&self, other: &Self) -> Ordering {
         if self.digits == [0] && other.digits == [0] {
             return Ordering::Equal;
@@ -970,8 +1036,20 @@ mod tests {
         validate_instance(&schema, &json!({"value":9007199254740992u64}))
             .expect("exact boundary is valid");
         assert!(validate_instance(&schema, &json!({"value":9007199254740993u64})).is_err());
-        assert!(matches_type(&json!(1.0), "integer"));
-        assert!(!matches_type(&json!(1.5), "integer"));
+        assert!(matches_type(&json!(1), "integer"));
+        assert!(!matches_type(&json!("1"), "integer"));
+
+        let rounded_instance: Value = serde_json::from_str(r#"{"value":9007199254740992.1}"#)
+            .expect("parse rounded wire instance");
+        assert!(
+            rounded_instance["value"]
+                .as_number()
+                .is_some_and(serde_json::Number::is_f64)
+        );
+        assert!(matches!(
+            validate_instance(&schema, &rounded_instance),
+            Err(ValidationError::UnsupportedValue(_))
+        ));
     }
 
     #[test]
@@ -996,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_value_equality_normalizes_numbers_recursively() {
+    fn schema_value_identity_is_recursive_and_key_order_independent() {
         let enum_schema = json!({
             "type":"object",
             "properties":{"value":{"enum":[1]}},
@@ -1004,8 +1082,7 @@ mod tests {
             "additionalProperties":false
         });
         validate_tool_schema(&enum_schema, "fixture").expect("valid enum schema");
-        validate_instance(&enum_schema, &json!({"value":1.0}))
-            .expect("1.0 must equal enum value 1");
+        validate_instance(&enum_schema, &json!({"value":1})).expect("enum value matches");
 
         let const_schema = json!({
             "type":"object",
@@ -1013,8 +1090,7 @@ mod tests {
             "required":["value"],
             "additionalProperties":false
         });
-        validate_instance(&const_schema, &json!({"value":1.0}))
-            .expect("1.0 must equal const value 1");
+        validate_instance(&const_schema, &json!({"value":1})).expect("const value matches");
 
         let unique_schema = json!({
             "type":"object",
@@ -1024,22 +1100,22 @@ mod tests {
         });
         let duplicate = json!({
             "values":[
-                {"number":1,"nested":[2.0]},
-                {"nested":[2],"number":1.0}
+                {"number":1,"nested":[2]},
+                {"nested":[2],"number":1}
             ]
         });
         assert!(validate_instance(&unique_schema, &duplicate).is_err());
         validate_instance(
             &unique_schema,
-            &json!({"values":[{"number":1},{"number":2.0}]}),
+            &json!({"values":[{"number":1},{"number":2}]}),
         )
         .expect("distinct recursive values remain unique");
 
         let mut meter = UnlimitedVisits;
         assert!(
             schema_values_equal(
-                &json!({"a":[1, {"b":2.0}]}),
-                &json!({"a":[1.0, {"b":2}]}),
+                &json!({"a":[1, {"b":2}]}),
+                &json!({"a":[1, {"b":2}]}),
                 &mut meter,
             )
             .expect("compare recursive values")
@@ -1051,7 +1127,7 @@ mod tests {
         let oversized = Value::Array(vec![Value::Null; MAX_INSTANCE_NODES]);
         let error = validate_instance(&Value::Bool(true), &oversized)
             .expect_err("instance node budget must fail closed");
-        assert!(error.contains("node budget"));
+        assert!(matches!(error, ValidationError::ResourceLimit(_)));
 
         let unique = json!({"type":"array","uniqueItems":true});
         let values = Value::Array(
@@ -1061,7 +1137,37 @@ mod tests {
         );
         let error = validate_instance(&unique, &values)
             .expect_err("uniqueItems item budget must fail closed");
-        assert!(error.contains("uniqueItems limit"));
+        assert!(matches!(error, ValidationError::ResourceLimit(_)));
+
+        let not_schema = json!({
+            "type":"object",
+            "properties":{
+                "values":{"not":{"type":"array","uniqueItems":true}}
+            },
+            "required":["values"],
+            "additionalProperties":false
+        });
+        validate_tool_schema(&not_schema, "fixture").expect("valid not schema");
+        let wrapped_values = json!({"values":values});
+        let error = validate_instance(&not_schema, &wrapped_values)
+            .expect_err("not must not swallow a uniqueItems resource limit");
+        assert!(matches!(error, ValidationError::ResourceLimit(_)));
+
+        let one_of_schema = json!({
+            "type":"object",
+            "properties":{
+                "values":{"oneOf":[
+                    {"type":"array","uniqueItems":true},
+                    false
+                ]}
+            },
+            "required":["values"],
+            "additionalProperties":false
+        });
+        validate_tool_schema(&one_of_schema, "fixture").expect("valid oneOf schema");
+        let error = validate_instance(&one_of_schema, &wrapped_values)
+            .expect_err("oneOf must not swallow a uniqueItems resource limit");
+        assert!(matches!(error, ValidationError::ResourceLimit(_)));
 
         let repeated_array_schema = json!({
             "allOf": (0..64)
@@ -1071,7 +1177,7 @@ mod tests {
         let repeated_instance = Value::Array(vec![Value::Null; 1024]);
         let error = validate_instance(&repeated_array_schema, &repeated_instance)
             .expect_err("composition must consume the shared visit budget");
-        assert!(error.contains("visit budget"));
+        assert!(matches!(error, ValidationError::ResourceLimit(_)));
     }
 
     #[test]

@@ -402,6 +402,7 @@ impl McpStdioSession {
         cancellation: &CancellationToken,
     ) -> std::result::Result<Value, McpCallError> {
         let Some(tool) = self.tools.iter().find(|tool| tool.definition.name == name) else {
+            drop_json_value_iteratively(arguments);
             return Err(McpCallError {
                 code: "not_found",
                 message: format!(
@@ -413,6 +414,19 @@ impl McpStdioSession {
                 interrupted: false,
             });
         };
+        if let Err(error) = schema::preflight_instance(&arguments) {
+            let message = format!(
+                "MCP tool arguments do not satisfy the bounded instance profile: {}",
+                untrusted_display::text_for_display(&error.to_string())
+            );
+            drop_json_value_iteratively(arguments);
+            return Err(McpCallError {
+                code: "validation_error",
+                message,
+                in_doubt: false,
+                interrupted: false,
+            });
+        }
         if let Err(error) = ensure_json_within_limit(&arguments, MAX_TOOL_ARGUMENT_BYTES) {
             return Err(McpCallError {
                 code: "validation_error",
@@ -429,7 +443,7 @@ impl McpStdioSession {
                 code: "validation_error",
                 message: format!(
                     "MCP tool arguments do not satisfy inputSchema: {}",
-                    untrusted_display::text_for_display(&error)
+                    untrusted_display::text_for_display(&error.to_string())
                 ),
                 in_doubt: false,
                 interrupted: false,
@@ -783,7 +797,7 @@ fn validate_tool_call_result(
         schema::validate_instance(output_schema, structured_content).map_err(|error| {
             OxidraError::Mcp(format!(
                 "MCP server {server} tools/call structuredContent does not satisfy outputSchema: {}",
-                untrusted_display::text_for_display(&error)
+                untrusted_display::text_for_display(&error.to_string())
             ))
         })?;
     }
@@ -1325,6 +1339,19 @@ async fn write_json_line(
         error,
         after_send: true,
     })
+}
+
+pub(super) fn drop_json_value_iteratively(value: Value) {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Array(mut values) => pending.append(&mut values),
+            Value::Object(values) => {
+                pending.extend(values.into_iter().map(|(_, value)| value));
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
 }
 
 fn ensure_json_within_limit(

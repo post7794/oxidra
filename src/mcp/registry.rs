@@ -193,6 +193,7 @@ impl McpRegistry {
         cancellation: &CancellationToken,
     ) -> std::result::Result<Value, McpCallError> {
         let Some(binding) = self.bindings.get(provider_name) else {
+            super::drop_json_value_iteratively(arguments);
             return Err(McpCallError {
                 code: "not_found",
                 message: format!(
@@ -206,6 +207,7 @@ impl McpRegistry {
         let server_name = binding.server_name.clone();
         let raw_tool_name = binding.raw_tool_name.clone();
         let Some(session) = self.sessions.get_mut(&server_name) else {
+            super::drop_json_value_iteratively(arguments);
             return Err(McpCallError {
                 code: "transport_closed",
                 message: format!("MCP server {server_name} session is unavailable"),
