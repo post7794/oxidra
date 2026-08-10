@@ -431,35 +431,57 @@ impl ValidationBudget {
 
 fn preflight_instance_budget(value: &Value) -> Result<ValidationBudget, ValidationError> {
     let mut budget = ValidationBudget::new();
-    let mut pending = vec![(value, 0usize)];
-    while let Some((value, depth)) = pending.pop() {
-        if depth > MAX_SCHEMA_DEPTH {
-            return Err(ValidationError::resource_limit(format!(
-                "instance exceeds validation depth {MAX_SCHEMA_DEPTH}"
-            )));
-        }
-        budget.nodes = budget.nodes.saturating_add(1);
-        if budget.nodes > MAX_INSTANCE_NODES {
-            return Err(ValidationError::resource_limit(format!(
-                "instance exceeds node budget {MAX_INSTANCE_NODES}"
-            )));
-        }
-        match value {
-            Value::Number(number) if number.is_f64() => {
-                return Err(ValidationError::unsupported_value(
-                    "instance uses an unsupported decimal/exponent number; schema profile v1 only accepts i64/u64 numbers",
-                ));
+    let mut pending = vec![InstanceFrame::Value(value, 0)];
+    while let Some(frame) = pending.pop() {
+        match frame {
+            InstanceFrame::Value(value, depth) => {
+                if depth > MAX_SCHEMA_DEPTH {
+                    return Err(ValidationError::resource_limit(format!(
+                        "instance exceeds validation depth {MAX_SCHEMA_DEPTH}"
+                    )));
+                }
+                budget.nodes = budget.nodes.saturating_add(1);
+                if budget.nodes > MAX_INSTANCE_NODES {
+                    return Err(ValidationError::resource_limit(format!(
+                        "instance exceeds node budget {MAX_INSTANCE_NODES}"
+                    )));
+                }
+                match value {
+                    Value::Number(number) if number.is_f64() => {
+                        return Err(ValidationError::unsupported_value(
+                            "instance uses an unsupported decimal/exponent number; schema profile v1 only accepts i64/u64 numbers",
+                        ));
+                    }
+                    Value::Array(values) => {
+                        pending.push(InstanceFrame::Array(values.iter(), depth + 1));
+                    }
+                    Value::Object(values) => {
+                        pending.push(InstanceFrame::Object(values.iter(), depth + 1));
+                    }
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+                }
             }
-            Value::Array(values) => {
-                pending.extend(values.iter().rev().map(|child| (child, depth + 1)));
+            InstanceFrame::Array(mut values, depth) => {
+                if let Some(value) = values.next() {
+                    pending.push(InstanceFrame::Array(values, depth));
+                    pending.push(InstanceFrame::Value(value, depth));
+                }
             }
-            Value::Object(values) => {
-                pending.extend(values.values().rev().map(|child| (child, depth + 1)));
+            InstanceFrame::Object(mut values, depth) => {
+                if let Some((_, value)) = values.next() {
+                    pending.push(InstanceFrame::Object(values, depth));
+                    pending.push(InstanceFrame::Value(value, depth));
+                }
             }
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
         }
     }
     Ok(budget)
+}
+
+enum InstanceFrame<'a> {
+    Value(&'a Value, usize),
+    Array(std::slice::Iter<'a, Value>, usize),
+    Object(serde_json::map::Iter<'a>, usize),
 }
 
 fn validate_value(

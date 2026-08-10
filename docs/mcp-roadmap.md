@@ -100,6 +100,11 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
   数字表示，之后才进入任何递归 serializer/evaluator；调用参数随后以有界 JSON writer
   检查至多 256 KiB。实例最多 16,384 个节点、65,536 次验证访问，`uniqueItems`
   数组最多 4,096 项并使用规范化 identity 的有界判重，避免 O(n²) 回扫。
+  Session 和 registry 的公开 `call_tool` 都是同步外壳：在构造 future 前把裸 `Value`
+  放入带迭代式 `Drop` 的 owning wrapper，并完成结构 preflight。future 在首次 poll 前
+  被丢弃也不会递归析构深层输入；扫描与释放都使用 container iterator frame，辅助空间
+  为 O(depth)，不会为宽容器复制一份 O(nodes) worklist。通过 preflight 后才允许把有界
+  value 移入 request future。
   evaluator 使用 typed outcome 区分 schema mismatch、resource limit、unsupported value
   和 internal failure；`anyOf`/`oneOf`/`not` 只能吞掉真正的 mismatch，其余错误必须
   传播。超限或无法精确表示的数字均 fail closed。

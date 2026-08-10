@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use super::{
     ApprovedMcpProjectConfig, MCP_EXECUTION_PLAN_VERSION, MCP_LEGACY_PROTOCOL_VERSION,
     MCP_MODERN_PROTOCOL_VERSION, MCP_SCHEMA_PROFILE_VERSION, MCP_STDIO_KERNEL_VERSION,
-    McpCallError, McpProtocolEra, McpStdioSession,
+    McpCallError, McpProtocolEra, McpStdioSession, PreflightedJsonValue,
 };
 use crate::error::{OxidraError, Result};
 use crate::types::ToolDefinition;
@@ -186,38 +186,39 @@ impl McpRegistry {
             .collect()
     }
 
-    pub async fn call_tool(
-        &mut self,
-        provider_name: &str,
+    pub fn call_tool<'a>(
+        &'a mut self,
+        provider_name: &'a str,
         arguments: Value,
-        cancellation: &CancellationToken,
-    ) -> std::result::Result<Value, McpCallError> {
-        let Some(binding) = self.bindings.get(provider_name) else {
-            super::drop_json_value_iteratively(arguments);
-            return Err(McpCallError {
-                code: "not_found",
-                message: format!(
-                    "MCP registry has no provider tool {}",
-                    untrusted_display::quoted_single_line(provider_name)
-                ),
-                in_doubt: false,
-                interrupted: false,
-            });
-        };
-        let server_name = binding.server_name.clone();
-        let raw_tool_name = binding.raw_tool_name.clone();
-        let Some(session) = self.sessions.get_mut(&server_name) else {
-            super::drop_json_value_iteratively(arguments);
-            return Err(McpCallError {
-                code: "transport_closed",
-                message: format!("MCP server {server_name} session is unavailable"),
-                in_doubt: false,
-                interrupted: false,
-            });
-        };
-        session
-            .call_tool(&raw_tool_name, arguments, cancellation)
-            .await
+        cancellation: &'a CancellationToken,
+    ) -> impl std::future::Future<Output = std::result::Result<Value, McpCallError>> + 'a {
+        let arguments = PreflightedJsonValue::new(arguments);
+        async move {
+            let Some(binding) = self.bindings.get(provider_name) else {
+                return Err(McpCallError {
+                    code: "not_found",
+                    message: format!(
+                        "MCP registry has no provider tool {}",
+                        untrusted_display::quoted_single_line(provider_name)
+                    ),
+                    in_doubt: false,
+                    interrupted: false,
+                });
+            };
+            let server_name = binding.server_name.clone();
+            let raw_tool_name = binding.raw_tool_name.clone();
+            let Some(session) = self.sessions.get_mut(&server_name) else {
+                return Err(McpCallError {
+                    code: "transport_closed",
+                    message: format!("MCP server {server_name} session is unavailable"),
+                    in_doubt: false,
+                    interrupted: false,
+                });
+            };
+            session
+                .call_tool_owned(&raw_tool_name, arguments, cancellation)
+                .await
+        }
     }
 
     pub async fn shutdown(&mut self) {

@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 use oxidra::mcp::{
     MCP_EXECUTION_PLAN_VERSION, MCP_TOOL_REGISTRY_VERSION, McpProjectConfig, McpRegistry,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -59,6 +59,14 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     assert_eq!(binding.definition.name, binding.provider_name);
     assert!(binding.output_schema.is_some());
     let provider_name = binding.provider_name.clone();
+
+    let mut unpolled = Value::Null;
+    for _ in 0..50_000 {
+        unpolled = Value::Array(vec![unpolled]);
+    }
+    let unpolled_cancellation = CancellationToken::new();
+    let unpolled_future = registry.call_tool(&provider_name, unpolled, &unpolled_cancellation);
+    drop(unpolled_future);
 
     let result = registry
         .call_tool(

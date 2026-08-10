@@ -254,6 +254,48 @@ pub struct McpStdioSession {
     tools: Vec<McpTool>,
 }
 
+/// Owns an untrusted JSON value across async cancellation boundaries without
+/// allowing the compiler-generated future to recursively drop a deep tree.
+/// The preflight result is computed before the future is constructed, while
+/// the value remains protected by this wrapper's iterative `Drop`.
+pub(super) struct PreflightedJsonValue {
+    value: Option<Value>,
+    preflight: Option<std::result::Result<(), schema::ValidationError>>,
+}
+
+impl PreflightedJsonValue {
+    fn new(value: Value) -> Self {
+        let mut owned = Self {
+            value: Some(value),
+            preflight: None,
+        };
+        let preflight = schema::preflight_instance(owned.value.as_ref().expect("owned value"));
+        owned.preflight = Some(preflight);
+        owned
+    }
+
+    fn as_value(&self) -> &Value {
+        self.value.as_ref().expect("owned value")
+    }
+
+    fn take_preflight(&mut self) -> std::result::Result<(), schema::ValidationError> {
+        self.preflight.take().expect("preflight result")
+    }
+
+    fn into_value(mut self) -> Value {
+        self.preflight.take();
+        self.value.take().expect("owned value")
+    }
+}
+
+impl Drop for PreflightedJsonValue {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            drop_json_value_iteratively(value);
+        }
+    }
+}
+
 impl McpStdioSession {
     /// Connect to an MCP executable that the caller already trusts with the
     /// authority of the current OS user.
@@ -395,14 +437,31 @@ impl McpStdioSession {
         sanitized_stderr_snapshot(&self.config.name, &self.stderr_capture)
     }
 
-    pub async fn call_tool(
+    pub fn call_tool<'a>(
+        &'a mut self,
+        name: &'a str,
+        arguments: Value,
+        cancellation: &'a CancellationToken,
+    ) -> impl std::future::Future<Output = std::result::Result<Value, McpCallError>> + 'a {
+        self.call_tool_owned(name, PreflightedJsonValue::new(arguments), cancellation)
+    }
+
+    pub(super) fn call_tool_owned<'a>(
+        &'a mut self,
+        name: &'a str,
+        arguments: PreflightedJsonValue,
+        cancellation: &'a CancellationToken,
+    ) -> impl std::future::Future<Output = std::result::Result<Value, McpCallError>> + 'a {
+        self.call_tool_owned_inner(name, arguments, cancellation)
+    }
+
+    async fn call_tool_owned_inner(
         &mut self,
         name: &str,
-        arguments: Value,
+        mut arguments: PreflightedJsonValue,
         cancellation: &CancellationToken,
     ) -> std::result::Result<Value, McpCallError> {
         let Some(tool) = self.tools.iter().find(|tool| tool.definition.name == name) else {
-            drop_json_value_iteratively(arguments);
             return Err(McpCallError {
                 code: "not_found",
                 message: format!(
@@ -414,12 +473,11 @@ impl McpStdioSession {
                 interrupted: false,
             });
         };
-        if let Err(error) = schema::preflight_instance(&arguments) {
+        if let Err(error) = arguments.take_preflight() {
             let message = format!(
                 "MCP tool arguments do not satisfy the bounded instance profile: {}",
                 untrusted_display::text_for_display(&error.to_string())
             );
-            drop_json_value_iteratively(arguments);
             return Err(McpCallError {
                 code: "validation_error",
                 message,
@@ -427,7 +485,8 @@ impl McpStdioSession {
                 interrupted: false,
             });
         }
-        if let Err(error) = ensure_json_within_limit(&arguments, MAX_TOOL_ARGUMENT_BYTES) {
+        if let Err(error) = ensure_json_within_limit(arguments.as_value(), MAX_TOOL_ARGUMENT_BYTES)
+        {
             return Err(McpCallError {
                 code: "validation_error",
                 message: format!(
@@ -438,7 +497,9 @@ impl McpStdioSession {
                 interrupted: false,
             });
         }
-        if let Err(error) = schema::validate_instance(&tool.validation_input_schema, &arguments) {
+        if let Err(error) =
+            schema::validate_instance(&tool.validation_input_schema, arguments.as_value())
+        {
             return Err(McpCallError {
                 code: "validation_error",
                 message: format!(
@@ -450,6 +511,7 @@ impl McpStdioSession {
             });
         }
         let output_schema = tool.validation_output_schema.clone();
+        let arguments = arguments.into_value();
         let params = match self.era {
             McpProtocolEra::Modern => modern_params(Map::from_iter([
                 ("name".to_owned(), Value::String(name.to_owned())),
@@ -1342,16 +1404,34 @@ async fn write_json_line(
 }
 
 pub(super) fn drop_json_value_iteratively(value: Value) {
-    let mut pending = vec![value];
-    while let Some(value) = pending.pop() {
-        match value {
-            Value::Array(mut values) => pending.append(&mut values),
-            Value::Object(values) => {
-                pending.extend(values.into_iter().map(|(_, value)| value));
+    let mut pending = vec![JsonDropFrame::Value(value)];
+    while let Some(frame) = pending.pop() {
+        match frame {
+            JsonDropFrame::Value(value) => match value {
+                Value::Array(values) => pending.push(JsonDropFrame::Array(values.into_iter())),
+                Value::Object(values) => pending.push(JsonDropFrame::Object(values.into_iter())),
+                Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+            },
+            JsonDropFrame::Array(mut values) => {
+                if let Some(value) = values.next() {
+                    pending.push(JsonDropFrame::Array(values));
+                    pending.push(JsonDropFrame::Value(value));
+                }
             }
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+            JsonDropFrame::Object(mut values) => {
+                if let Some((_, value)) = values.next() {
+                    pending.push(JsonDropFrame::Object(values));
+                    pending.push(JsonDropFrame::Value(value));
+                }
+            }
         }
     }
+}
+
+enum JsonDropFrame {
+    Value(Value),
+    Array(std::vec::IntoIter<Value>),
+    Object(serde_json::map::IntoIter),
 }
 
 fn ensure_json_within_limit(

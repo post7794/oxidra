@@ -172,6 +172,14 @@ async fn decimal_and_deep_arguments_fail_before_recursive_serialization_or_dispa
     .await
     .expect("connect bounded instance fixture");
 
+    let mut unpolled = Value::Null;
+    for _ in 0..50_000 {
+        unpolled = Value::Array(vec![unpolled]);
+    }
+    let unpolled_cancellation = CancellationToken::new();
+    let unpolled_future = session.call_tool("echo", unpolled, &unpolled_cancellation);
+    drop(unpolled_future);
+
     let rounded_arguments: Value = serde_json::from_str(r#"{"seconds":9007199254740992.1}"#)
         .expect("parse rounded wire arguments");
     let error = session
