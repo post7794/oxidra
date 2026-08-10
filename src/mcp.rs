@@ -44,6 +44,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const CANCEL_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_JSON_LINE_BYTES: usize = 1024 * 1024;
+const MAX_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
 const MAX_TOOL_RESULT_BYTES: usize = 50 * 1024;
 const MAX_TOOL_SURFACE_BYTES: usize = 512 * 1024;
 const MAX_TOOL_PAGES: usize = 64;
@@ -301,9 +302,12 @@ impl McpStdioSession {
             ),
             Err(ClientError::Rpc(error)) if unsupported_protocol_error(&error) => {
                 transport.terminate().await;
-                return Err(OxidraError::Mcp(format!(
-                    "MCP server {} does not support protocol {MCP_MODERN_PROTOCOL_VERSION}: {error}",
-                    config.name
+                return Err(OxidraError::Mcp(untrusted_display::text_for_display(
+                    &format!(
+                        "MCP server {} does not support protocol {MCP_MODERN_PROTOCOL_VERSION}: {}",
+                        config.name,
+                        untrusted_display::json_for_display(&error)
+                    ),
                 )));
             }
             Err(ClientError::Rpc(_))
@@ -409,12 +413,23 @@ impl McpStdioSession {
                 interrupted: false,
             });
         };
+        if let Err(error) = ensure_json_within_limit(&arguments, MAX_TOOL_ARGUMENT_BYTES) {
+            return Err(McpCallError {
+                code: "validation_error",
+                message: format!(
+                    "MCP tool arguments exceed the bounded input profile: {}",
+                    untrusted_display::text_for_display(&error)
+                ),
+                in_doubt: false,
+                interrupted: false,
+            });
+        }
         if let Err(error) = schema::validate_instance(&tool.validation_input_schema, &arguments) {
             return Err(McpCallError {
                 code: "validation_error",
                 message: format!(
                     "MCP tool arguments do not satisfy inputSchema: {}",
-                    untrusted_display::sanitize_single_line(&error)
+                    untrusted_display::text_for_display(&error)
                 ),
                 in_doubt: false,
                 interrupted: false,
@@ -629,7 +644,7 @@ fn parse_tool(server: &str, value: &Value) -> Result<McpTool> {
     schema::validate_tool_schema(&input_schema, "inputSchema").map_err(|error| {
         OxidraError::Mcp(format!(
             "MCP server {server} tool {name:?} has invalid inputSchema: {}",
-            untrusted_display::sanitize_single_line(&error)
+            untrusted_display::text_for_display(&error)
         ))
     })?;
     let output_schema = object
@@ -638,7 +653,7 @@ fn parse_tool(server: &str, value: &Value) -> Result<McpTool> {
             schema::validate_tool_schema(schema, "outputSchema").map_err(|error| {
                 OxidraError::Mcp(format!(
                     "MCP server {server} tool {name:?} has invalid outputSchema: {}",
-                    untrusted_display::sanitize_single_line(&error)
+                    untrusted_display::text_for_display(&error)
                 ))
             })?;
             Ok::<Value, OxidraError>(schema.clone())
@@ -768,7 +783,7 @@ fn validate_tool_call_result(
         schema::validate_instance(output_schema, structured_content).map_err(|error| {
             OxidraError::Mcp(format!(
                 "MCP server {server} tools/call structuredContent does not satisfy outputSchema: {}",
-                untrusted_display::sanitize_single_line(&error)
+                untrusted_display::text_for_display(&error)
             ))
         })?;
     }
@@ -1070,7 +1085,10 @@ impl Transport {
             };
             if response_id != &Value::from(id) {
                 return Err(ClientError::Protocol {
-                    message: format!("MCP response id {response_id} does not match request {id}"),
+                    message: format!(
+                        "MCP response id {} does not match request {id}",
+                        untrusted_display::json_for_display(response_id)
+                    ),
                     after_send: true,
                 });
             }
@@ -1309,6 +1327,49 @@ async fn write_json_line(
     })
 }
 
+fn ensure_json_within_limit(
+    value: &Value,
+    maximum_bytes: usize,
+) -> std::result::Result<(), String> {
+    let mut writer = BoundedJsonWriter::new(maximum_bytes);
+    match serde_json::to_writer(&mut writer, value) {
+        Ok(()) => Ok(()),
+        Err(_) if writer.exceeded => Err(format!("JSON value exceeds {maximum_bytes} bytes")),
+        Err(error) => Err(format!("cannot serialize JSON value: {error}")),
+    }
+}
+
+struct BoundedJsonWriter {
+    written: usize,
+    maximum: usize,
+    exceeded: bool,
+}
+
+impl BoundedJsonWriter {
+    fn new(maximum: usize) -> Self {
+        Self {
+            written: 0,
+            maximum,
+            exceeded: false,
+        }
+    }
+}
+
+impl std::io::Write for BoundedJsonWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.written.saturating_add(buffer.len()) > self.maximum {
+            self.exceeded = true;
+            return Err(std::io::Error::other("bounded JSON writer limit exceeded"));
+        }
+        self.written += buffer.len();
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 enum ClientError {
     Cancelled {
@@ -1344,7 +1405,7 @@ impl ClientError {
     }
 
     fn message(&self, server: &str, operation: &str) -> String {
-        match self {
+        let message = match self {
             Self::Cancelled { .. } => format!("{operation} for MCP server {server} was cancelled"),
             Self::Timeout { .. } => format!("{operation} for MCP server {server} timed out"),
             Self::Exited { .. } => format!("MCP server {server} exited during {operation}"),
@@ -1360,7 +1421,8 @@ impl ClientError {
                     untrusted_display::json_for_display(error)
                 )
             }
-        }
+        };
+        untrusted_display::text_for_display(&message)
     }
 
     fn into_oxidra(self, server: &str, operation: &str) -> OxidraError {

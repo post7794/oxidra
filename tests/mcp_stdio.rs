@@ -123,6 +123,39 @@ async fn schema_invalid_arguments_are_rejected_before_dispatch() {
 }
 
 #[tokio::test]
+async fn oversized_tool_arguments_are_rejected_before_schema_validation_or_dispatch() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP argument limit test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP argument limit fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("argument-limit.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+    let mut session = McpStdioSession::connect_trusted(
+        fixture_config(&python, &script, &log, "modern"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("connect argument limit fixture");
+
+    let error = session
+        .call_tool(
+            "echo",
+            json!({"text":"x".repeat(300 * 1024)}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("oversized arguments must fail before dispatch");
+    assert_eq!(error.code, "validation_error");
+    assert!(!error.in_doubt);
+    assert!(!error.interrupted);
+    assert!(error.message.contains("exceeds 262144 bytes"));
+    assert_eq!(methods(&read_log(&log)), ["server/discover", "tools/list"]);
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn invalid_tool_schema_fails_discovery_and_output_mismatch_closes_transport() {
     let Some(python) = find_python() else {
         eprintln!("skipping MCP schema result test: Python is unavailable");
@@ -353,11 +386,59 @@ async fn recognized_modern_unsupported_version_does_not_downgrade() {
         }
         Err(error) => error,
     };
-    assert!(error.to_string().contains("does not support protocol"));
+    let message = error.to_string();
+    assert!(message.contains("does not support protocol"));
+    assert!(!message.contains('\u{202e}'));
+    assert!(!message.contains('\u{200b}'));
+    assert!(!message.contains('\u{2028}'));
+    assert!(!message.contains('\u{2029}'));
+    assert!(!message.contains('\u{1b}'));
+    assert!(message.contains('�'));
+    assert!(message.len() < 17 * 1024);
 
     let log = read_log(&log);
     assert_eq!(process_count(&log), 1, "must not start a legacy process");
     assert_eq!(methods(&log), ["server/discover"]);
+}
+
+#[tokio::test]
+async fn malicious_response_id_is_sanitized_and_closes_transport() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP response id test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP response id fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("response-id.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+    let mut session = McpStdioSession::connect_trusted(
+        fixture_config(&python, &script, &log, "bad_response_id"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("connect response id fixture");
+
+    let error = session
+        .call_tool("echo", json!({"text":"trigger"}), &CancellationToken::new())
+        .await
+        .expect_err("mismatched response id must fail closed");
+    assert_eq!(error.code, "protocol_error");
+    assert!(error.in_doubt);
+    for character in ['\u{202e}', '\u{200b}', '\u{2028}', '\u{2029}', '\u{1b}'] {
+        assert!(!error.message.contains(character));
+    }
+    assert!(error.message.contains('�'));
+    assert!(error.message.len() < 17 * 1024);
+
+    let closed = session
+        .call_tool(
+            "echo",
+            json!({"text":"after-response-id"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("protocol failure must close transport");
+    assert_eq!(closed.code, "transport_closed");
 }
 
 #[tokio::test]
@@ -837,7 +918,7 @@ for line in sys.stdin:
         elif mode == "unsupported":
             write_response(message, error={
                 "code": -32022,
-                "message": "Unsupported protocol version",
+                "message": "Unsupported protocol \u202eversion\u200b\u2028\u2029\x1b" + ("x" * 20000),
                 "data": {
                     "requested": "2026-07-28",
                     "supported": ["2027-01-01"],
@@ -871,11 +952,11 @@ for line in sys.stdin:
                 "serverInfo": {"name": "fixture-legacy", "version": "1"},
             })
     elif method == "tools/list":
-        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output") and not require_modern_meta(message):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
         else:
             result = {"tools": tools}
-            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output"):
+            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id"):
                 result["resultType"] = "complete"
                 result["ttlMs"] = 1000
                 result["cacheScope"] = "private"
@@ -892,12 +973,24 @@ for line in sys.stdin:
                 worker.start()
                 ctypes.CDLL(None).pthread_exit(None)
     elif method == "tools/call":
-        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output") and not require_modern_meta(message):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
             continue
         params = message.get("params", {})
         name = params.get("name")
         arguments = params.get("arguments", {})
+        if mode == "bad_response_id":
+            response = {
+                "jsonrpc": "2.0",
+                "id": "evil\u202eidentifier\u200b\u2028\u2029\x1b" + ("x" * 20000),
+                "result": {
+                    "content": [{"type": "text", "text": "ignored"}],
+                    "isError": False,
+                    "resultType": "complete",
+                },
+            }
+            print(json.dumps(response), flush=True)
+            continue
         if name == "rpc_error":
             write_response(message, error={"code": -32000, "message": "fixture \u202e failure \u200b line\u2028next\u2029escape\x1b " + ("x" * 20000)})
             continue

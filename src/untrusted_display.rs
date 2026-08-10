@@ -26,6 +26,13 @@ pub(crate) fn sanitize_single_line(input: &str) -> String {
     sanitize_text(input).replace('\n', "�")
 }
 
+pub(crate) fn text_for_display(input: &str) -> String {
+    truncate_utf8(
+        &sanitize_single_line(input),
+        MAX_UNTRUSTED_JSON_DISPLAY_BYTES,
+    )
+}
+
 pub(crate) fn quoted_single_line(input: &str) -> String {
     format!("{:?}", sanitize_single_line(input))
 }
@@ -100,6 +107,15 @@ mod tests {
         let value = serde_json::json!({"message": format!("\u{202e}{}", "x".repeat(20000))});
         let rendered = json_for_display(&value);
         assert!(!rendered.contains('\u{202e}'));
+        assert!(rendered.ends_with("<truncated>"));
+        assert!(rendered.len() <= MAX_UNTRUSTED_JSON_DISPLAY_BYTES);
+    }
+
+    #[test]
+    fn untrusted_text_display_is_single_line_and_bounded() {
+        let rendered = text_for_display(&format!("safe\u{202e}\n{}", "x".repeat(20000)));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\n'));
         assert!(rendered.ends_with("<truncated>"));
         assert!(rendered.len() <= MAX_UNTRUSTED_JSON_DISPLAY_BYTES);
     }

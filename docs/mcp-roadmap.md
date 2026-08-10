@@ -93,7 +93,14 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
   result 上限 50 KiB。
 - `inputSchema` 与可选 `outputSchema` 必须通过固定 JSON Schema profile v1，根类型
   为 object。profile 支持登记的 type/object/array/string/number/composition 关键词，
-  拒绝 `$ref` 和所有未知关键词。调用参数在序列化 `tools/call` 前验证；失败返回
+  拒绝 `$ref` 和所有未知关键词。为避免 serde_json 默认 f64 在 wire 解析时先舍入，
+  schema 内所有 decimal/exponent/f64 数字字面量 fail closed；profile v1 的 schema
+  数字只接受无损的 i64/u64 表示。JSON Schema 数值相等使用数学值比较（因此实例中
+  `1` 与 `1.0` 相等），对象值递归且键序无关；`enum`、`const`、`uniqueItems`
+  共用同一规范化 identity。调用参数先以有界 JSON writer 检查至多 256 KiB，再进入
+  验证；实例最多 16,384 个节点、65,536 次验证访问，`uniqueItems` 数组最多 4,096
+  项并使用规范化 identity 的有界判重，避免 O(n²) 回扫。超限均 fail closed。
+  调用参数在序列化 `tools/call` 前验证；失败返回
   `validation_error`、`in_doubt=false` 且 server 收不到请求。声明 output schema 时，
   complete result 必须包含满足 schema 的 `structuredContent`；失败按已写出协议错误
   返回 `in_doubt=true` 并关闭 transport。它是有限 profile，不声称实现完整 JSON Schema。
@@ -145,6 +152,24 @@ execution-plan digest 与 registry digest 是单向的两层证据：前者在�
 ## 4. 尚未实现：Agent 与 CLI policy
 
 下一阶段必须按以下顺序推进。
+
+在任何 Provider tool 暴露前，先建立唯一的 MCP execution coordinator。CLI、Agent、
+registry 和 journal 不能分别推断“是否获批”“是否已 dispatch”或“如何终态化”；它们
+只能消费 coordinator 从同一 durable snapshot 生成的版本化 execution plan：
+
+```text
+durable execution trust
+→ registry snapshot / epoch
+→ per-call approval
+→ tool.started fsync
+→ dispatch
+→ exactly one tool.completed / tool.in_doubt terminal
+```
+
+`ApprovedMcpProjectConfig` 只是启动 capability 的类型约束，不是 durable approval 的
+事实源。coordinator 必须成为批准、started fsync、dispatch 与 terminalize 的唯一写入
+权限；否则 CLI preflight、Agent loop 和 recovery reducer 会形成可以互相矛盾的多套
+状态机。
 
 ### 4.1 CLI trust
 
