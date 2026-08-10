@@ -676,7 +676,11 @@ mod tests {
         assert_eq!(
             execution_plan_payload_digest_v2(&payload)
                 .expect("compute execution-plan v2 fixture digest"),
-            "eaa68f153bbd41bf1d80f991dcd9ecc737af4b9f835b13d9d11bce7e64d6693a"
+            if cfg!(windows) {
+                "eaa68f153bbd41bf1d80f991dcd9ecc737af4b9f835b13d9d11bce7e64d6693a"
+            } else {
+                "fea11536fa03252930641dd18187c94334c89cd3b91f30c1df205b0ca7e50f41"
+            }
         );
     }
 

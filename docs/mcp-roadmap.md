@@ -1,7 +1,7 @@
 # Oxidra MCP 接入路线
 
-状态：MCP stdio transport/session kernel v1、显式 project-config reader v1、
-execution-plan digest v2 和 session-scoped tool registry v3 已实现，尚未接入 Agent、
+状态：MCP stdio transport/session kernel v2、显式 project-config reader v1、
+execution-plan digest v2 和 session-scoped tool registry v4 已实现，尚未接入 Agent、
 CLI 参数或 session journal。
 当前代码只能由 Rust 调用方显式加载绝对 config path 并构造 registry；它不是已经
 对用户开放的插件入口。
@@ -23,9 +23,11 @@ MCP 不只是“从外部加载一组函数”。一次 `tools/call` 可能修�
 5. **历史协议有限且显式。** 只支持登记的协议版本和 reducer 版本；未知版本、
    动态 schema 变化和未支持的交互一律 fail closed。
 
-## 2. 已实现：stdio kernel v1
+## 2. 已实现：stdio kernel v2
 
 实现位于 `src/mcp.rs`，集成测试位于 `tests/mcp_stdio.rs`。
+kernel v1 的协议/限制组合继续由 registry v1-v3 冻结；当前 writer 使用 kernel v2，
+其新增语义仅是 Linux 强 containment 与对应的 no-subprocess 限制，没有原地改写 v1。
 
 ### 协议范围
 
@@ -58,11 +60,22 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - 子进程先 `env_clear()`，只继承显式 allowlist 和显式配置值；环境变量名按
   ASCII 不区分大小写去重，避免同一配置在 Windows 与 Unix 上产生不同含义。
 - `ProcessTree` 在 Windows 使用 `CREATE_SUSPENDED` 启动 MCP 进程，先关联带
-  `KILL_ON_JOB_CLOSE` 的 Job Object，再恢复主线程。Linux 在 spawn 前启用 child
-  subreaper，并把 process group、`/proc` descendant sweep 和 adopted-child cleanup
-  组合为 MCP containment；`setsid()` 后代也有定向故障测试。其他 Unix（包括当前
-  macOS）没有等价 owner 时会在 spawn 前 fail closed，不能退回只靠 process group。
-  受支持平台上的连接失败、取消、协议错误、in-doubt 或 shutdown 不会把后代进程留在后台。
+  `KILL_ON_JOB_CLOSE` 的 Job Object，再恢复主线程。Linux stdio kernel v2 在 `exec`
+  不可信 server 代码前安装 seccomp：允许同一 thread group 内的线程，但拒绝独立
+  `fork`/`vfork`/`clone`/`clone3`、namespace/session/process-group escape，并禁止清除
+  `PDEATHSIG` 或通过 credential mutation 触发内核清除；Oxidra 同时用 pidfd 固定唯一
+  server PID 的身份。宿主被 `SIGKILL` 时，
+  唯一 server process 由 `PDEATHSIG` 终止；受控清理使用 pidfd，不再扫描 `/proc`、
+  推断 adopted lineage 或按可复用的数值 PID 杀进程。Linux x86_64/aarch64 缺少
+  seccomp/pidfd 时，以及其他 Unix（包括当前 macOS）缺少等价边界时，都会 fail closed。
+  受支持平台上的连接失败、取消、协议错误、in-doubt、shutdown 或宿主强杀不会留下
+  MCP 后代进程。
+- Linux kernel v2 的强保证来自“禁止 server 创建独立子进程”，不是启动后补扫后代。
+  因此当前不支持需要 subprocess 的 MCP server，也不支持依赖 `npx`、shell wrapper
+  等二次 spawn 的启动链；应直接配置最终 interpreter/executable。若未来需要允许
+  subprocess，必须新增基于 PID namespace/cgroup 或等价 ownership primitive 的 kernel
+  版本，不能放宽 v2 的冻结语义。x86_64 与 aarch64 的 classic-BPF instruction stream
+  各有固定 SHA-256 fixture，修改 syscall policy 必须升级 kernel/registry 版本。
 - server stderr 使用持续 drain 的 64 KiB 有界捕获，不直接继承交互终端；诊断快照
   带 server 来源前缀，并清理终端控制字符、bidi、零宽字符和 Unicode 行分隔符，
   避免污染后续 trust/approval 界面。
@@ -100,14 +113,15 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
   需要“批准具体代码字节”，必须新增独立、版本化的 content-identity 协议，不能原地
   扩大 v2 的含义。
 
-### 3.2 session-scoped registry v3
+### 3.2 session-scoped registry v4
 
 - 合并 server 工具后仍限制为 512 tools / 512 KiB，不把 per-server 限额误当全局限额。
 - raw identity `(server, tool)` 映射为满足 Responses function-name 约束的稳定 64-byte
   namespace；alias 带 identity hash，且仍执行实际 collision 检查。
 - input/output schema、raw/provider name、协议版本和 execution-plan digest v2 进入当前
-  registry-digest v3；字面量 fixture 固定其 SHA-256。旧 registry-digest v1/v2 的
-  字面量 SHA 与算法仍保留，不会被原地改写。
+  registry-digest v4；v4 同时冻结 stdio kernel v2。字面量 fixture 固定其 SHA-256。
+  旧 registry-digest v1/v2/v3 分别继续绑定已登记的 kernel/execution-plan 组合，其
+  字面量 SHA 与算法保留，不会被原地改写。
 - registry 可按 provider alias 调用对应长连接 session，并统一 shutdown 全部进程。
 
 execution-plan digest 与 registry digest 是单向的两层证据：前者在启动任何不可信代码

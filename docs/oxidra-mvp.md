@@ -23,7 +23,9 @@
 - Responses SSE 实时文本与工具调用过程展示。
 - Ctrl+C 取消当前 LLM 请求或工具进程。
 - Windows Job Object 与 Unix process group 的常规 shell 子进程清理；MCP 另行要求
-  Windows Job 或 Linux subreaper containment，不把可被 `setsid()` 逃逸的 group 当成强边界。
+  Windows suspended Job containment，或 Linux stdio kernel v2 的 pre-exec seccomp
+  no-subprocess policy、`PDEATHSIG` 与 pidfd identity，不把可被 `setsid()` 逃逸的
+  process group 或启动后 `/proc` sweep 当成强边界。
 - 本地 session journal 与 `--resume`。
 - 可审计全局 memory 与 `remember`。
 - `doctor`、`session list/show/delete`。

@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use oxidra::mcp::{
     MCP_LEGACY_PROTOCOL_VERSION, MCP_MODERN_PROTOCOL_VERSION, MCP_STDIO_KERNEL_VERSION,
-    McpProtocolEra, McpStdioConfig, McpStdioSession,
+    MCP_STDIO_KERNEL_VERSION_V1, MCP_STDIO_KERNEL_VERSION_V2, McpProtocolEra, McpStdioConfig,
+    McpStdioSession,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -295,7 +296,7 @@ async fn server_stderr_is_drained_bounded_and_terminal_safe() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn linux_mcp_detached_setsid_child_is_terminated() {
+async fn linux_mcp_process_creation_and_pdeathsig_reset_are_denied() {
     let Some(python) = find_python() else {
         eprintln!("skipping Linux MCP containment test: Python is unavailable");
         return;
@@ -303,18 +304,150 @@ async fn linux_mcp_detached_setsid_child_is_terminated() {
     let directory = tempfile::tempdir().expect("create MCP fixture directory");
     let script = directory.path().join("mcp_fixture.py");
     let log = directory.path().join("detached.log");
-    let marker = directory.path().join("detached-child.txt");
     fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
 
-    let mut config = fixture_config(&python, &script, &log, "spawn_detached_child_then_fail");
-    config.args.push(marker.to_string_lossy().into_owned());
-    let result = McpStdioSession::connect(config, CancellationToken::new()).await;
-    assert!(result.is_err(), "fixture must fail during discovery");
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(
-        !marker.exists(),
-        "setsid child escaped MCP process-tree cleanup"
+    let mut session = McpStdioSession::connect(
+        fixture_config(&python, &script, &log, "verify_linux_containment"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("connect Linux containment fixture");
+    session.shutdown().await;
+
+    let log = read_log(&log);
+    for expected in [
+        "containment:fork-denied:1",
+        "containment:pdeathsig-reset-denied:1",
+        "containment:credential-change-denied:1",
+        "containment:thread-created",
+    ] {
+        assert!(
+            log.iter().any(|line| line == expected),
+            "missing Linux containment proof {expected}: {log:?}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_pidfd_cleanup_does_not_cross_mcp_sessions() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping Linux MCP pidfd isolation test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let first_log = directory.path().join("first.log");
+    let second_log = directory.path().join("second.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+
+    let mut first = McpStdioSession::connect(
+        fixture_config(&python, &script, &first_log, "modern"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("connect first Linux MCP session");
+    let mut second = McpStdioSession::connect(
+        fixture_config(&python, &script, &second_log, "modern"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("connect second Linux MCP session");
+
+    first.shutdown().await;
+    let result = second
+        .call_tool(
+            "echo",
+            json!({"text":"still-owned"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("first pidfd cleanup must not kill the second session");
+    assert_eq!(result["content"][0]["text"], "still-owned");
+    second.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_host_sigkill_terminates_the_only_mcp_process() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping Linux MCP host-kill test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("host-kill.log");
+    let ready = directory.path().join("host-kill.ready");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+
+    let mut helper = Command::new(std::env::current_exe().expect("resolve test executable"));
+    helper
+        .args([
+            "--ignored",
+            "--exact",
+            "linux_mcp_host_kill_helper",
+            "--nocapture",
+        ])
+        .env("OXIDRA_MCP_TEST_PYTHON", &python)
+        .env("OXIDRA_MCP_TEST_SCRIPT", &script)
+        .env("OXIDRA_MCP_TEST_LOG", &log)
+        .env("OXIDRA_MCP_TEST_READY", &ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut helper = KillChildOnDrop(helper.spawn().expect("spawn MCP host-kill helper"));
+
+    wait_for_path(&ready, Duration::from_secs(10));
+    wait_for_log_line(
+        &log,
+        "containment:worker-survived-leader-exit",
+        Duration::from_secs(10),
     );
+    let server_pid = read_log(&log)
+        .iter()
+        .find_map(|line| line.strip_prefix("process:"))
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .expect("fixture server pid");
+    assert!(
+        Path::new(&format!("/proc/{server_pid}")).exists(),
+        "MCP server exited before host-kill assertion"
+    );
+
+    helper.0.kill().expect("SIGKILL MCP owner helper");
+    let _ = helper.0.wait();
+    wait_for_process_exit(server_pid, Duration::from_secs(5));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "subprocess helper for linux_host_sigkill_terminates_the_only_mcp_process"]
+fn linux_mcp_host_kill_helper() {
+    let python = std::env::var_os("OXIDRA_MCP_TEST_PYTHON")
+        .map(std::path::PathBuf::from)
+        .expect("helper python path");
+    let script = std::env::var_os("OXIDRA_MCP_TEST_SCRIPT")
+        .map(std::path::PathBuf::from)
+        .expect("helper script path");
+    let log = std::env::var_os("OXIDRA_MCP_TEST_LOG")
+        .map(std::path::PathBuf::from)
+        .expect("helper log path");
+    let ready = std::env::var_os("OXIDRA_MCP_TEST_READY")
+        .map(std::path::PathBuf::from)
+        .expect("helper ready path");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build helper runtime");
+    runtime.block_on(async move {
+        let _session = McpStdioSession::connect(
+            fixture_config(&python, &script, &log, "leader_exits_with_worker"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("connect helper MCP session");
+        fs::write(&ready, b"ready").expect("write helper ready marker");
+        std::future::pending::<()>().await;
+    });
 }
 
 #[cfg(windows)]
@@ -390,9 +523,65 @@ fn process_count(log: &[String]) -> usize {
 
 fn methods(log: &[String]) -> Vec<&str> {
     log.iter()
-        .filter(|line| !line.starts_with("process:"))
+        .filter(|line| !line.starts_with("process:") && !line.starts_with("containment:"))
         .map(String::as_str)
         .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_path(path: &Path, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_process_exit(process_id: u32, timeout: Duration) {
+    let process_path = format!("/proc/{process_id}");
+    let deadline = std::time::Instant::now() + timeout;
+    while Path::new(&process_path).exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "MCP process {process_id} survived owner SIGKILL"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_log_line(path: &Path, expected: &str, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if path.exists()
+            && fs::read_to_string(path)
+                .is_ok_and(|contents| contents.lines().any(|line| line == expected))
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {expected} in {}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct KillChildOnDrop(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl Drop for KillChildOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 const PYTHON_FIXTURE: &str = r#"
@@ -400,6 +589,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 log_path = sys.argv[1]
@@ -421,14 +611,34 @@ elif mode == "spawn_child_then_fail":
         "import pathlib,sys,time; time.sleep(1.0); pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')",
         marker_path,
     ])
-elif mode == "spawn_detached_child_then_fail":
-    marker_path = sys.argv[3]
-    subprocess.Popen([
-        sys.executable,
-        "-c",
-        "import pathlib,sys,time; time.sleep(1.0); pathlib.Path(sys.argv[1]).write_text('survived', encoding='utf-8')",
-        marker_path,
-    ], start_new_session=True)
+elif mode == "verify_linux_containment":
+    import ctypes
+    import errno
+    try:
+        child = os.fork()
+        if child == 0:
+            os._exit(0)
+        os.waitpid(child, 0)
+        fork_denied = 0
+    except OSError as error:
+        fork_denied = int(error.errno == errno.EPERM)
+    libc = ctypes.CDLL(None, use_errno=True)
+    reset_result = libc.prctl(1, 0, 0, 0, 0)
+    reset_denied = int(reset_result == -1 and ctypes.get_errno() == errno.EPERM)
+    ctypes.set_errno(0)
+    credential_result = libc.setresuid(os.getuid(), os.getuid(), os.getuid())
+    credential_denied = int(credential_result == -1 and ctypes.get_errno() == errno.EPERM)
+    thread_marker = []
+    worker = threading.Thread(target=lambda: thread_marker.append("created"))
+    worker.start()
+    worker.join()
+    with open(log_path, "a", encoding="utf-8") as log:
+        log.write(f"containment:fork-denied:{fork_denied}\n")
+        log.write(f"containment:pdeathsig-reset-denied:{reset_denied}\n")
+        log.write(f"containment:credential-change-denied:{credential_denied}\n")
+        if thread_marker == ["created"]:
+            log.write("containment:thread-created\n")
+        log.flush()
 
 tools = [
     {
@@ -527,17 +737,28 @@ for line in sys.stdin:
                 "serverInfo": {"name": "fixture-legacy", "version": "1"},
             })
     elif method == "tools/list":
-        if mode in ("modern", "stderr") and not require_modern_meta(message):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
         else:
             result = {"tools": tools}
-            if mode in ("modern", "stderr"):
+            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker"):
                 result["resultType"] = "complete"
                 result["ttlMs"] = 1000
                 result["cacheScope"] = "private"
             write_response(message, result=result)
+            if mode == "leader_exits_with_worker":
+                import ctypes
+                def survive_leader_exit():
+                    time.sleep(0.2)
+                    with open(log_path, "a", encoding="utf-8") as worker_log:
+                        worker_log.write("containment:worker-survived-leader-exit\n")
+                        worker_log.flush()
+                    time.sleep(60.0)
+                worker = threading.Thread(target=survive_leader_exit, daemon=False)
+                worker.start()
+                ctypes.CDLL(None).pthread_exit(None)
     elif method == "tools/call":
-        if mode in ("modern", "stderr") and not require_modern_meta(message):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
             continue
         params = message.get("params", {})
@@ -552,7 +773,7 @@ for line in sys.stdin:
         else:
             text = arguments.get("text", "")
         result = {"content": [{"type": "text", "text": text}], "isError": False}
-        if mode in ("modern", "stderr"):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker"):
             result["resultType"] = "complete"
         write_response(message, result=result)
     else:
@@ -561,7 +782,9 @@ for line in sys.stdin:
 
 #[test]
 fn protocol_constants_are_frozen() {
-    assert_eq!(MCP_STDIO_KERNEL_VERSION, 1);
+    assert_eq!(MCP_STDIO_KERNEL_VERSION_V1, 1);
+    assert_eq!(MCP_STDIO_KERNEL_VERSION_V2, 2);
+    assert_eq!(MCP_STDIO_KERNEL_VERSION, 2);
     assert_eq!(MCP_MODERN_PROTOCOL_VERSION, "2026-07-28");
     assert_eq!(MCP_LEGACY_PROTOCOL_VERSION, "2025-11-25");
 }

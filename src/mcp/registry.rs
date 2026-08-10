@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     MCP_EXECUTION_PLAN_VERSION_V1, MCP_EXECUTION_PLAN_VERSION_V2, MCP_LEGACY_PROTOCOL_VERSION,
-    MCP_MODERN_PROTOCOL_VERSION, MCP_STDIO_KERNEL_VERSION, McpCallError, McpProjectConfig,
-    McpProtocolEra, McpStdioSession,
+    MCP_MODERN_PROTOCOL_VERSION, MCP_STDIO_KERNEL_VERSION_V1, MCP_STDIO_KERNEL_VERSION_V2,
+    McpCallError, McpProjectConfig, McpProtocolEra, McpStdioSession,
 };
 use crate::error::{OxidraError, Result};
 use crate::types::ToolDefinition;
@@ -16,7 +16,8 @@ use crate::types::ToolDefinition;
 pub const MCP_TOOL_REGISTRY_VERSION_V1: u32 = 1;
 pub const MCP_TOOL_REGISTRY_VERSION_V2: u32 = 2;
 pub const MCP_TOOL_REGISTRY_VERSION_V3: u32 = 3;
-pub const MCP_TOOL_REGISTRY_VERSION: u32 = MCP_TOOL_REGISTRY_VERSION_V3;
+pub const MCP_TOOL_REGISTRY_VERSION_V4: u32 = 4;
+pub const MCP_TOOL_REGISTRY_VERSION: u32 = MCP_TOOL_REGISTRY_VERSION_V4;
 
 const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 64;
 const TOOL_NAME_HASH_HEX_BYTES: usize = 12;
@@ -162,7 +163,7 @@ impl McpRegistry {
         let legacy_digest_v1 =
             registry_digest_v1(config.source_sha256(), &legacy_runtime_servers, &bindings)?;
         let digest =
-            registry_digest_v3(config.execution_plan_digest(), &runtime_servers, &bindings)?;
+            registry_digest_v4(config.execution_plan_digest(), &runtime_servers, &bindings)?;
         Ok(Self {
             config_sha256: config.source_sha256().to_owned(),
             execution_plan_digest: config.execution_plan_digest().to_owned(),
@@ -277,7 +278,7 @@ fn registry_digest_v1(
         .collect::<Vec<_>>();
     let payload = RegistryDigestV1 {
         registry_version: MCP_TOOL_REGISTRY_VERSION_V1,
-        kernel_version: MCP_STDIO_KERNEL_VERSION,
+        kernel_version: MCP_STDIO_KERNEL_VERSION_V1,
         config_sha256,
         servers,
         tools: &tools,
@@ -297,7 +298,7 @@ fn registry_digest_v2(
         .collect::<Vec<_>>();
     let payload = RegistryDigestV2 {
         registry_version: MCP_TOOL_REGISTRY_VERSION_V2,
-        kernel_version: MCP_STDIO_KERNEL_VERSION,
+        kernel_version: MCP_STDIO_KERNEL_VERSION_V1,
         execution_plan_version: MCP_EXECUTION_PLAN_VERSION_V1,
         execution_plan_digest,
         servers,
@@ -306,6 +307,7 @@ fn registry_digest_v2(
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&payload)?)))
 }
 
+#[allow(dead_code)]
 fn registry_digest_v3(
     execution_plan_digest: &str,
     servers: &[RuntimeServerDigestV2],
@@ -317,7 +319,27 @@ fn registry_digest_v3(
         .collect::<Vec<_>>();
     let payload = RegistryDigestV2 {
         registry_version: MCP_TOOL_REGISTRY_VERSION_V3,
-        kernel_version: MCP_STDIO_KERNEL_VERSION,
+        kernel_version: MCP_STDIO_KERNEL_VERSION_V1,
+        execution_plan_version: MCP_EXECUTION_PLAN_VERSION_V2,
+        execution_plan_digest,
+        servers,
+        tools: &tools,
+    };
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&payload)?)))
+}
+
+fn registry_digest_v4(
+    execution_plan_digest: &str,
+    servers: &[RuntimeServerDigestV2],
+    bindings: &BTreeMap<String, McpToolBinding>,
+) -> Result<String> {
+    let tools = bindings
+        .values()
+        .map(ToolDigestV2::from)
+        .collect::<Vec<_>>();
+    let payload = RegistryDigestV2 {
+        registry_version: MCP_TOOL_REGISTRY_VERSION_V4,
+        kernel_version: MCP_STDIO_KERNEL_VERSION_V2,
         execution_plan_version: MCP_EXECUTION_PLAN_VERSION_V2,
         execution_plan_digest,
         servers,
@@ -469,7 +491,9 @@ mod tests {
         );
         assert_eq!(MCP_TOOL_REGISTRY_VERSION_V1, 1);
         assert_eq!(MCP_TOOL_REGISTRY_VERSION_V2, 2);
-        assert_eq!(MCP_TOOL_REGISTRY_VERSION, 3);
+        assert_eq!(MCP_TOOL_REGISTRY_VERSION_V3, 3);
+        assert_eq!(MCP_TOOL_REGISTRY_VERSION_V4, 4);
+        assert_eq!(MCP_TOOL_REGISTRY_VERSION, 4);
         assert_eq!(
             registry_digest_v1(&"a".repeat(64), &servers, &bindings)
                 .expect("compute registry fixture digest"),
@@ -562,6 +586,50 @@ mod tests {
                 .expect("compute changed registry v3 digest"),
             registry_digest_v3(&"d".repeat(64), &servers, &bindings)
                 .expect("compute registry v3 fixture digest")
+        );
+    }
+
+    #[test]
+    fn registry_digest_v4_is_frozen_and_binds_kernel_v2() {
+        let servers = vec![RuntimeServerDigestV2 {
+            name: "fixture".to_owned(),
+            protocol_version: MCP_MODERN_PROTOCOL_VERSION.to_owned(),
+        }];
+        let provider_name = provider_tool_name("fixture", "echo.v1");
+        let mut bindings = BTreeMap::new();
+        bindings.insert(
+            provider_name.clone(),
+            McpToolBinding {
+                provider_name: provider_name.clone(),
+                server_name: "fixture".to_owned(),
+                raw_tool_name: "echo.v1".to_owned(),
+                protocol_version: MCP_MODERN_PROTOCOL_VERSION.to_owned(),
+                definition: ToolDefinition {
+                    name: provider_name,
+                    description: "MCP tool fixture/echo.v1: Echo text".to_owned(),
+                    input_schema: serde_json::json!({
+                        "type":"object",
+                        "properties":{"text":{"type":"string"}},
+                        "required":["text"],
+                        "additionalProperties":false
+                    }),
+                },
+                output_schema: Some(serde_json::json!({
+                    "type":"object",
+                    "properties":{"text":{"type":"string"}}
+                })),
+            },
+        );
+        assert_eq!(
+            registry_digest_v4(&"f".repeat(64), &servers, &bindings)
+                .expect("compute registry v4 fixture digest"),
+            "091ee00fa1f90e63783c962b76dd398efb95f72ac4c07a8ac98ced104f4d0764"
+        );
+        assert_ne!(
+            registry_digest_v4(&"0".repeat(64), &servers, &bindings)
+                .expect("compute changed registry v4 digest"),
+            registry_digest_v4(&"f".repeat(64), &servers, &bindings)
+                .expect("compute registry v4 fixture digest")
         );
     }
 }

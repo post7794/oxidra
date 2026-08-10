@@ -12,7 +12,7 @@ pub use config::{
 };
 pub use registry::{
     MCP_TOOL_REGISTRY_VERSION, MCP_TOOL_REGISTRY_VERSION_V1, MCP_TOOL_REGISTRY_VERSION_V2,
-    MCP_TOOL_REGISTRY_VERSION_V3, McpRegistry, McpToolBinding,
+    MCP_TOOL_REGISTRY_VERSION_V3, MCP_TOOL_REGISTRY_VERSION_V4, McpRegistry, McpToolBinding,
 };
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -36,7 +36,9 @@ use crate::types::ToolDefinition;
 
 pub const MCP_MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 pub const MCP_LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
-pub const MCP_STDIO_KERNEL_VERSION: u32 = 1;
+pub const MCP_STDIO_KERNEL_VERSION_V1: u32 = 1;
+pub const MCP_STDIO_KERNEL_VERSION_V2: u32 = 2;
+pub const MCP_STDIO_KERNEL_VERSION: u32 = MCP_STDIO_KERNEL_VERSION_V2;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -869,6 +871,7 @@ impl Transport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .env_clear();
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);

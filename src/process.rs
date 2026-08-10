@@ -10,11 +10,9 @@ const PROCESS_EXIT_GRACE: Duration = Duration::from_secs(2);
 pub(crate) struct ProcessTree {
     process_id: Option<u32>,
     #[cfg(target_os = "linux")]
-    linux_root_start_time: Option<u64>,
-    #[cfg(target_os = "linux")]
     linux_contained: bool,
     #[cfg(target_os = "linux")]
-    linux_registered_root: Option<(i32, u64)>,
+    linux_pidfd: Option<std::os::fd::OwnedFd>,
     #[cfg(windows)]
     job: WindowsJob,
 }
@@ -33,11 +31,10 @@ impl ProcessTree {
     /// Configure an MCP child so no uncontained server code is started.
     ///
     /// Windows starts suspended and attaches a Job Object before resume. Linux
-    /// establishes Oxidra as a child subreaper before spawn and later combines
-    /// process-group termination with `/proc` descendant sweeping. Other Unix
-    /// targets fail closed until they have an equivalent descendant owner;
-    /// a process group alone is not a containment boundary because `setsid()`
-    /// can escape it.
+    /// installs a pre-exec seccomp policy that forbids process creation and
+    /// process-group/session escape, binds the only server process to Oxidra
+    /// with `PDEATHSIG`, and later opens a pidfd before protocol traffic. Other
+    /// Unix targets fail closed until they have an equivalent kernel boundary.
     pub(crate) fn configure_suspended(command: &mut Command) -> io::Result<()> {
         Self::configure(command);
         #[cfg(target_os = "linux")]
@@ -56,8 +53,8 @@ impl ProcessTree {
     }
 
     /// Attach ownership immediately after spawn, before any protocol traffic is
-    /// sent. On Windows the Job Object owns all descendants; on Unix the child
-    /// is the leader of the process group configured above.
+    /// sent. Ordinary Unix children use a process group; Linux MCP children use
+    /// the stronger pre-exec policy plus a pidfd, and Windows uses a Job Object.
     pub(crate) fn attach(child: &Child) -> io::Result<Self> {
         Self::attach_with_containment(child, false)
     }
@@ -75,16 +72,10 @@ impl ProcessTree {
             )
         })?;
         #[cfg(target_os = "linux")]
-        let linux_root_start_time = match linux_containment::process_start_time(process_id as i32) {
-            Ok(start_time) => {
-                linux_containment::register_root(process_id as i32, start_time);
-                Some(start_time)
-            }
-            Err(error) if !contained => {
-                let _ = error;
-                None
-            }
-            Err(error) => return Err(error),
+        let linux_pidfd = if contained {
+            Some(linux_containment::open_pidfd(process_id)?)
+        } else {
+            None
         };
         #[cfg(not(target_os = "linux"))]
         let _ = contained;
@@ -93,12 +84,9 @@ impl ProcessTree {
         Ok(Self {
             process_id: Some(process_id),
             #[cfg(target_os = "linux")]
-            linux_root_start_time,
-            #[cfg(target_os = "linux")]
             linux_contained: contained,
             #[cfg(target_os = "linux")]
-            linux_registered_root: linux_root_start_time
-                .map(|start_time| (process_id as i32, start_time)),
+            linux_pidfd,
             #[cfg(windows)]
             job,
         })
@@ -124,8 +112,8 @@ impl ProcessTree {
         #[cfg(target_os = "linux")]
         if let Some(process_id) = process_id {
             if self.linux_contained {
-                if let Some(start_time) = self.linux_root_start_time {
-                    linux_containment::terminate(process_id as i32, start_time);
+                if let Some(pidfd) = &self.linux_pidfd {
+                    linux_containment::signal_pidfd(pidfd, nix::libc::SIGKILL);
                 }
             } else {
                 use nix::sys::signal::{Signal, killpg};
@@ -157,226 +145,230 @@ impl ProcessTree {
 
 #[cfg(target_os = "linux")]
 mod linux_containment {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::fs;
     use std::io;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
-    use std::sync::{Mutex, OnceLock};
-    use std::time::Duration;
+    use std::ptr;
 
     use nix::libc;
-    use nix::sys::signal::{Signal, kill, killpg};
-    use nix::unistd::{Pid, getpid};
     use tokio::process::Command;
 
-    const SWEEP_PASSES: usize = 8;
-    const SWEEP_PAUSE: Duration = Duration::from_millis(5);
-
-    #[derive(Clone, Copy)]
-    struct ProcessEntry {
-        parent: i32,
-        start_time: u64,
-    }
-
-    static SUBREAPER_RESULT: OnceLock<std::result::Result<(), i32>> = OnceLock::new();
-    static ACTIVE_ROOTS: OnceLock<Mutex<BTreeMap<i32, u64>>> = OnceLock::new();
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_ALU_AND_K: u16 = 0x54;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_JMP_JSET_K: u16 = 0x45;
+    const BPF_RET_K: u16 = 0x06;
+    const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+    const SECCOMP_SET_MODE_FILTER: libc::c_uint = 1;
+    const SECCOMP_DATA_NR_OFFSET: u32 = 0;
+    const SECCOMP_DATA_ARCH_OFFSET: u32 = 4;
+    const SECCOMP_DATA_ARG0_OFFSET: u32 = 16;
 
     pub(super) fn prepare(command: &mut Command) -> io::Result<()> {
-        ensure_subreaper()?;
-        let processes = scan_processes()?;
-        if !processes.contains_key(&getpid().as_raw()) {
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let _ = command;
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Linux /proc does not expose the current process",
+                "MCP Linux containment supports only x86_64 and aarch64",
             ));
         }
-        // If Oxidra itself exits, at least the direct MCP leader receives a
-        // fatal signal. Descendants are cleaned during controlled shutdown by
-        // the subreaper + descendant sweep below.
-        let owner = getpid().as_raw();
-        unsafe {
-            command.as_std_mut().pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                if libc::getppid() != owner {
-                    libc::_exit(127);
-                }
-                Ok(())
-            });
-        }
-        Ok(())
-    }
 
-    fn ensure_subreaper() -> io::Result<()> {
-        match *SUBREAPER_RESULT.get_or_init(|| {
-            let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) };
-            if result == -1 {
-                Err(io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(libc::EINVAL))
-            } else {
-                Ok(())
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            // Probe the required identity primitive before any untrusted MCP
+            // code executes. The real child pidfd is opened immediately after
+            // spawn, while the child is still an unreaped process and cannot
+            // have its PID reused.
+            let probe = open_pidfd(unsafe { libc::getpid() } as u32)?;
+            drop(probe);
+            let owner = unsafe { libc::getpid() };
+            let mut filter = process_policy_filter();
+            let filter_len = u16::try_from(filter.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "seccomp filter is too large")
+            })?;
+            unsafe {
+                command.as_std_mut().pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::getppid() != owner {
+                        libc::_exit(127);
+                    }
+                    if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let program = libc::sock_fprog {
+                        len: filter_len,
+                        filter: filter.as_mut_ptr(),
+                    };
+                    if libc::syscall(
+                        libc::SYS_seccomp,
+                        SECCOMP_SET_MODE_FILTER,
+                        0,
+                        &raw const program,
+                    ) == -1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if libc::getppid() != owner {
+                        libc::_exit(127);
+                    }
+                    Ok(())
+                });
             }
-        }) {
-            Ok(()) => Ok(()),
-            Err(code) => Err(io::Error::from_raw_os_error(code)),
-        }
-    }
-
-    pub(super) fn process_start_time(process_id: i32) -> io::Result<u64> {
-        let stat = fs::read_to_string(format!("/proc/{process_id}/stat"))?;
-        parse_stat(&stat)
-            .map(|entry| entry.start_time)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid Linux process stat"))
-    }
-
-    pub(super) fn register_root(process_id: i32, start_time: u64) {
-        if let Ok(mut roots) = active_roots().lock() {
-            roots.insert(process_id, start_time);
-        }
-    }
-
-    pub(super) fn unregister_root(process_id: i32, start_time: u64) {
-        if let Ok(mut roots) = active_roots().lock() {
-            if roots.get(&process_id) == Some(&start_time) {
-                roots.remove(&process_id);
-            }
+            Ok(())
         }
     }
 
-    pub(super) fn terminate(root: i32, root_start_time: u64) {
-        let mut owned = BTreeSet::from([root]);
-        let mut stable_passes = 0usize;
-        for _ in 0..SWEEP_PASSES {
-            let Ok(processes) = scan_processes() else {
-                break;
-            };
-            if processes
-                .get(&root)
-                .is_some_and(|entry| entry.start_time == root_start_time)
-            {
-                let _ = killpg(Pid::from_raw(root), Signal::SIGSTOP);
-                let _ = kill(Pid::from_raw(root), Signal::SIGSTOP);
-            }
-            let descendants = descendants_of(&processes, root);
-            let previous_len = owned.len();
-            for process_id in descendants {
-                if process_id != getpid().as_raw() {
-                    let _ = kill(Pid::from_raw(process_id), Signal::SIGSTOP);
-                    owned.insert(process_id);
-                }
-            }
-            if owned.len() == previous_len {
-                stable_passes += 1;
-                if stable_passes >= 2 {
-                    break;
-                }
-            } else {
-                stable_passes = 0;
-            }
-            std::thread::sleep(SWEEP_PAUSE);
+    pub(super) fn open_pidfd(process_id: u32) -> io::Result<OwnedFd> {
+        let raw_fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process_id, 0) };
+        if raw_fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(raw_fd as libc::c_int) })
+    }
+
+    pub(super) fn signal_pidfd(pidfd: &OwnedFd, signal: libc::c_int) {
+        let _ = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                pidfd.as_raw_fd(),
+                signal,
+                ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn process_policy_filter() -> Vec<libc::sock_filter> {
+        let mut filter = vec![
+            statement(BPF_LD_W_ABS, SECCOMP_DATA_ARCH_OFFSET),
+            jump(BPF_JMP_JEQ_K, audit_arch(), 1, 0),
+            statement(BPF_RET_K, SECCOMP_RET_KILL_PROCESS),
+            statement(BPF_LD_W_ABS, SECCOMP_DATA_NR_OFFSET),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        filter.push(statement(BPF_ALU_AND_K, !0x4000_0000));
+
+        let denied = [
+            libc::SYS_unshare,
+            libc::SYS_setns,
+            libc::SYS_setsid,
+            libc::SYS_setpgid,
+            // Linux clears PR_SET_PDEATHSIG when effective/filesystem IDs
+            // change. Deny the complete credential-mutating family so a
+            // privileged launch cannot discard the host-death binding by
+            // dropping or reshaping credentials after exec.
+            libc::SYS_setuid,
+            libc::SYS_setgid,
+            libc::SYS_setreuid,
+            libc::SYS_setregid,
+            libc::SYS_setresuid,
+            libc::SYS_setresgid,
+            libc::SYS_setfsuid,
+            libc::SYS_setfsgid,
+            libc::SYS_setgroups,
+        ];
+        for syscall in denied {
+            filter.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
+            filter.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
+        }
+        #[cfg(target_arch = "x86_64")]
+        for syscall in [libc::SYS_fork, libc::SYS_vfork] {
+            filter.push(jump(BPF_JMP_JEQ_K, syscall as u32, 0, 1));
+            filter.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
         }
 
-        for process_id in owned.iter().rev() {
-            let _ = kill(Pid::from_raw(*process_id), Signal::SIGKILL);
-        }
-        let _ = killpg(Pid::from_raw(root), Signal::SIGKILL);
+        // Modern runtimes probe clone3() for thread creation and fall back to
+        // clone() only on ENOSYS. Deny clone3 entirely because classic seccomp
+        // cannot inspect the pointed-to clone_args structure safely.
+        filter.push(jump(BPF_JMP_JEQ_K, libc::SYS_clone3 as u32, 0, 1));
+        filter.push(statement(
+            BPF_RET_K,
+            SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+        ));
 
-        // A setsid() descendant can leave the original process group. Linux
-        // reparents it to this subreaper when its intermediate parent exits.
-        // Sweep newly adopted children while excluding every still-registered
-        // ProcessTree root, then recursively kill their descendants as well.
-        for _ in 0..SWEEP_PASSES {
-            std::thread::sleep(SWEEP_PAUSE);
-            let Ok(processes) = scan_processes() else {
-                break;
-            };
-            let active = active_roots()
-                .lock()
-                .map(|roots| roots.clone())
-                .unwrap_or_default();
-            let owner = getpid().as_raw();
-            let adopted_roots = processes
-                .iter()
-                .filter_map(|(process_id, entry)| {
-                    (entry.parent == owner
-                        && *process_id != root
-                        && entry.start_time >= root_start_time
-                        && active.get(process_id) != Some(&entry.start_time))
-                    .then_some(*process_id)
-                })
-                .collect::<Vec<_>>();
-            if adopted_roots.is_empty() {
-                break;
-            }
-            for adopted in adopted_roots {
-                let mut adopted_tree = descendants_of(&processes, adopted);
-                adopted_tree.insert(adopted);
-                for process_id in &adopted_tree {
-                    let _ = kill(Pid::from_raw(*process_id), Signal::SIGSTOP);
-                }
-                for process_id in adopted_tree.iter().rev() {
-                    let _ = kill(Pid::from_raw(*process_id), Signal::SIGKILL);
-                }
-            }
+        // The server may use prctl for harmless runtime metadata, but it may
+        // not clear the parent-death signal that ties it to Oxidra.
+        filter.push(jump(BPF_JMP_JEQ_K, libc::SYS_prctl as u32, 0, 4));
+        filter.push(statement(BPF_LD_W_ABS, SECCOMP_DATA_ARG0_OFFSET));
+        filter.push(jump(BPF_JMP_JEQ_K, libc::PR_SET_PDEATHSIG as u32, 0, 1));
+        filter.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
+        filter.push(statement(BPF_RET_K, SECCOMP_RET_ALLOW));
+
+        // clone() is allowed only for threads in the same thread group. A
+        // separate process, namespace or daemon cannot be created.
+        filter.push(jump(BPF_JMP_JEQ_K, libc::SYS_clone as u32, 0, 3));
+        filter.push(statement(BPF_LD_W_ABS, SECCOMP_DATA_ARG0_OFFSET));
+        filter.push(jump(BPF_JMP_JSET_K, libc::CLONE_THREAD as u32, 1, 0));
+        filter.push(statement(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EPERM as u32));
+        filter.push(statement(BPF_RET_K, SECCOMP_RET_ALLOW));
+        filter
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    const fn audit_arch() -> u32 {
+        0xc000_003e
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    const fn audit_arch() -> u32 {
+        0xc000_00b7
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    const fn statement(code: u16, value: u32) -> libc::sock_filter {
+        libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k: value,
         }
     }
 
-    fn active_roots() -> &'static Mutex<BTreeMap<i32, u64>> {
-        ACTIVE_ROOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
-    }
-
-    fn scan_processes() -> io::Result<BTreeMap<i32, ProcessEntry>> {
-        let mut processes = BTreeMap::new();
-        for directory in fs::read_dir("/proc")? {
-            let Ok(directory) = directory else {
-                continue;
-            };
-            let Some(process_id) = directory
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<i32>().ok())
-            else {
-                continue;
-            };
-            let Ok(stat) = fs::read_to_string(directory.path().join("stat")) else {
-                continue;
-            };
-            if let Some(entry) = parse_stat(&stat) {
-                processes.insert(process_id, entry);
-            }
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    const fn jump(code: u16, value: u32, on_true: u8, on_false: u8) -> libc::sock_filter {
+        libc::sock_filter {
+            code,
+            jt: on_true,
+            jf: on_false,
+            k: value,
         }
-        Ok(processes)
     }
 
-    fn parse_stat(stat: &str) -> Option<ProcessEntry> {
-        let fields = stat
-            .get(stat.rfind(')')?.saturating_add(1)..)?
-            .split_whitespace();
-        let fields = fields.collect::<Vec<_>>();
-        Some(ProcessEntry {
-            parent: fields.get(1)?.parse().ok()?,
-            start_time: fields.get(19)?.parse().ok()?,
-        })
-    }
+    #[cfg(test)]
+    mod tests {
+        use sha2::{Digest, Sha256};
 
-    fn descendants_of(processes: &BTreeMap<i32, ProcessEntry>, root: i32) -> BTreeSet<i32> {
-        let mut descendants = BTreeSet::new();
-        loop {
-            let before = descendants.len();
-            for (process_id, entry) in processes {
-                if entry.parent == root || descendants.contains(&entry.parent) {
-                    descendants.insert(*process_id);
-                }
+        use super::process_policy_filter;
+
+        #[test]
+        fn linux_mcp_seccomp_policy_v2_is_frozen() {
+            let mut bytes = Vec::new();
+            for instruction in process_policy_filter() {
+                bytes.extend_from_slice(&instruction.code.to_le_bytes());
+                bytes.push(instruction.jt);
+                bytes.push(instruction.jf);
+                bytes.extend_from_slice(&instruction.k.to_le_bytes());
             }
-            if descendants.len() == before {
-                return descendants;
-            }
+            let digest = hex::encode(Sha256::digest(bytes));
+            #[cfg(target_arch = "x86_64")]
+            assert_eq!(
+                digest,
+                "bdde0e838640e64c2608b7aa961d2ac9e3bc76bd05b89b75247d83aa428d2eb4"
+            );
+            #[cfg(target_arch = "aarch64")]
+            assert_eq!(
+                digest,
+                "7c87ec0a3efcf2fbafa78f4555a12fbc5230a791a47dd478aab6f03716cff9d7"
+            );
         }
     }
 }
-
 #[cfg(windows)]
 fn resume_process_threads(process_id: u32) -> io::Result<()> {
     use std::mem::{size_of, zeroed};
@@ -434,10 +426,6 @@ fn resume_process_threads(process_id: u32) -> io::Result<()> {
 impl Drop for ProcessTree {
     fn drop(&mut self) {
         self.terminate_descendants();
-        #[cfg(target_os = "linux")]
-        if let Some((process_id, start_time)) = self.linux_registered_root.take() {
-            linux_containment::unregister_root(process_id, start_time);
-        }
     }
 }
 
