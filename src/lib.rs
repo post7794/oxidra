@@ -18,5 +18,6 @@ pub mod session;
 pub mod tools;
 pub mod turn;
 pub mod types;
+mod untrusted_display;
 
 pub use error::{OxidraError, Result};

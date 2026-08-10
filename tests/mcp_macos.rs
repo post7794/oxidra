@@ -20,7 +20,7 @@ async fn macos_mcp_fails_closed_before_uncontained_code_executes() {
 
     let mut config = McpStdioConfig::new("fixture", server);
     config.args.push(marker.to_string_lossy().into_owned());
-    let result = McpStdioSession::connect(config, CancellationToken::new()).await;
+    let result = McpStdioSession::connect_trusted(config, CancellationToken::new()).await;
     let error = match result {
         Ok(mut session) => {
             session.shutdown().await;

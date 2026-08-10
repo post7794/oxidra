@@ -7,8 +7,7 @@ use std::time::Duration;
 
 use oxidra::mcp::{
     MCP_LEGACY_PROTOCOL_VERSION, MCP_MODERN_PROTOCOL_VERSION, MCP_STDIO_KERNEL_VERSION,
-    MCP_STDIO_KERNEL_VERSION_V1, MCP_STDIO_KERNEL_VERSION_V2, McpProtocolEra, McpStdioConfig,
-    McpStdioSession,
+    McpProtocolEra, McpStdioConfig, McpStdioSession,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -24,7 +23,7 @@ async fn modern_stdio_discovers_lists_calls_and_reuses_one_process() {
     let log = directory.path().join("modern.log");
     fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
 
-    let mut session = McpStdioSession::connect(
+    let mut session = McpStdioSession::connect_trusted(
         fixture_config(&python, &script, &log, "modern"),
         CancellationToken::new(),
     )
@@ -41,7 +40,24 @@ async fn modern_stdio_discovers_lists_calls_and_reuses_one_process() {
             .iter()
             .map(|tool| tool.definition.name.as_str())
             .collect::<Vec<_>>(),
-        ["echo", "sleep", "rpc_error"]
+        ["echo", "sleep", "rpc_error", "typed_output"]
+    );
+    assert!(
+        session
+            .tools()
+            .iter()
+            .find(|tool| tool.definition.name == "echo")
+            .expect("echo tool")
+            .definition
+            .description
+            .contains('�')
+    );
+    assert!(
+        !session
+            .server_info()
+            .expect("modern server info")
+            .version
+            .contains('\u{202e}')
     );
 
     for text in ["first", "second"] {
@@ -63,6 +79,92 @@ async fn modern_stdio_discovers_lists_calls_and_reuses_one_process() {
 }
 
 #[tokio::test]
+async fn schema_invalid_arguments_are_rejected_before_dispatch() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP schema dispatch test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP schema fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("schema-input.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+    let mut session = McpStdioSession::connect_trusted(
+        fixture_config(&python, &script, &log, "modern"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("connect schema MCP fixture");
+
+    for arguments in [
+        json!({}),
+        json!({"text":"ok","extra":true}),
+        json!({"text":"ok","options":{"uppercase":"yes"}}),
+    ] {
+        let error = session
+            .call_tool("echo", arguments, &CancellationToken::new())
+            .await
+            .expect_err("schema-invalid arguments must fail before dispatch");
+        assert_eq!(error.code, "validation_error");
+        assert!(!error.in_doubt);
+        assert!(!error.interrupted);
+    }
+    assert_eq!(methods(&read_log(&log)), ["server/discover", "tools/list"]);
+
+    let result = session
+        .call_tool(
+            "echo",
+            json!({"text":"ok","options":{"uppercase":true}}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("valid arguments still dispatch");
+    assert_eq!(result["content"][0]["text"], "ok");
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_tool_schema_fails_discovery_and_output_mismatch_closes_transport() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP schema result test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP schema result fixture");
+    let script = directory.path().join("mcp_fixture.py");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+
+    let invalid_log = directory.path().join("invalid-schema.log");
+    let invalid = McpStdioSession::connect_trusted(
+        fixture_config(&python, &script, &invalid_log, "bad_schema"),
+        CancellationToken::new(),
+    )
+    .await;
+    assert!(matches!(invalid, Err(error) if error.to_string().contains("unsupported keyword")));
+    assert_eq!(
+        methods(&read_log(&invalid_log)),
+        ["server/discover", "tools/list"]
+    );
+
+    let output_log = directory.path().join("invalid-output.log");
+    let mut session = McpStdioSession::connect_trusted(
+        fixture_config(&python, &script, &output_log, "bad_output"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("connect invalid-output fixture");
+    let error = session
+        .call_tool("typed_output", json!({}), &CancellationToken::new())
+        .await
+        .expect_err("schema-invalid structuredContent must fail closed");
+    assert_eq!(error.code, "protocol_error");
+    assert!(error.in_doubt);
+    let closed = session
+        .call_tool("echo", json!({"text":"after"}), &CancellationToken::new())
+        .await
+        .expect_err("output protocol failure must close transport");
+    assert_eq!(closed.code, "transport_closed");
+}
+
+#[tokio::test]
 async fn pre_cancelled_connect_does_not_start_an_mcp_server() {
     let Some(python) = find_python() else {
         eprintln!("skipping MCP cancellation integration test: Python is unavailable");
@@ -75,7 +177,7 @@ async fn pre_cancelled_connect_does_not_start_an_mcp_server() {
 
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    let error = match McpStdioSession::connect(
+    let error = match McpStdioSession::connect_trusted(
         fixture_config(&python, &script, &log, "modern"),
         cancellation,
     )
@@ -105,7 +207,7 @@ async fn legacy_stdio_fallback_restarts_then_initializes() {
     let log = directory.path().join("legacy.log");
     fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
 
-    let mut session = McpStdioSession::connect(
+    let mut session = McpStdioSession::connect_trusted(
         fixture_config(&python, &script, &log, "legacy"),
         CancellationToken::new(),
     )
@@ -153,7 +255,7 @@ async fn cancelled_mcp_call_is_reported_in_doubt_and_closes_transport() {
     let log = directory.path().join("cancel.log");
     fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
 
-    let mut session = McpStdioSession::connect(
+    let mut session = McpStdioSession::connect_trusted(
         fixture_config(&python, &script, &log, "modern"),
         CancellationToken::new(),
     )
@@ -196,7 +298,7 @@ async fn rpc_error_after_tool_dispatch_is_in_doubt_and_closes_transport() {
     let log = directory.path().join("rpc-error.log");
     fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
 
-    let mut session = McpStdioSession::connect(
+    let mut session = McpStdioSession::connect_trusted(
         fixture_config(&python, &script, &log, "modern"),
         CancellationToken::new(),
     )
@@ -209,6 +311,13 @@ async fn rpc_error_after_tool_dispatch_is_in_doubt_and_closes_transport() {
     assert_eq!(error.code, "server_error");
     assert!(error.in_doubt);
     assert!(!error.interrupted);
+    assert!(!error.message.contains('\u{202e}'));
+    assert!(!error.message.contains('\u{200b}'));
+    assert!(!error.message.contains('\u{2028}'));
+    assert!(!error.message.contains('\u{2029}'));
+    assert!(!error.message.contains('\u{1b}'));
+    assert!(error.message.contains('�'));
+    assert!(error.message.len() < 17 * 1024);
 
     let closed = session
         .call_tool(
@@ -232,7 +341,7 @@ async fn recognized_modern_unsupported_version_does_not_downgrade() {
     let log = directory.path().join("unsupported.log");
     fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
 
-    let error = match McpStdioSession::connect(
+    let error = match McpStdioSession::connect_trusted(
         fixture_config(&python, &script, &log, "unsupported"),
         CancellationToken::new(),
     )
@@ -262,7 +371,7 @@ async fn server_stderr_is_drained_bounded_and_terminal_safe() {
     let log = directory.path().join("stderr.log");
     fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
 
-    let mut session = McpStdioSession::connect(
+    let mut session = McpStdioSession::connect_trusted(
         fixture_config(&python, &script, &log, "stderr"),
         CancellationToken::new(),
     )
@@ -306,7 +415,7 @@ async fn linux_mcp_process_creation_and_pdeathsig_reset_are_denied() {
     let log = directory.path().join("detached.log");
     fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
 
-    let mut session = McpStdioSession::connect(
+    let mut session = McpStdioSession::connect_trusted(
         fixture_config(&python, &script, &log, "verify_linux_containment"),
         CancellationToken::new(),
     )
@@ -341,13 +450,13 @@ async fn linux_pidfd_cleanup_does_not_cross_mcp_sessions() {
     let second_log = directory.path().join("second.log");
     fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
 
-    let mut first = McpStdioSession::connect(
+    let mut first = McpStdioSession::connect_trusted(
         fixture_config(&python, &script, &first_log, "modern"),
         CancellationToken::new(),
     )
     .await
     .expect("connect first Linux MCP session");
-    let mut second = McpStdioSession::connect(
+    let mut second = McpStdioSession::connect_trusted(
         fixture_config(&python, &script, &second_log, "modern"),
         CancellationToken::new(),
     )
@@ -439,7 +548,7 @@ fn linux_mcp_host_kill_helper() {
         .build()
         .expect("build helper runtime");
     runtime.block_on(async move {
-        let _session = McpStdioSession::connect(
+        let _session = McpStdioSession::connect_trusted(
             fixture_config(&python, &script, &log, "leader_exits_with_worker"),
             CancellationToken::new(),
         )
@@ -465,7 +574,7 @@ async fn windows_mcp_child_is_owned_before_server_resume() {
 
     let mut config = fixture_config(&python, &script, &log, "spawn_child_then_fail");
     config.args.push(marker.to_string_lossy().into_owned());
-    let result = McpStdioSession::connect(config, CancellationToken::new()).await;
+    let result = McpStdioSession::connect_trusted(config, CancellationToken::new()).await;
     assert!(result.is_err(), "fixture must fail during discovery");
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(
@@ -643,10 +752,17 @@ elif mode == "verify_linux_containment":
 tools = [
     {
         "name": "echo",
-        "description": "Echo text",
+        "description": "Echo \u202e text\u200b",
         "inputSchema": {
             "type": "object",
-            "properties": {"text": {"type": "string"}},
+            "properties": {
+                "text": {"type": "string"},
+                "options": {
+                    "type": "object",
+                    "properties": {"uppercase": {"type": "boolean"}},
+                    "additionalProperties": False,
+                },
+            },
             "required": ["text"],
             "additionalProperties": False,
         },
@@ -670,7 +786,25 @@ tools = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "typed_output",
+        "description": "Return typed structured content",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    },
 ]
+
+if mode == "bad_schema":
+    tools[0]["inputSchema"]["patternProperties"] = {}
 
 def write_response(message, result=None, error=None):
     response = {"jsonrpc": "2.0", "id": message["id"]}
@@ -723,7 +857,7 @@ for line in sys.stdin:
                 "_meta": {
                     "io.modelcontextprotocol/serverInfo": {
                         "name": "fixture-modern",
-                        "version": "1",
+                        "version": "1\u202eunsafe",
                     }
                 },
             })
@@ -737,11 +871,11 @@ for line in sys.stdin:
                 "serverInfo": {"name": "fixture-legacy", "version": "1"},
             })
     elif method == "tools/list":
-        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker") and not require_modern_meta(message):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
         else:
             result = {"tools": tools}
-            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker"):
+            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output"):
                 result["resultType"] = "complete"
                 result["ttlMs"] = 1000
                 result["cacheScope"] = "private"
@@ -758,22 +892,32 @@ for line in sys.stdin:
                 worker.start()
                 ctypes.CDLL(None).pthread_exit(None)
     elif method == "tools/call":
-        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker") and not require_modern_meta(message):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
             continue
         params = message.get("params", {})
         name = params.get("name")
         arguments = params.get("arguments", {})
         if name == "rpc_error":
-            write_response(message, error={"code": -32000, "message": "fixture failure"})
+            write_response(message, error={"code": -32000, "message": "fixture \u202e failure \u200b line\u2028next\u2029escape\x1b " + ("x" * 20000)})
             continue
         if name == "sleep":
             time.sleep(float(arguments.get("seconds", 0)))
             text = "slept"
+        elif name == "typed_output":
+            result = {
+                "content": [{"type": "text", "text": "typed"}],
+                "structuredContent": {"value": 42 if mode == "bad_output" else "ok"},
+                "isError": False,
+            }
+            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output"):
+                result["resultType"] = "complete"
+            write_response(message, result=result)
+            continue
         else:
             text = arguments.get("text", "")
         result = {"content": [{"type": "text", "text": text}], "isError": False}
-        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker"):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output"):
             result["resultType"] = "complete"
         write_response(message, result=result)
     else:
@@ -782,9 +926,7 @@ for line in sys.stdin:
 
 #[test]
 fn protocol_constants_are_frozen() {
-    assert_eq!(MCP_STDIO_KERNEL_VERSION_V1, 1);
-    assert_eq!(MCP_STDIO_KERNEL_VERSION_V2, 2);
-    assert_eq!(MCP_STDIO_KERNEL_VERSION, 2);
+    assert_eq!(MCP_STDIO_KERNEL_VERSION, 1);
     assert_eq!(MCP_MODERN_PROTOCOL_VERSION, "2026-07-28");
     assert_eq!(MCP_LEGACY_PROTOCOL_VERSION, "2025-11-25");
 }

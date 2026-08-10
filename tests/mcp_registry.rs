@@ -29,10 +29,13 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .canonicalize()
         .expect("canonicalize MCP project config");
     let config = McpProjectConfig::load(&root, &config_path).expect("load MCP project config");
+    let approved = config
+        .approve_execution(config.execution_plan_digest())
+        .expect("approve MCP execution plan fixture");
 
     let cancellation = CancellationToken::new();
     let mut registry = McpRegistry::connect(
-        &config,
+        &approved,
         ["read", "edit", "write", "shell", "remember"]
             .into_iter()
             .map(str::to_owned),
@@ -40,17 +43,15 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     )
     .await
     .expect("connect MCP registry");
-    assert_eq!(MCP_EXECUTION_PLAN_VERSION, 2);
-    assert_eq!(MCP_TOOL_REGISTRY_VERSION, 4);
+    assert_eq!(MCP_EXECUTION_PLAN_VERSION, 1);
+    assert_eq!(MCP_TOOL_REGISTRY_VERSION, 1);
     assert_eq!(registry.config_sha256(), config.source_sha256());
     assert_eq!(
         registry.execution_plan_digest(),
         config.execution_plan_digest()
     );
     assert_eq!(registry.execution_plan_digest().len(), 64);
-    assert_eq!(registry.legacy_digest_v1().len(), 64);
     assert_eq!(registry.digest().len(), 64);
-    assert_ne!(registry.digest(), registry.legacy_digest_v1());
     let binding = registry.bindings().next().expect("registry binding");
     assert_eq!(binding.server_name, "fixture");
     assert_eq!(binding.raw_tool_name, "echo.v1");
@@ -70,7 +71,8 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     assert_eq!(result["structuredContent"]["text"], "registry");
     registry.shutdown().await;
 
-    let collision = McpRegistry::connect(&config, [provider_name], &CancellationToken::new()).await;
+    let collision =
+        McpRegistry::connect(&approved, [provider_name], &CancellationToken::new()).await;
     assert!(matches!(collision, Err(error) if error.to_string().contains("tool name collision")));
 
     let original_sha = config.source_sha256().to_owned();
@@ -78,6 +80,36 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("rewrite MCP project config");
     let changed = McpProjectConfig::load(&root, &config_path).expect("reload changed config");
     assert_ne!(changed.source_sha256(), original_sha);
+}
+
+#[tokio::test]
+async fn execution_digest_mismatch_cannot_start_a_server() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP approval integration test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP approval fixture");
+    let root = directory.path().join("project");
+    fs::create_dir_all(&root).expect("create MCP approval project");
+    let script = root.join("server.py");
+    let log = root.join("server.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP approval fixture");
+    let config_path = root.join("mcp.toml");
+    fs::write(&config_path, project_config(&python, &script, &log, false))
+        .expect("write MCP project config");
+    let config = McpProjectConfig::load(
+        &root,
+        &config_path
+            .canonicalize()
+            .expect("canonicalize MCP project config"),
+    )
+    .expect("load MCP project config");
+
+    let error = config
+        .approve_execution(&"0".repeat(64))
+        .expect_err("mismatched execution approval must fail");
+    assert!(error.to_string().contains("does not match"));
+    assert!(!log.exists(), "approval failure must not execute MCP code");
 }
 
 fn project_config(python: &Path, script: &Path, log: &Path, extra_newline: bool) -> String {

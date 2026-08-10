@@ -175,13 +175,17 @@ execution plan、显式 project-config reader 和 session-scoped namespaced regi
 支持 modern `2026-07-28` discovery
 和冻结的 `2025-11-25` legacy fallback，并覆盖进程树、显式环境 allowlist、
 分页/大小限制、spawn 前取消、启动前 execution-plan digest、discovery 后 registry
-digest 以及 `in_doubt`。Windows 使用 suspended Job Object；Linux stdio kernel v2 在
+digest 以及 `in_doubt`。Windows 使用 suspended Job Object；Linux stdio kernel v1 在
 exec 前用 seccomp 禁止独立子进程和逃逸操作，以 `PDEATHSIG` 覆盖宿主强杀，并以 pidfd
 固定唯一 server process 的身份，不再依赖 `/proc` descendant 推断。该版本因此暂不
 支持需要 subprocess 或二次 launcher spawn 的 MCP server；缺少等价 containment 的
 macOS 当前在 MCP spawn 前 fail closed。
-execution trust 明确是 path/command capability trust，不是脚本或依赖内容证明；继承
-环境的秘密值也不进入公开 digest。它尚未进入 CLI 参数、Agent approval、journal 或 context.tools，
+execution trust 明确是授予当前 OS 用户权限的 path/command capability trust，不是脚本
+或依赖内容证明；继承环境的秘密值也不进入公开 digest。no-subprocess seccomp 只负责
+lifecycle containment，不限制文件或网络权限；未来 per-tool approval 只是请求意图确认
+与审计，不是进程 sandbox。固定 JSON Schema profile v1 已在 dispatch 前验证参数、在
+complete result 后验证 structured output，并由 registry digest 绑定。它尚未进入 CLI
+参数、Agent approval、journal 或 context.tools，
 因此用户现在仍然只能使用固定内置工具，不能把上述 MCP server 暴露给模型。
 
 下一步是 CLI execution trust 与 Agent approval：把 execution-plan digest 接入启动前

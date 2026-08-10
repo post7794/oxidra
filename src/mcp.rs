@@ -5,15 +5,14 @@
 
 mod config;
 mod registry;
+mod schema;
 
 pub use config::{
-    MCP_EXECUTION_PLAN_VERSION, MCP_EXECUTION_PLAN_VERSION_V1, MCP_EXECUTION_PLAN_VERSION_V2,
-    MCP_PROJECT_CONFIG_VERSION, MCP_PROJECT_CONFIG_VERSION_V1, McpProjectConfig,
+    ApprovedMcpProjectConfig, MCP_EXECUTION_PLAN_VERSION, MCP_PROJECT_CONFIG_VERSION,
+    MCP_PROJECT_CONFIG_VERSION_V1, McpProjectConfig,
 };
-pub use registry::{
-    MCP_TOOL_REGISTRY_VERSION, MCP_TOOL_REGISTRY_VERSION_V1, MCP_TOOL_REGISTRY_VERSION_V2,
-    MCP_TOOL_REGISTRY_VERSION_V3, MCP_TOOL_REGISTRY_VERSION_V4, McpRegistry, McpToolBinding,
-};
+pub use registry::{MCP_TOOL_REGISTRY_VERSION, McpRegistry, McpToolBinding};
+pub use schema::MCP_SCHEMA_PROFILE_VERSION;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
@@ -33,12 +32,11 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{OxidraError, Result};
 use crate::process::ProcessTree;
 use crate::types::ToolDefinition;
+use crate::untrusted_display;
 
 pub const MCP_MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 pub const MCP_LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
-pub const MCP_STDIO_KERNEL_VERSION_V1: u32 = 1;
-pub const MCP_STDIO_KERNEL_VERSION_V2: u32 = 2;
-pub const MCP_STDIO_KERNEL_VERSION: u32 = MCP_STDIO_KERNEL_VERSION_V2;
+pub const MCP_STDIO_KERNEL_VERSION: u32 = 1;
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,6 +49,13 @@ const MAX_TOOL_SURFACE_BYTES: usize = 512 * 1024;
 const MAX_TOOL_PAGES: usize = 64;
 const MAX_TOOLS: usize = 512;
 const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+const MAX_SERVER_INFO_FIELD_BYTES: usize = 256;
+
+/// Render a raw MCP tool result for a terminal, approval UI or model-facing
+/// diagnostic without mutating the protocol value retained by the caller.
+pub fn tool_result_for_display(result: &Value) -> String {
+    untrusted_display::json_for_display(result)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum McpProtocolEra {
@@ -89,8 +94,8 @@ impl McpStdioConfig {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
         {
             return Err(OxidraError::Config(format!(
-                "invalid MCP server name {:?}; use 1-64 ASCII letters, digits, '_' or '-'",
-                self.name
+                "invalid MCP server name {}; use 1-64 ASCII letters, digits, '_' or '-'",
+                untrusted_display::quoted_single_line(&self.name)
             )));
         }
         if !self.command.is_absolute() {
@@ -123,7 +128,8 @@ impl McpStdioConfig {
         {
             if !valid_environment_name(name) {
                 return Err(OxidraError::Config(format!(
-                    "invalid MCP environment variable name {name:?}"
+                    "invalid MCP environment variable name {}",
+                    untrusted_display::quoted_single_line(name)
                 )));
             }
             // Windows environment names are case-insensitive. Reject aliases on
@@ -131,7 +137,8 @@ impl McpStdioConfig {
             // across hosts.
             if !environment_names.insert(name.to_ascii_uppercase()) {
                 return Err(OxidraError::Config(format!(
-                    "MCP environment variable {name:?} is configured more than once"
+                    "MCP environment variable {} is configured more than once",
+                    untrusted_display::quoted_single_line(name)
                 )));
             }
         }
@@ -157,7 +164,7 @@ impl McpStdioConfig {
 /// The command and working directory are canonical paths, and inherited
 /// environment values are captured at preparation time. Trust presentation,
 /// execution-plan hashing and process spawning all consume this same value.
-/// The public v2 digest authorizes paths, arguments and environment
+/// The public v1 digest authorizes paths, arguments and environment
 /// capabilities; it deliberately does not claim executable/script content
 /// identity and does not hash inherited secret values.
 #[derive(Clone)]
@@ -206,8 +213,8 @@ impl PreparedMcpStdioConfig {
         &self.inherit_env
     }
 
-    pub(super) fn inherited_env(&self) -> &BTreeMap<String, OsString> {
-        &self.inherited_env
+    pub fn explicit_env_names(&self) -> impl Iterator<Item = &str> {
+        self.env.keys().map(String::as_str)
     }
 
     pub(super) fn explicit_env(&self) -> &BTreeMap<String, String> {
@@ -233,6 +240,8 @@ pub struct McpCallError {
 pub struct McpTool {
     pub definition: ToolDefinition,
     pub output_schema: Option<Value>,
+    validation_input_schema: Value,
+    validation_output_schema: Option<Value>,
 }
 
 pub struct McpStdioSession {
@@ -242,15 +251,23 @@ pub struct McpStdioSession {
     era: McpProtocolEra,
     server_info: Option<McpServerInfo>,
     tools: Vec<McpTool>,
-    tool_names: BTreeSet<String>,
 }
 
 impl McpStdioSession {
-    pub async fn connect(config: McpStdioConfig, cancellation: CancellationToken) -> Result<Self> {
+    /// Connect to an MCP executable that the caller already trusts with the
+    /// authority of the current OS user.
+    ///
+    /// This low-level API does not perform project execution-plan approval.
+    /// Applications should normally use [`McpProjectConfig::approve_execution`]
+    /// followed by [`McpRegistry::connect`].
+    pub async fn connect_trusted(
+        config: McpStdioConfig,
+        cancellation: CancellationToken,
+    ) -> Result<Self> {
         Self::connect_prepared(config.prepare()?, cancellation).await
     }
 
-    pub async fn connect_prepared(
+    pub(super) async fn connect_prepared(
         config: PreparedMcpStdioConfig,
         cancellation: CancellationToken,
     ) -> Result<Self> {
@@ -345,10 +362,6 @@ impl McpStdioSession {
         };
 
         let tools = load_tools(&config.name, &mut transport, era, &cancellation).await?;
-        let tool_names = tools
-            .iter()
-            .map(|tool| tool.definition.name.clone())
-            .collect();
         Ok(Self {
             config,
             transport: Some(transport),
@@ -356,7 +369,6 @@ impl McpStdioSession {
             era,
             server_info,
             tools,
-            tool_names,
         })
     }
 
@@ -385,27 +397,30 @@ impl McpStdioSession {
         arguments: Value,
         cancellation: &CancellationToken,
     ) -> std::result::Result<Value, McpCallError> {
-        if !self.tool_names.contains(name) {
+        let Some(tool) = self.tools.iter().find(|tool| tool.definition.name == name) else {
             return Err(McpCallError {
                 code: "not_found",
-                message: format!("MCP server {} has no tool {name:?}", self.config.name),
+                message: format!(
+                    "MCP server {} has no tool {}",
+                    self.config.name,
+                    untrusted_display::quoted_single_line(name)
+                ),
                 in_doubt: false,
                 interrupted: false,
             });
-        }
-        if !arguments.is_object() {
+        };
+        if let Err(error) = schema::validate_instance(&tool.validation_input_schema, &arguments) {
             return Err(McpCallError {
                 code: "validation_error",
-                message: "MCP tool arguments must be a JSON object".to_owned(),
+                message: format!(
+                    "MCP tool arguments do not satisfy inputSchema: {}",
+                    untrusted_display::sanitize_single_line(&error)
+                ),
                 in_doubt: false,
                 interrupted: false,
             });
         }
-        let expects_structured_content = self
-            .tools
-            .iter()
-            .find(|tool| tool.definition.name == name)
-            .is_some_and(|tool| tool.output_schema.is_some());
+        let output_schema = tool.validation_output_schema.clone();
         let params = match self.era {
             McpProtocolEra::Modern => modern_params(Map::from_iter([
                 ("name".to_owned(), Value::String(name.to_owned())),
@@ -456,7 +471,7 @@ impl McpStdioSession {
             });
         }
         if let Err(error) =
-            validate_tool_call_result(&self.config.name, &result, expects_structured_content)
+            validate_tool_call_result(&self.config.name, &result, output_schema.as_ref())
         {
             if let Some(mut transport) = self.transport.take() {
                 transport.terminate().await;
@@ -591,18 +606,19 @@ fn parse_tool(server: &str, value: &Value) -> Result<McpTool> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
         return Err(OxidraError::Mcp(format!(
-            "MCP server {server} returned invalid tool name {name:?}"
+            "MCP server {server} returned invalid tool name {}",
+            untrusted_display::quoted_single_line(name)
         )));
     }
     let description = match object.get("description") {
-        Some(value) => value
-            .as_str()
-            .ok_or_else(|| {
+        Some(value) => {
+            let description = value.as_str().ok_or_else(|| {
                 OxidraError::Mcp(format!(
                     "MCP server {server} tool {name:?} description is not a string"
                 ))
-            })?
-            .to_owned(),
+            })?;
+            untrusted_display::sanitize_text(description)
+        }
         None => String::new(),
     };
     let input_schema = object.get("inputSchema").cloned().ok_or_else(|| {
@@ -610,31 +626,33 @@ fn parse_tool(server: &str, value: &Value) -> Result<McpTool> {
             "MCP server {server} tool {name:?} has no inputSchema"
         ))
     })?;
-    if !input_schema.is_object()
-        || input_schema.get("type").and_then(Value::as_str) != Some("object")
-    {
-        return Err(OxidraError::Mcp(format!(
-            "MCP server {server} tool {name:?} inputSchema must declare object type"
-        )));
-    }
+    schema::validate_tool_schema(&input_schema, "inputSchema").map_err(|error| {
+        OxidraError::Mcp(format!(
+            "MCP server {server} tool {name:?} has invalid inputSchema: {}",
+            untrusted_display::sanitize_single_line(&error)
+        ))
+    })?;
     let output_schema = object
         .get("outputSchema")
         .map(|schema| {
-            if !schema.is_object() || schema.get("type").and_then(Value::as_str) != Some("object") {
-                return Err(OxidraError::Mcp(format!(
-                    "MCP server {server} tool {name:?} outputSchema must declare object type"
-                )));
-            }
-            Ok(schema.clone())
+            schema::validate_tool_schema(schema, "outputSchema").map_err(|error| {
+                OxidraError::Mcp(format!(
+                    "MCP server {server} tool {name:?} has invalid outputSchema: {}",
+                    untrusted_display::sanitize_single_line(&error)
+                ))
+            })?;
+            Ok::<Value, OxidraError>(schema.clone())
         })
         .transpose()?;
     Ok(McpTool {
         definition: ToolDefinition {
             name: name.to_owned(),
             description,
-            input_schema,
+            input_schema: schema::schema_for_display(&input_schema),
         },
-        output_schema,
+        output_schema: output_schema.as_ref().map(schema::schema_for_display),
+        validation_input_schema: input_schema,
+        validation_output_schema: output_schema,
     })
 }
 
@@ -726,7 +744,7 @@ fn validate_cacheable_complete_result(server: &str, method: &str, result: &Value
 fn validate_tool_call_result(
     server: &str,
     result: &Value,
-    expects_structured_content: bool,
+    output_schema: Option<&Value>,
 ) -> Result<()> {
     if !result.get("content").is_some_and(Value::is_array) {
         return Err(OxidraError::Mcp(format!(
@@ -741,14 +759,18 @@ fn validate_tool_call_result(
             "MCP server {server} tools/call result has invalid isError"
         )));
     }
-    if expects_structured_content
-        && !result
-            .get("structuredContent")
-            .is_some_and(Value::is_object)
-    {
-        return Err(OxidraError::Mcp(format!(
-            "MCP server {server} tools/call result does not satisfy its declared outputSchema"
-        )));
+    if let Some(output_schema) = output_schema {
+        let structured_content = result.get("structuredContent").ok_or_else(|| {
+            OxidraError::Mcp(format!(
+                "MCP server {server} tools/call result has no structuredContent required by outputSchema"
+            ))
+        })?;
+        schema::validate_instance(output_schema, structured_content).map_err(|error| {
+            OxidraError::Mcp(format!(
+                "MCP server {server} tools/call structuredContent does not satisfy outputSchema: {}",
+                untrusted_display::sanitize_single_line(&error)
+            ))
+        })?;
     }
     Ok(())
 }
@@ -779,14 +801,18 @@ fn parse_server_info(server: &str, value: Option<&Value>) -> Result<McpServerInf
     let version = info.get("version").and_then(Value::as_str).ok_or_else(|| {
         OxidraError::Mcp(format!("MCP server {server} serverInfo has no version"))
     })?;
-    if name.is_empty() || version.is_empty() {
+    if name.is_empty()
+        || version.is_empty()
+        || name.len() > MAX_SERVER_INFO_FIELD_BYTES
+        || version.len() > MAX_SERVER_INFO_FIELD_BYTES
+    {
         return Err(OxidraError::Mcp(format!(
-            "MCP server {server} serverInfo has an empty name or version"
+            "MCP server {server} serverInfo name/version must contain 1-{MAX_SERVER_INFO_FIELD_BYTES} bytes"
         )));
     }
     Ok(McpServerInfo {
-        name: name.to_owned(),
-        version: version.to_owned(),
+        name: untrusted_display::sanitize_single_line(name),
+        version: untrusted_display::sanitize_single_line(version),
     })
 }
 
@@ -1171,13 +1197,13 @@ fn sanitized_stderr_snapshot(server: &str, capture: &Arc<Mutex<StderrCapture>>) 
     let prefix = format!("[mcp:{server} stderr] ");
     let mut body = String::with_capacity(bytes.len());
     body.push_str(&prefix);
-    for character in String::from_utf8_lossy(&bytes).chars() {
+    let sanitized = untrusted_display::sanitize_text(&String::from_utf8_lossy(&bytes));
+    for character in sanitized.chars() {
         match character {
             '\n' => {
                 body.push('\n');
                 body.push_str(&prefix);
             }
-            character if is_stderr_presentation_control(character) => body.push('�'),
             character => body.push(character),
         }
     }
@@ -1191,28 +1217,6 @@ fn sanitized_stderr_snapshot(server: &str, capture: &Arc<Mutex<StderrCapture>>) 
     let budget = MAX_STDERR_CAPTURE_BYTES.saturating_sub(marker.len());
     let tail = prefixed_stderr_tail(&body, &prefix, budget);
     format!("{marker}{tail}")
-}
-
-/// Characters in these ranges can alter terminal/UI presentation without
-/// being rejected by `char::is_control()`. They are replaced rather than
-/// preserved so an MCP server cannot spoof a later trust or approval prompt.
-fn is_stderr_presentation_control(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{00ad}'
-                | '\u{061c}'
-                | '\u{180e}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2060}'..='\u{206f}'
-                | '\u{feff}'
-                | '\u{fff9}'..='\u{fffb}'
-                | '\u{1bca0}'..='\u{1bca3}'
-                | '\u{1d173}'..='\u{1d17a}'
-                | '\u{e0001}'
-                | '\u{e0020}'..='\u{e007f}'
-        )
 }
 
 fn prefixed_stderr_tail<'a>(
@@ -1351,7 +1355,10 @@ impl ClientError {
                 format!("MCP server {server} protocol violation during {operation}: {message}")
             }
             Self::Rpc(error) => {
-                format!("MCP server {server} returned JSON-RPC error during {operation}: {error}")
+                format!(
+                    "MCP server {server} returned JSON-RPC error during {operation}: {}",
+                    untrusted_display::json_for_display(error)
+                )
             }
         }
     }
@@ -1484,22 +1491,39 @@ mod tests {
 
     #[test]
     fn structured_content_is_required_only_for_declared_output_schema() {
+        let output_schema = json!({
+            "type":"object",
+            "properties":{"value":{"type":"string"}},
+            "required":["value"],
+            "additionalProperties":false
+        });
         assert!(
             validate_tool_call_result(
                 "fixture",
                 &json!({"content":[],"structuredContent":"free-form"}),
-                false,
+                None,
             )
             .is_ok()
         );
-        assert!(validate_tool_call_result("fixture", &json!({"content":[]}), true).is_err());
+        assert!(
+            validate_tool_call_result("fixture", &json!({"content":[]}), Some(&output_schema))
+                .is_err()
+        );
         assert!(
             validate_tool_call_result(
                 "fixture",
                 &json!({"content":[],"structuredContent":{"value":"ok"}}),
-                true,
+                Some(&output_schema),
             )
             .is_ok()
+        );
+        assert!(
+            validate_tool_call_result(
+                "fixture",
+                &json!({"content":[],"structuredContent":{"value":42}}),
+                Some(&output_schema),
+            )
+            .is_err()
         );
         assert!(
             parse_tool(
@@ -1519,6 +1543,27 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn untrusted_metadata_and_results_have_a_safe_display_projection() {
+        let tool = parse_tool(
+            "fixture",
+            &json!({
+                "name":"safe_name",
+                "description":"visible\u{202e}hidden\u{200b}",
+                "inputSchema":{"type":"object"}
+            }),
+        )
+        .expect("parse display fixture");
+        assert_eq!(tool.definition.description, "visible�hidden�");
+
+        let raw = json!({"text":"visible\u{202e}hidden\u{200b}\u{2028}line"});
+        let rendered = tool_result_for_display(&raw);
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(!rendered.contains('\u{200b}'));
+        assert!(!rendered.contains('\u{2028}'));
+        assert_eq!(raw["text"], "visible\u{202e}hidden\u{200b}\u{2028}line");
     }
 
     #[test]

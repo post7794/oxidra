@@ -236,5 +236,11 @@ cancellation returns promptly, and project-root boundaries hold across file
 tools. CI runs Rust 1.85 on Windows, Linux, and macOS via
 `.github/workflows/ci.yml`.
 
-Oxidra has no extension system. The removed experimental implementation is
-retained only as historical source at the `archive/mcp-mvp` tag.
+The main branch contains an MCP stdio kernel, explicit project-config reader,
+execution-plan approval capability, fixed JSON Schema profile, and a
+session-scoped registry. These are Rust policy foundations only: MCP is not yet
+wired into the CLI, Agent tool surface, approvals, or session journal, so users
+still have only the built-in tools. Approving an MCP execution plan grants that
+local program the authority of the current OS user; future per-tool approval is
+request audit/intent confirmation, not a filesystem or network sandbox. See
+`docs/mcp-roadmap.md` for the remaining integration and recovery gates.

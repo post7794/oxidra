@@ -347,7 +347,7 @@ mod linux_containment {
         use super::process_policy_filter;
 
         #[test]
-        fn linux_mcp_seccomp_policy_v2_is_frozen() {
+        fn linux_mcp_seccomp_policy_v1_is_frozen() {
             let mut bytes = Vec::new();
             for instruction in process_policy_filter() {
                 bytes.extend_from_slice(&instruction.code.to_le_bytes());

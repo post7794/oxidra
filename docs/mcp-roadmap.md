@@ -1,8 +1,8 @@
 # Oxidra MCP 接入路线
 
-状态：MCP stdio transport/session kernel v2、显式 project-config reader v1、
-execution-plan digest v2 和 session-scoped tool registry v4 已实现，尚未接入 Agent、
-CLI 参数或 session journal。
+状态：MCP stdio transport/session kernel v1、显式 project-config reader v1、
+execution-plan digest v1、JSON Schema profile v1 和 session-scoped tool registry v1
+已实现，尚未接入 Agent、CLI 参数或 session journal。
 当前代码只能由 Rust 调用方显式加载绝对 config path 并构造 registry；它不是已经
 对用户开放的插件入口。
 
@@ -12,22 +12,26 @@ MCP 不只是“从外部加载一组函数”。一次 `tools/call` 可能修�
 而客户端在写出请求后崩溃、超时或断线时，无法仅凭本地状态判断副作用是否
 发生。因此 Agent 接入必须先解决以下问题，不能先把工具塞进 Provider 请求：
 
-1. **工具表是版本化输入。** Provider 看到的名称、描述和 schema 必须进入
+1. **execution approval 是进程级信任。** 启动/discovery 发生在任何 tool call 之前；
+   获批 server 拥有当前 OS 用户的文件和网络权限，也可能在 startup/discovery 产生
+   副作用。Linux seccomp 只约束生命周期和后代进程，不是权限 sandbox。未来的
+   per-tool approval 只能确认请求意图并形成审计证据，不能反向限制已运行的进程。
+2. **工具表是版本化输入。** Provider 看到的名称、描述和 schema 必须进入
    `context.tools` snapshot/epoch/digest；调用只能绑定生成该 tool call 时的工具表。
-2. **授权先于 durable start。** 未通过项目 trust 和 per-tool approval 时，不能写
+3. **授权先于 durable start。** 未通过项目 trust 和 per-tool approval 时，不能写
    `tool.started`，更不能向 MCP server 发送请求。
-3. **写出后未知即 `in_doubt`。** 只有经过校验的 complete result 能关闭副作用
+4. **写出后未知即 `in_doubt`。** 只有经过校验的 complete result 能关闭副作用
    不确定窗口；JSON-RPC error 也不能证明服务端已回滚。
-4. **未知副作用不自动重试。** `tool.in_doubt` 必须复用现有人工解决协议，不能因
+5. **未知副作用不自动重试。** `tool.in_doubt` 必须复用现有人工解决协议，不能因
    transport 重启、turn retry 或 compaction 自动重放。
-5. **历史协议有限且显式。** 只支持登记的协议版本和 reducer 版本；未知版本、
+6. **历史协议有限且显式。** 只支持登记的协议版本和 reducer 版本；未知版本、
    动态 schema 变化和未支持的交互一律 fail closed。
 
-## 2. 已实现：stdio kernel v2
+## 2. 已实现：stdio kernel v1
 
 实现位于 `src/mcp.rs`，集成测试位于 `tests/mcp_stdio.rs`。
-kernel v1 的协议/限制组合继续由 registry v1-v3 冻结；当前 writer 使用 kernel v2，
-其新增语义仅是 Linux 强 containment 与对应的 no-subprocess 限制，没有原地改写 v1。
+MCP 尚未进入 CLI/journal，也未对外发布，因此首次可持久化版本直接登记当前实现为
+kernel v1；内部提交序号不保留成伪历史协议。
 
 ### 协议范围
 
@@ -60,8 +64,8 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - 子进程先 `env_clear()`，只继承显式 allowlist 和显式配置值；环境变量名按
   ASCII 不区分大小写去重，避免同一配置在 Windows 与 Unix 上产生不同含义。
 - `ProcessTree` 在 Windows 使用 `CREATE_SUSPENDED` 启动 MCP 进程，先关联带
-  `KILL_ON_JOB_CLOSE` 的 Job Object，再恢复主线程。Linux stdio kernel v2 在 `exec`
-  不可信 server 代码前安装 seccomp：允许同一 thread group 内的线程，但拒绝独立
+  `KILL_ON_JOB_CLOSE` 的 Job Object，再恢复主线程。Linux stdio kernel v1 在 `exec`
+  已批准的 server 代码前安装 seccomp：允许同一 thread group 内的线程，但拒绝独立
   `fork`/`vfork`/`clone`/`clone3`、namespace/session/process-group escape，并禁止清除
   `PDEATHSIG` 或通过 credential mutation 触发内核清除；Oxidra 同时用 pidfd 固定唯一
   server PID 的身份。宿主被 `SIGKILL` 时，
@@ -70,12 +74,16 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
   seccomp/pidfd 时，以及其他 Unix（包括当前 macOS）缺少等价边界时，都会 fail closed。
   受支持平台上的连接失败、取消、协议错误、in-doubt、shutdown 或宿主强杀不会留下
   MCP 后代进程。
-- Linux kernel v2 的强保证来自“禁止 server 创建独立子进程”，不是启动后补扫后代。
+- Linux kernel v1 的 lifecycle 保证来自“禁止 server 创建独立子进程”，不是启动后补扫后代。
   因此当前不支持需要 subprocess 的 MCP server，也不支持依赖 `npx`、shell wrapper
   等二次 spawn 的启动链；应直接配置最终 interpreter/executable。若未来需要允许
   subprocess，必须新增基于 PID namespace/cgroup 或等价 ownership primitive 的 kernel
-  版本，不能放宽 v2 的冻结语义。x86_64 与 aarch64 的 classic-BPF instruction stream
+  版本，不能放宽 v1 的冻结语义。x86_64 与 aarch64 的 classic-BPF instruction stream
   各有固定 SHA-256 fixture，修改 syscall policy 必须升级 kernel/registry 版本。
+- 该 containment **不限制**已批准 server 以当前 OS 用户权限读写文件或访问网络；
+  它解决的是受支持平台上的 spawn/cleanup ownership，不是插件权限隔离。需要运行
+  不可信插件时，必须另行设计 AppContainer、低权限账户、namespace/cgroup、文件与
+  网络 capability 等权限边界，不能把 per-tool approval 或 seccomp no-subprocess 当替代品。
 - server stderr 使用持续 drain 的 64 KiB 有界捕获，不直接继承交互终端；诊断快照
   带 server 来源前缀，并清理终端控制字符、bidi、零宽字符和 Unicode 行分隔符，
   避免污染后续 trust/approval 界面。
@@ -83,9 +91,12 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
   再检查 cancellation，不会为已取消的连接执行 server 初始化代码。
 - 单条 JSONL 上限 1 MiB；工具表上限 512 KiB、512 个工具、64 页；单次工具
   result 上限 50 KiB。
-- `inputSchema` 必须声明 object root；可选 `outputSchema` 同样保留在 `McpTool`
-  中并要求 object root。当前 kernel 只验证 result 的结构性义务，不声称完整执行
-  JSON Schema 的全部断言关键词。
+- `inputSchema` 与可选 `outputSchema` 必须通过固定 JSON Schema profile v1，根类型
+  为 object。profile 支持登记的 type/object/array/string/number/composition 关键词，
+  拒绝 `$ref` 和所有未知关键词。调用参数在序列化 `tools/call` 前验证；失败返回
+  `validation_error`、`in_doubt=false` 且 server 收不到请求。声明 output schema 时，
+  complete result 必须包含满足 schema 的 `structuredContent`；失败按已写出协议错误
+  返回 `in_doubt=true` 并关闭 transport。它是有限 profile，不声称实现完整 JSON Schema。
 - tool name 只接受 MCP 登记的 ASCII `[A-Za-z0-9_.-]` 子集，Agent 层仍需映射为
   独立、稳定、无碰撞的 Provider tool name。
 - server 若声明 `tools.listChanged=true`，或会话中发送
@@ -104,27 +115,29 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - 最多 16 个 server；名称唯一，command 为绝对文件，cwd 为 project 内相对目录。
 - project config 只允许环境变量 inherit allowlist，不接受明文 `[servers.env]` secret。
 - 原始 config bytes 计算 SHA-256；effective canonical command/cwd、args、继承环境变量名
-  和显式环境变量名进入启动前可得的 execution-plan digest v2。路径按平台使用无损
-  OS-native 编码，不通过 `to_string_lossy()` 生成执行身份。冻结的 v1 算法与字面量
-  fixture 保留，但当前 writer 不再把实际环境值放入公开 SHA-256。
-- execution-plan v2 是 **path/command capability trust**，不是代码内容 attestation。
+  和显式环境变量名进入启动前可得的 execution-plan digest v1。路径按平台使用无损
+  OS-native 编码，不通过 `to_string_lossy()` 生成执行身份；实际环境值不进入公开
+  SHA-256，避免为低熵 secret 建立离线猜测 oracle。
+- execution-plan v1 是 **path/command capability trust**，不是代码内容 attestation。
   它批准 canonical command、cwd、args 和环境权限；不会散列解释器参数所指脚本、
   executable 的依赖闭包或文件内容。文件在相同路径被原地替换时 digest 不变。若未来
   需要“批准具体代码字节”，必须新增独立、版本化的 content-identity 协议，不能原地
-  扩大 v2 的含义。
+  扩大 v1 的含义。
+- `McpProjectConfig::load()` 只被动生成 immutable prepared plan；
+  `approve_execution(expected_digest)` 才生成 Registry connect 所需的 capability。
+  trust UI 与 spawn 必须消费同一个 prepared plan，digest mismatch 在启动任何代码前失败。
 
-### 3.2 session-scoped registry v4
+### 3.2 session-scoped registry v1
 
 - 合并 server 工具后仍限制为 512 tools / 512 KiB，不把 per-server 限额误当全局限额。
 - raw identity `(server, tool)` 映射为满足 Responses function-name 约束的稳定 64-byte
   namespace；alias 带 identity hash，且仍执行实际 collision 检查。
-- input/output schema、raw/provider name、协议版本和 execution-plan digest v2 进入当前
-  registry-digest v4；v4 同时冻结 stdio kernel v2。字面量 fixture 固定其 SHA-256。
-  旧 registry-digest v1/v2/v3 分别继续绑定已登记的 kernel/execution-plan 组合，其
-  字面量 SHA 与算法保留，不会被原地改写。
+- input/output schema、raw/provider name、server 协议版本、execution-plan v1、stdio
+  kernel v1 和 JSON Schema profile v1 进入 registry-digest v1；字面量 fixture 固定
+  其 SHA-256。MCP 尚未发布或写入 journal，因此不存在 v2-v4 legacy digest。
 - registry 可按 provider alias 调用对应长连接 session，并统一 shutdown 全部进程。
 
-execution-plan digest 与 registry digest 是单向的两层证据：前者在启动任何不可信代码
+execution-plan digest 与 registry digest 是单向的两层证据：前者在启动任何外部代码
 之前授权“按哪些路径、参数和环境权限执行”，后者只能在 discovery 之后冻结“模型能
 看到哪些工具”。工具表 digest 不能反向充当 executable 的执行许可；path trust 也不能
 被表述成具体代码内容已经得到认证。
@@ -152,10 +165,9 @@ config reader 已实现，但 CLI 还不能选择它。用户入口必须：
 - raw identity 为 `(server_name, raw_tool_name)`；
 - 生成满足 Provider 约束的稳定 namespace，长度超限或 alias collision 时 fail closed；
 - 保存原始 MCP schema、Provider 投影 schema、server protocol、kernel version、
-  config digest 和全表 digest；
-- 为 MCP schema 登记有限、版本化的 JSON Schema profile，或引入完整且固定版本的
-  validator。现有 `validate_json_schema()` 会忽略未知关键词，只适合内置工具，不能
-  作为远程 MCP schema 的安全/正确性 authority；
+  config digest、schema-profile version 和全表 digest；
+- 直接消费已登记的 MCP JSON Schema profile v1 验证结果，不能改用会忽略未知关键词
+  的内置 `validate_json_schema()`；
 - 合并内置/history/MCP 工具前做全局 collision 检查；
 - registry snapshot 进入 `context.tools`，同一 prepared request 与后续调用必须使用
   同一 epoch，不能在中途重新 list。
@@ -178,6 +190,8 @@ config reader 已实现，但 CLI 还不能选择它。用户入口必须：
 ### 4.4 approval 与结果投影
 
 - 第一版所有 MCP tool 默认需要 approval；不能让 `--full-auto` 自动授权远程副作用。
+  该 approval 只确认本次 `tools/call` 意图和 durable journal 顺序，不是 MCP 进程权限
+  sandbox，也不能覆盖 startup/discovery 已经可能产生的副作用。
 - 后续若增加只读 policy，权限必须来自本地配置，不信任 server annotations 自报。
 - MCP `content`、`structuredContent` 和 `_meta` 是不可信 tool output；投给模型前使用
   有界、确定的 envelope，不提升为 instructions。
@@ -205,7 +219,9 @@ config reader 已实现，但 CLI 还不能选择它。用户入口必须：
 5. complete、MCP `isError`、RPC error、取消、timeout、server exit、超限结果测试；
 6. unresolved in-doubt 阻止 Provider 继续和人工 resolution E2E；
 7. approval 未通过时 journal 无 `tool.started` 且 server 未收到 `tools/call`；
-8. Debug/Release、Clippy、Rustdoc、fmt、`git diff --check` 和三平台 CI。
+8. schema-invalid 参数不 dispatch、未知关键词 fail closed、output mismatch 进入
+   `in_doubt` 的 fixture；
+9. Debug/Release、Clippy、Rustdoc、fmt、`git diff --check` 和三平台 CI。
 
 真正的完成标准不是“模型能调用一个 MCP tool”，而是：**schema、授权、durable
 dispatch、副作用不确定性与 resume 都由同一个版本化证据链约束。**
