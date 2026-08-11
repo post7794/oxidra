@@ -103,7 +103,19 @@ pub(super) fn validate_tool_schema(schema: &Value, label: &str) -> Result<(), St
 }
 
 pub(super) fn preflight_instance(instance: &Value) -> Result<(), ValidationError> {
-    preflight_instance_budget(instance).map(|_| ())
+    preflight_instance_for_profile(MCP_SCHEMA_PROFILE_VERSION, instance)
+}
+
+pub(super) fn preflight_instance_for_profile(
+    version: u32,
+    instance: &Value,
+) -> Result<(), ValidationError> {
+    match version {
+        1 => preflight_instance_budget(instance).map(|_| ()),
+        _ => Err(ValidationError::unsupported_value(format!(
+            "unsupported MCP schema profile version {version}"
+        ))),
+    }
 }
 
 pub(super) fn validate_instance(schema: &Value, instance: &Value) -> Result<(), ValidationError> {

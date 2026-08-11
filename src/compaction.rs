@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::error::{OxidraError, Result};
 use crate::event_kind::{is_response_terminal, is_tool_lifecycle};
+use crate::mcp::{MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, validate_mcp_call_chain_for_version};
 use crate::projection::{
     SOURCE_PROJECTION_VERSION, project_events_for_compaction,
     source_projection_supports_boundary_exclusions, validate_response_output_items,
@@ -42,7 +43,7 @@ pub const COMPACTION_ABORTED_KIND: &str = "compaction.aborted";
 // boundary events are the durable intent/state machine for that larger
 // request boundary.  They deliberately live in `extra`/open journal kinds so
 // the already-published checkpoint protocol remains byte-for-byte compatible.
-pub const COMPACTION_BOUNDARY_VERSION: u32 = 5;
+pub const COMPACTION_BOUNDARY_VERSION: u32 = 6;
 pub const COMPACTION_BOUNDARY_STARTED_KIND: &str = "compaction.boundary.started";
 pub const COMPACTION_BOUNDARY_CHECKPOINTED_KIND: &str = "compaction.boundary.checkpointed";
 pub const COMPACTION_BOUNDARY_FAILED_KIND: &str = "compaction.boundary.failed";
@@ -63,28 +64,33 @@ const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2: u32 = 4;
 const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V3: u32 = 4;
 const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4: u32 = 5;
 const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V5: u32 = 5;
+const COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V6: u32 = 6;
 // Boundary v2/v3 were published against slot reducer v1. Keep this literal
 // binding stable even if the current writer later adopts a newer slot policy.
 const COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1: u32 = 1;
 const COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V2: u32 = 2;
+const COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V3: u32 = 3;
 const COMPACTION_BOUNDARY_BUDGET_RETRY_OVERLAY_VERSION_V1: u32 = 1;
 const COMPACTION_BOUNDARY_VERSION_V1: u32 = 1;
 const COMPACTION_BOUNDARY_VERSION_V2: u32 = 2;
 const COMPACTION_BOUNDARY_VERSION_V3: u32 = 3;
 const COMPACTION_BOUNDARY_VERSION_V4: u32 = 4;
 const COMPACTION_BOUNDARY_VERSION_V5: u32 = 5;
-const SUPPORTED_COMPACTION_BOUNDARY_VERSIONS: [u32; 5] = [
+const COMPACTION_BOUNDARY_VERSION_V6: u32 = 6;
+const SUPPORTED_COMPACTION_BOUNDARY_VERSIONS: [u32; 6] = [
     COMPACTION_BOUNDARY_VERSION_V1,
     COMPACTION_BOUNDARY_VERSION_V2,
     COMPACTION_BOUNDARY_VERSION_V3,
     COMPACTION_BOUNDARY_VERSION_V4,
     COMPACTION_BOUNDARY_VERSION_V5,
+    COMPACTION_BOUNDARY_VERSION_V6,
 ];
 
 #[derive(Clone, Copy)]
 struct CompactionBoundaryPolicy {
     turn_validator_version: u32,
     turn_metadata_ceiling: Option<u32>,
+    mcp_call_chain_validator_version: Option<u32>,
     provider_budget_retry_overlay_version: Option<u32>,
     provider_request_slot_validator_version: Option<u32>,
     legacy_completion_uses_next_user: bool,
@@ -101,6 +107,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
         COMPACTION_BOUNDARY_VERSION_V1 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1,
             turn_metadata_ceiling: Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V1),
+            mcp_call_chain_validator_version: None,
             provider_budget_retry_overlay_version: None,
             provider_request_slot_validator_version: None,
             legacy_completion_uses_next_user: false,
@@ -112,6 +119,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
         COMPACTION_BOUNDARY_VERSION_V2 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2,
             turn_metadata_ceiling: Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2),
+            mcp_call_chain_validator_version: None,
             provider_budget_retry_overlay_version: None,
             provider_request_slot_validator_version: Some(
                 COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V1,
@@ -125,6 +133,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
         COMPACTION_BOUNDARY_VERSION_V3 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V3,
             turn_metadata_ceiling: Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V3),
+            mcp_call_chain_validator_version: None,
             provider_budget_retry_overlay_version: Some(
                 COMPACTION_BOUNDARY_BUDGET_RETRY_OVERLAY_VERSION_V1,
             ),
@@ -140,6 +149,7 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
         COMPACTION_BOUNDARY_VERSION_V4 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4,
             turn_metadata_ceiling: Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4),
+            mcp_call_chain_validator_version: None,
             provider_budget_retry_overlay_version: None,
             provider_request_slot_validator_version: Some(
                 COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V2,
@@ -153,9 +163,24 @@ fn compaction_boundary_policy(version: u32) -> Result<CompactionBoundaryPolicy> 
         COMPACTION_BOUNDARY_VERSION_V5 => Ok(CompactionBoundaryPolicy {
             turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V5,
             turn_metadata_ceiling: Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V5),
+            mcp_call_chain_validator_version: None,
             provider_budget_retry_overlay_version: None,
             provider_request_slot_validator_version: Some(
                 COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V2,
+            ),
+            legacy_completion_uses_next_user: true,
+            enforces_session_protocol_epoch: true,
+            requires_attempt_resolution_before_abandon: true,
+            requires_settled_slot_before_abandon: true,
+            supports_resolved_without_checkpoint: true,
+        }),
+        COMPACTION_BOUNDARY_VERSION_V6 => Ok(CompactionBoundaryPolicy {
+            turn_validator_version: COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V6,
+            turn_metadata_ceiling: Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V6),
+            mcp_call_chain_validator_version: Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V1),
+            provider_budget_retry_overlay_version: None,
+            provider_request_slot_validator_version: Some(
+                COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V3,
             ),
             legacy_completion_uses_next_user: true,
             enforces_session_protocol_epoch: true,
@@ -973,6 +998,9 @@ fn boundary_turn_facts(version: u32, events: &[JournalEvent]) -> Result<Boundary
     let policy = compaction_boundary_policy(version)?;
     let compatibility_events = boundary_turn_compatibility_view(events, policy)?;
     let validation_events = compatibility_events.as_deref().unwrap_or(events);
+    if let Some(mcp_version) = policy.mcp_call_chain_validator_version {
+        validate_mcp_call_chain_for_version(mcp_version, validation_events)?;
+    }
     let turns = segment_turns_for_version(policy.turn_validator_version, validation_events)?;
     let mut facts = BoundaryTurnFacts::default();
     for turn in turns {
@@ -2971,6 +2999,7 @@ fn validate_boundary_version_for_turn(
         }
         Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V2) => COMPACTION_BOUNDARY_VERSION_V2,
         Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V4) => COMPACTION_BOUNDARY_VERSION_V4,
+        Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V6) => COMPACTION_BOUNDARY_VERSION_V6,
         Some(version) => {
             return session_error(format!(
                 "unsupported turn boundary version {version} at user.message seq {user_message_seq}"
@@ -3042,6 +3071,24 @@ fn validate_boundary_version_transition(
         ) | (
             COMPACTION_BOUNDARY_VERSION_V5,
             COMPACTION_BOUNDARY_VERSION_V5
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V1,
+            COMPACTION_BOUNDARY_VERSION_V6
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V2,
+            COMPACTION_BOUNDARY_VERSION_V6
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V3,
+            COMPACTION_BOUNDARY_VERSION_V6
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V4,
+            COMPACTION_BOUNDARY_VERSION_V6
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V5,
+            COMPACTION_BOUNDARY_VERSION_V6
+        ) | (
+            COMPACTION_BOUNDARY_VERSION_V6,
+            COMPACTION_BOUNDARY_VERSION_V6
         )
     );
     if !allowed {
@@ -7667,12 +7714,27 @@ mod tests {
             Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V5)
         );
         assert!(v5.supports_resolved_without_checkpoint);
+        let v6 =
+            compaction_boundary_policy(COMPACTION_BOUNDARY_VERSION_V6).expect("boundary v6 policy");
+        assert_eq!(
+            v6.provider_request_slot_validator_version,
+            Some(COMPACTION_BOUNDARY_PROVIDER_SLOT_VALIDATOR_VERSION_V3)
+        );
+        assert_eq!(
+            v6.turn_metadata_ceiling,
+            Some(COMPACTION_BOUNDARY_TURN_VALIDATOR_VERSION_V6)
+        );
+        assert_eq!(
+            v6.mcp_call_chain_validator_version,
+            Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V1)
+        );
+        assert!(v6.supports_resolved_without_checkpoint);
     }
 
     #[test]
     fn boundary_v5_resolves_below_trigger_without_discarding_the_turn() {
         let mut events = vec![
-            open_user(1, "turn-1", "prompt"),
+            open_user_with_boundary_version(1, "turn-1", "prompt", 5),
             boundary_started_with_version(2, "boundary-1", "turn-1", 1, 5),
             event(
                 3,
@@ -8094,7 +8156,7 @@ mod tests {
             .expect_err("current turn validator must not opt into boundary v1")
             .to_string();
         assert!(
-            error.contains("minimum compaction boundary version is 4"),
+            error.contains("minimum compaction boundary version is 6"),
             "unexpected boundary error: {error}"
         );
 

@@ -1,8 +1,9 @@
 # Oxidra MCP 接入路线
 
 状态：MCP stdio transport/session kernel v1、显式 project-config reader v1、
-execution-plan digest v1、JSON Schema profile v1、session-scoped tool registry v1 和
-durable execution coordinator core v1 已实现，尚未接入 Agent 或 CLI 参数。
+execution-plan digest v1、JSON Schema profile v1、session-scoped tool registry v1、
+durable execution coordinator core v1 和 MCP call-chain validator v1 已实现，尚未接入
+Agent 或 CLI 参数。
 当前代码只能由 Rust 调用方显式加载绝对 config path、批准 execution plan 与 registry
 surface，并把 coordinator 绑定到 session journal；它不是已经对用户开放的插件入口。
 
@@ -29,9 +30,9 @@ MCP 不只是“从外部加载一组函数”。一次 `tools/call` 可能修�
 
 ## 2. 已实现：stdio kernel v1
 
-实现位于 `src/mcp.rs`，集成测试位于 `tests/mcp_stdio.rs`。
-MCP 尚未进入 CLI/journal，也未对外发布，因此首次可持久化版本直接登记当前实现为
-kernel v1；内部提交序号不保留成伪历史协议。
+实现位于 `src/mcp.rs`，集成测试位于 `tests/mcp_stdio.rs`。MCP 尚未进入 CLI/Agent 用户
+路径，也未对外发布；journal 目前仅由显式 Rust coordinator API 写入。因此首次可持久化
+版本直接登记当前实现为 kernel v1，内部提交序号不保留成伪历史协议。
 
 ### 协议范围
 
@@ -208,9 +209,36 @@ registry epoch 的 reader，也尚未把 `context.tools` snapshot writer 改为�
 `response.started` 填充上述 registry epoch 字段。Agent 必须从同一 prepared request snapshot
 写入这些字段，证明 Provider request 所使用的 `context.tools`、返回 call、approval、started
 和 permit 属于同一个 epoch；完成这条绑定前不能把 MCP definitions 放进 Agent 请求。
-此外，现有 turn/projection/history reducer 仍会接受通用 `tool.completed` 等事件；在 Agent
-接入前必须新增冻结版本的 MCP call-chain validator，使这些 reducer 只消费经过 activation、
-durable Provider call、started provenance 和 terminal lineage 完整证明的 canonical MCP facts。
+
+### 3.4 MCP call-chain validator v1
+
+MCP terminal 的语义权限现由单一、冻结的 call-chain validator 授予，不再要求 turn、slot、
+projection 和 history 各自“碰巧做出相同判断”：
+
+- `mcp.registry.activated` 持久化 `call_chain_validator_version = 1`；coordinator v1、turn v6、
+  Provider slot v3、source projection v5、history extractor v5 和 compaction boundary v6 均
+  绑定字面量 validator v1，而不是读取未来可变的默认版本。
+- validator 从 activation 之后、显式带同一 registry epoch/digest 的 `response.started` 与唯一
+  `response.completed` 重建 durable MCP call；activation 之前的同名普通工具保持历史语义，
+  不会被未来 registry 追溯解释。
+- lifecycle 必须使用 canonical `call_id`。generic reducer 兼容的 `id` alias 不能结算 MCP
+  call；turn/call/provider、参数 digest、started seq、registry/execution provenance 和 terminal
+  状态迁移均由同一 validator 证明。
+- session reopen 在写入任何自动 recovery terminal 之前先验证已有 MCP chain。未开始调用仅
+  能由 `journal.recovered` marker 授权的 `tool.skipped_due_to_recovery` 关闭，并绑定原始
+  response seq、参数 digest 和 marker 中的 exact unstarted-call authorization；同时要求
+  `response_seq < recovery_marker_seq < skip_seq`。其他 generic `tool.skipped_due_to_*` 在
+  v1 中不能结算 MCP call。
+- 同一 Provider response attempt 必须只有一个 terminal；session recovery 还会在写入 skip
+  前后运行冻结的 generic Provider slot v2 consistency check，非法 response/tool ordering
+  不会先被自动 recovery 写入污染。
+- schema profile v1 也是 validator v1 的冻结传递依赖；历史 `tool.started` 不读取未来默认
+  profile。未知 call-chain、activation、provenance 或 profile 版本一律 fail closed。
+
+call-chain v1 解决的是 durable 事实解释，不会自动恢复 live server。下一阶段仍需在 session
+reopen 后按已批准 execution plan 重建或替换 live registry epoch，并把实际 request 的
+`context.tools` snapshot 与 `response.started` epoch 一次性绑定；完成前不能向 Agent 暴露
+MCP definitions。
 
 ## 4. 尚未实现：Agent 与 CLI policy
 
@@ -283,8 +311,10 @@ config reader 已实现，但 CLI 还不能选择它。用户入口必须：
 - transport/kernel 的 `in_doubt` 只能由现有 `tool.in_doubt_resolved` 流程显式解决；
 - session reopen 必须在启动 MCP server 前先归约 journal；存在 unresolved in-doubt 时
   禁止继续 Provider turn；
-- projection/history 继续只消费经过 turn reducer 验证的标准 tool terminal，不直接
-  扫描 MCP 私有字段。
+- session reopen 在自动写入 `response.aborted`、recovery skip 或 boundary repair 之前先运行
+  MCP call-chain validator，并在 repair 后再次验证完整 journal；
+- projection/history 只消费同时通过冻结 call-chain validator 与 turn reducer 的标准 tool
+  terminal，不自行建立第二套 MCP terminal 事实源。
 
 ### 4.4 approval 与结果投影
 

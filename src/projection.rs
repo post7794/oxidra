@@ -12,6 +12,7 @@ use crate::compaction::{
     validate_compaction_boundary_chain,
 };
 use crate::error::{OxidraError, Result};
+use crate::mcp::{MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, validate_mcp_call_chain_for_version};
 use crate::session::JournalEvent;
 use crate::turn::{
     ValidatedTurnRecovery, complete_prefix_candidates, validate_turn_recovery_v2,
@@ -19,7 +20,9 @@ use crate::turn::{
 };
 
 /// Current immutable event-to-item format used when building compaction input.
-pub const SOURCE_PROJECTION_VERSION: u32 = 4;
+pub const SOURCE_PROJECTION_VERSION: u32 = 5;
+const SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5: u32 =
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V1;
 
 /// Whether a persisted source projection version can prove that a validated
 /// compaction-boundary abandon was excluded from the opaque summary source.
@@ -30,7 +33,7 @@ pub const SOURCE_PROJECTION_VERSION: u32 = 4;
 pub(crate) fn source_projection_supports_boundary_exclusions(version: u32) -> Result<bool> {
     match version {
         1..=3 => Ok(false),
-        4 => Ok(true),
+        4 | 5 => Ok(true),
         _ => Err(OxidraError::Session(format!(
             "unsupported compaction source projection version {version}"
         ))),
@@ -48,6 +51,10 @@ pub(crate) fn project_events_with_boundary_chain(
     events: &[JournalEvent],
     boundary_chain: &CompactionBoundaryChain,
 ) -> Result<Vec<Value>> {
+    validate_mcp_call_chain_for_version(
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5,
+        events,
+    )?;
     let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
     project_events_current(events, &excluded_turn_ids)
 }
@@ -63,6 +70,10 @@ pub(crate) fn project_events_for_recovery_planning(
     events: &[JournalEvent],
     boundary_chain: &CompactionBoundaryChain,
 ) -> Result<Vec<Value>> {
+    validate_mcp_call_chain_for_version(
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5,
+        events,
+    )?;
     project_events_current(events, &boundary_chain.abandoned_turn_ids())
 }
 
@@ -74,6 +85,7 @@ pub fn project_events_for_compaction(version: u32, events: &[JournalEvent]) -> R
         2 => project_events_v2(events),
         3 => project_events_v3(events),
         4 => project_events_v4(events),
+        5 => project_events_v5(events),
         _ => Err(OxidraError::Session(format!(
             "unsupported compaction source projection version {version}"
         ))),
@@ -100,6 +112,17 @@ fn project_events_v4(events: &[JournalEvent]) -> Result<Vec<Value>> {
     // v4 is the first compaction source format that consumes the independently
     // versioned boundary reducer and removes every item from a validated
     // abandoned boundary turn. v1-v3 intentionally remain unaware of it.
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+    let recovery = validate_turn_recovery_v3(events)?;
+    project_events_impl(events, Some(&recovery), true, Some(&excluded_turn_ids))
+}
+
+fn project_events_v5(events: &[JournalEvent]) -> Result<Vec<Value>> {
+    validate_mcp_call_chain_for_version(
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5,
+        events,
+    )?;
     let boundary_chain = validate_compaction_boundary_chain(events)?;
     let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
     let recovery = validate_turn_recovery_v3(events)?;
@@ -291,6 +314,10 @@ fn validate_user_input_item(item: &Value, seq: u64) -> Result<()> {
 
 /// Project only events after a verified complete-turn prefix boundary.
 pub fn project_tail(events: &[JournalEvent], covers_through_seq: u64) -> Result<Vec<Value>> {
+    validate_mcp_call_chain_for_version(
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5,
+        events,
+    )?;
     let boundary_is_valid = complete_prefix_candidates(events)?
         .iter()
         .any(|candidate| candidate.covers_through_seq == covers_through_seq);
@@ -324,6 +351,10 @@ pub(crate) fn project_checkpoint_and_tail_with_boundary_chain(
     chain: &CheckpointChain,
     boundary_chain: &CompactionBoundaryChain,
 ) -> Result<Vec<Value>> {
+    validate_mcp_call_chain_for_version(
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5,
+        events,
+    )?;
     let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
     project_checkpoint_and_tail_with_exclusions(events, chain, boundary_chain, &excluded_turn_ids)
 }
@@ -371,6 +402,10 @@ pub(crate) fn project_checkpoint_and_tail_for_recovery_planning(
     chain: &CheckpointChain,
     boundary_chain: &CompactionBoundaryChain,
 ) -> Result<Vec<Value>> {
+    validate_mcp_call_chain_for_version(
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5,
+        events,
+    )?;
     let excluded_turn_ids = boundary_chain.abandoned_turn_ids();
     project_checkpoint_and_tail_with_exclusions(events, chain, boundary_chain, &excluded_turn_ids)
 }
@@ -390,6 +425,10 @@ pub(crate) fn project_compaction_summary_and_tail(
     summary: &str,
     boundary_chain: &CompactionBoundaryChain,
 ) -> Result<Vec<Value>> {
+    validate_mcp_call_chain_for_version(
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5,
+        events,
+    )?;
     let excluded_turn_ids = boundary_chain.abandoned_turn_ids();
     let mut projected = vec![compacted_history_item(summary_envelope_version, summary)?];
     projected.extend(project_tail_after_validated_cutoff(

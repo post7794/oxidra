@@ -6,14 +6,18 @@ use serde_json::Value;
 
 use crate::compaction::validate_provider_budget_retries_v1;
 use crate::error::{OxidraError, Result};
+use crate::mcp::{MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, validate_mcp_call_chain_for_version};
 use crate::session::JournalEvent;
 
-pub const TURN_BOUNDARY_VALIDATOR_VERSION: u32 = 5;
+pub const TURN_BOUNDARY_VALIDATOR_VERSION: u32 = 6;
 pub const TURN_BOUNDARY_VERSION: u64 = TURN_BOUNDARY_VALIDATOR_VERSION as u64;
+const TURN_BOUNDARY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V1;
+const PROVIDER_REQUEST_SLOT_MCP_CALL_CHAIN_VALIDATOR_VERSION_V3: u32 =
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V1;
 /// Default slot reducer for a new writer. Persisted compaction boundary
 /// policies bind their own historical version and must not read this constant.
 #[allow(dead_code)]
-pub(crate) const PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION: u32 = 2;
+pub(crate) const PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionEvidence {
@@ -752,6 +756,7 @@ pub(crate) fn segment_turns_for_version(
         3 => segment_turns_v3(events),
         4 => segment_turns_v4(events),
         5 => segment_turns_v5(events),
+        6 => segment_turns_v6(events),
         _ => Err(OxidraError::Session(format!(
             "unsupported turn boundary reducer version {version}"
         ))),
@@ -994,6 +999,52 @@ fn segment_turns_v5(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
     segment_turns_base(&normalized, LegacyCompletionSeq::NextUserEvidence)
 }
 
+fn segment_turns_v6(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
+    validate_mcp_call_chain_for_version(TURN_BOUNDARY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6, events)?;
+    let recovery = validate_turn_recovery_v3(events)?;
+    let latest_retry_by_turn =
+        recovery
+            .retries
+            .iter()
+            .fold(HashMap::<String, u64>::new(), |mut latest, retry| {
+                latest
+                    .entry(retry.turn_id.clone())
+                    .and_modify(|seq| *seq = (*seq).max(retry.retry_seq))
+                    .or_insert(retry.retry_seq);
+                latest
+            });
+    let budget_retry_limit_seqs = validate_provider_budget_retries_v1(events)?
+        .into_iter()
+        .map(|retry| retry.limit_seq)
+        .collect::<HashSet<_>>();
+    let mut normalized = events.to_vec();
+    for event in &mut normalized {
+        normalize_boundary_version_v6_for_v1(event)?;
+        let context_retry_supersedes = event
+            .turn_id
+            .as_ref()
+            .and_then(|turn_id| latest_retry_by_turn.get(turn_id))
+            .is_some_and(|retry_seq| {
+                event.seq < *retry_seq
+                    && matches!(
+                        event.kind.as_str(),
+                        "response.failed"
+                            | "response.aborted"
+                            | "turn.cancelled"
+                            | "agent.stalled"
+                            | "agent.limit_reached"
+                            | "context.limit_reached"
+                    )
+            });
+        let budget_retry_supersedes =
+            event.kind == "agent.limit_reached" && budget_retry_limit_seqs.contains(&event.seq);
+        if context_retry_supersedes || budget_retry_supersedes {
+            event.kind = "turn.retry_superseded".to_owned();
+        }
+    }
+    segment_turns_base(&normalized, LegacyCompletionSeq::NextUserEvidence)
+}
+
 fn normalize_boundary_version_v4_for_v1(event: &mut JournalEvent) -> Result<()> {
     if let Some(version) = event.data.get_mut("turn_boundary_version") {
         let value = version.as_u64().ok_or_else(|| {
@@ -1062,6 +1113,45 @@ fn normalize_boundary_version_v5_for_v1(event: &mut JournalEvent) -> Result<()> 
             ))
         })?;
         if !matches!(value, 1..=5) {
+            return Err(OxidraError::Session(format!(
+                "unsupported inline turn boundary version {value} at seq {}",
+                event.seq
+            )));
+        }
+        *version = Value::from(1);
+    }
+    Ok(())
+}
+
+fn normalize_boundary_version_v6_for_v1(event: &mut JournalEvent) -> Result<()> {
+    if let Some(version) = event.data.get_mut("turn_boundary_version") {
+        let value = version.as_u64().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "turn boundary version at seq {} is not an unsigned integer",
+                event.seq
+            ))
+        })?;
+        if !matches!(value, 1..=6) {
+            return Err(OxidraError::Session(format!(
+                "unsupported turn boundary version {value} at seq {}",
+                event.seq
+            )));
+        }
+        *version = Value::from(1);
+    }
+    if let Some(version) = event
+        .data
+        .get_mut("turn_completion")
+        .and_then(Value::as_object_mut)
+        .and_then(|completion| completion.get_mut("turn_boundary_version"))
+    {
+        let value = version.as_u64().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "inline turn boundary version at seq {} is not an unsigned integer",
+                event.seq
+            ))
+        })?;
+        if !matches!(value, 1..=6) {
             return Err(OxidraError::Session(format!(
                 "unsupported inline turn boundary version {value} at seq {}",
                 event.seq
@@ -1574,10 +1664,22 @@ pub(crate) fn provider_request_slot_state_for_version(
     match version {
         1 => provider_request_slot_state_v1(events, turn_id),
         2 => provider_request_slot_state_v2(events, turn_id),
+        3 => provider_request_slot_state_v3(events, turn_id),
         _ => Err(OxidraError::Session(format!(
             "unsupported Provider request-slot reducer version {version}"
         ))),
     }
+}
+
+fn provider_request_slot_state_v3(
+    events: &[JournalEvent],
+    turn_id: &str,
+) -> Result<ProviderRequestSlotState> {
+    validate_mcp_call_chain_for_version(
+        PROVIDER_REQUEST_SLOT_MCP_CALL_CHAIN_VALIDATOR_VERSION_V3,
+        events,
+    )?;
+    provider_request_slot_state_v2(events, turn_id)
 }
 
 fn provider_request_slot_state_v2(

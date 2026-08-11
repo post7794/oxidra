@@ -6,6 +6,7 @@
 
 mod config;
 mod coordinator;
+mod journal;
 mod registry;
 mod schema;
 
@@ -17,6 +18,11 @@ pub use coordinator::{
     DenyMcpCallApproval, MCP_ARGUMENT_DIGEST_VERSION, MCP_DISPATCH_PERMIT_VERSION,
     MCP_EXECUTION_COORDINATOR_VERSION, McpCallApprovalHandler, McpCallApprovalRequest,
     McpCallIdentity, McpExecutionCoordinator,
+};
+pub use journal::MCP_CALL_CHAIN_VALIDATOR_VERSION;
+pub(crate) use journal::{
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, argument_digest_v1, mcp_turn_ids_v1,
+    validate_mcp_call_chain_for_version, validate_mcp_call_chain_v1,
 };
 pub use registry::{ApprovedMcpRegistry, MCP_TOOL_REGISTRY_VERSION, McpRegistry, McpToolBinding};
 pub use schema::MCP_SCHEMA_PROFILE_VERSION;

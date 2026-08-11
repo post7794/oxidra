@@ -1,11 +1,13 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::journal::{
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, argument_digest_v1, validate_mcp_call_chain_v1,
+};
 use super::registry::{ApprovedMcpRegistry, McpRegistry, PreparedMcpRegistryCall};
 use super::{McpCallError, PreflightedJsonValue};
 use crate::error::{OxidraError, Result};
@@ -31,6 +33,7 @@ const MCP_REGISTRY_ACTIVATED_KIND: &str = "mcp.registry.activated";
 #[derive(Clone, Copy)]
 struct McpCoordinatorPolicy {
     coordinator_version: u32,
+    call_chain_validator_version: u32,
     dispatch_permit_version: u32,
     argument_digest_version: u32,
     registry_version: u32,
@@ -41,6 +44,7 @@ struct McpCoordinatorPolicy {
 
 const MCP_COORDINATOR_POLICY_V1: McpCoordinatorPolicy = McpCoordinatorPolicy {
     coordinator_version: MCP_EXECUTION_COORDINATOR_VERSION_V1,
+    call_chain_validator_version: MCP_CALL_CHAIN_VALIDATOR_VERSION_V1,
     dispatch_permit_version: MCP_DISPATCH_PERMIT_VERSION_V1,
     argument_digest_version: MCP_ARGUMENT_DIGEST_VERSION_V1,
     registry_version: MCP_TOOL_REGISTRY_VERSION_V1,
@@ -139,6 +143,7 @@ impl McpExecutionCoordinator {
             None,
             json!({
                 "coordinator_version": policy.coordinator_version,
+                "call_chain_validator_version": policy.call_chain_validator_version,
                 "coordinator_id": coordinator_id,
                 "registry_epoch_id": registry_epoch_id,
                 "registry_version": policy.registry_version,
@@ -392,6 +397,7 @@ impl McpExecutionCoordinator {
             ));
         }
         let events = journal.read_events()?;
+        validate_mcp_call_chain_v1(&events)?;
         let activation_seq = validate_activation_v1(&events, self)?;
         let durable_call = provider_call_v1(&events, call.turn_id, call.call_id)?;
         validate_call_after_activation_v1(&durable_call, activation_seq, self)?;
@@ -546,14 +552,6 @@ impl DispatchPermit {
     }
 }
 
-pub(super) fn argument_digest_v1(arguments: &Value) -> Result<String> {
-    let payload = json!({
-        "argument_digest_version": MCP_COORDINATOR_POLICY_V1.argument_digest_version,
-        "arguments": arguments,
-    });
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&payload)?)))
-}
-
 fn validate_call_identity(turn_id: &str, call_id: &str, provider_name: &str) -> Result<()> {
     for (label, value) in [
         ("turn_id", turn_id),
@@ -576,6 +574,7 @@ fn validate_dispatch_candidate_v1(
     approval: &McpCallApprovalRequest,
     arguments: &Value,
 ) -> Result<()> {
+    validate_mcp_call_chain_v1(&events)?;
     let activation_seq = validate_activation_v1(&events, coordinator)?;
 
     let durable_call = provider_call_v1(&events, &approval.turn_id, &approval.call_id)?;
@@ -598,6 +597,7 @@ fn validate_dispatch_candidate_v1(
         turn_id: Some(approval.turn_id.clone()),
         data: started_data(approval, arguments),
     });
+    validate_mcp_call_chain_v1(&events)?;
     let state = provider_request_slot_state_for_version(
         MCP_COORDINATOR_POLICY_V1.provider_slot_version,
         &events,
@@ -617,6 +617,7 @@ fn validate_pre_start_terminal_candidate_v1(
     coordinator: &McpExecutionCoordinator,
     call: McpCallIdentity<'_>,
 ) -> Result<()> {
+    validate_mcp_call_chain_v1(&events)?;
     let activation_seq = validate_activation_v1(&events, coordinator)?;
     let durable_call = provider_call_v1(&events, call.turn_id, call.call_id)?;
     validate_call_after_activation_v1(&durable_call, activation_seq, coordinator)?;
@@ -638,8 +639,12 @@ fn validate_pre_start_terminal_candidate_v1(
             "output":{"error":{"code":"validation_error","message":"rejected before dispatch"}},
             "is_error":true,
             "error_code":"validation_error",
+            "mcp_execution_coordinator_version": MCP_COORDINATOR_POLICY_V1.coordinator_version,
+            "registry_epoch_id": coordinator.registry_epoch_id,
+            "registry_digest": coordinator.registry.digest(),
         }),
     });
+    validate_mcp_call_chain_v1(&events)?;
     provider_request_slot_state_for_version(
         MCP_COORDINATOR_POLICY_V1.provider_slot_version,
         &events,
@@ -719,6 +724,11 @@ fn validate_activation_v1(
                 .get("coordinator_version")
                 .and_then(Value::as_u64)
                 == Some(u64::from(policy.coordinator_version))
+            && activation
+                .data
+                .get("call_chain_validator_version")
+                .and_then(Value::as_u64)
+                == Some(u64::from(policy.call_chain_validator_version))
             && activation
                 .data
                 .get("registry_version")
@@ -992,6 +1002,7 @@ mod tests {
         assert_eq!(MCP_DISPATCH_PERMIT_VERSION, 1);
         assert_eq!(MCP_ARGUMENT_DIGEST_VERSION, 1);
         assert_eq!(MCP_COORDINATOR_POLICY_V1.coordinator_version, 1);
+        assert_eq!(MCP_COORDINATOR_POLICY_V1.call_chain_validator_version, 1);
         assert_eq!(MCP_COORDINATOR_POLICY_V1.dispatch_permit_version, 1);
         assert_eq!(MCP_COORDINATOR_POLICY_V1.argument_digest_version, 1);
         assert_eq!(MCP_COORDINATOR_POLICY_V1.registry_version, 1);

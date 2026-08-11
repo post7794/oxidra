@@ -24,6 +24,7 @@ use crate::event_kind::{
     is_compaction_lifecycle, is_compaction_terminal, is_response_terminal, is_tool_lifecycle,
     is_tool_terminal,
 };
+use crate::turn::provider_request_slot_state_for_version;
 
 pub const JOURNAL_SCHEMA: u32 = 1;
 pub const SESSION_STARTED_KIND: &str = "session.started";
@@ -352,6 +353,7 @@ impl SessionStore {
                     && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
             })
             .count();
+        crate::mcp::validate_mcp_call_chain_v1(&scan.events)?;
         let unstarted_tools = unstarted_tool_calls(&scan.events);
         let previously_skipped = scan
             .events
@@ -413,29 +415,6 @@ impl SessionStore {
             )?;
         }
 
-        let recovered_unstarted = !unstarted_tools.is_empty();
-        for tool in unstarted_tools {
-            journal.append_and_sync(
-                "tool.skipped_due_to_recovery",
-                tool.turn_id.as_deref(),
-                json!({
-                    "response_seq": tool.response_seq,
-                    "call_id": tool.call_id,
-                    "tool": tool.tool_name,
-                    "arguments": tool.arguments,
-                    "reason": "process stopped before tool.started was committed",
-                    "output": {
-                        "error": {
-                            "code": "interrupted_before_start",
-                            "message": "tool was not executed because the previous process stopped before dispatch",
-                        }
-                    },
-                    "is_error": true,
-                    "error_code": "interrupted_before_start",
-                }),
-            )?;
-        }
-
         let recovered_boundaries = recover_compaction_boundaries(&mut journal)?;
         recovery.failed_compaction_boundaries = recovery
             .failed_compaction_boundaries
@@ -443,6 +422,13 @@ impl SessionStore {
         recovery.checkpointed_compaction_boundaries = recovery
             .checkpointed_compaction_boundaries
             .saturating_add(recovered_boundaries.checkpointed);
+        let mcp_turn_ids = crate::mcp::mcp_turn_ids_v1(&journal.read_events()?)?;
+        for turn_id in &mcp_turn_ids {
+            // Use the frozen generic slot v2 as a recovery-consistency check;
+            // slot v3 calls back into the MCP validator and is therefore not
+            // used from inside this validator-owned repair window.
+            provider_request_slot_state_for_version(2, &journal.read_events()?, turn_id)?;
+        }
         recovery.marker_seq = matching_recovery_marker(
             &scan.events,
             &recovery.in_doubt,
@@ -453,6 +439,7 @@ impl SessionStore {
             recovery.checkpointed_compaction_boundaries,
         );
 
+        let recovered_unstarted = !unstarted_tools.is_empty();
         if recovery.truncated_tail.is_some()
             || recovered_unfinished_response
             || recovered_unfinished_compaction
@@ -464,9 +451,49 @@ impl SessionStore {
             || (recovery.failed_compaction_boundaries > 0 && recovery.marker_seq.is_none())
             || (recovery.checkpointed_compaction_boundaries > 0 && recovery.marker_seq.is_none())
         {
-            let event =
-                journal.append_and_sync(RECOVERY_KIND, None, recovery_marker_data(&recovery))?;
+            let event = journal.append_and_sync(
+                RECOVERY_KIND,
+                None,
+                recovery_marker_data(&recovery, &unstarted_tools)?,
+            )?;
             recovery.marker_seq = Some(event.seq);
+        }
+
+        // The recovery marker is the durable authority for automatically
+        // skipping calls that never reached `tool.started`.  Write it before
+        // those skips so each MCP skip can bind to an immutable marker seq;
+        // this prevents a generic lifecycle writer from manufacturing a
+        // plausible-looking recovery terminal with only call/argument data.
+        let recovery_marker_seq = recovery.marker_seq;
+        for tool in unstarted_tools {
+            let mut data = json!({
+                "response_seq": tool.response_seq,
+                "call_id": tool.call_id,
+                "tool": tool.tool_name,
+                "arguments": tool.arguments,
+                "reason": "process stopped before tool.started was committed",
+                "output": {
+                    "error": {
+                        "code": "interrupted_before_start",
+                        "message": "tool was not executed because the previous process stopped before dispatch",
+                    }
+                },
+                "is_error": true,
+                "error_code": "interrupted_before_start",
+            });
+            if let Some(marker_seq) = recovery_marker_seq {
+                data["recovery_marker_seq"] = Value::from(marker_seq);
+            }
+            journal.append_and_sync(
+                "tool.skipped_due_to_recovery",
+                tool.turn_id.as_deref(),
+                data,
+            )?;
+        }
+        crate::mcp::validate_mcp_call_chain_v1(&journal.read_events()?)?;
+        let final_events = journal.read_events()?;
+        for turn_id in &mcp_turn_ids {
+            provider_request_slot_state_for_version(2, &final_events, turn_id)?;
         }
         journal.recovery = recovery;
         Ok(journal)
@@ -1301,8 +1328,11 @@ fn same_in_doubt_set(left: &[InDoubtTool], right: &[InDoubtTool]) -> bool {
     left_keys == right_keys
 }
 
-fn recovery_marker_data(recovery: &RecoveryInfo) -> Value {
-    json!({
+fn recovery_marker_data(
+    recovery: &RecoveryInfo,
+    unstarted_tools: &[UnstartedTool],
+) -> Result<Value> {
+    let mut data = json!({
         "reason": if recovery.truncated_tail.is_some() {
             "incomplete_tail"
         } else if recovery.aborted_responses > 0 {
@@ -1325,7 +1355,25 @@ fn recovery_marker_data(recovery: &RecoveryInfo) -> Value {
         "aborted_compactions": recovery.aborted_compactions,
         "failed_compaction_boundaries": recovery.failed_compaction_boundaries,
         "checkpointed_compaction_boundaries": recovery.checkpointed_compaction_boundaries,
-    })
+    });
+    if !unstarted_tools.is_empty() {
+        let authorizations = unstarted_tools
+            .iter()
+            .map(|tool| {
+                let arguments = tool.arguments.as_ref().unwrap_or(&Value::Null);
+                Ok(json!({
+                    "response_seq": tool.response_seq,
+                    "turn_id": tool.turn_id,
+                    "call_id": tool.call_id,
+                    "tool": tool.tool_name,
+                    "arguments_sha256": crate::mcp::argument_digest_v1(arguments)?,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        data["tool_skip_authorization_version"] = Value::from(1);
+        data["unstarted_tool_calls"] = Value::Array(authorizations);
+    }
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -1901,6 +1949,11 @@ mod tests {
             .find(|event| event.kind == "tool.skipped_due_to_recovery")
             .unwrap();
         assert_eq!(skipped.data["call_id"], "call-from-id");
+        assert_eq!(
+            skipped.data["recovery_marker_seq"].as_u64(),
+            recovered.recovery_info().marker_seq
+        );
+        assert!(recovered.recovery_info().marker_seq.unwrap() < skipped.seq);
         drop(recovered);
 
         let reopened = store.open("unstarted-tool").unwrap();
@@ -1913,6 +1966,87 @@ mod tests {
                 .filter(|event| event.kind == "tool.skipped_due_to_recovery")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn invalid_mcp_response_chain_is_rejected_before_recovery_writes() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("invalid-mcp-response", header(temp.path()))
+            .unwrap();
+        let epoch = "0190f5e6-7b00-7abc-8000-000000000002";
+        let digest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        journal
+            .append_and_sync(
+                "mcp.registry.activated",
+                None,
+                json!({
+                    "coordinator_version":1,
+                    "call_chain_validator_version":1,
+                    "coordinator_id":"0190f5e6-7b00-7abc-8000-000000000001",
+                    "registry_epoch_id":epoch,
+                    "registry_version":1,
+                    "stdio_kernel_version":1,
+                    "schema_profile_version":1,
+                    "config_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "execution_plan_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "registry_digest":digest,
+                    "provider_names":["mcp_fixture_echo_deadbeef"]
+                }),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "user.message",
+                Some("turn-mcp"),
+                json!({"turn_boundary_version":6}),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "response.started",
+                Some("turn-mcp"),
+                json!({
+                    "response_attempt_id":"attempt-1",
+                    "mcp_registry_epoch_id":epoch,
+                    "mcp_registry_digest":digest
+                }),
+            )
+            .unwrap();
+        for call_id in ["call-1", "call-2"] {
+            journal
+                .append_and_sync(
+                    "response.completed",
+                    Some("turn-mcp"),
+                    json!({
+                        "response_attempt_id":"attempt-1",
+                        "output_items":[{
+                            "type":"function_call",
+                            "call_id":call_id,
+                            "name":"mcp_fixture_echo_deadbeef",
+                            "arguments":"{}"
+                        }]
+                    }),
+                )
+                .unwrap();
+        }
+        let original_count = journal.read_events().unwrap().len();
+        drop(journal);
+
+        let error = store
+            .open("invalid-mcp-response")
+            .err()
+            .expect("invalid MCP chain must fail before recovery")
+            .to_string();
+        assert!(
+            error.contains("has 2 terminals"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            store.inspect("invalid-mcp-response").unwrap().len(),
+            original_count
         );
     }
 
