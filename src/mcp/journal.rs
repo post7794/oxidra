@@ -35,6 +35,23 @@ struct McpCallKey {
     call_id: String,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct RecoveryAuthorizationKey {
+    response_seq: u64,
+    turn_id: String,
+    call_id: String,
+    provider_name: String,
+    arguments_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct RecoveryMarkerAuthority {
+    skipped_before_start: u64,
+    authorization_version: Option<u64>,
+    authorization_count: Option<usize>,
+    authorization_matches: HashMap<RecoveryAuthorizationKey, u8>,
+}
+
 #[derive(Clone, Debug)]
 struct Activation {
     seq: u64,
@@ -106,7 +123,7 @@ fn validate_mcp_call_chain_with_activation(
     activation: &Activation,
 ) -> Result<()> {
     validate_response_registry_claims(events, activation)?;
-    let durable_calls = durable_mcp_calls_v1(events, activation)?;
+    let durable_calls = durable_mcp_calls(events, activation)?;
     let mcp_call_response_seqs = durable_calls
         .values()
         .map(|call| (call.key.call_id.as_str(), call.response_seq))
@@ -116,6 +133,10 @@ fn validate_mcp_call_chain_with_activation(
         .cloned()
         .map(|key| (key, CallState::Unstarted))
         .collect::<HashMap<_, _>>();
+    // Recovery skips may be numerous in a legacy v1 batch. Build the durable
+    // marker/authorization authority once so each lifecycle edge remains an
+    // O(1) lookup instead of rescanning the journal and up to 4096 entries.
+    let recovery_authorities = recovery_marker_authorities(events);
     for event in events {
         if !is_tool_lifecycle(&event.kind) {
             continue;
@@ -167,10 +188,80 @@ fn validate_mcp_call_chain_with_activation(
         };
         validate_lifecycle_identity(event, call)?;
         let state = states.get_mut(&key).expect("durable MCP call state");
-        validate_lifecycle_event_v1(events, event, call, activation, state)?;
+        validate_lifecycle_event_v1(event, call, activation, state, &recovery_authorities)?;
     }
 
     Ok(())
+}
+
+fn recovery_marker_authorities(events: &[JournalEvent]) -> HashMap<u64, RecoveryMarkerAuthority> {
+    events
+        .iter()
+        .filter(|event| event.kind == crate::session::RECOVERY_KIND && event.turn_id.is_none())
+        .map(|event| {
+            let authorizations = event
+                .data
+                .get("unstarted_tool_calls")
+                .and_then(Value::as_array);
+            let authorization_count = authorizations.map(Vec::len);
+            let mut authorization_matches = HashMap::new();
+            // Do not allocate an attacker-sized index for a marker the frozen
+            // protocol will reject. The referenced skip receives the same
+            // limit error below from the recorded count.
+            if let Some(authorizations) =
+                authorizations.filter(|items| items.len() <= MAX_MCP_CALLS_PER_RESPONSE_V1)
+            {
+                for authorization in authorizations {
+                    let Some(response_seq) =
+                        authorization.get("response_seq").and_then(Value::as_u64)
+                    else {
+                        continue;
+                    };
+                    let Some(turn_id) = authorization.get("turn_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(call_id) = authorization.get("call_id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Some(provider_name) = authorization.get("tool").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let Some(arguments_sha256) = authorization
+                        .get("arguments_sha256")
+                        .and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    let key = RecoveryAuthorizationKey {
+                        response_seq,
+                        turn_id: turn_id.to_owned(),
+                        call_id: call_id.to_owned(),
+                        provider_name: provider_name.to_owned(),
+                        arguments_sha256: arguments_sha256.to_owned(),
+                    };
+                    let matches = authorization_matches.entry(key).or_insert(0u8);
+                    *matches = matches.saturating_add(1).min(2);
+                }
+            }
+            (
+                event.seq,
+                RecoveryMarkerAuthority {
+                    skipped_before_start: event
+                        .data
+                        .get("skipped_before_start")
+                        .and_then(Value::as_u64)
+                        .unwrap_or_default(),
+                    authorization_version: event
+                        .data
+                        .get("tool_skip_authorization_version")
+                        .and_then(Value::as_u64),
+                    authorization_count,
+                    authorization_matches,
+                },
+            )
+        })
+        .collect()
 }
 
 pub(crate) fn validate_mcp_call_chain_for_version(
@@ -231,36 +322,21 @@ pub(crate) fn validate_mcp_call_chain(events: &[JournalEvent]) -> Result<()> {
     validate_mcp_call_chain_through_version(MCP_CALL_CHAIN_VALIDATOR_VERSION, events)
 }
 
-pub(crate) fn mcp_turn_ids_v1(events: &[JournalEvent]) -> Result<Vec<String>> {
-    let Some(activation) = activation_v1(events)? else {
-        return Ok(Vec::new());
-    };
-    mcp_turn_ids_with_activation(events, &activation)
-}
-
-pub(crate) fn mcp_turn_ids_v2(events: &[JournalEvent]) -> Result<Vec<String>> {
-    let Some(activation) = activation_v2(events)? else {
-        return Ok(Vec::new());
-    };
-    mcp_turn_ids_with_activation(events, &activation)
-}
-
 pub(crate) fn mcp_turn_ids(events: &[JournalEvent]) -> Result<Vec<String>> {
-    match call_chain_validator_version(events)? {
-        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V1) => mcp_turn_ids_v1(events),
-        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) => mcp_turn_ids_v2(events),
-        Some(version) => session_error(format!(
-            "unsupported MCP call-chain validator version {version}"
-        )),
-        None => Ok(Vec::new()),
-    }
-}
-
-fn mcp_turn_ids_with_activation(
-    events: &[JournalEvent],
-    activation: &Activation,
-) -> Result<Vec<String>> {
-    let mut turn_ids = durable_mcp_calls_v1(events, activation)?
+    let activation = match call_chain_validator_version(events)? {
+        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V1) => activation_v1(events)?,
+        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) => activation_v2(events)?,
+        Some(version) => {
+            return session_error(format!(
+                "unsupported MCP call-chain validator version {version}"
+            ));
+        }
+        None => return Ok(Vec::new()),
+    };
+    let Some(activation) = activation else {
+        return Ok(Vec::new());
+    };
+    let mut turn_ids = durable_mcp_calls(events, &activation)?
         .keys()
         .map(|key| key.turn_id.clone())
         .collect::<Vec<_>>();
@@ -300,7 +376,7 @@ fn ensure_no_unstarted_mcp_calls_with_activation(
     events: &[JournalEvent],
     activation: &Activation,
 ) -> Result<()> {
-    let calls = durable_mcp_calls_v1(events, activation)?;
+    let calls = durable_mcp_calls(events, activation)?;
     let lifecycle_calls = events
         .iter()
         .filter(|event| is_tool_lifecycle(&event.kind))
@@ -591,6 +667,19 @@ fn activation_v2(events: &[JournalEvent]) -> Result<Option<Activation>> {
     }))
 }
 
+fn durable_mcp_calls(
+    events: &[JournalEvent],
+    activation: &Activation,
+) -> Result<HashMap<McpCallKey, DurableMcpCall>> {
+    match activation.call_chain_validator_version {
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => durable_mcp_calls_v1(events, activation),
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => durable_mcp_calls_v2(events, activation),
+        version => session_error(format!(
+            "unsupported MCP call-chain validator version {version}"
+        )),
+    }
+}
+
 fn durable_mcp_calls_v1(
     events: &[JournalEvent],
     activation: &Activation,
@@ -703,6 +792,151 @@ fn durable_mcp_calls_v1(
                     matching_terminals.len()
                 ));
             }
+            let arguments = durable_arguments(item, event, call_id)?;
+            let key = McpCallKey {
+                turn_id: turn_id.to_owned(),
+                call_id: call_id.to_owned(),
+            };
+            let call = DurableMcpCall {
+                key: key.clone(),
+                provider_name: provider_name.to_owned(),
+                arguments_sha256: argument_digest_v1(&arguments)?,
+                arguments,
+                response_seq: event.seq,
+            };
+            if let Some(previous) = call_ids.insert(call_id.to_owned(), key.clone()) {
+                return session_error(format!(
+                    "MCP call_id {call_id} is reused by turns {} and {turn_id}",
+                    previous.turn_id
+                ));
+            }
+            if calls.insert(key, call).is_some() {
+                return session_error(format!(
+                    "MCP call_id {call_id} appears more than once in turn {turn_id}"
+                ));
+            }
+        }
+    }
+    Ok(calls)
+}
+
+/// Extract durable MCP calls under the frozen v2 response-ownership rules.
+///
+/// A response belongs to the activated MCP epoch because its unique matching
+/// `response.started` claims that epoch, not because a later output item happens
+/// to use an MCP provider alias. Once claimed, the complete canonical Provider
+/// batch is bounded before individual MCP bindings are interpreted.
+fn durable_mcp_calls_v2(
+    events: &[JournalEvent],
+    activation: &Activation,
+) -> Result<HashMap<McpCallKey, DurableMcpCall>> {
+    let starts = response_starts(events)?;
+    let terminals = response_terminals(events);
+    let mut calls = HashMap::new();
+    let mut call_ids = HashMap::<String, McpCallKey>::new();
+    for event in events
+        .iter()
+        .filter(|event| event.kind == "response.completed")
+    {
+        if event.seq <= activation.seq {
+            continue;
+        }
+        let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+            session_message(
+                event,
+                "response.completed after MCP activation has no turn_id",
+            )
+        })?;
+        let attempt_id = event
+            .data
+            .get("response_attempt_id")
+            .and_then(Value::as_str)
+            .filter(|value| valid_identity(value))
+            .ok_or_else(|| {
+                session_message(
+                    event,
+                    "response.completed after MCP activation has no valid response_attempt_id",
+                )
+            })?;
+        let Some(matching_starts) = starts.get(&(turn_id.to_owned(), attempt_id.to_owned())) else {
+            continue;
+        };
+        let start_claims_mcp = matching_starts.iter().any(|start| {
+            start.data.get("mcp_registry_epoch_id").is_some()
+                || start.data.get("mcp_registry_digest").is_some()
+        });
+        if !start_claims_mcp {
+            continue;
+        }
+        if matching_starts.len() != 1 {
+            return session_error(format!(
+                "MCP response attempt {attempt_id} for turn {turn_id} has {} matching starts",
+                matching_starts.len()
+            ));
+        }
+        let start = matching_starts[0];
+        if start.seq >= event.seq {
+            return session_error(format!(
+                "MCP response.completed at seq {} is not ordered after its response.started",
+                event.seq
+            ));
+        }
+        validate_response_registry(start, activation)?;
+
+        let items = event
+            .data
+            .get("output_items")
+            .ok_or_else(|| {
+                session_message(
+                    event,
+                    "MCP-owned response.completed has no canonical output_items",
+                )
+            })?
+            .as_array()
+            .ok_or_else(|| {
+                session_message(
+                    event,
+                    "MCP-owned response.completed has non-array canonical output_items",
+                )
+            })?;
+        let response_function_call_count = items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .count();
+        if response_function_call_count > MAX_MCP_CALLS_PER_RESPONSE_V1 {
+            return session_error(format!(
+                "MCP response.completed at seq {} exceeds the {MAX_MCP_CALLS_PER_RESPONSE_V1}-call limit",
+                event.seq
+            ));
+        }
+
+        let terminal_key = (turn_id.to_owned(), attempt_id.to_owned());
+        let matching_terminals = terminals.get(&terminal_key).ok_or_else(|| {
+            session_message(event, "MCP response has no matching response terminal")
+        })?;
+        if matching_terminals.len() != 1 || matching_terminals[0].seq != event.seq {
+            return session_error(format!(
+                "MCP response attempt {attempt_id} for turn {turn_id} has {} terminals",
+                matching_terminals.len()
+            ));
+        }
+
+        for item in items {
+            if item.get("type").and_then(Value::as_str) != Some("function_call") {
+                continue;
+            }
+            let Some(provider_name) = item.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if !activation.provider_names.contains(provider_name) {
+                continue;
+            }
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .filter(|value| valid_identity(value))
+                .ok_or_else(|| session_message(event, "MCP function_call has no valid call_id"))?;
             let arguments = durable_arguments(item, event, call_id)?;
             let key = McpCallKey {
                 turn_id: turn_id.to_owned(),
@@ -858,11 +1092,11 @@ fn validate_lifecycle_identity(event: &JournalEvent, call: &DurableMcpCall) -> R
 }
 
 fn validate_lifecycle_event_v1(
-    events: &[JournalEvent],
     event: &JournalEvent,
     call: &DurableMcpCall,
     activation: &Activation,
     state: &mut CallState,
+    recovery_authorities: &HashMap<u64, RecoveryMarkerAuthority>,
 ) -> Result<()> {
     match event.kind.as_str() {
         "tool.started" => {
@@ -949,7 +1183,7 @@ fn validate_lifecycle_event_v1(
             if !matches!(state, CallState::Unstarted) {
                 return invalid_transition(event, state);
             }
-            validate_safe_skip(event, call, activation, events)?;
+            validate_safe_skip(event, call, activation, recovery_authorities)?;
             *state = CallState::Terminal;
         }
         _ if is_tool_terminal(&event.kind) => return invalid_transition(event, state),
@@ -1123,7 +1357,7 @@ fn validate_safe_skip(
     event: &JournalEvent,
     call: &DurableMcpCall,
     _activation: &Activation,
-    events: &[JournalEvent],
+    recovery_authorities: &HashMap<u64, RecoveryMarkerAuthority>,
 ) -> Result<()> {
     let code = event
         .data
@@ -1174,19 +1408,11 @@ fn validate_safe_skip(
                     "tool.skipped_due_to_recovery has no recovery_marker_seq",
                 )
             })?;
-        let marker = events.iter().find(|candidate| {
-            candidate.seq == marker_seq
-                && candidate.kind == crate::session::RECOVERY_KIND
-                && candidate.turn_id.is_none()
-        });
+        let marker = recovery_authorities.get(&marker_seq);
         if marker.is_none()
             || marker_seq <= call.response_seq
             || marker_seq >= event.seq
-            || marker
-                .and_then(|marker| marker.data.get("skipped_before_start"))
-                .and_then(Value::as_u64)
-                .unwrap_or_default()
-                == 0
+            || marker.is_some_and(|marker| marker.skipped_before_start == 0)
         {
             return session_error(format!(
                 "tool.skipped_due_to_recovery at seq {} has no preceding recovery authority",
@@ -1194,43 +1420,32 @@ fn validate_safe_skip(
             ));
         }
         let marker = marker.expect("checked recovery marker");
-        if marker
-            .data
-            .get("tool_skip_authorization_version")
-            .and_then(Value::as_u64)
-            != Some(1)
-        {
+        if marker.authorization_version != Some(1) {
             return session_error(format!(
                 "tool.skipped_due_to_recovery at seq {} has an unsupported recovery authorization",
                 event.seq
             ));
         }
-        let authorizations = marker
-            .data
-            .get("unstarted_tool_calls")
-            .and_then(Value::as_array)
+        let authorization_count = marker
+            .authorization_count
             .ok_or_else(|| session_message(event, "recovery marker has no unstarted_tool_calls"))?;
-        if authorizations.len() > MAX_MCP_CALLS_PER_RESPONSE_V1 {
+        if authorization_count > MAX_MCP_CALLS_PER_RESPONSE_V1 {
             return session_error(format!(
                 "recovery marker at seq {marker_seq} exceeds the unstarted-call limit"
             ));
         }
-        let matching_authorizations = authorizations
-            .iter()
-            .filter(|authorization| {
-                authorization.get("response_seq").and_then(Value::as_u64) == Some(call.response_seq)
-                    && authorization.get("turn_id").and_then(Value::as_str)
-                        == Some(&call.key.turn_id)
-                    && authorization.get("call_id").and_then(Value::as_str)
-                        == Some(&call.key.call_id)
-                    && authorization.get("tool").and_then(Value::as_str)
-                        == Some(&call.provider_name)
-                    && authorization
-                        .get("arguments_sha256")
-                        .and_then(Value::as_str)
-                        == Some(&call.arguments_sha256)
-            })
-            .count();
+        let authorization_key = RecoveryAuthorizationKey {
+            response_seq: call.response_seq,
+            turn_id: call.key.turn_id.clone(),
+            call_id: call.key.call_id.clone(),
+            provider_name: call.provider_name.clone(),
+            arguments_sha256: call.arguments_sha256.clone(),
+        };
+        let matching_authorizations = marker
+            .authorization_matches
+            .get(&authorization_key)
+            .copied()
+            .unwrap_or_default();
         if matching_authorizations != 1 {
             return session_error(format!(
                 "tool.skipped_due_to_recovery at seq {} is not uniquely authorized by marker {marker_seq}",
@@ -1660,6 +1875,62 @@ mod tests {
             .to_string();
         assert!(
             error.contains("exceeds the 4096-call limit"),
+            "unexpected error: {error}"
+        );
+
+        let mut all_generic = mcp_events_v2();
+        all_generic.truncate(4);
+        all_generic[3].data["output_items"] = Value::Array(
+            (0..=MAX_MCP_CALLS_PER_RESPONSE_V1)
+                .map(|index| {
+                    json!({
+                        "type":"function_call",
+                        "call_id":format!("generic-call-{index}"),
+                        "name":"read",
+                        "arguments":"{}"
+                    })
+                })
+                .collect(),
+        );
+        let error = validate_mcp_call_chain_v2(&all_generic)
+            .expect_err("an MCP-owned response must bound the complete Provider call batch")
+            .to_string();
+        assert!(
+            error.contains("exceeds the 4096-call limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn v2_response_ownership_requires_canonical_output_items() {
+        fn hide_call_in_raw_response_and_make_terminal_generic(events: &mut Vec<JournalEvent>) {
+            let output_items = events[3]
+                .data
+                .as_object_mut()
+                .expect("response data")
+                .remove("output_items")
+                .expect("output items");
+            events[3].data["raw_response"] = json!({"output":output_items});
+            events.remove(4);
+            events[4].seq = 5;
+            let terminal = events[4].data.as_object_mut().expect("terminal data");
+            terminal.remove("mcp");
+            terminal.remove("started_seq");
+            terminal.remove("before_dispatch");
+        }
+
+        let mut v1 = mcp_events();
+        hide_call_in_raw_response_and_make_terminal_generic(&mut v1);
+        validate_mcp_call_chain_v1(&v1)
+            .expect("frozen v1 identified ownership from output_items rather than the start claim");
+
+        let mut v2 = mcp_events_v2();
+        hide_call_in_raw_response_and_make_terminal_generic(&mut v2);
+        let error = validate_mcp_call_chain_v2(&v2)
+            .expect_err("v2 must not let a claimed raw-only MCP call use a generic terminal")
+            .to_string();
+        assert!(
+            error.contains("no canonical output_items"),
             "unexpected error: {error}"
         );
     }

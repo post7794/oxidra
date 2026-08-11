@@ -1807,6 +1807,55 @@ fn provider_request_slot_state_v2(
     provider_request_slot_state_v1(&normalized, turn_id)
 }
 
+/// Validate the frozen v2 Provider slot reducer for a set of turns without
+/// rerunning its global journal reducers or cloning the complete journal once
+/// per turn. Recovery uses this batch form for large legacy MCP responses.
+pub(crate) fn validate_provider_request_slots_v2(
+    events: &[JournalEvent],
+    turn_ids: &[String],
+) -> Result<()> {
+    let mut seen_turn_ids = HashSet::new();
+    let ordered_turn_ids = turn_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|turn_id| seen_turn_ids.insert(*turn_id))
+        .collect::<Vec<_>>();
+    if ordered_turn_ids.is_empty() {
+        return Ok(());
+    }
+    let turn_id_membership = ordered_turn_ids.iter().copied().collect::<HashSet<_>>();
+    let superseded_limit_seqs = validate_provider_budget_retries_v1(events)?
+        .into_iter()
+        .filter(|retry| turn_id_membership.contains(retry.boundary.turn_id.as_str()))
+        .map(|retry| retry.limit_seq)
+        .collect::<HashSet<_>>();
+    let mut normalized = events.to_vec();
+    for event in &mut normalized {
+        if event.kind == "agent.limit_reached" && superseded_limit_seqs.contains(&event.seq) {
+            event.kind = "turn.budget_retry_superseded".to_owned();
+        }
+    }
+    let recovery = validate_turn_recovery_v3(&normalized)?;
+    validate_provider_slot_event_turn_ids(&normalized)?;
+    let mut scoped = HashMap::<&str, Vec<JournalEvent>>::new();
+    for event in &normalized {
+        let Some(turn_id) = event.turn_id.as_deref() else {
+            continue;
+        };
+        if turn_id_membership.contains(turn_id) {
+            scoped.entry(turn_id).or_default().push(event.clone());
+        }
+    }
+    for turn_id in ordered_turn_ids {
+        provider_request_slot_state_v1_with_recovery(
+            scoped.get(turn_id).map(Vec::as_slice).unwrap_or_default(),
+            turn_id,
+            &recovery,
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct ProviderSlotCall {
     call_id: String,
@@ -1820,6 +1869,27 @@ fn provider_request_slot_state_v1(
     turn_id: &str,
 ) -> Result<ProviderRequestSlotState> {
     let recovery = validate_turn_recovery_v3(events)?;
+    validate_provider_slot_event_turn_ids(events)?;
+    provider_request_slot_state_v1_with_recovery(events, turn_id, &recovery)
+}
+
+fn validate_provider_slot_event_turn_ids(events: &[JournalEvent]) -> Result<()> {
+    for event in events {
+        if is_provider_slot_event_kind(&event.kind) && event.turn_id.is_none() {
+            return Err(OxidraError::Session(format!(
+                "{} at seq {} has no turn_id",
+                event.kind, event.seq
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn provider_request_slot_state_v1_with_recovery(
+    events: &[JournalEvent],
+    turn_id: &str,
+    recovery: &ValidatedTurnRecovery,
+) -> Result<ProviderRequestSlotState> {
     let validated_retry_seqs = recovery
         .retries
         .iter()
@@ -1833,15 +1903,8 @@ fn provider_request_slot_state_v1(
     let mut seen_attempts = HashSet::<String>::new();
     let mut calls = Vec::<ProviderSlotCall>::new();
     let mut seen_call_ids = HashSet::<String>::new();
-
-    for event in events {
-        if is_provider_slot_event_kind(&event.kind) && event.turn_id.is_none() {
-            return Err(OxidraError::Session(format!(
-                "{} at seq {} has no turn_id",
-                event.kind, event.seq
-            )));
-        }
-    }
+    let mut call_indexes = HashMap::<String, usize>::new();
+    let mut unresolved_calls = 0usize;
 
     for event in events
         .iter()
@@ -1860,7 +1923,7 @@ fn provider_request_slot_state_v1(
                 require_slot_user(saw_user, event, turn_id)?;
                 if state != ProviderRequestSlotState::Ready
                     || active_attempt.is_some()
-                    || calls.iter().any(|call| !call.terminal)
+                    || unresolved_calls != 0
                 {
                     return Err(OxidraError::Session(format!(
                         "response.started at seq {} cannot acquire turn {turn_id}'s Provider request slot from state {state:?}",
@@ -1902,11 +1965,18 @@ fn provider_request_slot_state_v1(
                                 )));
                             }
                             calls.push(ProviderSlotCall {
-                                call_id,
+                                call_id: call_id.clone(),
                                 started_seq: None,
                                 in_doubt: false,
                                 terminal: false,
                             });
+                            call_indexes.insert(call_id, calls.len() - 1);
+                            unresolved_calls =
+                                unresolved_calls.checked_add(1).ok_or_else(|| {
+                                    OxidraError::Session(format!(
+                                        "turn {turn_id} Provider call count overflow"
+                                    ))
+                                })?;
                         }
                         state = ProviderRequestSlotState::AwaitingTools;
                     }
@@ -1918,20 +1988,25 @@ fn provider_request_slot_state_v1(
                 require_slot_user(saw_user, event, turn_id)?;
                 require_awaiting_tools(state, event, turn_id)?;
                 let call_id = required_call_id(event)?;
-                let Some(call) = calls.iter_mut().find(|call| {
-                    call.call_id == call_id && call.started_seq.is_none() && !call.terminal
-                }) else {
+                let Some(index) = call_indexes.get(call_id).copied() else {
                     return Err(OxidraError::Session(format!(
                         "tool.started at seq {} does not match an unstarted call {call_id}",
                         event.seq
                     )));
                 };
+                let call = &mut calls[index];
+                if call.started_seq.is_some() || call.terminal {
+                    return Err(OxidraError::Session(format!(
+                        "tool.started at seq {} does not match an unstarted call {call_id}",
+                        event.seq
+                    )));
+                }
                 call.started_seq = Some(event.seq);
             }
             "tool.in_doubt" => {
                 require_slot_user(saw_user, event, turn_id)?;
                 require_awaiting_tools(state, event, turn_id)?;
-                let index = slot_call_index(&calls, event, SlotCallMatch::Started)?;
+                let index = slot_call_index(&calls, &call_indexes, event, SlotCallMatch::Started)?;
                 if calls[index].in_doubt {
                     return Err(OxidraError::Session(format!(
                         "tool.in_doubt at seq {} duplicates call {}",
@@ -1950,7 +2025,7 @@ fn provider_request_slot_state_v1(
                 } else {
                     SlotCallMatch::AnyPending
                 };
-                let index = slot_call_index(&calls, event, match_kind)?;
+                let index = slot_call_index(&calls, &call_indexes, event, match_kind)?;
                 if kind != "tool.in_doubt_resolved" && calls[index].in_doubt {
                     return Err(OxidraError::Session(format!(
                         "{} at seq {} cannot settle in-doubt call {} without explicit resolution",
@@ -1959,7 +2034,13 @@ fn provider_request_slot_state_v1(
                 }
                 calls[index].terminal = true;
                 calls[index].in_doubt = false;
-                if calls.iter().all(|call| call.terminal) {
+                unresolved_calls = unresolved_calls.checked_sub(1).ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "{} at seq {} underflows turn {turn_id}'s pending call count",
+                        event.kind, event.seq
+                    ))
+                })?;
+                if unresolved_calls == 0 {
                     state = ProviderRequestSlotState::Ready;
                 }
             }
@@ -1973,7 +2054,7 @@ fn provider_request_slot_state_v1(
                 }
                 if state != ProviderRequestSlotState::Terminal
                     || active_attempt.is_some()
-                    || calls.iter().any(|call| !call.terminal)
+                    || unresolved_calls != 0
                 {
                     return Err(OxidraError::Session(format!(
                         "turn.retry_started at seq {} cannot reacquire turn {turn_id}'s Provider request slot from state {state:?}",
@@ -1990,7 +2071,7 @@ fn provider_request_slot_state_v1(
                 require_slot_user(saw_user, event, turn_id)?;
                 if active_attempt.is_some()
                     || state == ProviderRequestSlotState::ResponseInFlight
-                    || calls.iter().any(|call| !call.terminal)
+                    || unresolved_calls != 0
                 {
                     return Err(OxidraError::Session(format!(
                         "{} at seq {} terminates turn {turn_id} while its Provider request slot is unsettled",
@@ -2128,31 +2209,24 @@ enum SlotCallMatch {
 
 fn slot_call_index(
     calls: &[ProviderSlotCall],
+    call_indexes: &HashMap<String, usize>,
     event: &JournalEvent,
     match_kind: SlotCallMatch,
 ) -> Result<usize> {
     let call_id = required_call_id(event)?;
-    let started_seq = event.data.get("started_seq").and_then(Value::as_u64);
     let matches_kind = |call: &ProviderSlotCall| match match_kind {
         SlotCallMatch::Started => call.started_seq.is_some(),
         SlotCallMatch::InDoubt => call.in_doubt,
         SlotCallMatch::Unstarted => call.started_seq.is_none(),
         SlotCallMatch::AnyPending => true,
     };
-    let position = started_seq
-        .and_then(|started_seq| {
-            calls.iter().position(|call| {
-                !call.terminal
-                    && call.started_seq == Some(started_seq)
-                    && call.call_id == call_id
-                    && matches_kind(call)
-            })
-        })
-        .or_else(|| {
-            calls
-                .iter()
-                .position(|call| !call.terminal && call.call_id == call_id && matches_kind(call))
-        });
+    let position = call_indexes.get(call_id).copied().filter(|index| {
+        let call = &calls[*index];
+        // Frozen v1/v2 semantics used `started_seq` only as a preferred
+        // lookup and then fell back to the unique call_id. Preserve that
+        // compatibility while making both paths O(1).
+        !call.terminal && matches_kind(call)
+    });
     position.ok_or_else(|| {
         OxidraError::Session(format!(
             "{} at seq {} does not match pending call {call_id}",

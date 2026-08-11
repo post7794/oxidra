@@ -234,9 +234,11 @@ projection 和 history 各自“碰巧做出相同判断”：
   `call_chain_validator_version = 2`；turn v7、Provider slot v4、source projection v6、
   history extractor v6 和 compaction boundary v7 冻结兼容集合 `{v1, v2}`，按 activation
   声明选择 exact reducer，并拒绝未来版本，而不是读取可变默认值。
-- validator 从 activation 之后、显式带同一 registry epoch/digest 的 `response.started` 与唯一
-  `response.completed` 重建 durable MCP call；activation 之前的同名普通工具保持历史语义，
-  不会被未来 registry 追溯解释。
+- validator v2 先由 activation 之后、显式带同一 registry epoch/digest 的
+  `response.started` 确定整个 response transaction 的 MCP 所有权，再要求唯一 terminal 和
+  canonical `output_items`；批次限制在区分 MCP/内置 binding 前应用。activation 之前的同名
+  普通工具保持历史语义，不会被未来 registry 追溯解释。v1 reader 保留原先按 MCP alias
+  识别 call 的冻结行为。
 - lifecycle 必须使用 canonical `call_id`。generic reducer 兼容的 `id` alias 不能结算 MCP
   call；turn/call/provider、参数 digest、started seq、registry/execution provenance 和 terminal
   状态迁移均由同一 validator 证明。
@@ -245,14 +247,17 @@ projection 和 history 各自“碰巧做出相同判断”：
   response seq、参数 digest 和 marker 中的 exact unstarted-call authorization；同时要求
   `response_seq < recovery_marker_seq < skip_seq`。其他 generic `tool.skipped_due_to_*` 在
   v1 中不能结算 MCP call。
-- 同一 Provider response attempt 必须只有一个 terminal；session recovery 还会在写入 skip
-  前后运行冻结的 generic Provider slot v2 consistency check，非法 response/tool ordering
-  不会先被自动 recovery 写入污染。
+- 同一 Provider response attempt 必须只有一个 terminal；session recovery 会先在内存中构造
+  response/compaction abort、boundary terminal、recovery marker 与全部 skip 的完整 prospective
+  transaction，并在首笔 journal 写入前运行 call-chain 与批量 generic Provider slot v2
+  consistency check、精确计算 JSONL 容量。容量不足时零写入；成功事务只使用一次 fsync。
 - v2 将单个 Provider response 的全部 function calls（包括 MCP 与内置工具混合批次）限制为
   4096；Agent 在 `response.completed` 持久化前使用同一常量，超限只写 `response.failed`。
   v1 在该限制发布前可接受更大的历史批次，因此 recovery 不修改 v1 接受集合，而是先完整
   预检 authorization，再按每个 marker 至多 4096 条分片写入；每个自动 skip 只绑定其所属
-  marker。恢复中途再次崩溃时，下一次 reopen 仅为剩余调用生成新的有界 marker。
+  marker。marker authorization、pending/unstarted identity 与 slot call 状态均使用一次构建的
+  索引，恢复主路径受限为 journal/call 数量的线性扫描。恢复中途再次崩溃时，下一次 reopen
+  仅为剩余调用生成新的有界 marker。
 - schema profile v1 也是 validator v1 的冻结传递依赖；历史 `tool.started` 不读取未来默认
   profile。未知 call-chain、activation、provenance 或 profile 版本一律 fail closed。
 

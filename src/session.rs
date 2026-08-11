@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(any(target_os = "windows", all(unix, not(target_os = "macos"))))]
 use std::env;
 use std::fs::{self, File, OpenOptions};
@@ -25,7 +25,7 @@ use crate::event_kind::{
     is_tool_terminal,
 };
 use crate::mcp::MAX_MCP_CALLS_PER_RESPONSE;
-use crate::turn::provider_request_slot_state_for_version;
+use crate::turn::validate_provider_request_slots_v2;
 
 pub const JOURNAL_SCHEMA: u32 = 1;
 pub const SESSION_STARTED_KIND: &str = "session.started";
@@ -312,17 +312,21 @@ impl SessionStore {
             })?;
 
         let scan = scan_and_repair_tail(&mut file, session_id)?;
-        validate_events(&scan.events, session_id)?;
-        let next_seq = match scan.events.last() {
+        let JournalScan {
+            events: mut prospective_events,
+            truncated_tail,
+            normalized_missing_newline,
+        } = scan;
+        validate_events(&prospective_events, session_id)?;
+        let next_seq = match prospective_events.last() {
             Some(event) => event
                 .seq
                 .checked_add(1)
                 .ok_or_else(|| OxidraError::Session("journal sequence is exhausted".to_owned()))?,
             None => 1,
         };
-        let unfinished_responses = unfinished_responses(&scan.events);
-        let previously_aborted_responses = scan
-            .events
+        let unfinished_responses = unfinished_responses(&prospective_events);
+        let previously_aborted_responses = prospective_events
             .iter()
             .filter(|event| {
                 event.kind == "response.aborted"
@@ -330,9 +334,8 @@ impl SessionStore {
             })
             .count();
         let aborted_responses = previously_aborted_responses + unfinished_responses.len();
-        let unfinished_compactions = unfinished_compactions(&scan.events);
-        let previously_aborted_compactions = scan
-            .events
+        let unfinished_compactions = unfinished_compactions(&prospective_events);
+        let previously_aborted_compactions = prospective_events
             .iter()
             .filter(|event| {
                 event.kind == COMPACTION_ABORTED_KIND
@@ -340,40 +343,37 @@ impl SessionStore {
             })
             .count();
         let aborted_compactions = previously_aborted_compactions + unfinished_compactions.len();
-        let failed_compaction_boundaries = scan
-            .events
+        let failed_compaction_boundaries = prospective_events
             .iter()
             .filter(|event| {
                 event.kind == COMPACTION_BOUNDARY_FAILED_KIND
                     && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
             })
             .count();
-        let checkpointed_compaction_boundaries = scan
-            .events
+        let checkpointed_compaction_boundaries = prospective_events
             .iter()
             .filter(|event| {
                 event.kind == COMPACTION_BOUNDARY_CHECKPOINTED_KIND
                     && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
             })
             .count();
-        crate::mcp::validate_mcp_call_chain(&scan.events)?;
-        let unstarted_tools = unstarted_tool_calls(&scan.events);
+        crate::mcp::validate_mcp_call_chain(&prospective_events)?;
+        let unstarted_tools = unstarted_tool_calls(&prospective_events);
         // Build every authorization payload before the first recovery write.
         // Legacy call-chain v1 could durably contain more than the current
         // per-response maximum, so recovery chunks that old batch into
         // multiple independently bounded v1 markers instead of rewriting the
         // frozen validator or poisoning the journal midway through repair.
         preflight_recovery_authorization_batches(&unstarted_tools)?;
-        let previously_skipped = scan
-            .events
+        let previously_skipped = prospective_events
             .iter()
             .filter(|event| event.kind == "tool.skipped_due_to_recovery")
             .count();
         let skipped_before_start = previously_skipped + unstarted_tools.len();
-        let in_doubt = pending_tools(&scan.events);
+        let in_doubt = pending_tools(&prospective_events);
         let mut recovery = RecoveryInfo {
-            truncated_tail: scan.truncated_tail,
-            normalized_missing_newline: scan.normalized_missing_newline,
+            truncated_tail,
+            normalized_missing_newline,
             in_doubt,
             marker_seq: None,
             skipped_before_start,
@@ -401,9 +401,16 @@ impl SessionStore {
         };
         fs::create_dir_all(&journal.artifact_dir)?;
 
+        let original_event_count = prospective_events.len();
+        let mut planned_events = Vec::new();
+        let mut planned_seq = journal.next_seq();
         let recovered_unfinished_response = !unfinished_responses.is_empty();
         for response in unfinished_responses {
-            journal.append_and_sync(
+            stage_recovery_event(
+                session_id,
+                &mut planned_seq,
+                &mut planned_events,
+                &mut prospective_events,
                 "response.aborted",
                 response.turn_id.as_deref(),
                 json!({
@@ -417,7 +424,11 @@ impl SessionStore {
 
         let recovered_unfinished_compaction = !unfinished_compactions.is_empty();
         for attempt in unfinished_compactions {
-            journal.append_and_sync(
+            stage_recovery_event(
+                session_id,
+                &mut planned_seq,
+                &mut planned_events,
+                &mut prospective_events,
                 COMPACTION_ABORTED_KIND,
                 None,
                 json!({
@@ -430,22 +441,52 @@ impl SessionStore {
             )?;
         }
 
-        let recovered_boundaries = recover_compaction_boundaries(&mut journal)?;
+        let boundary_actions = compaction_boundary_recovery_actions(&prospective_events)?;
+        let mut recovered_boundaries = RecoveredCompactionBoundaries::default();
+        for action in boundary_actions {
+            match action {
+                CompactionBoundaryRecoveryAction::Checkpointed(payload) => {
+                    stage_recovery_event(
+                        session_id,
+                        &mut planned_seq,
+                        &mut planned_events,
+                        &mut prospective_events,
+                        COMPACTION_BOUNDARY_CHECKPOINTED_KIND,
+                        None,
+                        serde_json::to_value(payload)?,
+                    )?;
+                    recovered_boundaries.checkpointed =
+                        recovered_boundaries.checkpointed.saturating_add(1);
+                }
+                CompactionBoundaryRecoveryAction::Failed(payload) => {
+                    stage_recovery_event(
+                        session_id,
+                        &mut planned_seq,
+                        &mut planned_events,
+                        &mut prospective_events,
+                        COMPACTION_BOUNDARY_FAILED_KIND,
+                        None,
+                        serde_json::to_value(payload)?,
+                    )?;
+                    recovered_boundaries.failed = recovered_boundaries.failed.saturating_add(1);
+                }
+            }
+        }
+        if !compaction_boundary_recovery_actions(&prospective_events)?.is_empty() {
+            return Err(OxidraError::Session(
+                "compaction boundary recovery did not reach a stable state".to_owned(),
+            ));
+        }
         recovery.failed_compaction_boundaries = recovery
             .failed_compaction_boundaries
             .saturating_add(recovered_boundaries.failed);
         recovery.checkpointed_compaction_boundaries = recovery
             .checkpointed_compaction_boundaries
             .saturating_add(recovered_boundaries.checkpointed);
-        let mcp_turn_ids = crate::mcp::mcp_turn_ids(&journal.read_events()?)?;
-        for turn_id in &mcp_turn_ids {
-            // Use the frozen generic slot v2 as a recovery-consistency check;
-            // slot v3 calls back into the MCP validator and is therefore not
-            // used from inside this validator-owned repair window.
-            provider_request_slot_state_for_version(2, &journal.read_events()?, turn_id)?;
-        }
+        let mcp_turn_ids = crate::mcp::mcp_turn_ids(&prospective_events)?;
+        validate_provider_request_slots_v2(&prospective_events, &mcp_turn_ids)?;
         recovery.marker_seq = matching_recovery_marker(
-            &scan.events,
+            &prospective_events[..original_event_count],
             &recovery.in_doubt,
             recovery.skipped_before_start,
             recovery.aborted_responses,
@@ -454,46 +495,32 @@ impl SessionStore {
             recovery.checkpointed_compaction_boundaries,
         );
 
-        let recovered_unstarted = !unstarted_tools.is_empty();
-        if recovered_unstarted {
-            for tools in unstarted_tools.chunks(MAX_MCP_CALLS_PER_RESPONSE) {
-                let event = journal.append_and_sync(
-                    RECOVERY_KIND,
-                    None,
-                    recovery_marker_data(&recovery, tools)?,
-                )?;
-                recovery.marker_seq = Some(event.seq);
-
-                // Each skip binds to the exact bounded marker that authorized
-                // its call. If recovery is interrupted, the next reopen may
-                // append a fresh marker for only the remaining calls; unused
-                // markers are harmless and the frozen validator stays valid.
-                for tool in tools {
-                    append_recovery_tool_skip(&mut journal, tool, event.seq)?;
-                }
-            }
-        } else if recovery.truncated_tail.is_some()
-            || recovered_unfinished_response
-            || recovered_unfinished_compaction
-            || (!recovery.in_doubt.is_empty() && recovery.marker_seq.is_none())
-            || (recovery.skipped_before_start > 0 && recovery.marker_seq.is_none())
-            || (recovery.aborted_responses > 0 && recovery.marker_seq.is_none())
-            || (recovery.aborted_compactions > 0 && recovery.marker_seq.is_none())
-            || (recovery.failed_compaction_boundaries > 0 && recovery.marker_seq.is_none())
-            || (recovery.checkpointed_compaction_boundaries > 0 && recovery.marker_seq.is_none())
-        {
-            let event = journal.append_and_sync(
-                RECOVERY_KIND,
-                None,
-                recovery_marker_data(&recovery, &unstarted_tools)?,
-            )?;
-            recovery.marker_seq = Some(event.seq);
-        }
-        crate::mcp::validate_mcp_call_chain(&journal.read_events()?)?;
-        let final_events = journal.read_events()?;
-        for turn_id in &mcp_turn_ids {
-            provider_request_slot_state_for_version(2, &final_events, turn_id)?;
-        }
+        let marker_required_without_tools = unstarted_tools.is_empty()
+            && (recovery.truncated_tail.is_some()
+                || recovered_unfinished_response
+                || recovered_unfinished_compaction
+                || (!recovery.in_doubt.is_empty() && recovery.marker_seq.is_none())
+                || (recovery.skipped_before_start > 0 && recovery.marker_seq.is_none())
+                || (recovery.aborted_responses > 0 && recovery.marker_seq.is_none())
+                || (recovery.aborted_compactions > 0 && recovery.marker_seq.is_none())
+                || (recovery.failed_compaction_boundaries > 0 && recovery.marker_seq.is_none())
+                || (recovery.checkpointed_compaction_boundaries > 0
+                    && recovery.marker_seq.is_none()));
+        // Freeze every recovery event before any transaction byte is written.
+        // This includes generic aborts, compaction boundary terminals, MCP
+        // markers and all authorized skips.
+        let mcp_recovery_events = plan_mcp_recovery_events(
+            journal.session_id(),
+            planned_seq,
+            &mut recovery,
+            &unstarted_tools,
+            marker_required_without_tools,
+        )?;
+        prospective_events.extend(mcp_recovery_events.iter().cloned());
+        planned_events.extend(mcp_recovery_events);
+        crate::mcp::validate_mcp_call_chain(&prospective_events)?;
+        validate_provider_request_slots_v2(&prospective_events, &mcp_turn_ids)?;
+        journal.append_recovery_batch(&planned_events)?;
         journal.recovery = recovery;
         Ok(journal)
     }
@@ -672,6 +699,76 @@ impl SessionJournal {
         let event = self.append(kind, turn_id, data)?;
         self.sync()?;
         Ok(event)
+    }
+
+    /// Append a fully prebuilt recovery transaction after proving the exact
+    /// encoded batch fits. No journal byte is written when the reservation
+    /// fails, and successful batches use one durability barrier.
+    fn append_recovery_batch(&mut self, events: &[JournalEvent]) -> Result<()> {
+        self.append_recovery_batch_with_limit(events, MAX_SESSION_BYTES)
+    }
+
+    fn append_recovery_batch_with_limit(
+        &mut self,
+        events: &[JournalEvent],
+        byte_limit: u64,
+    ) -> Result<()> {
+        self.ensure_healthy()?;
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        let mut expected_seq = self.next_seq;
+        let mut encoded_bytes = 0u64;
+        for event in events {
+            if event.schema != JOURNAL_SCHEMA
+                || event.session_id != self.session_id
+                || event.seq != expected_seq
+                || event.kind.trim().is_empty()
+            {
+                return Err(OxidraError::Session(
+                    "invalid prebuilt recovery transaction".to_owned(),
+                ));
+            }
+            expected_seq = expected_seq
+                .checked_add(1)
+                .ok_or_else(|| OxidraError::Session("journal sequence exhausted".to_owned()))?;
+            let event_len = u64::try_from(serde_json::to_vec(event)?.len())
+                .map_err(|_| OxidraError::Session("recovery event is too large".to_owned()))?;
+            encoded_bytes = encoded_bytes
+                .checked_add(event_len)
+                .and_then(|size| size.checked_add(1))
+                .ok_or_else(|| {
+                    OxidraError::Session("recovery transaction size overflow".to_owned())
+                })?;
+        }
+
+        let metadata_result = self.file.metadata();
+        let current_size = self.finish_io(metadata_result)?.len();
+        if current_size
+            .checked_add(encoded_bytes)
+            .is_none_or(|size| size > byte_limit)
+        {
+            return Err(OxidraError::Session(format!(
+                "session recovery transaction would exceed the {MAX_SESSION_BYTES}-byte safety limit"
+            )));
+        }
+
+        // The exact reservation above is complete before this first seek or
+        // write. Every valid on-disk prefix is replayable: markers precede the
+        // skips they authorize, so a crash merely leaves a smaller set for the
+        // next open to recover.
+        let seek_result = self.file.seek(SeekFrom::End(0));
+        self.finish_io(seek_result)?;
+        for event in events {
+            let encoded = serde_json::to_vec(event)?;
+            let write_result = self.file.write_all(&encoded);
+            self.finish_io(write_result)?;
+            let newline_result = self.file.write_all(b"\n");
+            self.finish_io(newline_result)?;
+        }
+        self.next_seq = expected_seq;
+        self.sync()
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -936,7 +1033,7 @@ fn pending_tools(events: &[JournalEvent]) -> Vec<InDoubtTool> {
     // A malformed/provider-replayed response may reuse a call_id. Keep all
     // sequence numbers instead of letting a later call erase earlier
     // in-doubt evidence.
-    let mut call_ids = BTreeMap::<String, Vec<u64>>::new();
+    let mut call_ids = HashMap::<(Option<String>, String), PendingCallSequences>::new();
 
     for event in events {
         match event.kind.as_str() {
@@ -951,7 +1048,10 @@ fn pending_tools(events: &[JournalEvent]) -> Vec<InDoubtTool> {
                     data: event.data.clone(),
                 };
                 if let Some(call_id) = call_id {
-                    call_ids.entry(call_id).or_default().push(event.seq);
+                    call_ids
+                        .entry((event.turn_id.clone(), call_id))
+                        .or_default()
+                        .insert(event.seq);
                 }
                 pending.insert(event.seq, tool);
             }
@@ -959,7 +1059,7 @@ fn pending_tools(events: &[JournalEvent]) -> Vec<InDoubtTool> {
                 record_in_doubt_tool(event, &mut pending, &mut call_ids);
             }
             kind if is_tool_terminal(kind) => {
-                resolve_tool(&event.data, &mut pending, &mut call_ids);
+                resolve_tool(event, &mut pending, &mut call_ids);
             }
             _ => {}
         }
@@ -970,22 +1070,30 @@ fn pending_tools(events: &[JournalEvent]) -> Vec<InDoubtTool> {
 fn record_in_doubt_tool(
     event: &JournalEvent,
     pending: &mut BTreeMap<u64, InDoubtTool>,
-    call_ids: &mut BTreeMap<String, Vec<u64>>,
+    call_ids: &mut HashMap<(Option<String>, String), PendingCallSequences>,
 ) {
     let call_id = string_field(&event.data, &["call_id", "id"]);
+    let identity = call_id
+        .as_ref()
+        .map(|call_id| (event.turn_id.clone(), call_id.clone()));
     let referenced_seq = event.data.get("started_seq").and_then(Value::as_u64);
     let existing_seq = referenced_seq
-        .filter(|seq| pending.contains_key(seq))
+        .filter(|seq| {
+            pending.get(seq).is_some_and(|tool| {
+                pending_tool_matches_event_identity(tool, event, call_id.as_deref())
+            })
+        })
         .or_else(|| {
-            call_id.as_ref().and_then(|id| {
+            identity.as_ref().and_then(|identity| {
                 call_ids
-                    .get(id)
-                    .and_then(|sequences| sequences.last().copied())
+                    .get_mut(identity)
+                    .and_then(PendingCallSequences::latest)
             })
         });
 
     if let Some(started_seq) = existing_seq {
         let updated_ids = pending.get_mut(&started_seq).map(|tool| {
+            let previous_turn_id = tool.turn_id.clone();
             let previous_call_id = tool.call_id.clone();
             tool.turn_id = event.turn_id.clone().or_else(|| tool.turn_id.clone());
             tool.call_id = call_id.or_else(|| tool.call_id.clone());
@@ -997,18 +1105,29 @@ fn record_in_doubt_tool(
                 .cloned()
                 .or_else(|| tool.arguments.clone());
             tool.data = event.data.clone();
-            (previous_call_id, tool.call_id.clone())
+            (
+                previous_turn_id,
+                previous_call_id,
+                tool.turn_id.clone(),
+                tool.call_id.clone(),
+            )
         });
-        if let Some((previous_call_id, current_call_id)) = updated_ids {
-            if previous_call_id != current_call_id {
+        if let Some((previous_turn_id, previous_call_id, current_turn_id, current_call_id)) =
+            updated_ids
+        {
+            if previous_turn_id != current_turn_id || previous_call_id != current_call_id {
                 if let Some(previous_call_id) = previous_call_id {
-                    remove_call_id_seq(call_ids, &previous_call_id, started_seq);
+                    remove_call_id_seq(
+                        call_ids,
+                        &(previous_turn_id, previous_call_id),
+                        started_seq,
+                    );
                 }
                 if let Some(current_call_id) = current_call_id {
                     call_ids
-                        .entry(current_call_id)
+                        .entry((current_turn_id, current_call_id))
                         .or_default()
-                        .push(started_seq);
+                        .insert(started_seq);
                 }
             }
         }
@@ -1025,47 +1144,102 @@ fn record_in_doubt_tool(
         data: event.data.clone(),
     };
     if let Some(call_id) = call_id {
-        call_ids.entry(call_id).or_default().push(started_seq);
+        call_ids
+            .entry((event.turn_id.clone(), call_id))
+            .or_default()
+            .insert(started_seq);
     }
     pending.insert(started_seq, tool);
 }
 
 fn resolve_tool(
-    data: &Value,
+    event: &JournalEvent,
     pending: &mut BTreeMap<u64, InDoubtTool>,
-    call_ids: &mut BTreeMap<String, Vec<u64>>,
+    call_ids: &mut HashMap<(Option<String>, String), PendingCallSequences>,
 ) {
+    let data = &event.data;
+    let call_id = string_field(data, &["call_id", "id"]);
     if let Some(started_seq) = data.get("started_seq").and_then(Value::as_u64) {
-        if let Some(tool) = pending.remove(&started_seq) {
+        let matches_identity = pending.get(&started_seq).is_some_and(|tool| {
+            pending_tool_matches_event_identity(tool, event, call_id.as_deref())
+        });
+        if matches_identity {
+            let tool = pending
+                .remove(&started_seq)
+                .expect("checked pending tool identity");
             if let Some(call_id) = tool.call_id {
-                remove_call_id_seq(call_ids, &call_id, started_seq);
+                remove_call_id_seq(call_ids, &(tool.turn_id, call_id), started_seq);
             }
         }
         return;
     }
-    if let Some(call_id) = string_field(data, &["call_id", "id"]) {
+    if let Some(call_id) = call_id {
+        let identity = (event.turn_id.clone(), call_id);
         if let Some(started_seq) = call_ids
-            .get(&call_id)
-            .and_then(|sequences| sequences.last().copied())
+            .get_mut(&identity)
+            .and_then(PendingCallSequences::latest)
         {
-            remove_call_id_seq(call_ids, &call_id, started_seq);
+            remove_call_id_seq(call_ids, &identity, started_seq);
             pending.remove(&started_seq);
         }
     }
 }
 
-fn remove_call_id_seq(call_ids: &mut BTreeMap<String, Vec<u64>>, call_id: &str, seq: u64) {
+fn pending_tool_matches_event_identity(
+    tool: &InDoubtTool,
+    event: &JournalEvent,
+    event_call_id: Option<&str>,
+) -> bool {
+    tool.turn_id == event.turn_id
+        && event_call_id.is_none_or(|call_id| tool.call_id.as_deref() == Some(call_id))
+}
+
+#[derive(Default)]
+struct PendingCallSequences {
+    insertion_order: Vec<u64>,
+    active: HashSet<u64>,
+}
+
+impl PendingCallSequences {
+    fn insert(&mut self, seq: u64) {
+        self.insertion_order.push(seq);
+        self.active.insert(seq);
+    }
+
+    fn remove(&mut self, seq: u64) {
+        self.active.remove(&seq);
+    }
+
+    fn latest(&mut self) -> Option<u64> {
+        while self
+            .insertion_order
+            .last()
+            .is_some_and(|seq| !self.active.contains(seq))
+        {
+            self.insertion_order.pop();
+        }
+        self.insertion_order.last().copied()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.active.is_empty()
+    }
+}
+
+fn remove_call_id_seq(
+    call_ids: &mut HashMap<(Option<String>, String), PendingCallSequences>,
+    identity: &(Option<String>, String),
+    seq: u64,
+) {
     let empty = {
-        let Some(sequences) = call_ids.get_mut(call_id) else {
+        let Some(sequences) = call_ids.get_mut(identity) else {
             return;
         };
-        if let Some(index) = sequences.iter().position(|candidate| *candidate == seq) {
-            sequences.remove(index);
-        }
+        sequences.remove(seq);
         sequences.is_empty()
     };
     if empty {
-        call_ids.remove(call_id);
+        call_ids.remove(identity);
     }
 }
 
@@ -1168,47 +1342,10 @@ struct RecoveredCompactionBoundaries {
     checkpointed: usize,
 }
 
-fn recover_compaction_boundaries(
-    journal: &mut SessionJournal,
-) -> Result<RecoveredCompactionBoundaries> {
-    let events = journal.read_events()?;
-    let actions = compaction_boundary_recovery_actions(&events)?;
-    let mut recovered = RecoveredCompactionBoundaries::default();
-    for action in actions {
-        match action {
-            CompactionBoundaryRecoveryAction::Checkpointed(payload) => {
-                journal.append_and_sync(
-                    COMPACTION_BOUNDARY_CHECKPOINTED_KIND,
-                    None,
-                    serde_json::to_value(payload)?,
-                )?;
-                recovered.checkpointed = recovered.checkpointed.saturating_add(1);
-            }
-            CompactionBoundaryRecoveryAction::Failed(payload) => {
-                journal.append_and_sync(
-                    COMPACTION_BOUNDARY_FAILED_KIND,
-                    None,
-                    serde_json::to_value(payload)?,
-                )?;
-                recovered.failed = recovered.failed.saturating_add(1);
-            }
-        }
-    }
-
-    // Re-run the pure reducer against the committed bytes.  Recovery must not
-    // merely append plausible-looking events; the resulting protocol state
-    // must be self-consistent and require no second repair pass.
-    let remaining = compaction_boundary_recovery_actions(&journal.read_events()?)?;
-    if !remaining.is_empty() {
-        return Err(OxidraError::Session(
-            "compaction boundary recovery did not reach a stable state".to_owned(),
-        ));
-    }
-    Ok(recovered)
-}
-
 fn unstarted_tool_calls(events: &[JournalEvent]) -> Vec<UnstartedTool> {
     let mut unstarted = BTreeMap::<u64, UnstartedTool>::new();
+    let mut pending_by_identity =
+        std::collections::HashMap::<(Option<String>, String), Vec<u64>>::new();
     let mut next_key = 0u64;
     for event in events {
         match event.kind.as_str() {
@@ -1252,16 +1389,23 @@ fn unstarted_tool_calls(events: &[JournalEvent]) -> Vec<UnstartedTool> {
                             arguments,
                         },
                     );
+                    pending_by_identity
+                        .entry((event.turn_id.clone(), call_id.to_owned()))
+                        .or_default()
+                        .push(key);
                 }
             }
             kind if is_tool_lifecycle(kind) => {
                 if let Some(call_id) = string_field(&event.data, &["call_id", "id"]) {
-                    if let Some(key) = unstarted
-                        .iter()
-                        .rev()
-                        .find_map(|(key, tool)| (tool.call_id == call_id).then_some(*key))
-                    {
+                    let identity = (event.turn_id.clone(), call_id);
+                    if let Some(key) = pending_by_identity.get_mut(&identity).and_then(Vec::pop) {
                         unstarted.remove(&key);
+                    }
+                    if pending_by_identity
+                        .get(&identity)
+                        .is_some_and(Vec::is_empty)
+                    {
+                        pending_by_identity.remove(&identity);
                     }
                 }
             }
@@ -1278,32 +1422,110 @@ fn preflight_recovery_authorization_batches(unstarted_tools: &[UnstartedTool]) -
     Ok(())
 }
 
-fn append_recovery_tool_skip(
-    journal: &mut SessionJournal,
-    tool: &UnstartedTool,
-    recovery_marker_seq: u64,
-) -> Result<()> {
-    journal.append_and_sync(
-        "tool.skipped_due_to_recovery",
-        tool.turn_id.as_deref(),
-        json!({
-            "response_seq": tool.response_seq,
-            "call_id": tool.call_id,
-            "tool": tool.tool_name,
-            "arguments": tool.arguments,
-            "reason": "process stopped before tool.started was committed",
-            "output": {
-                "error": {
-                    "code": "interrupted_before_start",
-                    "message": "tool was not executed because the previous process stopped before dispatch",
-                }
-            },
-            "is_error": true,
-            "error_code": "interrupted_before_start",
-            "recovery_marker_seq": recovery_marker_seq,
-        }),
-    )?;
-    Ok(())
+fn planned_recovery_event(
+    session_id: &str,
+    next_seq: &mut u64,
+    kind: &str,
+    turn_id: Option<&str>,
+    data: Value,
+) -> Result<JournalEvent> {
+    let event = JournalEvent {
+        schema: JOURNAL_SCHEMA,
+        seq: *next_seq,
+        ts: Utc::now(),
+        kind: kind.to_owned(),
+        session_id: session_id.to_owned(),
+        turn_id: turn_id.map(str::to_owned),
+        data,
+    };
+    *next_seq = next_seq
+        .checked_add(1)
+        .ok_or_else(|| OxidraError::Session("journal sequence exhausted".to_owned()))?;
+    Ok(event)
+}
+
+fn stage_recovery_event(
+    session_id: &str,
+    next_seq: &mut u64,
+    planned: &mut Vec<JournalEvent>,
+    prospective: &mut Vec<JournalEvent>,
+    kind: &str,
+    turn_id: Option<&str>,
+    data: Value,
+) -> Result<JournalEvent> {
+    let event = planned_recovery_event(session_id, next_seq, kind, turn_id, data)?;
+    planned.push(event.clone());
+    prospective.push(event.clone());
+    Ok(event)
+}
+
+fn recovery_tool_skip_data(tool: &UnstartedTool, recovery_marker_seq: u64) -> Value {
+    json!({
+        "response_seq": tool.response_seq,
+        "call_id": tool.call_id,
+        "tool": tool.tool_name,
+        "arguments": tool.arguments,
+        "reason": "process stopped before tool.started was committed",
+        "output": {
+            "error": {
+                "code": "interrupted_before_start",
+                "message": "tool was not executed because the previous process stopped before dispatch",
+            }
+        },
+        "is_error": true,
+        "error_code": "interrupted_before_start",
+        "recovery_marker_seq": recovery_marker_seq,
+    })
+}
+
+fn plan_mcp_recovery_events(
+    session_id: &str,
+    first_seq: u64,
+    recovery: &mut RecoveryInfo,
+    unstarted_tools: &[UnstartedTool],
+    marker_required_without_tools: bool,
+) -> Result<Vec<JournalEvent>> {
+    let mut next_seq = first_seq;
+    let mut events = Vec::with_capacity(
+        unstarted_tools
+            .len()
+            .saturating_add(unstarted_tools.len().div_ceil(MAX_MCP_CALLS_PER_RESPONSE))
+            .saturating_add(usize::from(marker_required_without_tools)),
+    );
+    if !unstarted_tools.is_empty() {
+        for tools in unstarted_tools.chunks(MAX_MCP_CALLS_PER_RESPONSE) {
+            let marker = planned_recovery_event(
+                session_id,
+                &mut next_seq,
+                RECOVERY_KIND,
+                None,
+                recovery_marker_data(recovery, tools)?,
+            )?;
+            let marker_seq = marker.seq;
+            recovery.marker_seq = Some(marker_seq);
+            events.push(marker);
+            for tool in tools {
+                events.push(planned_recovery_event(
+                    session_id,
+                    &mut next_seq,
+                    "tool.skipped_due_to_recovery",
+                    tool.turn_id.as_deref(),
+                    recovery_tool_skip_data(tool, marker_seq),
+                )?);
+            }
+        }
+    } else if marker_required_without_tools {
+        let marker = planned_recovery_event(
+            session_id,
+            &mut next_seq,
+            RECOVERY_KIND,
+            None,
+            recovery_marker_data(recovery, unstarted_tools)?,
+        )?;
+        recovery.marker_seq = Some(marker.seq);
+        events.push(marker);
+    }
+    Ok(events)
 }
 
 fn matching_recovery_marker(
@@ -1324,6 +1546,8 @@ fn matching_recovery_marker(
     {
         return None;
     }
+
+    let expected_in_doubt_keys = sorted_in_doubt_keys(in_doubt);
 
     events
         .iter()
@@ -1358,7 +1582,7 @@ fn matching_recovery_marker(
                 .and_then(Value::as_u64)
                 .unwrap_or_default()
                 as usize;
-            (same_in_doubt_set(&marked, in_doubt)
+            (sorted_in_doubt_keys(&marked) == expected_in_doubt_keys
                 && marked_skipped == skipped_before_start
                 && marked_aborted == aborted_responses
                 && marked_aborted_compactions == aborted_compactions
@@ -1368,8 +1592,8 @@ fn matching_recovery_marker(
         })
 }
 
-fn same_in_doubt_set(left: &[InDoubtTool], right: &[InDoubtTool]) -> bool {
-    let mut left_keys = left
+fn sorted_in_doubt_keys(tools: &[InDoubtTool]) -> Vec<(u64, String, String)> {
+    let mut keys = tools
         .iter()
         .map(|tool| {
             (
@@ -1379,19 +1603,8 @@ fn same_in_doubt_set(left: &[InDoubtTool], right: &[InDoubtTool]) -> bool {
             )
         })
         .collect::<Vec<_>>();
-    let mut right_keys = right
-        .iter()
-        .map(|tool| {
-            (
-                tool.started_seq,
-                tool.call_id.as_deref().unwrap_or_default().to_owned(),
-                tool.tool_name.as_deref().unwrap_or_default().to_owned(),
-            )
-        })
-        .collect::<Vec<_>>();
-    left_keys.sort();
-    right_keys.sort();
-    left_keys == right_keys
+    keys.sort();
+    keys
 }
 
 fn recovery_marker_data(
@@ -2085,6 +2298,182 @@ mod tests {
             1
         );
         assert!(recovery_marker_data(&recovery, &tools).is_err());
+    }
+
+    #[test]
+    fn recovery_transaction_reserves_all_events_before_writing() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("recovery-capacity", header(temp.path()))
+            .unwrap();
+        let tools = vec![UnstartedTool {
+            response_seq: 2,
+            turn_id: Some("turn-tool".to_owned()),
+            call_id: "call-1".to_owned(),
+            tool_name: Some("read".to_owned()),
+            arguments: Some(json!({"path":"calc.py"})),
+        }];
+        let mut recovery = RecoveryInfo {
+            skipped_before_start: 1,
+            ..RecoveryInfo::default()
+        };
+        let mut planned_seq = journal.next_seq();
+        let mut events = vec![
+            planned_recovery_event(
+                journal.session_id(),
+                &mut planned_seq,
+                "response.aborted",
+                Some("turn-tool"),
+                json!({
+                    "response_attempt_id":"attempt-1",
+                    "started_seq":2,
+                    "reason":"recovered",
+                    "recovered":true
+                }),
+            )
+            .unwrap(),
+        ];
+        events.extend(
+            plan_mcp_recovery_events(
+                journal.session_id(),
+                planned_seq,
+                &mut recovery,
+                &tools,
+                false,
+            )
+            .unwrap(),
+        );
+        assert_eq!(events.len(), 3);
+        let first_event_bytes = serde_json::to_vec(&events[0]).unwrap().len() as u64 + 1;
+        let original_size = journal.file.metadata().unwrap().len();
+        let original_seq = journal.next_seq();
+
+        let error = journal
+            .append_recovery_batch_with_limit(&events, original_size + first_event_bytes)
+            .expect_err("the complete transaction must not fit")
+            .to_string();
+        assert!(error.contains("recovery transaction would exceed"));
+        assert_eq!(journal.file.metadata().unwrap().len(), original_size);
+        assert_eq!(journal.next_seq(), original_seq);
+        assert!(!journal.poisoned);
+    }
+
+    #[test]
+    fn unstarted_call_lifecycle_index_is_scoped_by_turn() {
+        let base = Utc::now();
+        let event = |seq, kind: &str, turn_id: &str, data| JournalEvent {
+            schema: JOURNAL_SCHEMA,
+            seq,
+            ts: base,
+            kind: kind.to_owned(),
+            session_id: "turn-scoped".to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            data,
+        };
+        let events = vec![
+            event(
+                1,
+                "response.completed",
+                "turn-a",
+                json!({"output_items":[{
+                    "type":"function_call", "call_id":"shared", "name":"read", "arguments":{}
+                }]}),
+            ),
+            event(
+                2,
+                "response.completed",
+                "turn-b",
+                json!({"output_items":[{
+                    "type":"function_call", "call_id":"shared", "name":"read", "arguments":{}
+                }]}),
+            ),
+            event(3, "tool.completed", "turn-a", json!({"call_id":"shared"})),
+        ];
+
+        let pending = unstarted_tool_calls(&events);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].turn_id.as_deref(), Some("turn-b"));
+    }
+
+    #[test]
+    fn pending_call_lifecycle_index_is_scoped_by_turn() {
+        let base = Utc::now();
+        let event = |seq, kind: &str, turn_id: &str, data| JournalEvent {
+            schema: JOURNAL_SCHEMA,
+            seq,
+            ts: base,
+            kind: kind.to_owned(),
+            session_id: "pending-turn-scoped".to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            data,
+        };
+        let events = vec![
+            event(
+                1,
+                "tool.started",
+                "turn-a",
+                json!({"call_id":"shared","tool":"read"}),
+            ),
+            event(
+                2,
+                "tool.started",
+                "turn-b",
+                json!({"call_id":"shared","tool":"read"}),
+            ),
+            event(
+                3,
+                "tool.completed",
+                "turn-a",
+                json!({"call_id":"shared","output":"ok"}),
+            ),
+        ];
+
+        let pending = pending_tools(&events);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].started_seq, 2);
+        assert_eq!(pending[0].turn_id.as_deref(), Some("turn-b"));
+    }
+
+    #[test]
+    fn pending_call_started_seq_cannot_cross_identity() {
+        let base = Utc::now();
+        let event = |seq, kind: &str, turn_id: &str, data| JournalEvent {
+            schema: JOURNAL_SCHEMA,
+            seq,
+            ts: base,
+            kind: kind.to_owned(),
+            session_id: "pending-started-seq".to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            data,
+        };
+        let events = vec![
+            event(
+                1,
+                "tool.started",
+                "turn-a",
+                json!({"call_id":"call-a","tool":"read"}),
+            ),
+            event(
+                2,
+                "tool.started",
+                "turn-b",
+                json!({"call_id":"call-b","tool":"read"}),
+            ),
+            event(
+                3,
+                "tool.completed",
+                "turn-b",
+                json!({"call_id":"call-b","started_seq":1,"output":"ok"}),
+            ),
+        ];
+
+        let pending = pending_tools(&events);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].started_seq, 1);
+        assert_eq!(pending[0].turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(pending[1].started_seq, 2);
+        assert_eq!(pending[1].turn_id.as_deref(), Some("turn-b"));
     }
 
     #[test]

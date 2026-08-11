@@ -184,13 +184,14 @@ execution trust 明确是授予当前 OS 用户权限的 path/command capability
 或依赖内容证明；继承环境的秘密值也不进入公开 digest。no-subprocess seccomp 只负责
 lifecycle containment，不限制文件或网络权限；未来 per-tool approval 只是请求意图确认
 与审计，不是进程 sandbox。固定 JSON Schema profile v1 已在 dispatch 前验证参数、在
-complete result 后验证 structured output，并由 registry digest 绑定。它尚未进入 CLI
-参数、Agent approval、journal 或 context.tools，
-因此用户现在仍然只能使用固定内置工具，不能把上述 MCP server 暴露给模型。
+complete result 后验证 structured output，并由 registry digest 绑定。durable execution
+coordinator core、registry epoch activation、call-chain validator v2 与 crash recovery 已接入
+journal，但尚未进入 CLI 参数、Agent approval 或 `context.tools`，因此用户现在仍然只能使用
+固定内置工具，不能把上述 MCP server 暴露给模型。
 
-下一步是 CLI execution trust 与 Agent approval：把 execution-plan digest 接入启动前
-批准，再把 discovery 后的 registry epoch/digest 接入 `context.tools`，最后复用现有
-`tool.started/completed/in_doubt` reducer 完成 journal、崩溃恢复和 in-doubt 人工解决。
+下一步是 CLI execution trust 与 Agent approval：把 session-open 产生的 resume capability、
+execution-plan approval 和 discovery 后的 registry epoch/digest 接入 `context.tools`，再让
+Agent 只通过 coordinator 的一次性 dispatch permit 执行调用，并补 in-doubt 人工解决入口。
 完整顺序与 release gate 见 `docs/mcp-roadmap.md`；不能把 kernel 的存在误报为已完成
 用户入口。
 
