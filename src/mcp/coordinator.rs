@@ -2,15 +2,19 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+use std::marker::PhantomData;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::journal::{
-    MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, argument_digest_v1, ensure_no_unstarted_mcp_calls_v1,
-    validate_mcp_call_chain_v1,
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, MCP_CALL_CHAIN_VALIDATOR_VERSION_V2, argument_digest_v1,
+    ensure_no_unstarted_mcp_calls, validate_mcp_call_chain,
 };
-use super::registry::{ApprovedMcpRegistry, McpRegistry, PreparedMcpRegistryCall};
+use super::registry::{
+    ApprovedMcpRegistry, ApprovedMcpResumeRegistry, McpRegistry, PreparedMcpRegistryCall,
+};
 use super::{McpCallError, PreflightedJsonValue};
+use crate::compaction::validate_compaction_boundary_chain;
 use crate::error::{OxidraError, Result};
 use crate::session::{JOURNAL_SCHEMA, JournalEvent, SessionJournal};
 use crate::turn::{ProviderRequestSlotState, provider_request_slot_state_for_version};
@@ -18,6 +22,7 @@ use crate::types::{ToolDefinition, ToolResult};
 use crate::untrusted_display;
 
 const MCP_EXECUTION_COORDINATOR_VERSION_V1: u32 = 1;
+const MCP_EXECUTION_COORDINATOR_VERSION_V2: u32 = 2;
 const MCP_DISPATCH_PERMIT_VERSION_V1: u32 = 1;
 const MCP_ARGUMENT_DIGEST_VERSION_V1: u32 = 1;
 const MCP_TOOL_REGISTRY_VERSION_V1: u32 = 1;
@@ -25,13 +30,13 @@ const MCP_STDIO_KERNEL_VERSION_V1: u32 = 1;
 const MCP_SCHEMA_PROFILE_VERSION_V1: u32 = 1;
 const MCP_COORDINATOR_PROVIDER_SLOT_VERSION_V1: u32 = 2;
 
-pub const MCP_EXECUTION_COORDINATOR_VERSION: u32 = MCP_EXECUTION_COORDINATOR_VERSION_V1;
+pub const MCP_EXECUTION_COORDINATOR_VERSION: u32 = MCP_EXECUTION_COORDINATOR_VERSION_V2;
 pub const MCP_DISPATCH_PERMIT_VERSION: u32 = MCP_DISPATCH_PERMIT_VERSION_V1;
 pub const MCP_ARGUMENT_DIGEST_VERSION: u32 = MCP_ARGUMENT_DIGEST_VERSION_V1;
 
 const MCP_REGISTRY_ACTIVATED_KIND: &str = "mcp.registry.activated";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct McpCoordinatorPolicy {
     coordinator_version: u32,
     call_chain_validator_version: u32,
@@ -54,8 +59,20 @@ const MCP_COORDINATOR_POLICY_V1: McpCoordinatorPolicy = McpCoordinatorPolicy {
     provider_slot_version: MCP_COORDINATOR_PROVIDER_SLOT_VERSION_V1,
 };
 
+const MCP_COORDINATOR_POLICY_V2: McpCoordinatorPolicy = McpCoordinatorPolicy {
+    coordinator_version: MCP_EXECUTION_COORDINATOR_VERSION_V2,
+    call_chain_validator_version: MCP_CALL_CHAIN_VALIDATOR_VERSION_V2,
+    dispatch_permit_version: MCP_DISPATCH_PERMIT_VERSION_V1,
+    argument_digest_version: MCP_ARGUMENT_DIGEST_VERSION_V1,
+    registry_version: MCP_TOOL_REGISTRY_VERSION_V1,
+    stdio_kernel_version: MCP_STDIO_KERNEL_VERSION_V1,
+    schema_profile_version: MCP_SCHEMA_PROFILE_VERSION_V1,
+    provider_slot_version: MCP_COORDINATOR_PROVIDER_SLOT_VERSION_V1,
+};
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpCallApprovalRequest {
+    pub execution_coordinator_version: u32,
     pub turn_id: String,
     pub call_id: String,
     pub provider_name: String,
@@ -117,6 +134,7 @@ impl McpCallApprovalHandler for DenyMcpCallApproval {
 /// Callers can request approval and execution, but cannot construct the
 /// private `DispatchPermit` consumed by the registry.
 pub struct McpExecutionCoordinator {
+    policy: McpCoordinatorPolicy,
     coordinator_id: String,
     registry_epoch_id: String,
     session_id: String,
@@ -124,39 +142,152 @@ pub struct McpExecutionCoordinator {
     registry: McpRegistry,
 }
 
+/// Opaque proof that a durable session was opened, recovered and reduced
+/// before any MCP process is started for resume.
+///
+/// The private fields make the proof unforgeable outside this crate.  Its
+/// lifetime also keeps the recovered [`SessionJournal`] borrowed until
+/// `connect_for_resume` has consumed the proof.
+pub struct McpResumeEligibility<'journal> {
+    policy: McpCoordinatorPolicy,
+    session_id: String,
+    journal_open_id: String,
+    activation_seq: u64,
+    coordinator_id: String,
+    registry_epoch_id: String,
+    config_sha256: String,
+    execution_plan_digest: String,
+    registry_digest: String,
+    _journal: PhantomData<&'journal mut SessionJournal>,
+}
+
+pub(super) struct McpResumePermit {
+    policy: McpCoordinatorPolicy,
+    session_id: String,
+    journal_open_id: String,
+    activation_seq: u64,
+    coordinator_id: String,
+    registry_epoch_id: String,
+    config_sha256: String,
+    execution_plan_digest: String,
+    registry_digest: String,
+}
+
+impl<'journal> McpResumeEligibility<'journal> {
+    pub(crate) fn from_recovered_journal(journal: &'journal mut SessionJournal) -> Result<Self> {
+        let events = journal.read_events()?;
+        validate_mcp_call_chain(&events)?;
+        ensure_no_unstarted_mcp_calls(&events)?;
+        let activation = durable_activation(&events)?;
+        let policy = activation_policy(activation)?;
+        let activation_seq = activation.seq;
+        let coordinator_id = required_activation_string(activation, "coordinator_id")?.to_owned();
+        let registry_epoch_id =
+            required_activation_string(activation, "registry_epoch_id")?.to_owned();
+        let config_sha256 = required_activation_string(activation, "config_sha256")?.to_owned();
+        let execution_plan_digest =
+            required_activation_string(activation, "execution_plan_digest")?.to_owned();
+        let registry_digest = required_activation_string(activation, "registry_digest")?.to_owned();
+        let journal_open_id = journal.claim_mcp_resume_open_id()?;
+
+        Ok(Self {
+            policy,
+            session_id: journal.session_id().to_owned(),
+            journal_open_id,
+            activation_seq,
+            coordinator_id,
+            registry_epoch_id,
+            config_sha256,
+            execution_plan_digest,
+            registry_digest,
+            _journal: PhantomData,
+        })
+    }
+
+    pub(super) fn validate_config(
+        &self,
+        config_sha256: &str,
+        execution_plan_digest: &str,
+    ) -> Result<()> {
+        if self.config_sha256 != config_sha256
+            || self.execution_plan_digest != execution_plan_digest
+        {
+            return Err(OxidraError::Mcp(
+                "MCP resume config does not match the durable registry activation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_permit(self) -> McpResumePermit {
+        McpResumePermit {
+            policy: self.policy,
+            session_id: self.session_id,
+            journal_open_id: self.journal_open_id,
+            activation_seq: self.activation_seq,
+            coordinator_id: self.coordinator_id,
+            registry_epoch_id: self.registry_epoch_id,
+            config_sha256: self.config_sha256,
+            execution_plan_digest: self.execution_plan_digest,
+            registry_digest: self.registry_digest,
+        }
+    }
+}
+
+impl McpResumePermit {
+    fn validate_journal(&self, journal: &SessionJournal) -> Result<()> {
+        if journal.session_id() != self.session_id
+            || journal.mcp_resume_open_id() != Some(self.journal_open_id.as_str())
+        {
+            return Err(OxidraError::Session(
+                "MCP resume permit does not belong to this recovered journal handle".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl McpExecutionCoordinator {
     pub fn activate(
         approved_registry: ApprovedMcpRegistry,
         journal: &mut SessionJournal,
     ) -> Result<Self> {
-        validate_new_activation_v1(&journal.read_events()?)?;
+        let mut events = journal.read_events()?;
+        validate_new_activation(&events)?;
         let mut registry = approved_registry.into_registry();
-        let policy = MCP_COORDINATOR_POLICY_V1;
-        let provider_names = registry
-            .bindings()
-            .map(|binding| binding.provider_name.clone())
-            .collect::<Vec<_>>();
+        let policy = MCP_COORDINATOR_POLICY_V2;
+        let bindings = registry.binding_identity_snapshot();
         let coordinator_id = Uuid::now_v7().to_string();
         let registry_epoch_id = Uuid::now_v7().to_string();
+        let activation_data = json!({
+            "coordinator_version": policy.coordinator_version,
+            "call_chain_validator_version": policy.call_chain_validator_version,
+            "coordinator_id": coordinator_id,
+            "registry_epoch_id": registry_epoch_id,
+            "registry_version": policy.registry_version,
+            "stdio_kernel_version": policy.stdio_kernel_version,
+            "schema_profile_version": policy.schema_profile_version,
+            "config_sha256": registry.config_sha256(),
+            "execution_plan_digest": registry.execution_plan_digest(),
+            "registry_digest": registry.digest(),
+            "bindings": bindings,
+        });
+        events.push(JournalEvent {
+            schema: JOURNAL_SCHEMA,
+            seq: journal.next_seq(),
+            ts: Utc::now(),
+            kind: MCP_REGISTRY_ACTIVATED_KIND.to_owned(),
+            session_id: journal.session_id().to_owned(),
+            turn_id: None,
+            data: activation_data.clone(),
+        });
+        validate_mcp_call_chain(&events)?;
+        validate_compaction_boundary_chain(&events)?;
+
         registry.bind_dispatch_authority(&coordinator_id, &registry_epoch_id)?;
-        let event = journal.append_and_sync(
-            MCP_REGISTRY_ACTIVATED_KIND,
-            None,
-            json!({
-                "coordinator_version": policy.coordinator_version,
-                "call_chain_validator_version": policy.call_chain_validator_version,
-                "coordinator_id": coordinator_id,
-                "registry_epoch_id": registry_epoch_id,
-                "registry_version": policy.registry_version,
-                "stdio_kernel_version": policy.stdio_kernel_version,
-                "schema_profile_version": policy.schema_profile_version,
-                "config_sha256": registry.config_sha256(),
-                "execution_plan_digest": registry.execution_plan_digest(),
-                "registry_digest": registry.digest(),
-                "provider_names": provider_names,
-            }),
-        )?;
+        let event = journal.append_and_sync(MCP_REGISTRY_ACTIVATED_KIND, None, activation_data)?;
         Ok(Self {
+            policy,
             coordinator_id,
             registry_epoch_id,
             session_id: journal.session_id().to_owned(),
@@ -170,58 +301,50 @@ impl McpExecutionCoordinator {
     ///
     /// This does not create a second activation.  The live registry must
     /// reproduce the exact config, execution-plan, provider surface and
-    /// registry digest recorded by coordinator v1.  Callers must open the
+    /// registry digest recorded by the activation policy. Callers must open the
     /// session through [`crate::session::SessionStore`] first so interrupted
     /// pre-start calls have already received their durable recovery outcome.
     pub fn resume(
-        approved_registry: ApprovedMcpRegistry,
+        approved_registry: ApprovedMcpResumeRegistry,
         journal: &SessionJournal,
     ) -> Result<Self> {
+        let (mut registry, resume_permit) = approved_registry.into_parts();
+        resume_permit.validate_journal(journal)?;
         let events = journal.read_events()?;
-        validate_mcp_call_chain_v1(&events)?;
-        ensure_no_unstarted_mcp_calls_v1(&events)?;
+        validate_mcp_call_chain(&events)?;
+        ensure_no_unstarted_mcp_calls(&events)?;
+        let activation = durable_activation(&events)?;
+        if activation_policy(activation)? != resume_permit.policy
+            || activation.seq != resume_permit.activation_seq
+            || required_activation_string(activation, "coordinator_id")?
+                != resume_permit.coordinator_id
+            || required_activation_string(activation, "registry_epoch_id")?
+                != resume_permit.registry_epoch_id
+            || required_activation_string(activation, "config_sha256")?
+                != resume_permit.config_sha256
+            || required_activation_string(activation, "execution_plan_digest")?
+                != resume_permit.execution_plan_digest
+            || required_activation_string(activation, "registry_digest")?
+                != resume_permit.registry_digest
+        {
+            return Err(OxidraError::Session(
+                "MCP resume permit no longer matches the durable registry activation".to_owned(),
+            ));
+        }
 
-        let activation = events
-            .iter()
-            .find(|event| event.kind == MCP_REGISTRY_ACTIVATED_KIND)
-            .ok_or_else(|| {
-                OxidraError::Session(
-                    "MCP coordinator resume requires a durable registry activation".to_owned(),
-                )
-            })?;
-        let coordinator_id = activation
-            .data
-            .get("coordinator_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "mcp.registry.activated at seq {} has no coordinator_id",
-                    activation.seq
-                ))
-            })?
-            .to_owned();
-        let registry_epoch_id = activation
-            .data
-            .get("registry_epoch_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "mcp.registry.activated at seq {} has no registry_epoch_id",
-                    activation.seq
-                ))
-            })?
-            .to_owned();
-
-        let mut registry = approved_registry.into_registry();
-        registry.bind_dispatch_authority(&coordinator_id, &registry_epoch_id)?;
+        registry.bind_dispatch_authority(
+            &resume_permit.coordinator_id,
+            &resume_permit.registry_epoch_id,
+        )?;
         let coordinator = Self {
-            coordinator_id,
-            registry_epoch_id,
+            policy: resume_permit.policy,
+            coordinator_id: resume_permit.coordinator_id,
+            registry_epoch_id: resume_permit.registry_epoch_id,
             session_id: journal.session_id().to_owned(),
             activation_seq: activation.seq,
             registry,
         };
-        validate_activation_v1(&events, &coordinator)?;
+        validate_activation(&events, &coordinator)?;
         Ok(coordinator)
     }
 
@@ -271,12 +394,7 @@ impl McpExecutionCoordinator {
                 prepared,
             } => (arguments_sha256, prepared),
             PreparedCoordinatorCall::Rejected(error) => {
-                validate_pre_start_terminal_candidate_v1(
-                    journal.read_events()?,
-                    journal,
-                    self,
-                    call,
-                )?;
+                validate_pre_start_terminal_candidate(journal.read_events()?, journal, self, call)?;
                 return self.commit_known_failure(
                     journal,
                     call,
@@ -289,6 +407,7 @@ impl McpExecutionCoordinator {
         };
         let arguments_json = serde_json::to_string(prepared.arguments())?;
         let approval_request = McpCallApprovalRequest {
+            execution_coordinator_version: self.policy.coordinator_version,
             turn_id: call.turn_id.to_owned(),
             call_id: call.call_id.to_owned(),
             provider_name: call.provider_name.to_owned(),
@@ -305,7 +424,7 @@ impl McpExecutionCoordinator {
         };
 
         let snapshot = journal.read_events()?;
-        validate_dispatch_candidate_v1(
+        validate_dispatch_candidate(
             snapshot,
             journal,
             self,
@@ -353,7 +472,7 @@ impl McpExecutionCoordinator {
         // can change the prefix. Re-read anyway and bind the durable permit to
         // the exact post-approval snapshot that authorizes dispatch.
         let snapshot = journal.read_events()?;
-        validate_dispatch_candidate_v1(
+        validate_dispatch_candidate(
             snapshot,
             journal,
             self,
@@ -367,7 +486,7 @@ impl McpExecutionCoordinator {
             started_data(&approved_call.request, approved_call.prepared.arguments()),
         )?;
         let permit = DispatchPermit {
-            permit_version: MCP_COORDINATOR_POLICY_V1.dispatch_permit_version,
+            permit_version: self.policy.dispatch_permit_version,
             coordinator_id: self.coordinator_id.clone(),
             registry_epoch_id: self.registry_epoch_id.clone(),
             registry_digest: self.registry.digest().to_owned(),
@@ -458,10 +577,10 @@ impl McpExecutionCoordinator {
             ));
         }
         let events = journal.read_events()?;
-        validate_mcp_call_chain_v1(&events)?;
-        let activation_seq = validate_activation_v1(&events, self)?;
+        validate_mcp_call_chain(&events)?;
+        let activation_seq = validate_activation(&events, self)?;
         let durable_call = provider_call_v1(&events, call.turn_id, call.call_id)?;
-        validate_call_after_activation_v1(&durable_call, activation_seq, self)?;
+        validate_call_after_activation(&durable_call, activation_seq, self)?;
         if durable_call.provider_name != call.provider_name {
             return Err(OxidraError::Session(
                 "MCP call identity does not match the durable Provider call".to_owned(),
@@ -489,7 +608,7 @@ impl McpExecutionCoordinator {
         message: &str,
     ) -> Result<ToolResult> {
         let result = ToolResult::error(call.call_id, "cancelled", message);
-        let policy = MCP_COORDINATOR_POLICY_V1;
+        let policy = self.policy;
         journal.append_and_sync(
             "tool.cancelled",
             Some(call.turn_id),
@@ -518,7 +637,7 @@ impl McpExecutionCoordinator {
         started_seq: Option<u64>,
     ) -> Result<ToolResult> {
         let result = ToolResult::error(call.call_id, code, message);
-        let policy = MCP_COORDINATOR_POLICY_V1;
+        let policy = self.policy;
         let mut data = json!({
             "call_id": call.call_id,
             "tool": call.provider_name,
@@ -628,18 +747,18 @@ fn validate_call_identity(turn_id: &str, call_id: &str, provider_name: &str) -> 
     Ok(())
 }
 
-fn validate_dispatch_candidate_v1(
+fn validate_dispatch_candidate(
     mut events: Vec<JournalEvent>,
     journal: &SessionJournal,
     coordinator: &McpExecutionCoordinator,
     approval: &McpCallApprovalRequest,
     arguments: &Value,
 ) -> Result<()> {
-    validate_mcp_call_chain_v1(&events)?;
-    let activation_seq = validate_activation_v1(&events, coordinator)?;
+    validate_mcp_call_chain(&events)?;
+    let activation_seq = validate_activation(&events, coordinator)?;
 
     let durable_call = provider_call_v1(&events, &approval.turn_id, &approval.call_id)?;
-    validate_call_after_activation_v1(&durable_call, activation_seq, coordinator)?;
+    validate_call_after_activation(&durable_call, activation_seq, coordinator)?;
     if durable_call.provider_name != approval.provider_name
         || argument_digest_v1(&durable_call.arguments)? != approval.arguments_sha256
         || argument_digest_v1(arguments)? != approval.arguments_sha256
@@ -658,9 +777,9 @@ fn validate_dispatch_candidate_v1(
         turn_id: Some(approval.turn_id.clone()),
         data: started_data(approval, arguments),
     });
-    validate_mcp_call_chain_v1(&events)?;
+    validate_mcp_call_chain(&events)?;
     let state = provider_request_slot_state_for_version(
-        MCP_COORDINATOR_POLICY_V1.provider_slot_version,
+        coordinator.policy.provider_slot_version,
         &events,
         &approval.turn_id,
     )?;
@@ -672,16 +791,16 @@ fn validate_dispatch_candidate_v1(
     Ok(())
 }
 
-fn validate_pre_start_terminal_candidate_v1(
+fn validate_pre_start_terminal_candidate(
     mut events: Vec<JournalEvent>,
     journal: &SessionJournal,
     coordinator: &McpExecutionCoordinator,
     call: McpCallIdentity<'_>,
 ) -> Result<()> {
-    validate_mcp_call_chain_v1(&events)?;
-    let activation_seq = validate_activation_v1(&events, coordinator)?;
+    validate_mcp_call_chain(&events)?;
+    let activation_seq = validate_activation(&events, coordinator)?;
     let durable_call = provider_call_v1(&events, call.turn_id, call.call_id)?;
-    validate_call_after_activation_v1(&durable_call, activation_seq, coordinator)?;
+    validate_call_after_activation(&durable_call, activation_seq, coordinator)?;
     if durable_call.provider_name != call.provider_name {
         return Err(OxidraError::Session(
             "MCP rejected call does not match the durable Provider call".to_owned(),
@@ -700,67 +819,107 @@ fn validate_pre_start_terminal_candidate_v1(
             "output":{"error":{"code":"validation_error","message":"rejected before dispatch"}},
             "is_error":true,
             "error_code":"validation_error",
-            "mcp_execution_coordinator_version": MCP_COORDINATOR_POLICY_V1.coordinator_version,
+            "mcp_execution_coordinator_version": coordinator.policy.coordinator_version,
             "registry_epoch_id": coordinator.registry_epoch_id,
             "registry_digest": coordinator.registry.digest(),
         }),
     });
-    validate_mcp_call_chain_v1(&events)?;
+    validate_mcp_call_chain(&events)?;
     provider_request_slot_state_for_version(
-        MCP_COORDINATOR_POLICY_V1.provider_slot_version,
+        coordinator.policy.provider_slot_version,
         &events,
         call.turn_id,
     )?;
     Ok(())
 }
 
-fn validate_activation_v1(
+fn durable_activation(events: &[JournalEvent]) -> Result<&JournalEvent> {
+    let mut activations = events
+        .iter()
+        .filter(|event| event.kind == MCP_REGISTRY_ACTIVATED_KIND);
+    let activation = activations.next().ok_or_else(|| {
+        OxidraError::Session(
+            "MCP coordinator resume requires a durable registry activation".to_owned(),
+        )
+    })?;
+    if activations.next().is_some() {
+        return Err(OxidraError::Session(
+            "MCP coordinator requires exactly one registry activation per session".to_owned(),
+        ));
+    }
+    activation_policy(activation)?;
+    Ok(activation)
+}
+
+fn required_activation_string<'a>(activation: &'a JournalEvent, field: &str) -> Result<&'a str> {
+    activation
+        .data
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            OxidraError::Session(format!(
+                "mcp.registry.activated at seq {} has no valid {field}",
+                activation.seq
+            ))
+        })
+}
+
+fn validate_activation(
     events: &[JournalEvent],
     coordinator: &McpExecutionCoordinator,
 ) -> Result<u64> {
-    let activations = events
-        .iter()
-        .filter(|event| event.kind == MCP_REGISTRY_ACTIVATED_KIND)
-        .collect::<Vec<_>>();
-    if activations.len() != 1 {
+    let activation = durable_activation(events)?;
+    let policy = activation_policy(activation)?;
+    if policy != coordinator.policy {
         return Err(OxidraError::Session(
-            "MCP coordinator v1 requires exactly one registry activation per session".to_owned(),
+            "MCP registry activation policy does not match the live coordinator".to_owned(),
         ));
     }
-    let activation = activations[0];
-    let policy = activation_policy_v1(activation)?;
-    let expected_provider_names = coordinator
-        .registry
-        .bindings()
-        .map(|binding| binding.provider_name.clone())
-        .collect::<Vec<_>>();
-    let recorded_provider_names = activation
-        .data
-        .get("provider_names")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            OxidraError::Session(format!(
-                "mcp.registry.activated at seq {} has no provider_names",
-                activation.seq
-            ))
-        })?
-        .iter()
-        .map(|value| {
-            value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "mcp.registry.activated at seq {} has a non-string provider name",
-                    activation.seq
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if recorded_provider_names.len() != expected_provider_names.len()
-        || recorded_provider_names.iter().collect::<BTreeSet<_>>()
-            != expected_provider_names.iter().collect::<BTreeSet<_>>()
-    {
-        return Err(OxidraError::Session(
-            "MCP registry activation provider_names do not match the live registry".to_owned(),
-        ));
+    match policy.coordinator_version {
+        MCP_EXECUTION_COORDINATOR_VERSION_V1 => {
+            let expected_provider_names = coordinator
+                .registry
+                .bindings()
+                .map(|binding| binding.provider_name.clone())
+                .collect::<BTreeSet<_>>();
+            let recorded_provider_names = activation
+                .data
+                .get("provider_names")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "mcp.registry.activated at seq {} has no provider_names",
+                        activation.seq
+                    ))
+                })?
+                .iter()
+                .map(|value| {
+                    value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                        OxidraError::Session(format!(
+                            "mcp.registry.activated at seq {} has a non-string provider name",
+                            activation.seq
+                        ))
+                    })
+                })
+                .collect::<Result<BTreeSet<_>>>()?;
+            if recorded_provider_names != expected_provider_names {
+                return Err(OxidraError::Session(
+                    "MCP registry activation provider_names do not match the live registry"
+                        .to_owned(),
+                ));
+            }
+        }
+        MCP_EXECUTION_COORDINATOR_VERSION_V2 => {
+            let expected_bindings =
+                serde_json::to_value(coordinator.registry.binding_identity_snapshot())?;
+            if activation.data.get("bindings") != Some(&expected_bindings) {
+                return Err(OxidraError::Session(
+                    "MCP registry activation bindings do not match the live registry".to_owned(),
+                ));
+            }
+        }
+        _ => unreachable!("activation_policy rejected an unknown coordinator version"),
     }
     let activation_matches = activation.seq == coordinator.activation_seq && {
         activation.kind == MCP_REGISTRY_ACTIVATED_KIND
@@ -822,19 +981,25 @@ fn validate_activation_v1(
     Ok(activation.seq)
 }
 
-fn validate_new_activation_v1(events: &[JournalEvent]) -> Result<()> {
+fn validate_new_activation(events: &[JournalEvent]) -> Result<()> {
     if events
         .iter()
         .any(|event| event.kind == MCP_REGISTRY_ACTIVATED_KIND)
     {
         return Err(OxidraError::Session(
-            "MCP coordinator v1 does not replace an existing registry activation".to_owned(),
+            "MCP coordinator does not replace an existing registry activation".to_owned(),
         ));
+    }
+    if let Some(pending) = validate_compaction_boundary_chain(events)?.latest_pending() {
+        return Err(OxidraError::Session(format!(
+            "MCP registry activation cannot cross pending compaction boundary {}",
+            pending.boundary.boundary_id
+        )));
     }
     Ok(())
 }
 
-fn activation_policy_v1(event: &JournalEvent) -> Result<McpCoordinatorPolicy> {
+fn activation_policy(event: &JournalEvent) -> Result<McpCoordinatorPolicy> {
     match event
         .data
         .get("coordinator_version")
@@ -842,6 +1007,9 @@ fn activation_policy_v1(event: &JournalEvent) -> Result<McpCoordinatorPolicy> {
     {
         Some(version) if version == u64::from(MCP_EXECUTION_COORDINATOR_VERSION_V1) => {
             Ok(MCP_COORDINATOR_POLICY_V1)
+        }
+        Some(version) if version == u64::from(MCP_EXECUTION_COORDINATOR_VERSION_V2) => {
+            Ok(MCP_COORDINATOR_POLICY_V2)
         }
         Some(version) => Err(OxidraError::Session(format!(
             "unsupported MCP execution coordinator version {version} at seq {}",
@@ -863,7 +1031,7 @@ struct DurableProviderCall {
     response_completed_seq: u64,
 }
 
-fn validate_call_after_activation_v1(
+fn validate_call_after_activation(
     durable_call: &DurableProviderCall,
     activation_seq: u64,
     coordinator: &McpExecutionCoordinator,
@@ -1036,12 +1204,11 @@ fn terminal_data(
 }
 
 fn provenance_data(approval: &McpCallApprovalRequest) -> Value {
-    let policy = MCP_COORDINATOR_POLICY_V1;
     json!({
-        "execution_coordinator_version": policy.coordinator_version,
-        "dispatch_permit_version": policy.dispatch_permit_version,
-        "argument_digest_version": policy.argument_digest_version,
-        "registry_version": policy.registry_version,
+        "execution_coordinator_version": approval.execution_coordinator_version,
+        "dispatch_permit_version": MCP_DISPATCH_PERMIT_VERSION_V1,
+        "argument_digest_version": MCP_ARGUMENT_DIGEST_VERSION_V1,
+        "registry_version": MCP_TOOL_REGISTRY_VERSION_V1,
         "registry_epoch_id": approval.registry_epoch_id,
         "registry_digest": approval.registry_digest,
         "execution_plan_digest": approval.execution_plan_digest,
@@ -1057,9 +1224,21 @@ fn provenance_data(approval: &McpCallApprovalRequest) -> Value {
 mod tests {
     use super::*;
 
+    fn event(seq: u64, turn_id: Option<&str>, kind: &str, data: Value) -> JournalEvent {
+        JournalEvent {
+            schema: JOURNAL_SCHEMA,
+            seq,
+            ts: Utc::now(),
+            kind: kind.to_owned(),
+            session_id: "session".to_owned(),
+            turn_id: turn_id.map(ToOwned::to_owned),
+            data,
+        }
+    }
+
     #[test]
     fn coordinator_versions_and_argument_digest_v1_are_frozen() {
-        assert_eq!(MCP_EXECUTION_COORDINATOR_VERSION, 1);
+        assert_eq!(MCP_EXECUTION_COORDINATOR_VERSION, 2);
         assert_eq!(MCP_DISPATCH_PERMIT_VERSION, 1);
         assert_eq!(MCP_ARGUMENT_DIGEST_VERSION, 1);
         assert_eq!(MCP_COORDINATOR_POLICY_V1.coordinator_version, 1);
@@ -1070,6 +1249,14 @@ mod tests {
         assert_eq!(MCP_COORDINATOR_POLICY_V1.stdio_kernel_version, 1);
         assert_eq!(MCP_COORDINATOR_POLICY_V1.schema_profile_version, 1);
         assert_eq!(MCP_COORDINATOR_POLICY_V1.provider_slot_version, 2);
+        assert_eq!(MCP_COORDINATOR_POLICY_V2.coordinator_version, 2);
+        assert_eq!(MCP_COORDINATOR_POLICY_V2.call_chain_validator_version, 2);
+        assert_eq!(MCP_COORDINATOR_POLICY_V2.dispatch_permit_version, 1);
+        assert_eq!(MCP_COORDINATOR_POLICY_V2.argument_digest_version, 1);
+        assert_eq!(MCP_COORDINATOR_POLICY_V2.registry_version, 1);
+        assert_eq!(MCP_COORDINATOR_POLICY_V2.stdio_kernel_version, 1);
+        assert_eq!(MCP_COORDINATOR_POLICY_V2.schema_profile_version, 1);
+        assert_eq!(MCP_COORDINATOR_POLICY_V2.provider_slot_version, 2);
         assert_eq!(
             argument_digest_v1(&json!({
                 "count": 7,
@@ -1079,5 +1266,38 @@ mod tests {
             .expect("compute frozen MCP argument digest"),
             "490f03fe740f99e35c2ed88df2cdc00017e89d463b891dd2e0c16ff866fe1b31"
         );
+    }
+
+    #[test]
+    fn activation_cannot_cross_a_pending_compaction_boundary() {
+        let events = vec![
+            event(
+                1,
+                Some("turn-1"),
+                "user.message",
+                json!({
+                    "turn_boundary_version":crate::turn::TURN_BOUNDARY_VALIDATOR_VERSION,
+                    "item":{"role":"user","content":"prompt"},
+                }),
+            ),
+            event(
+                2,
+                None,
+                "compaction.boundary.started",
+                json!({
+                    "boundary":{
+                        "version":crate::compaction::COMPACTION_BOUNDARY_VERSION,
+                        "boundary_id":"boundary-1",
+                        "turn_id":"turn-1",
+                        "user_message_seq":1,
+                    },
+                    "trigger":"context_trigger",
+                }),
+            ),
+        ];
+        let error = validate_new_activation(&events)
+            .expect_err("activation must not cross a pending compaction boundary")
+            .to_string();
+        assert!(error.contains("cannot cross pending compaction boundary boundary-1"));
     }
 }

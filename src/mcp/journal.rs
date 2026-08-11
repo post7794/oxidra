@@ -4,7 +4,7 @@
 //! registry only receives tool lifecycle semantics after this reducer proves
 //! the activation, durable Provider call and every started/terminal edge.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -16,8 +16,12 @@ use crate::event_kind::{is_response_terminal, is_tool_lifecycle, is_tool_termina
 use crate::session::JournalEvent;
 
 pub(crate) const MCP_CALL_CHAIN_VALIDATOR_VERSION_V1: u32 = 1;
-pub const MCP_CALL_CHAIN_VALIDATOR_VERSION: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V1;
+pub(crate) const MCP_CALL_CHAIN_VALIDATOR_VERSION_V2: u32 = 2;
+pub const MCP_CALL_CHAIN_VALIDATOR_VERSION: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V2;
+const MAX_MCP_CALLS_PER_RESPONSE_V1: usize = 4_096;
+pub const MAX_MCP_CALLS_PER_RESPONSE: usize = MAX_MCP_CALLS_PER_RESPONSE_V1;
 const MCP_EXECUTION_COORDINATOR_VERSION_V1: u64 = 1;
+const MCP_EXECUTION_COORDINATOR_VERSION_V2: u64 = 2;
 const MCP_DISPATCH_PERMIT_VERSION_V1: u64 = 1;
 const MCP_ARGUMENT_DIGEST_VERSION_V1: u64 = 1;
 const MCP_TOOL_REGISTRY_VERSION_V1: u64 = 1;
@@ -32,14 +36,23 @@ struct McpCallKey {
 }
 
 #[derive(Clone, Debug)]
-struct ActivationV1 {
+struct Activation {
     seq: u64,
+    coordinator_version: u32,
     call_chain_validator_version: u32,
     schema_profile_version: u32,
     registry_epoch_id: String,
     registry_digest: String,
     execution_plan_digest: String,
     provider_names: BTreeSet<String>,
+    bindings: Option<BTreeMap<String, BindingIdentity>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BindingIdentity {
+    server_name: String,
+    raw_tool_name: String,
+    protocol_version: String,
 }
 
 #[derive(Clone, Debug)]
@@ -72,8 +85,28 @@ pub(crate) fn validate_mcp_call_chain_v1(events: &[JournalEvent]) -> Result<()> 
         return session_error("unsupported MCP call-chain validator version");
     }
 
-    validate_response_registry_claims(events, &activation)?;
-    let durable_calls = durable_mcp_calls_v1(events, &activation)?;
+    validate_mcp_call_chain_with_activation(events, &activation)
+}
+
+pub(crate) fn validate_mcp_call_chain_v2(events: &[JournalEvent]) -> Result<()> {
+    let activation = activation_v2(events)?;
+    let Some(activation) = activation else {
+        reject_orphan_mcp_markers(events)?;
+        return Ok(());
+    };
+    if activation.call_chain_validator_version != MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 {
+        return session_error("unsupported MCP call-chain validator version");
+    }
+
+    validate_mcp_call_chain_with_activation(events, &activation)
+}
+
+fn validate_mcp_call_chain_with_activation(
+    events: &[JournalEvent],
+    activation: &Activation,
+) -> Result<()> {
+    validate_response_registry_claims(events, activation)?;
+    let durable_calls = durable_mcp_calls_v1(events, activation)?;
     let mcp_call_response_seqs = durable_calls
         .values()
         .map(|call| (call.key.call_id.as_str(), call.response_seq))
@@ -134,7 +167,7 @@ pub(crate) fn validate_mcp_call_chain_v1(events: &[JournalEvent]) -> Result<()> 
         };
         validate_lifecycle_identity(event, call)?;
         let state = states.get_mut(&key).expect("durable MCP call state");
-        validate_lifecycle_event_v1(events, event, call, &activation, state)?;
+        validate_lifecycle_event_v1(events, event, call, activation, state)?;
     }
 
     Ok(())
@@ -146,17 +179,88 @@ pub(crate) fn validate_mcp_call_chain_for_version(
 ) -> Result<()> {
     match version {
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => validate_mcp_call_chain_v1(events),
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => validate_mcp_call_chain_v2(events),
         _ => session_error(format!(
             "unsupported MCP call-chain validator version {version}"
         )),
     }
 }
 
+/// Validate the durable MCP activation with the exact reducer selected by the
+/// journal, while freezing the newest activation version this caller can
+/// interpret. This lets a new projection/reducer continue to read v1 and v2
+/// journals without silently opting into a future v3 validator.
+pub(crate) fn validate_mcp_call_chain_through_version(
+    ceiling: u32,
+    events: &[JournalEvent],
+) -> Result<()> {
+    match call_chain_validator_version(events)? {
+        Some(version) if version <= ceiling => validate_mcp_call_chain_for_version(version, events),
+        Some(version) => session_error(format!(
+            "MCP call-chain validator version {version} exceeds compatibility ceiling {ceiling}"
+        )),
+        None => {
+            reject_orphan_mcp_markers(events)?;
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn call_chain_validator_version(events: &[JournalEvent]) -> Result<Option<u32>> {
+    let mut activations = events
+        .iter()
+        .filter(|event| event.kind == MCP_REGISTRY_ACTIVATED_KIND);
+    let Some(activation) = activations.next() else {
+        return Ok(None);
+    };
+    if activations.next().is_some() {
+        return session_error("MCP journal contains more than one registry activation");
+    }
+    let version = activation
+        .data
+        .get("call_chain_validator_version")
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .ok_or_else(|| {
+            session_message(activation, "has no supported call_chain_validator_version")
+        })?;
+    Ok(Some(version))
+}
+
+pub(crate) fn validate_mcp_call_chain(events: &[JournalEvent]) -> Result<()> {
+    validate_mcp_call_chain_through_version(MCP_CALL_CHAIN_VALIDATOR_VERSION, events)
+}
+
 pub(crate) fn mcp_turn_ids_v1(events: &[JournalEvent]) -> Result<Vec<String>> {
     let Some(activation) = activation_v1(events)? else {
         return Ok(Vec::new());
     };
-    let mut turn_ids = durable_mcp_calls_v1(events, &activation)?
+    mcp_turn_ids_with_activation(events, &activation)
+}
+
+pub(crate) fn mcp_turn_ids_v2(events: &[JournalEvent]) -> Result<Vec<String>> {
+    let Some(activation) = activation_v2(events)? else {
+        return Ok(Vec::new());
+    };
+    mcp_turn_ids_with_activation(events, &activation)
+}
+
+pub(crate) fn mcp_turn_ids(events: &[JournalEvent]) -> Result<Vec<String>> {
+    match call_chain_validator_version(events)? {
+        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V1) => mcp_turn_ids_v1(events),
+        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) => mcp_turn_ids_v2(events),
+        Some(version) => session_error(format!(
+            "unsupported MCP call-chain validator version {version}"
+        )),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn mcp_turn_ids_with_activation(
+    events: &[JournalEvent],
+    activation: &Activation,
+) -> Result<Vec<String>> {
+    let mut turn_ids = durable_mcp_calls_v1(events, activation)?
         .keys()
         .map(|key| key.turn_id.clone())
         .collect::<Vec<_>>();
@@ -170,15 +274,47 @@ pub(crate) fn ensure_no_unstarted_mcp_calls_v1(events: &[JournalEvent]) -> Resul
     let Some(activation) = activation_v1(events)? else {
         return Ok(());
     };
-    let calls = durable_mcp_calls_v1(events, &activation)?;
+    ensure_no_unstarted_mcp_calls_with_activation(events, &activation)
+}
+
+pub(crate) fn ensure_no_unstarted_mcp_calls_v2(events: &[JournalEvent]) -> Result<()> {
+    validate_mcp_call_chain_v2(events)?;
+    let Some(activation) = activation_v2(events)? else {
+        return Ok(());
+    };
+    ensure_no_unstarted_mcp_calls_with_activation(events, &activation)
+}
+
+pub(crate) fn ensure_no_unstarted_mcp_calls(events: &[JournalEvent]) -> Result<()> {
+    match call_chain_validator_version(events)? {
+        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V1) => ensure_no_unstarted_mcp_calls_v1(events),
+        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) => ensure_no_unstarted_mcp_calls_v2(events),
+        Some(version) => session_error(format!(
+            "unsupported MCP call-chain validator version {version}"
+        )),
+        None => Ok(()),
+    }
+}
+
+fn ensure_no_unstarted_mcp_calls_with_activation(
+    events: &[JournalEvent],
+    activation: &Activation,
+) -> Result<()> {
+    let calls = durable_mcp_calls_v1(events, activation)?;
+    let lifecycle_calls = events
+        .iter()
+        .filter(|event| is_tool_lifecycle(&event.kind))
+        .filter_map(|event| {
+            let key = McpCallKey {
+                turn_id: event.turn_id.as_deref()?.to_owned(),
+                call_id: event.data.get("call_id")?.as_str()?.to_owned(),
+            };
+            let call = calls.get(&key)?;
+            (event.seq > call.response_seq).then_some(key)
+        })
+        .collect::<HashSet<_>>();
     for call in calls.values() {
-        let has_lifecycle = events.iter().any(|event| {
-            event.seq > call.response_seq
-                && event.turn_id.as_deref() == Some(&call.key.turn_id)
-                && event.data.get("call_id").and_then(Value::as_str) == Some(&call.key.call_id)
-                && is_tool_lifecycle(&event.kind)
-        });
-        if !has_lifecycle {
+        if !lifecycle_calls.contains(&call.key) {
             return session_error(format!(
                 "MCP call {} in turn {} must be recovered before the live registry resumes",
                 call.key.call_id, call.key.turn_id
@@ -196,7 +332,7 @@ pub(crate) fn argument_digest_v1(arguments: &Value) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&payload)?)))
 }
 
-fn activation_v1(events: &[JournalEvent]) -> Result<Option<ActivationV1>> {
+fn activation_v1(events: &[JournalEvent]) -> Result<Option<Activation>> {
     let activations = events
         .iter()
         .filter(|event| event.kind == MCP_REGISTRY_ACTIVATED_KIND)
@@ -295,20 +431,169 @@ fn activation_v1(events: &[JournalEvent]) -> Result<Option<ActivationV1>> {
         previous = Some(name);
         provider_names.insert(name.to_owned());
     }
-    Ok(Some(ActivationV1 {
+    Ok(Some(Activation {
         seq: event.seq,
+        coordinator_version: MCP_EXECUTION_COORDINATOR_VERSION_V1 as u32,
         call_chain_validator_version: MCP_CALL_CHAIN_VALIDATOR_VERSION_V1,
         schema_profile_version: MCP_SCHEMA_PROFILE_VERSION_V1 as u32,
         registry_epoch_id,
         registry_digest,
         execution_plan_digest,
         provider_names,
+        bindings: None,
+    }))
+}
+
+fn activation_v2(events: &[JournalEvent]) -> Result<Option<Activation>> {
+    let activations = events
+        .iter()
+        .filter(|event| event.kind == MCP_REGISTRY_ACTIVATED_KIND)
+        .collect::<Vec<_>>();
+    if activations.is_empty() {
+        return Ok(None);
+    }
+    if activations.len() != 1 {
+        return session_error(
+            "MCP call-chain validator v2 requires exactly one registry activation",
+        );
+    }
+    let event = activations[0];
+    if event.turn_id.is_some() {
+        return session_error(format!(
+            "mcp.registry.activated at seq {} must be a global event",
+            event.seq
+        ));
+    }
+    let data = object_data(event)?;
+    require_exact_keys(
+        data,
+        &[
+            "bindings",
+            "config_sha256",
+            "call_chain_validator_version",
+            "coordinator_id",
+            "coordinator_version",
+            "execution_plan_digest",
+            "registry_digest",
+            "registry_epoch_id",
+            "registry_version",
+            "schema_profile_version",
+            "stdio_kernel_version",
+        ],
+        event,
+    )?;
+    require_version(
+        data,
+        "coordinator_version",
+        MCP_EXECUTION_COORDINATOR_VERSION_V2,
+        event,
+    )?;
+    require_version(
+        data,
+        "call_chain_validator_version",
+        u64::from(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2),
+        event,
+    )?;
+    require_version(
+        data,
+        "registry_version",
+        MCP_TOOL_REGISTRY_VERSION_V1,
+        event,
+    )?;
+    require_version(
+        data,
+        "stdio_kernel_version",
+        MCP_STDIO_KERNEL_VERSION_V1,
+        event,
+    )?;
+    require_version(
+        data,
+        "schema_profile_version",
+        MCP_SCHEMA_PROFILE_VERSION_V1,
+        event,
+    )?;
+    required_uuid_v7(data, "coordinator_id", event)?;
+    let registry_epoch_id = required_uuid_v7(data, "registry_epoch_id", event)?;
+    let registry_digest = required_sha256(data, "registry_digest", event)?;
+    let execution_plan_digest = required_sha256(data, "execution_plan_digest", event)?;
+    required_sha256(data, "config_sha256", event)?;
+
+    let snapshot = data
+        .get("bindings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| session_message(event, "bindings must be an array"))?;
+    if snapshot.len() > 512 {
+        return session_error(format!(
+            "mcp.registry.activated at seq {} exceeds the binding limit",
+            event.seq
+        ));
+    }
+    let mut provider_names = BTreeSet::new();
+    let mut bindings = BTreeMap::new();
+    let mut previous = None::<&str>;
+    for value in snapshot {
+        let binding = value
+            .as_object()
+            .ok_or_else(|| session_message(event, "bindings contains a non-object entry"))?;
+        require_exact_keys(
+            binding,
+            &[
+                "protocol_version",
+                "provider_name",
+                "raw_tool_name",
+                "server_name",
+            ],
+            event,
+        )?;
+        let provider_name = binding
+            .get("provider_name")
+            .and_then(Value::as_str)
+            .filter(|name| valid_provider_name(name))
+            .ok_or_else(|| session_message(event, "bindings contains an invalid provider_name"))?;
+        if previous.is_some_and(|candidate| candidate >= provider_name) {
+            return session_error(format!(
+                "mcp.registry.activated at seq {} bindings are not strictly sorted and unique",
+                event.seq
+            ));
+        }
+        previous = Some(provider_name);
+        let required_identity = |field: &str| -> Result<String> {
+            binding
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| valid_identity(value))
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    session_message(event, format!("bindings contains an invalid {field}"))
+                })
+        };
+        provider_names.insert(provider_name.to_owned());
+        bindings.insert(
+            provider_name.to_owned(),
+            BindingIdentity {
+                server_name: required_identity("server_name")?,
+                raw_tool_name: required_identity("raw_tool_name")?,
+                protocol_version: required_identity("protocol_version")?,
+            },
+        );
+    }
+
+    Ok(Some(Activation {
+        seq: event.seq,
+        coordinator_version: MCP_EXECUTION_COORDINATOR_VERSION_V2 as u32,
+        call_chain_validator_version: MCP_CALL_CHAIN_VALIDATOR_VERSION_V2,
+        schema_profile_version: MCP_SCHEMA_PROFILE_VERSION_V1 as u32,
+        registry_epoch_id,
+        registry_digest,
+        execution_plan_digest,
+        provider_names,
+        bindings: Some(bindings),
     }))
 }
 
 fn durable_mcp_calls_v1(
     events: &[JournalEvent],
-    activation: &ActivationV1,
+    activation: &Activation,
 ) -> Result<HashMap<McpCallKey, DurableMcpCall>> {
     let starts = response_starts(events)?;
     let terminals = response_terminals(events);
@@ -327,6 +612,11 @@ fn durable_mcp_calls_v1(
         let Some(items) = event.data.get("output_items").and_then(Value::as_array) else {
             continue;
         };
+        let response_function_call_count = items
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .count();
+        let mut response_limit_checked = false;
         for item in items {
             if item.get("type").and_then(Value::as_str) != Some("function_call") {
                 continue;
@@ -376,6 +666,20 @@ fn durable_mcp_calls_v1(
                 // merely because its completion appears after activation.
                 continue;
             }
+            // Coordinator/call-chain v1 predates the durable response-batch
+            // bound and remains byte-compatible. v2 freezes the bound across
+            // the complete Provider response (including non-MCP calls in a
+            // mixed batch), because recovery authorizes the whole batch.
+            if activation.call_chain_validator_version >= MCP_CALL_CHAIN_VALIDATOR_VERSION_V2
+                && !response_limit_checked
+                && response_function_call_count > MAX_MCP_CALLS_PER_RESPONSE_V1
+            {
+                return session_error(format!(
+                    "MCP response.completed at seq {} exceeds the {MAX_MCP_CALLS_PER_RESPONSE_V1}-call limit",
+                    event.seq
+                ));
+            }
+            response_limit_checked = true;
             if start.seq >= event.seq {
                 return session_error(format!(
                     "MCP Provider call {call_id} is not ordered after its response.started"
@@ -477,7 +781,7 @@ fn response_terminals(events: &[JournalEvent]) -> HashMap<(String, String), Vec<
 
 fn validate_response_registry_claims(
     events: &[JournalEvent],
-    activation: &ActivationV1,
+    activation: &Activation,
 ) -> Result<()> {
     for event in events
         .iter()
@@ -515,7 +819,7 @@ fn durable_arguments(item: &Value, event: &JournalEvent, call_id: &str) -> Resul
     }
 }
 
-fn validate_response_registry(event: &JournalEvent, activation: &ActivationV1) -> Result<()> {
+fn validate_response_registry(event: &JournalEvent, activation: &Activation) -> Result<()> {
     if event
         .data
         .get("mcp_registry_epoch_id")
@@ -557,7 +861,7 @@ fn validate_lifecycle_event_v1(
     events: &[JournalEvent],
     event: &JournalEvent,
     call: &DurableMcpCall,
-    activation: &ActivationV1,
+    activation: &Activation,
     state: &mut CallState,
 ) -> Result<()> {
     match event.kind.as_str() {
@@ -657,7 +961,7 @@ fn validate_lifecycle_event_v1(
 fn validate_full_provenance<'a>(
     event: &'a JournalEvent,
     call: &DurableMcpCall,
-    activation: &ActivationV1,
+    activation: &Activation,
 ) -> Result<&'a Value> {
     let provenance = event
         .data
@@ -669,7 +973,7 @@ fn validate_full_provenance<'a>(
     require_version_map(
         data,
         "execution_coordinator_version",
-        MCP_EXECUTION_COORDINATOR_VERSION_V1,
+        u64::from(activation.coordinator_version),
         event,
     )?;
     require_version_map(
@@ -718,6 +1022,24 @@ fn validate_full_provenance<'a>(
             ));
         }
     }
+    if let Some(bindings) = &activation.bindings {
+        let binding = bindings.get(&call.provider_name).ok_or_else(|| {
+            session_message(
+                event,
+                "MCP lifecycle provider alias has no activated binding",
+            )
+        })?;
+        if data.get("server_name").and_then(Value::as_str) != Some(&binding.server_name)
+            || data.get("raw_tool_name").and_then(Value::as_str) != Some(&binding.raw_tool_name)
+            || data.get("protocol_version").and_then(Value::as_str)
+                != Some(&binding.protocol_version)
+        {
+            return session_error(format!(
+                "{} at seq {} MCP provenance does not match the activated provider binding",
+                event.kind, event.seq
+            ));
+        }
+    }
     Ok(provenance)
 }
 
@@ -726,7 +1048,7 @@ fn validate_started_terminal(
     started_seq: u64,
     provenance: &Value,
     call: &DurableMcpCall,
-    activation: &ActivationV1,
+    activation: &Activation,
 ) -> Result<()> {
     require_started_seq(event, started_seq)?;
     let terminal_provenance = validate_full_provenance(event, call, activation)?;
@@ -742,7 +1064,7 @@ fn validate_started_terminal(
 fn validate_pre_start_terminal(
     event: &JournalEvent,
     call: &DurableMcpCall,
-    activation: &ActivationV1,
+    activation: &Activation,
     cancelled: bool,
 ) -> Result<()> {
     if event.data.get("started_seq").is_some() {
@@ -755,7 +1077,7 @@ fn validate_pre_start_terminal(
         .data
         .get("mcp_execution_coordinator_version")
         .and_then(Value::as_u64)
-        != Some(MCP_EXECUTION_COORDINATOR_VERSION_V1)
+        != Some(u64::from(activation.coordinator_version))
         || event.data.get("registry_epoch_id").and_then(Value::as_str)
             != Some(&activation.registry_epoch_id)
         || event.data.get("registry_digest").and_then(Value::as_str)
@@ -800,7 +1122,7 @@ fn validate_pre_start_terminal(
 fn validate_safe_skip(
     event: &JournalEvent,
     call: &DurableMcpCall,
-    _activation: &ActivationV1,
+    _activation: &Activation,
     events: &[JournalEvent],
 ) -> Result<()> {
     let code = event
@@ -888,7 +1210,7 @@ fn validate_safe_skip(
             .get("unstarted_tool_calls")
             .and_then(Value::as_array)
             .ok_or_else(|| session_message(event, "recovery marker has no unstarted_tool_calls"))?;
-        if authorizations.len() > 4_096 {
+        if authorizations.len() > MAX_MCP_CALLS_PER_RESPONSE_V1 {
             return session_error(format!(
                 "recovery marker at seq {marker_seq} exceeds the unstarted-call limit"
             ));
@@ -1241,9 +1563,120 @@ mod tests {
         ]
     }
 
+    fn mcp_events_v2() -> Vec<JournalEvent> {
+        let mut events = mcp_events();
+        let activation = events[0].data.as_object_mut().expect("activation data");
+        activation.insert("coordinator_version".to_owned(), Value::from(2));
+        activation.insert("call_chain_validator_version".to_owned(), Value::from(2));
+        activation.remove("provider_names");
+        activation.insert(
+            "bindings".to_owned(),
+            json!([{
+                "provider_name":"mcp_fixture_echo_deadbeef",
+                "server_name":"fixture",
+                "raw_tool_name":"echo",
+                "protocol_version":"2026-07-28",
+            }]),
+        );
+        for event in &mut events {
+            if let Some(provenance) = event.data.get_mut("mcp") {
+                provenance["execution_coordinator_version"] = Value::from(2);
+            }
+        }
+        events
+    }
+
     #[test]
     fn valid_mcp_call_chain_v1_is_accepted() {
         validate_mcp_call_chain_v1(&mcp_events()).expect("valid MCP chain");
+    }
+
+    #[test]
+    fn valid_mcp_call_chain_v2_binds_offline_provider_identity() {
+        validate_mcp_call_chain_v2(&mcp_events_v2()).expect("valid MCP v2 chain");
+    }
+
+    #[test]
+    fn frozen_v1_and_v2_have_explicit_binding_semantics() {
+        let mut v1 = mcp_events();
+        for event in &mut v1[4..=5] {
+            event.data["mcp"]["server_name"] = Value::String("other-server".to_owned());
+            event.data["mcp"]["raw_tool_name"] = Value::String("other-tool".to_owned());
+            event.data["mcp"]["protocol_version"] = Value::String("other-protocol".to_owned());
+        }
+        validate_mcp_call_chain_v1(&v1).expect("frozen v1 did not persist a binding snapshot");
+
+        let mut v2 = mcp_events_v2();
+        for event in &mut v2[4..=5] {
+            event.data["mcp"]["server_name"] = Value::String("other-server".to_owned());
+            event.data["mcp"]["raw_tool_name"] = Value::String("other-tool".to_owned());
+            event.data["mcp"]["protocol_version"] = Value::String("other-protocol".to_owned());
+        }
+        let error = validate_mcp_call_chain_v2(&v2)
+            .expect_err("v2 must prove provider alias provenance from the activation snapshot")
+            .to_string();
+        assert!(
+            error.contains("does not match the activated provider binding"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn mcp_response_call_limit_is_frozen_in_validator_v2_without_rewriting_v1() {
+        let mut events = mcp_events();
+        events.truncate(4);
+        events[3].data["output_items"] = Value::Array(
+            (0..=MAX_MCP_CALLS_PER_RESPONSE_V1)
+                .map(|index| {
+                    json!({
+                        "type":"function_call",
+                        "call_id":format!("call-{index}"),
+                        "name":"mcp_fixture_echo_deadbeef",
+                        "arguments":"{}"
+                    })
+                })
+                .collect(),
+        );
+
+        validate_mcp_call_chain_v1(&events)
+            .expect("frozen validator v1 accepted oversized batches before v2 added the bound");
+
+        let mut events = mcp_events_v2();
+        events.truncate(4);
+        events[3].data["output_items"] = Value::Array(
+            (0..=MAX_MCP_CALLS_PER_RESPONSE_V1)
+                .map(|index| {
+                    json!({
+                        "type":"function_call",
+                        "call_id":format!("call-{index}"),
+                        "name": if index == 0 { "mcp_fixture_echo_deadbeef" } else { "read" },
+                        "arguments":"{}"
+                    })
+                })
+                .collect(),
+        );
+        let error = validate_mcp_call_chain_v2(&events)
+            .expect_err("validator v2 must reject an oversized mixed response batch")
+            .to_string();
+        assert!(
+            error.contains("exceeds the 4096-call limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validator_ceiling_accepts_registered_history_but_not_future_versions() {
+        validate_mcp_call_chain_through_version(2, &mcp_events())
+            .expect("v2 compatibility view must retain v1 journals");
+        validate_mcp_call_chain_through_version(2, &mcp_events_v2())
+            .expect("v2 compatibility view must accept v2 journals");
+
+        let mut future = mcp_events_v2();
+        future[0].data["call_chain_validator_version"] = Value::from(3);
+        let error = validate_mcp_call_chain_through_version(2, &future)
+            .expect_err("v2 compatibility view must not inherit future validators")
+            .to_string();
+        assert!(error.contains("exceeds compatibility ceiling 2"));
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::compaction::{
 };
 use crate::error::{OxidraError, Result};
 use crate::event_kind::is_tool_terminal;
-use crate::mcp::{MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, validate_mcp_call_chain_for_version};
+use crate::mcp::{MCP_CALL_CHAIN_VALIDATOR_VERSION_V2, validate_mcp_call_chain_through_version};
 use crate::projection::{
     source_projection_supports_boundary_exclusions, validate_response_output_items,
 };
@@ -26,8 +26,8 @@ use crate::types::ToolDefinition;
 
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
 /// Increment when the recovery/provenance semantics change; old cursors fail closed.
-pub const HISTORY_EXTRACTOR_VERSION: u32 = 5;
-const HISTORY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V1;
+pub const HISTORY_EXTRACTOR_VERSION: u32 = 6;
+const HISTORY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V2;
 pub const HISTORY_CURSOR_VERSION: u32 = 1;
 pub const MAX_HISTORY_QUERY_BYTES: usize = 512;
 pub const MAX_HISTORY_CURSOR_BYTES: usize = 2_048;
@@ -212,7 +212,10 @@ impl HistorySnapshot {
         boundary_chain: &CompactionBoundaryChain,
         excluded_turn_ids: &HashSet<String>,
     ) -> Result<Self> {
-        validate_mcp_call_chain_for_version(HISTORY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5, events)?;
+        validate_mcp_call_chain_through_version(
+            HISTORY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6,
+            events,
+        )?;
         chain.ensure_matches(events)?;
         boundary_chain.ensure_checkpoint_projection_safe(chain)?;
         let session_id = validate_journal_envelopes(events)?;

@@ -2,8 +2,8 @@
 
 状态：MCP stdio transport/session kernel v1、显式 project-config reader v1、
 execution-plan digest v1、JSON Schema profile v1、session-scoped tool registry v1、
-durable execution coordinator core v1 和 MCP call-chain validator v1 已实现，尚未接入
-Agent 或 CLI 参数。
+durable execution coordinator core v2 和 MCP call-chain validator v2 已实现；v1 reader
+保持冻结兼容，尚未接入 Agent 或 CLI 参数。
 当前代码只能由 Rust 调用方显式加载绝对 config path、批准 execution plan 与 registry
 surface，并把 coordinator 绑定到 session journal；它不是已经对用户开放的插件入口。
 
@@ -163,7 +163,7 @@ execution-plan digest 与 registry digest 是单向的两层证据：前者在�
 看到哪些工具”。工具表 digest 不能反向充当 executable 的执行许可；path trust 也不能
 被表述成具体代码内容已经得到认证。
 
-### 3.3 durable execution coordinator core v1
+### 3.3 durable execution coordinator core v1/v2
 
 `McpExecutionCoordinator` 是正常 registry dispatch 的唯一 capability owner。Rust 可见性
 和私有类型建立以下边界，而不是依赖调用约定：
@@ -176,9 +176,12 @@ McpRegistry::approve_surface(expected digest)
 → pub(super) registry dispatch
 ```
 
-- activation 同步写入 `mcp.registry.activated`，绑定 session、coordinator ID、registry
+- 当前 writer 使用 coordinator v2；v1 activation reader 保持原有 `provider_names` 语义。
+  activation 同步写入 `mcp.registry.activated`，绑定 session、coordinator ID、registry
   epoch、config SHA、execution-plan digest、registry digest，以及 kernel/schema/registry/
-  coordinator 的具体版本；live coordinator 只能写入同一 session journal。
+  coordinator 的具体版本；v2 还持久化排序后的
+  `provider alias → server/raw tool/protocol` binding snapshot，供离线 reducer 查表证明
+  provenance。live coordinator 只能写入同一 session journal。
 - 每次调用先对参数完成同步 bounded ownership/preflight，再验证 durable
   `response.completed.output_items` 中存在唯一、同 turn/call ID、同 provider name、同参数
   digest 的 Provider call；对应的 `response.started` 还必须显式记录当前
@@ -200,27 +203,37 @@ McpRegistry::approve_surface(expected digest)
   不再暴露同类入口，只消费已经完成 bounded preflight 的 owning type 或 journal parser
   产生的有界 durable value。future、approval await 和 dispatch permit 不重新持有未受保护的
   深层裸 `Value`。
-- coordinator v1 从 durable Provider call 派生参数，不接受调用方另传一份可错配的裸参数；
-  每个 session 只允许一个 v1 registry activation。已有 `tool.started`/`tool.in_doubt` 未
+- coordinator 从 durable Provider call 派生参数，不接受调用方另传一份可错配的裸参数；
+  每个 session 只允许一个 registry activation。已有 `tool.started`/`tool.in_doubt` 未
   解决时，新的 MCP dispatch 统一 fail closed，禁止把 remaining calls 交给调用方约定跳过。
+- activation 不允许跨越 pending compaction boundary；已经结束的旧 boundary 使用其
+  activation 前兼容视图，后来的 v2 registry epoch 不会追溯改变冻结的 boundary v6 语义。
 
 coordinator core 当前仍不是 Agent 集成完成的声明。`McpExecutionCoordinator::resume()` 已能在
 session reopen/recovery 后，用重新取得 execution trust 与 surface trust 的 live registry 复用
 原 durable epoch：config、execution plan、Provider surface、registry digest 和 activation policy
 必须逐项一致；未恢复的 pre-start MCP call 会 fail closed，且不会写第二条 activation。
+resume 的启动顺序由类型而不是注释约定：只有 `SessionStore::open` 返回的同一 journal handle
+能一次性签发 `McpResumeEligibility`；`McpRegistry::connect_for_resume` 在 spawn 前消费它，并返回
+独立的 `McpResumeRegistry`；其 surface approval 生成 `ApprovedMcpResumeRegistry`，而
+`McpExecutionCoordinator::resume` 不接受普通 `connect` 产生的 `ApprovedMcpRegistry`。eligibility
+同时绑定 open-handle nonce、session、activation seq/版本、config SHA、execution-plan digest、
+registry epoch/digest；配置不一致会在执行任何 MCP 代码前失败，同一 open handle 不能重复启动。
 但 Agent 尚未消费该 reader，也尚未把 `context.tools` snapshot writer 改为在
 `response.started` 填充上述 registry epoch 字段。Agent 必须从同一 prepared request snapshot
 写入这些字段，证明 Provider request 所使用的 `context.tools`、返回 call、approval、started
 和 permit 属于同一个 epoch；完成这条绑定前不能把 MCP definitions 放进 Agent 请求。
 
-### 3.4 MCP call-chain validator v1
+### 3.4 MCP call-chain validator v1/v2
 
 MCP terminal 的语义权限现由单一、冻结的 call-chain validator 授予，不再要求 turn、slot、
 projection 和 history 各自“碰巧做出相同判断”：
 
-- `mcp.registry.activated` 持久化 `call_chain_validator_version = 1`；coordinator v1、turn v6、
-  Provider slot v3、source projection v5、history extractor v5 和 compaction boundary v6 均
-  绑定字面量 validator v1，而不是读取未来可变的默认版本。
+- v1 仍由 coordinator v1、turn v6、Provider slot v3、source projection v5、history
+  extractor v5 和 compaction boundary v6 按字面量解释。当前 writer 持久化
+  `call_chain_validator_version = 2`；turn v7、Provider slot v4、source projection v6、
+  history extractor v6 和 compaction boundary v7 冻结兼容集合 `{v1, v2}`，按 activation
+  声明选择 exact reducer，并拒绝未来版本，而不是读取可变默认值。
 - validator 从 activation 之后、显式带同一 registry epoch/digest 的 `response.started` 与唯一
   `response.completed` 重建 durable MCP call；activation 之前的同名普通工具保持历史语义，
   不会被未来 registry 追溯解释。
@@ -235,10 +248,15 @@ projection 和 history 各自“碰巧做出相同判断”：
 - 同一 Provider response attempt 必须只有一个 terminal；session recovery 还会在写入 skip
   前后运行冻结的 generic Provider slot v2 consistency check，非法 response/tool ordering
   不会先被自动 recovery 写入污染。
+- v2 将单个 Provider response 的全部 function calls（包括 MCP 与内置工具混合批次）限制为
+  4096；Agent 在 `response.completed` 持久化前使用同一常量，超限只写 `response.failed`。
+  v1 在该限制发布前可接受更大的历史批次，因此 recovery 不修改 v1 接受集合，而是先完整
+  预检 authorization，再按每个 marker 至多 4096 条分片写入；每个自动 skip 只绑定其所属
+  marker。恢复中途再次崩溃时，下一次 reopen 仅为剩余调用生成新的有界 marker。
 - schema profile v1 也是 validator v1 的冻结传递依赖；历史 `tool.started` 不读取未来默认
   profile。未知 call-chain、activation、provenance 或 profile 版本一律 fail closed。
 
-call-chain v1 解决的是 durable 事实解释，不会自动恢复 live server。下一阶段仍需在 session
+call-chain validator 解决的是 durable 事实解释，不会自动恢复 live server。下一阶段仍需在 session
 reopen 后按已批准 execution plan 重建或替换 live registry epoch，并把实际 request 的
 `context.tools` snapshot 与 `response.started` epoch 一次性绑定；完成前不能向 Agent 暴露
 MCP definitions。

@@ -65,6 +65,7 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     assert_eq!(binding.definition.name, binding.provider_name);
     assert!(binding.output_schema.is_some());
     let provider_name = binding.provider_name.clone();
+    let protocol_version = binding.protocol_version.clone();
 
     let data_dir = directory.path().join("data");
     let store = SessionStore::new(&data_dir).expect("create MCP coordinator session store");
@@ -77,6 +78,15 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("approve MCP registry surface");
     let mut coordinator = McpExecutionCoordinator::activate(approved_registry, &mut journal)
         .expect("activate MCP execution coordinator");
+    let fresh_resume_error = journal
+        .mcp_resume_eligibility()
+        .err()
+        .expect("a newly created journal cannot authorize resume startup");
+    assert!(
+        fresh_resume_error
+            .to_string()
+            .contains("SessionStore::open")
+    );
     assert_eq!(coordinator.registry_digest(), expected_registry_digest);
     let activation_events = journal.read_events().expect("read MCP activation");
     let activation = activation_events
@@ -84,7 +94,8 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .find(|event| event.kind == "mcp.registry.activated")
         .expect("durable MCP registry activation");
     assert!(activation.turn_id.is_none());
-    assert_eq!(activation.data["coordinator_version"], 1);
+    assert_eq!(activation.data["coordinator_version"], 2);
+    assert_eq!(activation.data["call_chain_validator_version"], 2);
     assert_eq!(
         activation.data["registry_version"],
         MCP_TOOL_REGISTRY_VERSION
@@ -94,6 +105,16 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         activation.data["execution_plan_digest"],
         approved.execution_plan_digest()
     );
+    assert_eq!(
+        activation.data["bindings"],
+        json!([{
+            "provider_name":provider_name.clone(),
+            "server_name":"fixture",
+            "raw_tool_name":"echo.v1",
+            "protocol_version":protocol_version,
+        }])
+    );
+    assert!(activation.data.get("provider_names").is_none());
 
     let mut other_journal = store
         .create(SessionHeader::new(&root, "mcp-other"))
@@ -378,18 +399,27 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     drop(coordinator);
     drop(journal);
 
-    let reopened = store
+    let mut reopened = store
         .open(&durable_session_id)
         .expect("reopen and recover MCP coordinator journal");
-    let resumed_registry = McpRegistry::connect(
+    let resume_eligibility = reopened
+        .mcp_resume_eligibility()
+        .expect("mint resume eligibility after journal recovery");
+    let resumed_registry = McpRegistry::connect_for_resume(
         &approved,
         ["read", "edit", "write", "shell", "remember"]
             .into_iter()
             .map(str::to_owned),
+        resume_eligibility,
         &CancellationToken::new(),
     )
     .await
     .expect("reconnect the approved MCP registry");
+    let duplicate_eligibility = reopened
+        .mcp_resume_eligibility()
+        .err()
+        .expect("one recovered journal handle can authorize only one MCP startup");
+    assert!(duplicate_eligibility.to_string().contains("already issued"));
     assert_eq!(resumed_registry.digest(), expected_registry_digest);
     let resumed_digest = resumed_registry.digest().to_owned();
     let approved_resumed_registry = resumed_registry
@@ -408,10 +438,42 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     assert!(matches!(collision, Err(error) if error.to_string().contains("tool name collision")));
 
     let original_sha = config.source_sha256().to_owned();
+    let log_before_mismatched_resume = fs::read(&log).expect("read log before mismatched resume");
     fs::write(&config_path, project_config(&python, &script, &log, true))
         .expect("rewrite MCP project config");
     let changed = McpProjectConfig::load(&root, &config_path).expect("reload changed config");
     assert_ne!(changed.source_sha256(), original_sha);
+    let approved_changed = changed
+        .approve_execution(changed.execution_plan_digest())
+        .expect("approve changed execution plan");
+    let mut reopened = store
+        .open(&durable_session_id)
+        .expect("reopen before mismatched resume attempt");
+    let eligibility = reopened
+        .mcp_resume_eligibility()
+        .expect("mint eligibility for mismatched resume attempt");
+    let mismatch = McpRegistry::connect_for_resume(
+        &approved_changed,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        eligibility,
+        &CancellationToken::new(),
+    )
+    .await;
+    let mismatch = match mismatch {
+        Ok(mut registry) => {
+            registry.shutdown().await;
+            panic!("changed config must fail before resume server startup");
+        }
+        Err(error) => error,
+    };
+    assert!(mismatch.to_string().contains("durable registry activation"));
+    assert_eq!(
+        fs::read(&log).expect("read log after mismatched resume"),
+        log_before_mismatched_resume,
+        "resume config mismatch must be rejected before MCP code executes"
+    );
 }
 
 struct AllowMcpApproval;

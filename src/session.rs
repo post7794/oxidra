@@ -24,6 +24,7 @@ use crate::event_kind::{
     is_compaction_lifecycle, is_compaction_terminal, is_response_terminal, is_tool_lifecycle,
     is_tool_terminal,
 };
+use crate::mcp::MAX_MCP_CALLS_PER_RESPONSE;
 use crate::turn::provider_request_slot_state_for_version;
 
 pub const JOURNAL_SCHEMA: u32 = 1;
@@ -285,6 +286,8 @@ impl SessionStore {
             next_seq: 1,
             recovery: RecoveryInfo::default(),
             poisoned: false,
+            mcp_resume_open_id: None,
+            mcp_resume_eligibility_issued: false,
         };
         journal.append_and_sync(SESSION_STARTED_KIND, None, serde_json::to_value(header)?)?;
         Ok(journal)
@@ -353,8 +356,14 @@ impl SessionStore {
                     && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
             })
             .count();
-        crate::mcp::validate_mcp_call_chain_v1(&scan.events)?;
+        crate::mcp::validate_mcp_call_chain(&scan.events)?;
         let unstarted_tools = unstarted_tool_calls(&scan.events);
+        // Build every authorization payload before the first recovery write.
+        // Legacy call-chain v1 could durably contain more than the current
+        // per-response maximum, so recovery chunks that old batch into
+        // multiple independently bounded v1 markers instead of rewriting the
+        // frozen validator or poisoning the journal midway through repair.
+        preflight_recovery_authorization_batches(&unstarted_tools)?;
         let previously_skipped = scan
             .events
             .iter()
@@ -383,6 +392,12 @@ impl SessionStore {
             next_seq,
             recovery: RecoveryInfo::default(),
             poisoned: false,
+            // This nonce identifies the exact recovered journal handle that
+            // authorized a later MCP resume.  A newly-created journal cannot
+            // mint that capability, and reopening after dropping this handle
+            // produces a different nonce.
+            mcp_resume_open_id: Some(Uuid::now_v7().to_string()),
+            mcp_resume_eligibility_issued: false,
         };
         fs::create_dir_all(&journal.artifact_dir)?;
 
@@ -422,7 +437,7 @@ impl SessionStore {
         recovery.checkpointed_compaction_boundaries = recovery
             .checkpointed_compaction_boundaries
             .saturating_add(recovered_boundaries.checkpointed);
-        let mcp_turn_ids = crate::mcp::mcp_turn_ids_v1(&journal.read_events()?)?;
+        let mcp_turn_ids = crate::mcp::mcp_turn_ids(&journal.read_events()?)?;
         for turn_id in &mcp_turn_ids {
             // Use the frozen generic slot v2 as a recovery-consistency check;
             // slot v3 calls back into the MCP validator and is therefore not
@@ -440,10 +455,26 @@ impl SessionStore {
         );
 
         let recovered_unstarted = !unstarted_tools.is_empty();
-        if recovery.truncated_tail.is_some()
+        if recovered_unstarted {
+            for tools in unstarted_tools.chunks(MAX_MCP_CALLS_PER_RESPONSE) {
+                let event = journal.append_and_sync(
+                    RECOVERY_KIND,
+                    None,
+                    recovery_marker_data(&recovery, tools)?,
+                )?;
+                recovery.marker_seq = Some(event.seq);
+
+                // Each skip binds to the exact bounded marker that authorized
+                // its call. If recovery is interrupted, the next reopen may
+                // append a fresh marker for only the remaining calls; unused
+                // markers are harmless and the frozen validator stays valid.
+                for tool in tools {
+                    append_recovery_tool_skip(&mut journal, tool, event.seq)?;
+                }
+            }
+        } else if recovery.truncated_tail.is_some()
             || recovered_unfinished_response
             || recovered_unfinished_compaction
-            || recovered_unstarted
             || (!recovery.in_doubt.is_empty() && recovery.marker_seq.is_none())
             || (recovery.skipped_before_start > 0 && recovery.marker_seq.is_none())
             || (recovery.aborted_responses > 0 && recovery.marker_seq.is_none())
@@ -458,39 +489,7 @@ impl SessionStore {
             )?;
             recovery.marker_seq = Some(event.seq);
         }
-
-        // The recovery marker is the durable authority for automatically
-        // skipping calls that never reached `tool.started`.  Write it before
-        // those skips so each MCP skip can bind to an immutable marker seq;
-        // this prevents a generic lifecycle writer from manufacturing a
-        // plausible-looking recovery terminal with only call/argument data.
-        let recovery_marker_seq = recovery.marker_seq;
-        for tool in unstarted_tools {
-            let mut data = json!({
-                "response_seq": tool.response_seq,
-                "call_id": tool.call_id,
-                "tool": tool.tool_name,
-                "arguments": tool.arguments,
-                "reason": "process stopped before tool.started was committed",
-                "output": {
-                    "error": {
-                        "code": "interrupted_before_start",
-                        "message": "tool was not executed because the previous process stopped before dispatch",
-                    }
-                },
-                "is_error": true,
-                "error_code": "interrupted_before_start",
-            });
-            if let Some(marker_seq) = recovery_marker_seq {
-                data["recovery_marker_seq"] = Value::from(marker_seq);
-            }
-            journal.append_and_sync(
-                "tool.skipped_due_to_recovery",
-                tool.turn_id.as_deref(),
-                data,
-            )?;
-        }
-        crate::mcp::validate_mcp_call_chain_v1(&journal.read_events()?)?;
+        crate::mcp::validate_mcp_call_chain(&journal.read_events()?)?;
         let final_events = journal.read_events()?;
         for turn_id in &mcp_turn_ids {
             provider_request_slot_state_for_version(2, &final_events, turn_id)?;
@@ -549,6 +548,8 @@ pub struct SessionJournal {
     next_seq: u64,
     recovery: RecoveryInfo,
     poisoned: bool,
+    mcp_resume_open_id: Option<String>,
+    mcp_resume_eligibility_issued: bool,
 }
 
 impl SessionJournal {
@@ -570,6 +571,36 @@ impl SessionJournal {
 
     pub fn recovery_info(&self) -> &RecoveryInfo {
         &self.recovery
+    }
+
+    /// Produce the one-shot journal-gate capability required to start MCP
+    /// processes for a durable registry epoch.
+    ///
+    /// Only a journal returned by [`SessionStore::open`] can mint this
+    /// capability.  The capability is bound to this exact open handle and is
+    /// consumed by [`crate::mcp::McpRegistry::connect_for_resume`].
+    pub fn mcp_resume_eligibility(&mut self) -> Result<crate::mcp::McpResumeEligibility<'_>> {
+        crate::mcp::McpResumeEligibility::from_recovered_journal(self)
+    }
+
+    pub(crate) fn mcp_resume_open_id(&self) -> Option<&str> {
+        self.mcp_resume_open_id.as_deref()
+    }
+
+    pub(crate) fn claim_mcp_resume_open_id(&mut self) -> Result<String> {
+        let open_id = self.mcp_resume_open_id.clone().ok_or_else(|| {
+            OxidraError::Session(
+                "MCP resume eligibility requires a journal returned by SessionStore::open"
+                    .to_owned(),
+            )
+        })?;
+        if self.mcp_resume_eligibility_issued {
+            return Err(OxidraError::Session(
+                "MCP resume eligibility was already issued for this journal handle".to_owned(),
+            ));
+        }
+        self.mcp_resume_eligibility_issued = true;
+        Ok(open_id)
     }
 
     pub fn header(&self) -> Result<Option<SessionHeader>> {
@@ -1240,6 +1271,41 @@ fn unstarted_tool_calls(events: &[JournalEvent]) -> Vec<UnstartedTool> {
     unstarted.into_values().collect()
 }
 
+fn preflight_recovery_authorization_batches(unstarted_tools: &[UnstartedTool]) -> Result<()> {
+    for tools in unstarted_tools.chunks(MAX_MCP_CALLS_PER_RESPONSE) {
+        recovery_authorizations(tools)?;
+    }
+    Ok(())
+}
+
+fn append_recovery_tool_skip(
+    journal: &mut SessionJournal,
+    tool: &UnstartedTool,
+    recovery_marker_seq: u64,
+) -> Result<()> {
+    journal.append_and_sync(
+        "tool.skipped_due_to_recovery",
+        tool.turn_id.as_deref(),
+        json!({
+            "response_seq": tool.response_seq,
+            "call_id": tool.call_id,
+            "tool": tool.tool_name,
+            "arguments": tool.arguments,
+            "reason": "process stopped before tool.started was committed",
+            "output": {
+                "error": {
+                    "code": "interrupted_before_start",
+                    "message": "tool was not executed because the previous process stopped before dispatch",
+                }
+            },
+            "is_error": true,
+            "error_code": "interrupted_before_start",
+            "recovery_marker_seq": recovery_marker_seq,
+        }),
+    )?;
+    Ok(())
+}
+
 fn matching_recovery_marker(
     events: &[JournalEvent],
     in_doubt: &[InDoubtTool],
@@ -1332,6 +1398,13 @@ fn recovery_marker_data(
     recovery: &RecoveryInfo,
     unstarted_tools: &[UnstartedTool],
 ) -> Result<Value> {
+    // Keep the writer aligned with the frozen validator even when this helper
+    // is called independently of SessionStore::open's pre-write scan.
+    if unstarted_tools.len() > MAX_MCP_CALLS_PER_RESPONSE {
+        return Err(OxidraError::Session(format!(
+            "recovery marker exceeds the {MAX_MCP_CALLS_PER_RESPONSE}-call authorization limit"
+        )));
+    }
     let mut data = json!({
         "reason": if recovery.truncated_tail.is_some() {
             "incomplete_tail"
@@ -1357,23 +1430,27 @@ fn recovery_marker_data(
         "checkpointed_compaction_boundaries": recovery.checkpointed_compaction_boundaries,
     });
     if !unstarted_tools.is_empty() {
-        let authorizations = unstarted_tools
-            .iter()
-            .map(|tool| {
-                let arguments = tool.arguments.as_ref().unwrap_or(&Value::Null);
-                Ok(json!({
-                    "response_seq": tool.response_seq,
-                    "turn_id": tool.turn_id,
-                    "call_id": tool.call_id,
-                    "tool": tool.tool_name,
-                    "arguments_sha256": crate::mcp::argument_digest_v1(arguments)?,
-                }))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let authorizations = recovery_authorizations(unstarted_tools)?;
         data["tool_skip_authorization_version"] = Value::from(1);
         data["unstarted_tool_calls"] = Value::Array(authorizations);
     }
     Ok(data)
+}
+
+fn recovery_authorizations(unstarted_tools: &[UnstartedTool]) -> Result<Vec<Value>> {
+    unstarted_tools
+        .iter()
+        .map(|tool| {
+            let arguments = tool.arguments.as_ref().unwrap_or(&Value::Null);
+            Ok(json!({
+                "response_seq": tool.response_seq,
+                "turn_id": tool.turn_id,
+                "call_id": tool.call_id,
+                "tool": tool.tool_name,
+                "arguments_sha256": crate::mcp::argument_digest_v1(arguments)?,
+            }))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1436,6 +1513,8 @@ mod tests {
             next_seq: 1,
             recovery: RecoveryInfo::default(),
             poisoned: false,
+            mcp_resume_open_id: None,
+            mcp_resume_eligibility_issued: false,
         };
 
         let first_error = journal
@@ -1967,6 +2046,45 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn legacy_oversized_unstarted_batch_is_preflighted_in_bounded_markers() {
+        let tools = (0..=MAX_MCP_CALLS_PER_RESPONSE)
+            .map(|index| UnstartedTool {
+                response_seq: 4,
+                turn_id: Some("turn-tool".to_owned()),
+                call_id: format!("call-{index}"),
+                tool_name: Some("read".to_owned()),
+                arguments: Some(json!({"index":index})),
+            })
+            .collect::<Vec<_>>();
+        preflight_recovery_authorization_batches(&tools)
+            .expect("all marker payloads must be valid before recovery writes");
+        let recovery = RecoveryInfo {
+            skipped_before_start: tools.len(),
+            ..RecoveryInfo::default()
+        };
+        let markers = tools
+            .chunks(MAX_MCP_CALLS_PER_RESPONSE)
+            .map(|chunk| recovery_marker_data(&recovery, chunk).expect("bounded marker"))
+            .collect::<Vec<_>>();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(
+            markers[0]["unstarted_tool_calls"]
+                .as_array()
+                .expect("first authorization batch")
+                .len(),
+            MAX_MCP_CALLS_PER_RESPONSE
+        );
+        assert_eq!(
+            markers[1]["unstarted_tool_calls"]
+                .as_array()
+                .expect("second authorization batch")
+                .len(),
+            1
+        );
+        assert!(recovery_marker_data(&recovery, &tools).is_err());
     }
 
     #[test]

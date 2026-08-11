@@ -45,6 +45,7 @@ use crate::history::{
     validate_history_snapshot_after_compaction,
 };
 use crate::history_artifact::{HistoryArtifactReader, HistoryArtifactRequest};
+use crate::mcp::MAX_MCP_CALLS_PER_RESPONSE;
 pub use crate::projection::project_events;
 use crate::projection::{
     SOURCE_PROJECTION_VERSION, project_checkpoint_and_tail_for_recovery_planning,
@@ -599,6 +600,17 @@ impl Agent {
             };
 
             if let Err(error) = validate_response_output_items(&turn.output_items) {
+                self.journal.append_and_sync(
+                    "response.failed",
+                    Some(turn_id),
+                    json!({
+                        "response_attempt_id": response_attempt_id,
+                        "error": error.to_string(),
+                    }),
+                )?;
+                return Err(error);
+            }
+            if let Err(error) = validate_function_call_batch_for_response(&turn.output_items) {
                 self.journal.append_and_sync(
                     "response.failed",
                     Some(turn_id),
@@ -3133,6 +3145,19 @@ fn validate_history_calls_for_response(
                 call.id
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_function_call_batch_for_response(output_items: &[Value]) -> Result<()> {
+    let function_call_count = output_items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .count();
+    if function_call_count > MAX_MCP_CALLS_PER_RESPONSE {
+        return Err(OxidraError::Limit(format!(
+            "a Provider response may contain at most {MAX_MCP_CALLS_PER_RESPONSE} function calls"
+        )));
     }
     Ok(())
 }
@@ -7284,6 +7309,64 @@ mod tests {
             completed_before
         );
         assert!(events.iter().any(|event| event.kind == "response.failed"));
+        assert_eq!(provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_function_call_batch_fails_before_response_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let journal = store
+            .create_with_id(
+                "mcp-response-call-limit-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let calls = (0..=MAX_MCP_CALLS_PER_RESPONSE)
+            .map(|index| ToolCall {
+                id: format!("mcp-call-{index}"),
+                name: "mcp_fixture_echo_deadbeef".to_owned(),
+                arguments: json!({}),
+            })
+            .collect::<Vec<_>>();
+        let provider = Arc::new(RecordingProvider::new([tool_turn(calls)]));
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let error = agent
+            .run_turn(
+                "make an oversized MCP call batch",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::Limit(_)));
+        let events = agent.journal().read_events().unwrap();
+        assert!(events.iter().any(|event| event.kind == "response.failed"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == "response.completed")
+        );
         assert_eq!(provider.requests().len(), 1);
     }
 

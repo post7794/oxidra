@@ -5,7 +5,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use super::coordinator::DispatchPermit;
+use super::coordinator::{DispatchPermit, McpResumeEligibility, McpResumePermit};
 use super::{
     ApprovedMcpProjectConfig, MCP_EXECUTION_PLAN_VERSION, MCP_LEGACY_PROTOCOL_VERSION,
     MCP_MODERN_PROTOCOL_VERSION, MCP_SCHEMA_PROFILE_VERSION, MCP_STDIO_KERNEL_VERSION,
@@ -32,6 +32,20 @@ pub struct McpToolBinding {
     pub output_schema: Option<Value>,
 }
 
+/// Durable, non-lossy identity of a Provider-visible MCP binding.
+///
+/// The registry digest covers the complete tool surface, but an offline
+/// journal reader cannot invert that digest to prove which raw server tool a
+/// Provider alias selected.  Coordinator v2 therefore persists this bounded,
+/// sorted identity view in the activation event.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(super) struct McpToolBindingIdentity {
+    pub provider_name: String,
+    pub server_name: String,
+    pub raw_tool_name: String,
+    pub protocol_version: String,
+}
+
 pub struct McpRegistry {
     config_sha256: String,
     execution_plan_digest: String,
@@ -50,6 +64,20 @@ pub struct ApprovedMcpRegistry {
     registry: McpRegistry,
 }
 
+/// A discovered registry whose process startup was authorized by a recovered
+/// journal capability.  This type cannot be passed to a new activation.
+pub struct McpResumeRegistry {
+    registry: McpRegistry,
+    permit: McpResumePermit,
+}
+
+/// Surface-approved resume registry.  Only this type is accepted by
+/// `McpExecutionCoordinator::resume`.
+pub struct ApprovedMcpResumeRegistry {
+    registry: McpRegistry,
+    permit: McpResumePermit,
+}
+
 pub(super) struct PreparedMcpRegistryCall {
     binding: McpToolBinding,
     server_attempt_id: String,
@@ -59,6 +87,54 @@ pub(super) struct PreparedMcpRegistryCall {
 impl ApprovedMcpRegistry {
     pub(super) fn into_registry(self) -> McpRegistry {
         self.registry
+    }
+}
+
+impl ApprovedMcpResumeRegistry {
+    pub(super) fn into_parts(self) -> (McpRegistry, McpResumePermit) {
+        (self.registry, self.permit)
+    }
+}
+
+impl McpResumeRegistry {
+    pub fn config_sha256(&self) -> &str {
+        self.registry.config_sha256()
+    }
+
+    pub fn execution_plan_digest(&self) -> &str {
+        self.registry.execution_plan_digest()
+    }
+
+    pub fn digest(&self) -> &str {
+        self.registry.digest()
+    }
+
+    pub fn bindings(&self) -> impl Iterator<Item = &McpToolBinding> {
+        self.registry.bindings()
+    }
+
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        self.registry.definitions()
+    }
+
+    pub fn stderr_snapshots(&self) -> BTreeMap<String, String> {
+        self.registry.stderr_snapshots()
+    }
+
+    pub fn approve_surface(self, expected_digest: &str) -> Result<ApprovedMcpResumeRegistry> {
+        if self.registry.digest != expected_digest {
+            return Err(OxidraError::Mcp(
+                "MCP registry approval does not match the discovered surface digest".to_owned(),
+            ));
+        }
+        Ok(ApprovedMcpResumeRegistry {
+            registry: self.registry,
+            permit: self.permit,
+        })
+    }
+
+    pub async fn shutdown(&mut self) {
+        self.registry.shutdown().await;
     }
 }
 
@@ -78,6 +154,32 @@ impl PreparedMcpRegistryCall {
 
 impl McpRegistry {
     pub async fn connect(
+        config: &ApprovedMcpProjectConfig,
+        reserved_provider_names: impl IntoIterator<Item = String>,
+        cancellation: &CancellationToken,
+    ) -> Result<Self> {
+        Self::connect_inner(config, reserved_provider_names, cancellation).await
+    }
+
+    /// Connect a live registry for an existing durable MCP epoch.
+    ///
+    /// `eligibility` can only be minted from a recovered `SessionJournal` and
+    /// is consumed here before any server is spawned.  The resulting registry
+    /// can only be consumed by `McpExecutionCoordinator::resume` for that same
+    /// journal handle; it cannot create a new activation.
+    pub async fn connect_for_resume(
+        config: &ApprovedMcpProjectConfig,
+        reserved_provider_names: impl IntoIterator<Item = String>,
+        eligibility: McpResumeEligibility<'_>,
+        cancellation: &CancellationToken,
+    ) -> Result<McpResumeRegistry> {
+        eligibility.validate_config(config.source_sha256(), config.execution_plan_digest())?;
+        let permit = eligibility.into_permit();
+        let registry = Self::connect_inner(config, reserved_provider_names, cancellation).await?;
+        Ok(McpResumeRegistry { registry, permit })
+    }
+
+    async fn connect_inner(
         config: &ApprovedMcpProjectConfig,
         reserved_provider_names: impl IntoIterator<Item = String>,
         cancellation: &CancellationToken,
@@ -216,6 +318,18 @@ impl McpRegistry {
 
     pub fn bindings(&self) -> impl Iterator<Item = &McpToolBinding> {
         self.bindings.values()
+    }
+
+    pub(super) fn binding_identity_snapshot(&self) -> Vec<McpToolBindingIdentity> {
+        self.bindings
+            .values()
+            .map(|binding| McpToolBindingIdentity {
+                provider_name: binding.provider_name.clone(),
+                server_name: binding.server_name.clone(),
+                raw_tool_name: binding.raw_tool_name.clone(),
+                protocol_version: binding.protocol_version.clone(),
+            })
+            .collect()
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
