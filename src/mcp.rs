@@ -1,9 +1,11 @@
 //! Bounded MCP stdio transport and tool discovery.
 //!
-//! This module deliberately stops at the session kernel. Agent exposure,
-//! project trust and per-tool approval remain separate policy layers.
+//! The low-level session kernel, project/registry trust capabilities and the
+//! durable execution-coordinator core live here. Agent/CLI exposure and the
+//! canonical MCP journal reader remain separate policy layers.
 
 mod config;
+mod coordinator;
 mod registry;
 mod schema;
 
@@ -11,7 +13,12 @@ pub use config::{
     ApprovedMcpProjectConfig, MCP_EXECUTION_PLAN_VERSION, MCP_PROJECT_CONFIG_VERSION,
     MCP_PROJECT_CONFIG_VERSION_V1, McpProjectConfig,
 };
-pub use registry::{MCP_TOOL_REGISTRY_VERSION, McpRegistry, McpToolBinding};
+pub use coordinator::{
+    DenyMcpCallApproval, MCP_ARGUMENT_DIGEST_VERSION, MCP_DISPATCH_PERMIT_VERSION,
+    MCP_EXECUTION_COORDINATOR_VERSION, McpCallApprovalHandler, McpCallApprovalRequest,
+    McpCallIdentity, McpExecutionCoordinator,
+};
+pub use registry::{ApprovedMcpRegistry, MCP_TOOL_REGISTRY_VERSION, McpRegistry, McpToolBinding};
 pub use schema::MCP_SCHEMA_PROFILE_VERSION;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -28,6 +35,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::error::{OxidraError, Result};
 use crate::process::ProcessTree;
@@ -246,6 +254,7 @@ pub struct McpTool {
 }
 
 pub struct McpStdioSession {
+    attempt_id: String,
     config: PreparedMcpStdioConfig,
     transport: Option<Transport>,
     stderr_capture: Arc<Mutex<StderrCapture>>,
@@ -263,6 +272,10 @@ pub(super) struct PreflightedJsonValue {
     preflight: Option<std::result::Result<(), schema::ValidationError>>,
 }
 
+pub(super) struct ValidatedMcpArguments {
+    value: Option<Value>,
+}
+
 impl PreflightedJsonValue {
     fn new(value: Value) -> Self {
         let mut owned = Self {
@@ -274,21 +287,57 @@ impl PreflightedJsonValue {
         owned
     }
 
-    fn as_value(&self) -> &Value {
-        self.value.as_ref().expect("owned value")
-    }
-
-    fn take_preflight(&mut self) -> std::result::Result<(), schema::ValidationError> {
-        self.preflight.take().expect("preflight result")
-    }
-
-    fn into_value(mut self) -> Value {
-        self.preflight.take();
-        self.value.take().expect("owned value")
+    fn into_validated(mut self) -> std::result::Result<ValidatedMcpArguments, McpCallError> {
+        if let Err(error) = self.preflight.take().expect("preflight result") {
+            return Err(McpCallError {
+                code: "validation_error",
+                message: format!(
+                    "MCP tool arguments do not satisfy the bounded instance profile: {}",
+                    untrusted_display::text_for_display(&error.to_string())
+                ),
+                in_doubt: false,
+                interrupted: false,
+            });
+        }
+        if let Err(error) = ensure_json_within_limit(
+            self.value.as_ref().expect("owned value"),
+            MAX_TOOL_ARGUMENT_BYTES,
+        ) {
+            return Err(McpCallError {
+                code: "validation_error",
+                message: format!(
+                    "MCP tool arguments exceed the bounded input profile: {}",
+                    untrusted_display::text_for_display(&error)
+                ),
+                in_doubt: false,
+                interrupted: false,
+            });
+        }
+        Ok(ValidatedMcpArguments {
+            value: self.value.take(),
+        })
     }
 }
 
 impl Drop for PreflightedJsonValue {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            drop_json_value_iteratively(value);
+        }
+    }
+}
+
+impl ValidatedMcpArguments {
+    pub(super) fn as_value(&self) -> &Value {
+        self.value.as_ref().expect("validated MCP arguments")
+    }
+
+    fn into_value(mut self) -> Value {
+        self.value.take().expect("validated MCP arguments")
+    }
+}
+
+impl Drop for ValidatedMcpArguments {
     fn drop(&mut self) {
         if let Some(value) = self.value.take() {
             drop_json_value_iteratively(value);
@@ -409,6 +458,7 @@ impl McpStdioSession {
 
         let tools = load_tools(&config.name, &mut transport, era, &cancellation).await?;
         Ok(Self {
+            attempt_id: Uuid::now_v7().to_string(),
             config,
             transport: Some(transport),
             stderr_capture,
@@ -430,6 +480,10 @@ impl McpStdioSession {
         &self.tools
     }
 
+    pub(super) fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+
     /// Return bounded, source-prefixed stderr diagnostics with terminal and
     /// Unicode presentation controls removed. MCP stderr is never connected
     /// directly to the interactive terminal.
@@ -443,22 +497,57 @@ impl McpStdioSession {
         arguments: Value,
         cancellation: &'a CancellationToken,
     ) -> impl std::future::Future<Output = std::result::Result<Value, McpCallError>> + 'a {
-        self.call_tool_owned(name, PreflightedJsonValue::new(arguments), cancellation)
+        let prepared = PreflightedJsonValue::new(arguments)
+            .into_validated()
+            .and_then(|arguments| self.prepare_tool_call(name, arguments));
+        async move {
+            match prepared {
+                Ok(arguments) => {
+                    self.dispatch_prepared_tool(name, arguments, cancellation)
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        }
     }
 
-    pub(super) fn call_tool_owned<'a>(
-        &'a mut self,
-        name: &'a str,
-        arguments: PreflightedJsonValue,
-        cancellation: &'a CancellationToken,
-    ) -> impl std::future::Future<Output = std::result::Result<Value, McpCallError>> + 'a {
-        self.call_tool_owned_inner(name, arguments, cancellation)
+    pub(super) fn prepare_tool_call(
+        &self,
+        name: &str,
+        arguments: ValidatedMcpArguments,
+    ) -> std::result::Result<ValidatedMcpArguments, McpCallError> {
+        let Some(tool) = self.tools.iter().find(|tool| tool.definition.name == name) else {
+            return Err(McpCallError {
+                code: "not_found",
+                message: format!(
+                    "MCP server {} has no tool {}",
+                    self.config.name,
+                    untrusted_display::quoted_single_line(name)
+                ),
+                in_doubt: false,
+                interrupted: false,
+            });
+        };
+        if let Err(error) =
+            schema::validate_instance(&tool.validation_input_schema, arguments.as_value())
+        {
+            return Err(McpCallError {
+                code: "validation_error",
+                message: format!(
+                    "MCP tool arguments do not satisfy inputSchema: {}",
+                    untrusted_display::text_for_display(&error.to_string())
+                ),
+                in_doubt: false,
+                interrupted: false,
+            });
+        }
+        Ok(arguments)
     }
 
-    async fn call_tool_owned_inner(
+    pub(super) async fn dispatch_prepared_tool(
         &mut self,
         name: &str,
-        mut arguments: PreflightedJsonValue,
+        arguments: ValidatedMcpArguments,
         cancellation: &CancellationToken,
     ) -> std::result::Result<Value, McpCallError> {
         let Some(tool) = self.tools.iter().find(|tool| tool.definition.name == name) else {
@@ -473,43 +562,6 @@ impl McpStdioSession {
                 interrupted: false,
             });
         };
-        if let Err(error) = arguments.take_preflight() {
-            let message = format!(
-                "MCP tool arguments do not satisfy the bounded instance profile: {}",
-                untrusted_display::text_for_display(&error.to_string())
-            );
-            return Err(McpCallError {
-                code: "validation_error",
-                message,
-                in_doubt: false,
-                interrupted: false,
-            });
-        }
-        if let Err(error) = ensure_json_within_limit(arguments.as_value(), MAX_TOOL_ARGUMENT_BYTES)
-        {
-            return Err(McpCallError {
-                code: "validation_error",
-                message: format!(
-                    "MCP tool arguments exceed the bounded input profile: {}",
-                    untrusted_display::text_for_display(&error)
-                ),
-                in_doubt: false,
-                interrupted: false,
-            });
-        }
-        if let Err(error) =
-            schema::validate_instance(&tool.validation_input_schema, arguments.as_value())
-        {
-            return Err(McpCallError {
-                code: "validation_error",
-                message: format!(
-                    "MCP tool arguments do not satisfy inputSchema: {}",
-                    untrusted_display::text_for_display(&error.to_string())
-                ),
-                in_doubt: false,
-                interrupted: false,
-            });
-        }
         let output_schema = tool.validation_output_schema.clone();
         let arguments = arguments.into_value();
         let params = match self.era {

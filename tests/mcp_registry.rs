@@ -4,9 +4,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use async_trait::async_trait;
+use oxidra::Result;
 use oxidra::mcp::{
-    MCP_EXECUTION_PLAN_VERSION, MCP_TOOL_REGISTRY_VERSION, McpProjectConfig, McpRegistry,
+    MCP_EXECUTION_PLAN_VERSION, MCP_TOOL_REGISTRY_VERSION, McpCallApprovalHandler,
+    McpCallApprovalRequest, McpCallIdentity, McpExecutionCoordinator, McpProjectConfig,
+    McpRegistry,
 };
+use oxidra::session::{SessionHeader, SessionStore};
+use oxidra::turn::TURN_BOUNDARY_VERSION;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -34,7 +40,7 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("approve MCP execution plan fixture");
 
     let cancellation = CancellationToken::new();
-    let mut registry = McpRegistry::connect(
+    let registry = McpRegistry::connect(
         &approved,
         ["read", "edit", "write", "shell", "remember"]
             .into_iter()
@@ -60,24 +66,313 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     assert!(binding.output_schema.is_some());
     let provider_name = binding.provider_name.clone();
 
-    let mut unpolled = Value::Null;
-    for _ in 0..50_000 {
-        unpolled = Value::Array(vec![unpolled]);
-    }
-    let unpolled_cancellation = CancellationToken::new();
-    let unpolled_future = registry.call_tool(&provider_name, unpolled, &unpolled_cancellation);
-    drop(unpolled_future);
+    let data_dir = directory.path().join("data");
+    let store = SessionStore::new(&data_dir).expect("create MCP coordinator session store");
+    let mut journal = store
+        .create(SessionHeader::new(&root, "mcp-test"))
+        .expect("create MCP coordinator journal");
+    let expected_registry_digest = registry.digest().to_owned();
+    let approved_registry = registry
+        .approve_surface(&expected_registry_digest)
+        .expect("approve MCP registry surface");
+    let mut coordinator = McpExecutionCoordinator::activate(approved_registry, &mut journal)
+        .expect("activate MCP execution coordinator");
+    assert_eq!(coordinator.registry_digest(), expected_registry_digest);
+    let activation_events = journal.read_events().expect("read MCP activation");
+    let activation = activation_events
+        .iter()
+        .find(|event| event.kind == "mcp.registry.activated")
+        .expect("durable MCP registry activation");
+    assert!(activation.turn_id.is_none());
+    assert_eq!(activation.data["coordinator_version"], 1);
+    assert_eq!(
+        activation.data["registry_version"],
+        MCP_TOOL_REGISTRY_VERSION
+    );
+    assert_eq!(activation.data["registry_digest"], expected_registry_digest);
+    assert_eq!(
+        activation.data["execution_plan_digest"],
+        approved.execution_plan_digest()
+    );
 
-    let result = registry
-        .call_tool(
-            &provider_name,
-            json!({"text":"registry"}),
+    let mut other_journal = store
+        .create(SessionHeader::new(&root, "mcp-other"))
+        .expect("create a different MCP coordinator journal");
+    let other_error = coordinator
+        .execute_call(
+            &mut other_journal,
+            McpCallIdentity::new("other-turn", "other-call", &provider_name),
             &CancellationToken::new(),
+            &mut PanicMcpApproval,
+        )
+        .await
+        .expect_err("a coordinator cannot write into another session");
+    assert!(other_error.to_string().contains("different session"));
+
+    let turn_id = "mcp-turn";
+    let call_id = "mcp-call";
+    let arguments = json!({"text":"registry"});
+    journal
+        .append_and_sync(
+            "user.message",
+            Some(turn_id),
+            json!({"text":"use MCP", "turn_boundary_version":TURN_BOUNDARY_VERSION}),
+        )
+        .expect("append MCP user message");
+    journal
+        .append_and_sync(
+            "response.started",
+            Some(turn_id),
+            json!({
+                "response_attempt_id":"mcp-response",
+                "mcp_registry_epoch_id":coordinator.registry_epoch_id(),
+                "mcp_registry_digest":coordinator.registry_digest(),
+            }),
+        )
+        .expect("append MCP response start");
+    let call_item = json!({
+        "type":"function_call",
+        "call_id":call_id,
+        "name":provider_name,
+        "arguments":serde_json::to_string(&arguments).expect("encode MCP arguments"),
+    });
+    journal
+        .append_and_sync(
+            "response.completed",
+            Some(turn_id),
+            json!({
+                "response_attempt_id":"mcp-response",
+                "raw_response":{"output":[call_item.clone()]},
+                "output_items":[call_item],
+                "text":"",
+                "usage":{},
+            }),
+        )
+        .expect("append MCP provider call");
+
+    let call_cancellation = CancellationToken::new();
+    let mut call_approval = AllowMcpApproval;
+    let result = coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(turn_id, call_id, &provider_name),
+            &call_cancellation,
+            &mut call_approval,
         )
         .await
         .expect("call namespaced MCP tool");
-    assert_eq!(result["structuredContent"]["text"], "registry");
-    registry.shutdown().await;
+    assert_eq!(result.output["structuredContent"]["text"], "registry");
+    let events = journal.read_events().expect("read MCP coordinator events");
+    let started = events
+        .iter()
+        .find(|event| event.kind == "tool.started")
+        .expect("durable MCP tool.started");
+    assert_eq!(started.data["call_id"], call_id);
+    assert_eq!(started.data["tool"], provider_name);
+    assert_eq!(
+        started.data["mcp"]["registry_digest"],
+        expected_registry_digest
+    );
+    assert_eq!(
+        started.data["mcp"]["registry_epoch_id"],
+        coordinator.registry_epoch_id()
+    );
+    let completed = events
+        .iter()
+        .find(|event| event.kind == "tool.completed")
+        .expect("durable MCP tool.completed");
+    assert_eq!(completed.data["started_seq"], started.seq);
+    assert_eq!(completed.data["mcp"], started.data["mcp"]);
+
+    let replay_error = coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(turn_id, call_id, &provider_name),
+            &CancellationToken::new(),
+            &mut PanicMcpApproval,
+        )
+        .await
+        .expect_err("a terminal call cannot acquire a second dispatch permit");
+    assert!(replay_error.to_string().contains("tool.started"));
+
+    append_provider_call(
+        &mut journal,
+        turn_id,
+        "identity-response",
+        "identity-call",
+        &provider_name,
+        &json!({"text":"identity"}),
+    );
+    let identity_error = coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(turn_id, "identity-call", "mcp_missing_fixture_tool"),
+            &CancellationToken::new(),
+            &mut PanicMcpApproval,
+        )
+        .await
+        .expect_err("an unknown provider name cannot settle a real durable call");
+    assert!(identity_error.to_string().contains("durable Provider call"));
+    let identity_terminal = coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(turn_id, "identity-call", &provider_name),
+            &CancellationToken::new(),
+            &mut oxidra::mcp::DenyMcpCallApproval,
+        )
+        .await
+        .expect("the original durable call remains recoverable");
+    assert_eq!(
+        identity_terminal.error_code.as_deref(),
+        Some("approval_required")
+    );
+
+    append_provider_call(
+        &mut journal,
+        turn_id,
+        "invalid-arguments-response",
+        "invalid-arguments-call",
+        &provider_name,
+        &json!({"text":0.5}),
+    );
+    let invalid_arguments = coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(turn_id, "invalid-arguments-call", &provider_name),
+            &CancellationToken::new(),
+            &mut PanicMcpApproval,
+        )
+        .await
+        .expect("unsupported durable arguments receive a known pre-start terminal");
+    assert_eq!(
+        invalid_arguments.error_code.as_deref(),
+        Some("validation_error")
+    );
+
+    append_provider_call(
+        &mut journal,
+        turn_id,
+        "denied-response",
+        "denied-call",
+        &provider_name,
+        &json!({"text":"denied"}),
+    );
+    let denied = coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(turn_id, "denied-call", &provider_name),
+            &CancellationToken::new(),
+            &mut oxidra::mcp::DenyMcpCallApproval,
+        )
+        .await
+        .expect("approval denial is a known pre-dispatch terminal");
+    assert_eq!(denied.error_code.as_deref(), Some("approval_required"));
+
+    append_provider_call(
+        &mut journal,
+        turn_id,
+        "cancelled-response",
+        "cancelled-call",
+        &provider_name,
+        &json!({"text":"cancelled"}),
+    );
+    let cancelled_token = CancellationToken::new();
+    cancelled_token.cancel();
+    let cancelled = coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(turn_id, "cancelled-call", &provider_name),
+            &cancelled_token,
+            &mut PanicMcpApproval,
+        )
+        .await
+        .expect("pre-cancelled MCP call is a known pre-start terminal");
+    assert_eq!(cancelled.error_code.as_deref(), Some("cancelled"));
+
+    append_provider_call(
+        &mut journal,
+        turn_id,
+        "output-limit-response",
+        "output-limit-call",
+        &provider_name,
+        &json!({"text":"__oversized_result__"}),
+    );
+    let output_limit = coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(turn_id, "output-limit-call", &provider_name),
+            &CancellationToken::new(),
+            &mut AllowMcpApproval,
+        )
+        .await
+        .expect("a known post-dispatch failure is durably terminal");
+    assert_eq!(output_limit.error_code.as_deref(), Some("output_limit"));
+
+    append_provider_calls(
+        &mut journal,
+        turn_id,
+        "in-doubt-response",
+        &provider_name,
+        &[
+            ("in-doubt-call", json!({"text":"__rpc_error__"})),
+            ("blocked-call", json!({"text":"must-not-dispatch"})),
+        ],
+    );
+    let in_doubt = coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(turn_id, "in-doubt-call", &provider_name),
+            &CancellationToken::new(),
+            &mut AllowMcpApproval,
+        )
+        .await
+        .expect("post-dispatch RPC error is durably in doubt");
+    assert_eq!(in_doubt.error_code.as_deref(), Some("in_doubt"));
+    let blocked = coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(turn_id, "blocked-call", &provider_name),
+            &CancellationToken::new(),
+            &mut PanicMcpApproval,
+        )
+        .await
+        .expect_err("an unresolved in-doubt call blocks every later dispatch");
+    assert!(blocked.to_string().contains("explicitly resolved"));
+
+    let events = journal.read_events().expect("read MCP terminal variants");
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.completed"
+            && event.data["call_id"] == "denied-call"
+            && event.data["error_code"] == "approval_required"
+            && event.data.get("started_seq").is_none()
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.cancelled"
+            && event.data["call_id"] == "cancelled-call"
+            && event.data["before_start"] == true
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.in_doubt"
+            && event.data["call_id"] == "in-doubt-call"
+            && event.data["started_seq"].is_u64()
+    }));
+    assert!(events.iter().any(|event| {
+        event.kind == "tool.completed"
+            && event.data["call_id"] == "output-limit-call"
+            && event.data["error_code"] == "output_limit"
+            && event.data["started_seq"].is_u64()
+            && event.data["mcp"]["server_attempt_id"].is_string()
+    }));
+    let log_text = fs::read_to_string(&log).expect("read MCP registry log");
+    assert_eq!(
+        log_text
+            .lines()
+            .filter(|line| *line == "tools/call")
+            .count(),
+        3,
+        "only approved single-use permits may reach the MCP transport"
+    );
+    coordinator.shutdown().await;
 
     let collision =
         McpRegistry::connect(&approved, [provider_name], &CancellationToken::new()).await;
@@ -88,6 +383,127 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("rewrite MCP project config");
     let changed = McpProjectConfig::load(&root, &config_path).expect("reload changed config");
     assert_ne!(changed.source_sha256(), original_sha);
+}
+
+struct AllowMcpApproval;
+
+#[async_trait]
+impl McpCallApprovalHandler for AllowMcpApproval {
+    async fn approve_mcp_call(
+        &mut self,
+        _request: &McpCallApprovalRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        Ok(true)
+    }
+}
+
+struct PanicMcpApproval;
+
+#[async_trait]
+impl McpCallApprovalHandler for PanicMcpApproval {
+    async fn approve_mcp_call(
+        &mut self,
+        _request: &McpCallApprovalRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<bool> {
+        panic!("approval must not be requested for an invalid or pre-cancelled dispatch")
+    }
+}
+
+fn append_provider_call(
+    journal: &mut oxidra::session::SessionJournal,
+    turn_id: &str,
+    response_attempt_id: &str,
+    call_id: &str,
+    provider_name: &str,
+    arguments: &Value,
+) {
+    append_provider_calls(
+        journal,
+        turn_id,
+        response_attempt_id,
+        provider_name,
+        &[(call_id, arguments.clone())],
+    );
+}
+
+fn append_provider_calls(
+    journal: &mut oxidra::session::SessionJournal,
+    turn_id: &str,
+    response_attempt_id: &str,
+    provider_name: &str,
+    calls: &[(&str, Value)],
+) {
+    let registry_epoch_id = active_registry_epoch(journal);
+    let registry_digest = active_registry_digest(journal);
+    journal
+        .append_and_sync(
+            "response.started",
+            Some(turn_id),
+            json!({
+                "response_attempt_id":response_attempt_id,
+                "mcp_registry_epoch_id":registry_epoch_id,
+                "mcp_registry_digest":registry_digest,
+            }),
+        )
+        .expect("append MCP response start");
+    let call_items = calls
+        .iter()
+        .map(|(call_id, arguments)| {
+            json!({
+                "type":"function_call",
+                "call_id":call_id,
+                "name":provider_name,
+                "arguments":serde_json::to_string(arguments).expect("encode MCP arguments"),
+            })
+        })
+        .collect::<Vec<_>>();
+    journal
+        .append_and_sync(
+            "response.completed",
+            Some(turn_id),
+            json!({
+                "response_attempt_id":response_attempt_id,
+                "raw_response":{"output":call_items},
+                "output_items":call_items,
+                "text":"",
+                "usage":{},
+            }),
+        )
+        .expect("append MCP provider call");
+}
+
+fn active_registry_epoch(journal: &oxidra::session::SessionJournal) -> String {
+    journal
+        .read_events()
+        .expect("read MCP activation for fixture response")
+        .into_iter()
+        .find(|event| event.kind == "mcp.registry.activated")
+        .and_then(|event| {
+            event
+                .data
+                .get("registry_epoch_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .expect("MCP registry activation epoch")
+}
+
+fn active_registry_digest(journal: &oxidra::session::SessionJournal) -> String {
+    journal
+        .read_events()
+        .expect("read MCP activation for fixture response")
+        .into_iter()
+        .find(|event| event.kind == "mcp.registry.activated")
+        .and_then(|event| {
+            event
+                .data
+                .get("registry_digest")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .expect("MCP registry activation digest")
 }
 
 #[tokio::test]
@@ -221,6 +637,17 @@ for line in sys.stdin:
         })
     elif method == "tools/call":
         text = message.get("params", {}).get("arguments", {}).get("text", "")
+        if text == "__rpc_error__":
+            reply(message, error={"code": -32001, "message": "fixture call failed after dispatch"})
+            continue
+        if text == "__oversized_result__":
+            reply(message, {
+                "resultType": "complete",
+                "content": [{"type": "text", "text": "x" * 60000}],
+                "structuredContent": {"text": "x" * 60000},
+                "isError": False,
+            })
+            continue
         reply(message, {
             "resultType": "complete",
             "content": [{"type": "text", "text": text}],

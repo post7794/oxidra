@@ -5,10 +5,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
+use super::coordinator::DispatchPermit;
 use super::{
     ApprovedMcpProjectConfig, MCP_EXECUTION_PLAN_VERSION, MCP_LEGACY_PROTOCOL_VERSION,
     MCP_MODERN_PROTOCOL_VERSION, MCP_SCHEMA_PROFILE_VERSION, MCP_STDIO_KERNEL_VERSION,
-    McpCallError, McpProtocolEra, McpStdioSession, PreflightedJsonValue,
+    McpCallError, McpProtocolEra, McpStdioSession, ValidatedMcpArguments,
 };
 use crate::error::{OxidraError, Result};
 use crate::types::ToolDefinition;
@@ -37,6 +38,42 @@ pub struct McpRegistry {
     digest: String,
     sessions: BTreeMap<String, McpStdioSession>,
     bindings: BTreeMap<String, McpToolBinding>,
+    dispatch_authority: Option<RegistryDispatchAuthority>,
+}
+
+struct RegistryDispatchAuthority {
+    coordinator_id: String,
+    registry_epoch_id: String,
+}
+
+pub struct ApprovedMcpRegistry {
+    registry: McpRegistry,
+}
+
+pub(super) struct PreparedMcpRegistryCall {
+    binding: McpToolBinding,
+    server_attempt_id: String,
+    arguments: ValidatedMcpArguments,
+}
+
+impl ApprovedMcpRegistry {
+    pub(super) fn into_registry(self) -> McpRegistry {
+        self.registry
+    }
+}
+
+impl PreparedMcpRegistryCall {
+    pub(super) fn binding(&self) -> &McpToolBinding {
+        &self.binding
+    }
+
+    pub(super) fn server_attempt_id(&self) -> &str {
+        &self.server_attempt_id
+    }
+
+    pub(super) fn arguments(&self) -> &Value {
+        self.arguments.as_value()
+    }
 }
 
 impl McpRegistry {
@@ -150,6 +187,7 @@ impl McpRegistry {
             digest,
             sessions,
             bindings,
+            dispatch_authority: None,
         })
     }
 
@@ -163,6 +201,17 @@ impl McpRegistry {
 
     pub fn digest(&self) -> &str {
         &self.digest
+    }
+
+    /// Convert a discovered registry into the surface-trust capability that
+    /// the execution coordinator alone can consume.
+    pub fn approve_surface(self, expected_digest: &str) -> Result<ApprovedMcpRegistry> {
+        if self.digest != expected_digest {
+            return Err(OxidraError::Mcp(
+                "MCP registry approval does not match the discovered surface digest".to_owned(),
+            ));
+        }
+        Ok(ApprovedMcpRegistry { registry: self })
     }
 
     pub fn bindings(&self) -> impl Iterator<Item = &McpToolBinding> {
@@ -186,39 +235,99 @@ impl McpRegistry {
             .collect()
     }
 
-    pub fn call_tool<'a>(
-        &'a mut self,
-        provider_name: &'a str,
-        arguments: Value,
-        cancellation: &'a CancellationToken,
-    ) -> impl std::future::Future<Output = std::result::Result<Value, McpCallError>> + 'a {
-        let arguments = PreflightedJsonValue::new(arguments);
-        async move {
-            let Some(binding) = self.bindings.get(provider_name) else {
-                return Err(McpCallError {
-                    code: "not_found",
-                    message: format!(
-                        "MCP registry has no provider tool {}",
-                        untrusted_display::quoted_single_line(provider_name)
-                    ),
-                    in_doubt: false,
-                    interrupted: false,
-                });
-            };
-            let server_name = binding.server_name.clone();
-            let raw_tool_name = binding.raw_tool_name.clone();
-            let Some(session) = self.sessions.get_mut(&server_name) else {
-                return Err(McpCallError {
-                    code: "transport_closed",
-                    message: format!("MCP server {server_name} session is unavailable"),
-                    in_doubt: false,
-                    interrupted: false,
-                });
-            };
-            session
-                .call_tool_owned(&raw_tool_name, arguments, cancellation)
-                .await
+    pub(super) fn prepare_call(
+        &self,
+        provider_name: &str,
+        arguments: ValidatedMcpArguments,
+    ) -> std::result::Result<PreparedMcpRegistryCall, McpCallError> {
+        let Some(binding) = self.bindings.get(provider_name) else {
+            return Err(McpCallError {
+                code: "not_found",
+                message: format!(
+                    "MCP registry has no provider tool {}",
+                    untrusted_display::quoted_single_line(provider_name)
+                ),
+                in_doubt: false,
+                interrupted: false,
+            });
+        };
+        let Some(session) = self.sessions.get(&binding.server_name) else {
+            return Err(McpCallError {
+                code: "transport_closed",
+                message: format!("MCP server {} session is unavailable", binding.server_name),
+                in_doubt: false,
+                interrupted: false,
+            });
+        };
+        let prepared = session.prepare_tool_call(&binding.raw_tool_name, arguments)?;
+        Ok(PreparedMcpRegistryCall {
+            binding: binding.clone(),
+            server_attempt_id: session.attempt_id().to_owned(),
+            arguments: prepared,
+        })
+    }
+
+    pub(super) fn bind_dispatch_authority(
+        &mut self,
+        coordinator_id: &str,
+        registry_epoch_id: &str,
+    ) -> Result<()> {
+        if self.dispatch_authority.is_some()
+            || coordinator_id.is_empty()
+            || registry_epoch_id.is_empty()
+        {
+            return Err(OxidraError::Mcp(
+                "MCP registry dispatch authority is invalid or already bound".to_owned(),
+            ));
         }
+        self.dispatch_authority = Some(RegistryDispatchAuthority {
+            coordinator_id: coordinator_id.to_owned(),
+            registry_epoch_id: registry_epoch_id.to_owned(),
+        });
+        Ok(())
+    }
+
+    pub(super) async fn dispatch(
+        &mut self,
+        permit: DispatchPermit,
+        prepared: PreparedMcpRegistryCall,
+        cancellation: &CancellationToken,
+    ) -> std::result::Result<Value, McpCallError> {
+        let Some(authority) = &self.dispatch_authority else {
+            return Err(McpCallError {
+                code: "dispatch_permit_invalid",
+                message: "MCP registry has no bound dispatch authority".to_owned(),
+                in_doubt: false,
+                interrupted: false,
+            });
+        };
+        permit.validate(
+            &authority.coordinator_id,
+            &authority.registry_epoch_id,
+            &self.digest,
+            &prepared,
+        )?;
+        let server_name = prepared.binding.server_name.clone();
+        let raw_tool_name = prepared.binding.raw_tool_name.clone();
+        let Some(session) = self.sessions.get_mut(&server_name) else {
+            return Err(McpCallError {
+                code: "transport_closed",
+                message: format!("MCP server {server_name} session is unavailable"),
+                in_doubt: false,
+                interrupted: false,
+            });
+        };
+        if session.attempt_id() != prepared.server_attempt_id {
+            return Err(McpCallError {
+                code: "dispatch_permit_invalid",
+                message: "MCP server attempt changed after approval".to_owned(),
+                in_doubt: false,
+                interrupted: false,
+            });
+        }
+        session
+            .dispatch_prepared_tool(&raw_tool_name, prepared.arguments, cancellation)
+            .await
     }
 
     pub async fn shutdown(&mut self) {
@@ -307,6 +416,23 @@ impl<'a> From<&'a McpToolBinding> for ToolDigest<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn surface_digest_mismatch_cannot_create_dispatch_capability() {
+        let registry = McpRegistry {
+            config_sha256: "c".repeat(64),
+            execution_plan_digest: "e".repeat(64),
+            digest: "d".repeat(64),
+            sessions: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            dispatch_authority: None,
+        };
+        let error = registry
+            .approve_surface(&"0".repeat(64))
+            .err()
+            .expect("surface mismatch must not produce an approved registry");
+        assert!(error.to_string().contains("surface digest"));
+    }
 
     #[test]
     fn provider_names_are_bounded_stable_and_collision_resistant() {

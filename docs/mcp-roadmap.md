@@ -1,10 +1,10 @@
 # Oxidra MCP 接入路线
 
 状态：MCP stdio transport/session kernel v1、显式 project-config reader v1、
-execution-plan digest v1、JSON Schema profile v1 和 session-scoped tool registry v1
-已实现，尚未接入 Agent、CLI 参数或 session journal。
-当前代码只能由 Rust 调用方显式加载绝对 config path 并构造 registry；它不是已经
-对用户开放的插件入口。
+execution-plan digest v1、JSON Schema profile v1、session-scoped tool registry v1 和
+durable execution coordinator core v1 已实现，尚未接入 Agent 或 CLI 参数。
+当前代码只能由 Rust 调用方显式加载绝对 config path、批准 execution plan 与 registry
+surface，并把 coordinator 绑定到 session journal；它不是已经对用户开放的插件入口。
 
 ## 1. 边界与原则
 
@@ -149,21 +149,76 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
   namespace；alias 带 identity hash，且仍执行实际 collision 检查。
 - input/output schema、raw/provider name、server 协议版本、execution-plan v1、stdio
   kernel v1 和 JSON Schema profile v1 进入 registry-digest v1；字面量 fixture 固定
-  其 SHA-256。MCP 尚未发布或写入 journal，因此不存在 v2-v4 legacy digest。
-- registry 可按 provider alias 调用对应长连接 session，并统一 shutdown 全部进程。
+  其 SHA-256。coordinator activation 首次把该 v1 identity 写入 journal；不存在需要兼容的
+  v2-v4 伪历史 digest。
+- registry 可统一 shutdown 全部长连接进程，但真实 dispatch 已不是公开方法；surface
+  digest 匹配后生成的 `ApprovedMcpRegistry` 只能交给 execution coordinator。registry
+  内部 dispatch 还要求 coordinator 私有、按值消费且不可 clone 的 `DispatchPermit`。
+  `McpStdioSession::call_tool` 仍保留为显式高级调用方使用的低层 API，不属于 Agent 的
+  正常执行路径，也不提供 journal/approval 语义。
 
 execution-plan digest 与 registry digest 是单向的两层证据：前者在启动任何外部代码
 之前授权“按哪些路径、参数和环境权限执行”，后者只能在 discovery 之后冻结“模型能
 看到哪些工具”。工具表 digest 不能反向充当 executable 的执行许可；path trust 也不能
 被表述成具体代码内容已经得到认证。
 
+### 3.3 durable execution coordinator core v1
+
+`McpExecutionCoordinator` 是正常 registry dispatch 的唯一 capability owner。Rust 可见性
+和私有类型建立以下边界，而不是依赖调用约定：
+
+```text
+McpRegistry::approve_surface(expected digest)
+→ ApprovedMcpRegistry
+→ McpExecutionCoordinator::activate(session journal)
+→ private single-use DispatchPermit
+→ pub(super) registry dispatch
+```
+
+- activation 同步写入 `mcp.registry.activated`，绑定 session、coordinator ID、registry
+  epoch、config SHA、execution-plan digest、registry digest，以及 kernel/schema/registry/
+  coordinator 的具体版本；live coordinator 只能写入同一 session journal。
+- 每次调用先对参数完成同步 bounded ownership/preflight，再验证 durable
+  `response.completed.output_items` 中存在唯一、同 turn/call ID、同 provider name、同参数
+  digest 的 Provider call；对应的 `response.started` 还必须显式记录当前
+  `mcp_registry_epoch_id` 与 `mcp_registry_digest`，并且该 response 必须在 activation 之后。
+  schema preparation 失败也不能借另一个真实 call ID 写 terminal。
+- per-call approval 前和通过后都从 journal snapshot 重建 candidate，并用冻结的 Provider
+  request-slot reducer v2 验证假想 `tool.started`。approval handler 不持有 journal，不能在
+  approval await 期间另行写入同一 writer；请求同时提供完整、有界的 `arguments_json`，
+  `arguments_display` 只是终端安全的展示摘要，不能作为审批策略的唯一输入。
+- approval 通过后先 fsync `tool.started`，再生成不可构造、不可 clone、按值消费的 permit。
+  permit 绑定 turn/call、provider/raw tool identity、registry epoch/digest、协议版本、server
+  attempt、参数 digest、coordinator ID 和 durable started seq；registry 与 session 在发送前
+  再核对 authority、binding、attempt 和参数。
+- validated complete result 写 `tool.completed`；请求可能写出但没有 validated complete
+  result 时写 `tool.in_doubt`；dispatch 前的已知拒绝不会产生 `tool.started`；started 后的
+  已知失败 terminal 必须引用 `started_seq`。terminal fsync 报错会 poison 当前 journal
+  writer；reopen 后只按实际可见的 durable prefix 保守归约，并且绝不自动重发。
+- Session 的公开裸 `Value` 入口有 50,000 层 unpolled-future 回归；registry/coordinator
+  不再暴露同类入口，只消费已经完成 bounded preflight 的 owning type 或 journal parser
+  产生的有界 durable value。future、approval await 和 dispatch permit 不重新持有未受保护的
+  深层裸 `Value`。
+- coordinator v1 从 durable Provider call 派生参数，不接受调用方另传一份可错配的裸参数；
+  每个 session 只允许一个 v1 registry activation。已有 `tool.started`/`tool.in_doubt` 未
+  解决时，新的 MCP dispatch 统一 fail closed，禁止把 remaining calls 交给调用方约定跳过。
+
+coordinator core 当前仍不是 Agent 集成完成的声明：尚无 session reopen 后恢复/替换 live
+registry epoch 的 reader，也尚未把 `context.tools` snapshot writer 改为在
+`response.started` 填充上述 registry epoch 字段。Agent 必须从同一 prepared request snapshot
+写入这些字段，证明 Provider request 所使用的 `context.tools`、返回 call、approval、started
+和 permit 属于同一个 epoch；完成这条绑定前不能把 MCP definitions 放进 Agent 请求。
+此外，现有 turn/projection/history reducer 仍会接受通用 `tool.completed` 等事件；在 Agent
+接入前必须新增冻结版本的 MCP call-chain validator，使这些 reducer 只消费经过 activation、
+durable Provider call、started provenance 和 terminal lineage 完整证明的 canonical MCP facts。
+
 ## 4. 尚未实现：Agent 与 CLI policy
 
 下一阶段必须按以下顺序推进。
 
-在任何 Provider tool 暴露前，先建立唯一的 MCP execution coordinator。CLI、Agent、
-registry 和 journal 不能分别推断“是否获批”“是否已 dispatch”或“如何终态化”；它们
-只能消费 coordinator 从同一 durable snapshot 生成的版本化 execution plan：
+execution coordinator core 已建立；CLI、Agent 和 recovery 不能再直接持有 registry
+dispatch primitive，也不能分别推断“是否获批”“是否已 dispatch”或“如何终态化”。
+它们只能消费 coordinator 从同一 durable snapshot 生成的版本化调用计划：
 
 ```text
 durable execution trust
@@ -178,9 +233,17 @@ tool.in_doubt
 ```
 
 `ApprovedMcpProjectConfig` 只是启动 capability 的类型约束，不是 durable approval 的
-事实源。coordinator 必须成为批准、started fsync、dispatch 与 terminalize 的唯一写入
-权限；否则 CLI preflight、Agent loop 和 recovery reducer 会形成可以互相矛盾的多套
-状态机。
+事实源。Agent 接入还必须把以下身份锁定为同一 snapshot，不能只因 provider alias 相同
+就授权调用：
+
+```text
+context.tools registry digest/epoch
+= Provider request registry digest/epoch
+= returned call identity
+= approval request epoch
+= tool.started provenance
+= DispatchPermit epoch
+```
 
 ### 4.1 CLI trust
 
