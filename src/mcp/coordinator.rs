@@ -6,7 +6,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::journal::{
-    MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, argument_digest_v1, validate_mcp_call_chain_v1,
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, argument_digest_v1, ensure_no_unstarted_mcp_calls_v1,
+    validate_mcp_call_chain_v1,
 };
 use super::registry::{ApprovedMcpRegistry, McpRegistry, PreparedMcpRegistryCall};
 use super::{McpCallError, PreflightedJsonValue};
@@ -162,6 +163,66 @@ impl McpExecutionCoordinator {
             activation_seq: event.seq,
             registry,
         })
+    }
+
+    /// Rebind a newly discovered, explicitly approved live registry to the
+    /// immutable registry epoch already recorded in a recovered session.
+    ///
+    /// This does not create a second activation.  The live registry must
+    /// reproduce the exact config, execution-plan, provider surface and
+    /// registry digest recorded by coordinator v1.  Callers must open the
+    /// session through [`crate::session::SessionStore`] first so interrupted
+    /// pre-start calls have already received their durable recovery outcome.
+    pub fn resume(
+        approved_registry: ApprovedMcpRegistry,
+        journal: &SessionJournal,
+    ) -> Result<Self> {
+        let events = journal.read_events()?;
+        validate_mcp_call_chain_v1(&events)?;
+        ensure_no_unstarted_mcp_calls_v1(&events)?;
+
+        let activation = events
+            .iter()
+            .find(|event| event.kind == MCP_REGISTRY_ACTIVATED_KIND)
+            .ok_or_else(|| {
+                OxidraError::Session(
+                    "MCP coordinator resume requires a durable registry activation".to_owned(),
+                )
+            })?;
+        let coordinator_id = activation
+            .data
+            .get("coordinator_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "mcp.registry.activated at seq {} has no coordinator_id",
+                    activation.seq
+                ))
+            })?
+            .to_owned();
+        let registry_epoch_id = activation
+            .data
+            .get("registry_epoch_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "mcp.registry.activated at seq {} has no registry_epoch_id",
+                    activation.seq
+                ))
+            })?
+            .to_owned();
+
+        let mut registry = approved_registry.into_registry();
+        registry.bind_dispatch_authority(&coordinator_id, &registry_epoch_id)?;
+        let coordinator = Self {
+            coordinator_id,
+            registry_epoch_id,
+            session_id: journal.session_id().to_owned(),
+            activation_seq: activation.seq,
+            registry,
+        };
+        validate_activation_v1(&events, &coordinator)?;
+        Ok(coordinator)
     }
 
     pub fn registry_epoch_id(&self) -> &str {

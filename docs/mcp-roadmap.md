@@ -204,8 +204,11 @@ McpRegistry::approve_surface(expected digest)
   每个 session 只允许一个 v1 registry activation。已有 `tool.started`/`tool.in_doubt` 未
   解决时，新的 MCP dispatch 统一 fail closed，禁止把 remaining calls 交给调用方约定跳过。
 
-coordinator core 当前仍不是 Agent 集成完成的声明：尚无 session reopen 后恢复/替换 live
-registry epoch 的 reader，也尚未把 `context.tools` snapshot writer 改为在
+coordinator core 当前仍不是 Agent 集成完成的声明。`McpExecutionCoordinator::resume()` 已能在
+session reopen/recovery 后，用重新取得 execution trust 与 surface trust 的 live registry 复用
+原 durable epoch：config、execution plan、Provider surface、registry digest 和 activation policy
+必须逐项一致；未恢复的 pre-start MCP call 会 fail closed，且不会写第二条 activation。
+但 Agent 尚未消费该 reader，也尚未把 `context.tools` snapshot writer 改为在
 `response.started` 填充上述 registry epoch 字段。Agent 必须从同一 prepared request snapshot
 写入这些字段，证明 Provider request 所使用的 `context.tools`、返回 call、approval、started
 和 permit 属于同一个 epoch；完成这条绑定前不能把 MCP definitions 放进 Agent 请求。

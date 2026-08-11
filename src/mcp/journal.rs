@@ -165,6 +165,29 @@ pub(crate) fn mcp_turn_ids_v1(events: &[JournalEvent]) -> Result<Vec<String>> {
     Ok(turn_ids)
 }
 
+pub(crate) fn ensure_no_unstarted_mcp_calls_v1(events: &[JournalEvent]) -> Result<()> {
+    validate_mcp_call_chain_v1(events)?;
+    let Some(activation) = activation_v1(events)? else {
+        return Ok(());
+    };
+    let calls = durable_mcp_calls_v1(events, &activation)?;
+    for call in calls.values() {
+        let has_lifecycle = events.iter().any(|event| {
+            event.seq > call.response_seq
+                && event.turn_id.as_deref() == Some(&call.key.turn_id)
+                && event.data.get("call_id").and_then(Value::as_str) == Some(&call.key.call_id)
+                && is_tool_lifecycle(&event.kind)
+        });
+        if !has_lifecycle {
+            return session_error(format!(
+                "MCP call {} in turn {} must be recovered before the live registry resumes",
+                call.key.call_id, call.key.turn_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn argument_digest_v1(arguments: &Value) -> Result<String> {
     let payload = json!({
         "argument_digest_version": MCP_ARGUMENT_DIGEST_VERSION_V1,
@@ -1361,6 +1384,10 @@ mod tests {
         let mut events = mcp_events();
         let arguments = json!({"text":"hello"});
         events.truncate(4);
+        let error = ensure_no_unstarted_mcp_calls_v1(&events)
+            .expect_err("live registry resume must wait for recovery")
+            .to_string();
+        assert!(error.contains("must be recovered"));
         events.push(event(
             6,
             None,
@@ -1393,6 +1420,8 @@ mod tests {
             }),
         ));
         validate_mcp_call_chain_v1(&events).expect("recovery-authorized skip");
+        ensure_no_unstarted_mcp_calls_v1(&events)
+            .expect("recovery terminal makes the durable epoch resumable");
 
         let mut forged = events;
         forged[5].data["recovery_marker_seq"] = Value::from(5);

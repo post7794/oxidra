@@ -372,7 +372,36 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         3,
         "only approved single-use permits may reach the MCP transport"
     );
+    let durable_epoch = coordinator.registry_epoch_id().to_owned();
+    let durable_session_id = journal.session_id().to_owned();
     coordinator.shutdown().await;
+    drop(coordinator);
+    drop(journal);
+
+    let reopened = store
+        .open(&durable_session_id)
+        .expect("reopen and recover MCP coordinator journal");
+    let resumed_registry = McpRegistry::connect(
+        &approved,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("reconnect the approved MCP registry");
+    assert_eq!(resumed_registry.digest(), expected_registry_digest);
+    let resumed_digest = resumed_registry.digest().to_owned();
+    let approved_resumed_registry = resumed_registry
+        .approve_surface(&resumed_digest)
+        .expect("reapprove the unchanged MCP surface");
+    let mut resumed = McpExecutionCoordinator::resume(approved_resumed_registry, &reopened)
+        .expect("resume the durable MCP registry epoch");
+    assert_eq!(resumed.registry_epoch_id(), durable_epoch);
+    assert_eq!(resumed.registry_digest(), expected_registry_digest);
+    resumed.shutdown().await;
+    drop(resumed);
+    drop(reopened);
 
     let collision =
         McpRegistry::connect(&approved, [provider_name], &CancellationToken::new()).await;
