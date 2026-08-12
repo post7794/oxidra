@@ -45,7 +45,7 @@ use crate::history::{
     validate_history_snapshot_after_compaction,
 };
 use crate::history_artifact::{HistoryArtifactReader, HistoryArtifactRequest};
-use crate::mcp::MAX_MCP_CALLS_PER_RESPONSE;
+use crate::mcp::{MAX_MCP_CALLS_PER_RESPONSE, response_status_text_for_journal};
 pub use crate::projection::project_events;
 use crate::projection::{
     SOURCE_PROJECTION_VERSION, project_checkpoint_and_tail_for_recovery_planning,
@@ -570,7 +570,7 @@ impl Agent {
                         Some(turn_id),
                         json!({
                             "response_attempt_id": response_attempt_id,
-                            "error": &reason,
+                            "error": response_status_text_for_journal(&reason),
                             "error_code": "provider_context_limit",
                         }),
                     )?;
@@ -578,7 +578,7 @@ impl Agent {
                         "context.limit_reached",
                         Some(turn_id),
                         json!({
-                            "error": &reason,
+                            "error": response_status_text_for_journal(&reason),
                             "source": "provider",
                             "response_attempt_id": response_attempt_id,
                             "context": prepared_tools.context.audit_value()?,
@@ -592,7 +592,7 @@ impl Agent {
                         Some(turn_id),
                         json!({
                             "response_attempt_id": response_attempt_id,
-                            "error": error.to_string(),
+                            "error": response_status_text_for_journal(&error.to_string()),
                         }),
                     )?;
                     return Err(error);
@@ -605,7 +605,7 @@ impl Agent {
                     Some(turn_id),
                     json!({
                         "response_attempt_id": response_attempt_id,
-                        "error": error.to_string(),
+                        "error": response_status_text_for_journal(&error.to_string()),
                     }),
                 )?;
                 return Err(error);
@@ -616,7 +616,7 @@ impl Agent {
                     Some(turn_id),
                     json!({
                         "response_attempt_id": response_attempt_id,
-                        "error": error.to_string(),
+                        "error": response_status_text_for_journal(&error.to_string()),
                     }),
                 )?;
                 return Err(error);
@@ -629,7 +629,7 @@ impl Agent {
                     Some(turn_id),
                     json!({
                         "response_attempt_id": response_attempt_id,
-                        "error": error.to_string(),
+                        "error": response_status_text_for_journal(&error.to_string()),
                     }),
                 )?;
                 return Err(error);
@@ -2105,7 +2105,7 @@ impl Agent {
             Some(turn_id),
             json!({
                 "response_attempt_id": response_attempt_id,
-                "reason": reason,
+                "reason": response_status_text_for_journal(reason),
             }),
         )?;
         Ok(())

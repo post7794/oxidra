@@ -22,8 +22,9 @@ pub use coordinator::{
 pub use journal::{MAX_MCP_CALLS_PER_RESPONSE, MCP_CALL_CHAIN_VALIDATOR_VERSION};
 pub(crate) use journal::{
     MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, MCP_CALL_CHAIN_VALIDATOR_VERSION_V2, argument_digest_v1,
-    call_chain_validator_version, mcp_turn_ids, validate_mcp_call_chain,
-    validate_mcp_call_chain_for_version, validate_mcp_call_chain_through_version,
+    call_chain_validator_version, mcp_turn_ids, response_status_text_for_journal,
+    validate_mcp_call_chain, validate_mcp_call_chain_for_version,
+    validate_mcp_call_chain_through_version,
 };
 pub use registry::{
     ApprovedMcpRegistry, ApprovedMcpResumeRegistry, MCP_TOOL_REGISTRY_VERSION, McpRegistry,

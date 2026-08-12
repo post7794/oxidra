@@ -242,6 +242,9 @@ projection 和 history 各自“碰巧做出相同判断”：
   至多一个 terminal；completed terminal 要求 canonical `output_items`，且批次限制在区分
   MCP/内置 binding 前应用。activation 之前的同名普通工具保持历史语义，不会被未来 registry
   追溯解释。v1 reader 保留原先按 MCP alias 识别 call 的冻结行为。
+- Agent 的 `response.failed.error` 与普通 `response.aborted.reason` writer 在首次 fsync 前使用
+  validator v2 共用的 UTF-8 byte limit/truncation profile；Provider 错误可以比 durable status
+  字段更大，但不能先写入一个冻结 reader 必然拒绝的 terminal。
 - lifecycle 必须使用 canonical `call_id`。generic reducer 兼容的 `id` alias 不能结算 MCP
   call；turn/call/provider、参数 digest、started seq、registry/execution provenance 和 terminal
   状态迁移均由同一 validator 证明。

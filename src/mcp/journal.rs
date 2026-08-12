@@ -211,7 +211,19 @@ fn validate_mcp_call_chain_with_activation(
     Ok(())
 }
 
-const MAX_RESPONSE_STATUS_TEXT_BYTES_V2: usize = 16 * 1024;
+/// Maximum durable response failure/abort status size.  Production writers
+/// use `response_status_text_for_journal` before fsync so the frozen reader
+/// and writer accept exactly the same profile.
+pub(crate) const MAX_RESPONSE_STATUS_TEXT_BYTES_V2: usize = 16 * 1024;
+
+pub(crate) fn response_status_text_for_journal(input: &str) -> String {
+    let input = if input.is_empty() {
+        "unspecified response status"
+    } else {
+        input
+    };
+    crate::untrusted_display::truncate_utf8(input, MAX_RESPONSE_STATUS_TEXT_BYTES_V2)
+}
 
 /// Validate the complete v2 response transaction before projecting any MCP
 /// calls.  The response start, not a discovered function call, owns the
@@ -228,7 +240,11 @@ fn response_attempts_v2<'a>(
     for event in events {
         match event.kind.as_str() {
             "response.started" => {
-                let Some(turn_id) = event.turn_id.as_deref() else {
+                let Some(turn_id) = event
+                    .turn_id
+                    .as_deref()
+                    .filter(|value| valid_identity(value))
+                else {
                     if event.seq > activation.seq {
                         return Err(session_message(
                             event,
@@ -2386,6 +2402,31 @@ mod tests {
     }
 
     #[test]
+    fn response_status_writer_matches_the_frozen_validator_limit() {
+        let exact =
+            response_status_text_for_journal(&"x".repeat(MAX_RESPONSE_STATUS_TEXT_BYTES_V2));
+        assert_eq!(exact.len(), MAX_RESPONSE_STATUS_TEXT_BYTES_V2);
+        let oversized =
+            response_status_text_for_journal(&"x".repeat(MAX_RESPONSE_STATUS_TEXT_BYTES_V2 + 1));
+        assert!(oversized.len() <= MAX_RESPONSE_STATUS_TEXT_BYTES_V2);
+        assert!(oversized.ends_with("<truncated>"));
+
+        let mut events = mcp_events_v2();
+        events.truncate(3);
+        events.push(event(
+            4,
+            Some("turn-1"),
+            "response.failed",
+            json!({
+                "response_attempt_id":"attempt-1",
+                "error":oversized,
+            }),
+        ));
+        validate_mcp_call_chain_v2(&events)
+            .expect("the shared writer projection must be accepted by the frozen validator");
+    }
+
+    #[test]
     fn v2_claimed_builtin_only_response_is_still_owned() {
         let mut events = mcp_events_v2();
         events.truncate(4);
@@ -2425,6 +2466,18 @@ mod tests {
             error.contains("no valid response_attempt_id"),
             "unexpected error: {error}"
         );
+
+        for invalid_turn_id in [String::new(), "turn\u{0001}".to_owned(), "x".repeat(129)] {
+            let mut events = mcp_events_v2();
+            events[2].turn_id = Some(invalid_turn_id);
+            let error = validate_mcp_call_chain_v2(&events)
+                .expect_err("claimed response.started must carry a valid turn_id")
+                .to_string();
+            assert!(
+                error.contains("no valid turn_id"),
+                "unexpected error: {error}"
+            );
+        }
     }
 
     #[test]
