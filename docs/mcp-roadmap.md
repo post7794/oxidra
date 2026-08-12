@@ -235,10 +235,11 @@ projection 和 history 各自“碰巧做出相同判断”：
   history extractor v6 和 compaction boundary v7 冻结兼容集合 `{v1, v2}`，按 activation
   声明选择 exact reducer，并拒绝未来版本，而不是读取可变默认值。
 - validator v2 先由 activation 之后、显式带同一 registry epoch/digest 的
-  `response.started` 确定整个 response transaction 的 MCP 所有权，再要求唯一 terminal 和
-  canonical `output_items`；批次限制在区分 MCP/内置 binding 前应用。activation 之前的同名
-  普通工具保持历史语义，不会被未来 registry 追溯解释。v1 reader 保留原先按 MCP alias
-  识别 call 的冻结行为。
+  `response.started` 确定整个 response transaction 的 MCP 所有权；unfinished、failed、aborted
+  以及只含内置工具的 response 仍属于该 epoch。每个 owned attempt 至多一个 terminal；仅
+  completed terminal 要求 canonical `output_items`，且批次限制在区分 MCP/内置 binding 前
+  应用。activation 之前的同名普通工具保持历史语义，不会被未来 registry 追溯解释。v1 reader
+  保留原先按 MCP alias 识别 call 的冻结行为。
 - lifecycle 必须使用 canonical `call_id`。generic reducer 兼容的 `id` alias 不能结算 MCP
   call；turn/call/provider、参数 digest、started seq、registry/execution provenance 和 terminal
   状态迁移均由同一 validator 证明。

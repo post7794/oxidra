@@ -325,7 +325,7 @@ impl SessionStore {
                 .ok_or_else(|| OxidraError::Session("journal sequence is exhausted".to_owned()))?,
             None => 1,
         };
-        let unfinished_responses = unfinished_responses(&prospective_events);
+        let unfinished_responses = unfinished_responses(&prospective_events)?;
         let previously_aborted_responses = prospective_events
             .iter()
             .filter(|event| {
@@ -1272,16 +1272,30 @@ struct UnfinishedCompaction {
     attempt_id: String,
 }
 
-fn unfinished_responses(events: &[JournalEvent]) -> Vec<UnfinishedResponse> {
-    let mut unfinished = BTreeMap::<String, UnfinishedResponse>::new();
+fn unfinished_responses(events: &[JournalEvent]) -> Result<Vec<UnfinishedResponse>> {
+    // A response attempt is scoped to its turn.  Keeping only the attempt ID
+    // here would let a terminal from one turn settle an unfinished response
+    // belonging to another turn when a provider reuses an ID.  It would also
+    // silently overwrite a duplicate start in the same turn, losing durable
+    // recovery evidence.  Treat the exact (turn, attempt) pair as the
+    // lifecycle identity and fail closed on duplicate starts.
+    let mut unfinished = BTreeMap::<(Option<String>, String), UnfinishedResponse>::new();
+    let mut started = HashSet::<(Option<String>, String)>::new();
     for event in events {
         match event.kind.as_str() {
             "response.started" => {
                 if let Some(response_attempt_id) =
                     string_field(&event.data, &["response_attempt_id"])
                 {
+                    let identity = (event.turn_id.clone(), response_attempt_id.clone());
+                    if !started.insert(identity.clone()) {
+                        return Err(OxidraError::Session(format!(
+                            "duplicate response.started for turn {:?}, attempt {} at seq {}",
+                            identity.0, response_attempt_id, event.seq
+                        )));
+                    }
                     unfinished.insert(
-                        response_attempt_id.clone(),
+                        identity,
                         UnfinishedResponse {
                             started_seq: event.seq,
                             turn_id: event.turn_id.clone(),
@@ -1294,13 +1308,15 @@ fn unfinished_responses(events: &[JournalEvent]) -> Vec<UnfinishedResponse> {
                 if let Some(response_attempt_id) =
                     string_field(&event.data, &["response_attempt_id"])
                 {
-                    unfinished.remove(&response_attempt_id);
+                    unfinished.remove(&(event.turn_id.clone(), response_attempt_id));
                 }
             }
             _ => {}
         }
     }
-    unfinished.into_values().collect()
+    let mut responses = unfinished.into_values().collect::<Vec<_>>();
+    responses.sort_by_key(|response| response.started_seq);
+    Ok(responses)
 }
 
 fn unfinished_compactions(events: &[JournalEvent]) -> Vec<UnfinishedCompaction> {
@@ -2042,6 +2058,137 @@ mod tests {
                 .filter(|event| event.kind == "response.aborted")
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn unfinished_response_terminal_is_scoped_to_turn() {
+        let ts = Utc::now();
+        let event = |seq, kind: &str, turn_id: &str, data| JournalEvent {
+            schema: JOURNAL_SCHEMA,
+            seq,
+            ts,
+            kind: kind.to_owned(),
+            session_id: "response-turn-scope".to_owned(),
+            turn_id: Some(turn_id.to_owned()),
+            data,
+        };
+        let events = vec![
+            event(
+                1,
+                "response.started",
+                "turn-a",
+                json!({"response_attempt_id":"attempt-reused"}),
+            ),
+            event(
+                2,
+                "response.started",
+                "turn-b",
+                json!({"response_attempt_id":"attempt-reused"}),
+            ),
+            event(
+                3,
+                "response.failed",
+                "turn-b",
+                json!({"response_attempt_id":"attempt-reused"}),
+            ),
+        ];
+        let unfinished = unfinished_responses(&events).expect("turn-scoped identities");
+        assert_eq!(unfinished.len(), 1);
+        assert_eq!(unfinished[0].turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(unfinished[0].response_attempt_id, "attempt-reused");
+        assert_eq!(unfinished[0].started_seq, 1);
+    }
+
+    #[test]
+    fn reopen_recovers_cross_turn_reused_response_attempt() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("cross-turn-response-recovery", header(temp.path()))
+            .unwrap();
+        journal
+            .append(
+                "response.started",
+                Some("turn-a"),
+                json!({"response_attempt_id":"attempt-reused"}),
+            )
+            .unwrap();
+        journal
+            .append(
+                "response.started",
+                Some("turn-b"),
+                json!({"response_attempt_id":"attempt-reused"}),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "response.failed",
+                Some("turn-b"),
+                json!({"response_attempt_id":"attempt-reused"}),
+            )
+            .unwrap();
+        drop(journal);
+
+        let recovered = store.open("cross-turn-response-recovery").unwrap();
+        let events = recovered.read_events().unwrap();
+        let aborted = events
+            .iter()
+            .find(|event| event.kind == "response.aborted")
+            .expect("turn-a response must be recovered");
+        assert_eq!(aborted.turn_id.as_deref(), Some("turn-a"));
+        assert_eq!(aborted.data["response_attempt_id"], "attempt-reused");
+    }
+
+    #[test]
+    fn duplicate_response_start_in_same_turn_fails_closed() {
+        let ts = Utc::now();
+        let event = |seq| JournalEvent {
+            schema: JOURNAL_SCHEMA,
+            seq,
+            ts,
+            kind: "response.started".to_owned(),
+            session_id: "duplicate-response-start".to_owned(),
+            turn_id: Some("turn-a".to_owned()),
+            data: json!({"response_attempt_id":"attempt-duplicate"}),
+        };
+        let error = unfinished_responses(&[event(1), event(2)])
+            .expect_err("duplicate response starts must be rejected");
+        assert!(error.to_string().contains("duplicate response.started"));
+    }
+
+    #[test]
+    fn reopen_rejects_duplicate_response_start_without_writing_recovery() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("duplicate-response-recovery", header(temp.path()))
+            .unwrap();
+        journal
+            .append(
+                "response.started",
+                Some("turn-a"),
+                json!({"response_attempt_id":"attempt-duplicate"}),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "response.started",
+                Some("turn-a"),
+                json!({"response_attempt_id":"attempt-duplicate"}),
+            )
+            .unwrap();
+        let original_count = journal.read_events().unwrap().len();
+        drop(journal);
+
+        let error = match store.open("duplicate-response-recovery") {
+            Ok(_) => panic!("duplicate response starts must fail before recovery"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("duplicate response.started"));
+        assert_eq!(
+            store.inspect("duplicate-response-recovery").unwrap().len(),
+            original_count
         );
     }
 

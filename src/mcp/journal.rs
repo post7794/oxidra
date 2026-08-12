@@ -323,7 +323,8 @@ pub(crate) fn validate_mcp_call_chain(events: &[JournalEvent]) -> Result<()> {
 }
 
 pub(crate) fn mcp_turn_ids(events: &[JournalEvent]) -> Result<Vec<String>> {
-    let activation = match call_chain_validator_version(events)? {
+    let version = call_chain_validator_version(events)?;
+    let activation = match version {
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V1) => activation_v1(events)?,
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) => activation_v2(events)?,
         Some(version) => {
@@ -336,10 +337,17 @@ pub(crate) fn mcp_turn_ids(events: &[JournalEvent]) -> Result<Vec<String>> {
     let Some(activation) = activation else {
         return Ok(Vec::new());
     };
-    let mut turn_ids = durable_mcp_calls(events, &activation)?
-        .keys()
-        .map(|key| key.turn_id.clone())
-        .collect::<Vec<_>>();
+    let mut turn_ids = if version == Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) {
+        owned_response_attempts_v2(events, &activation)?
+            .values()
+            .map(|attempt| attempt.turn_id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        durable_mcp_calls(events, &activation)?
+            .keys()
+            .map(|key| key.turn_id.clone())
+            .collect::<Vec<_>>()
+    };
     turn_ids.sort();
     turn_ids.dedup();
     Ok(turn_ids)
@@ -820,33 +828,43 @@ fn durable_mcp_calls_v1(
     Ok(calls)
 }
 
-/// Extract durable MCP calls under the frozen v2 response-ownership rules.
-///
-/// A response belongs to the activated MCP epoch because its unique matching
-/// `response.started` claims that epoch, not because a later output item happens
-/// to use an MCP provider alias. Once claimed, the complete canonical Provider
-/// batch is bounded before individual MCP bindings are interpreted.
-fn durable_mcp_calls_v2(
-    events: &[JournalEvent],
+/// A response attempt whose ownership was established by its durable
+/// `response.started` registry claim. The attempt remains an MCP-owned
+/// transaction even when it has no terminal yet, has failed/aborted, or
+/// completed without any MCP function calls.
+#[derive(Clone, Debug)]
+struct OwnedResponseAttemptV2<'a> {
+    turn_id: String,
+    terminal: Option<&'a JournalEvent>,
+}
+
+fn owned_response_attempts_v2<'a>(
+    events: &'a [JournalEvent],
     activation: &Activation,
-) -> Result<HashMap<McpCallKey, DurableMcpCall>> {
+) -> Result<BTreeMap<(String, String), OwnedResponseAttemptV2<'a>>> {
     let starts = response_starts(events)?;
     let terminals = response_terminals(events);
-    let mut calls = HashMap::new();
-    let mut call_ids = HashMap::<String, McpCallKey>::new();
+    let mut owned = BTreeMap::new();
     for event in events
         .iter()
-        .filter(|event| event.kind == "response.completed")
+        .filter(|event| event.kind == "response.started")
     {
-        if event.seq <= activation.seq {
+        let claims_mcp = event.data.get("mcp_registry_epoch_id").is_some()
+            || event.data.get("mcp_registry_digest").is_some();
+        if !claims_mcp {
             continue;
         }
-        let turn_id = event.turn_id.as_deref().ok_or_else(|| {
-            session_message(
-                event,
-                "response.completed after MCP activation has no turn_id",
-            )
-        })?;
+        if event.seq <= activation.seq {
+            return session_error(format!(
+                "response.started at seq {} claims MCP registry state before activation",
+                event.seq
+            ));
+        }
+        let turn_id = event
+            .turn_id
+            .as_deref()
+            .filter(|value| valid_identity(value))
+            .ok_or_else(|| session_message(event, "MCP response.started has no valid turn_id"))?;
         let attempt_id = event
             .data
             .get("response_attempt_id")
@@ -855,72 +873,104 @@ fn durable_mcp_calls_v2(
             .ok_or_else(|| {
                 session_message(
                     event,
-                    "response.completed after MCP activation has no valid response_attempt_id",
+                    "MCP response.started has no valid response_attempt_id",
                 )
             })?;
-        let Some(matching_starts) = starts.get(&(turn_id.to_owned(), attempt_id.to_owned())) else {
-            continue;
-        };
-        let start_claims_mcp = matching_starts.iter().any(|start| {
-            start.data.get("mcp_registry_epoch_id").is_some()
-                || start.data.get("mcp_registry_digest").is_some()
-        });
-        if !start_claims_mcp {
-            continue;
-        }
+        validate_response_registry(event, activation)?;
+        let key = (turn_id.to_owned(), attempt_id.to_owned());
+        let matching_starts = starts.get(&key).expect("start index contains event");
         if matching_starts.len() != 1 {
             return session_error(format!(
                 "MCP response attempt {attempt_id} for turn {turn_id} has {} matching starts",
                 matching_starts.len()
             ));
         }
-        let start = matching_starts[0];
-        if start.seq >= event.seq {
-            return session_error(format!(
-                "MCP response.completed at seq {} is not ordered after its response.started",
-                event.seq
-            ));
-        }
-        validate_response_registry(start, activation)?;
-
-        let items = event
-            .data
-            .get("output_items")
-            .ok_or_else(|| {
-                session_message(
-                    event,
-                    "MCP-owned response.completed has no canonical output_items",
-                )
-            })?
-            .as_array()
-            .ok_or_else(|| {
-                session_message(
-                    event,
-                    "MCP-owned response.completed has non-array canonical output_items",
-                )
-            })?;
-        let response_function_call_count = items
-            .iter()
-            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
-            .count();
-        if response_function_call_count > MAX_MCP_CALLS_PER_RESPONSE_V1 {
-            return session_error(format!(
-                "MCP response.completed at seq {} exceeds the {MAX_MCP_CALLS_PER_RESPONSE_V1}-call limit",
-                event.seq
-            ));
-        }
-
-        let terminal_key = (turn_id.to_owned(), attempt_id.to_owned());
-        let matching_terminals = terminals.get(&terminal_key).ok_or_else(|| {
-            session_message(event, "MCP response has no matching response terminal")
-        })?;
-        if matching_terminals.len() != 1 || matching_terminals[0].seq != event.seq {
+        let matching_terminals = terminals.get(&key).cloned().unwrap_or_default();
+        if matching_terminals.len() > 1 {
             return session_error(format!(
                 "MCP response attempt {attempt_id} for turn {turn_id} has {} terminals",
                 matching_terminals.len()
             ));
         }
+        let terminal = matching_terminals.into_iter().next();
+        if let Some(terminal) = terminal {
+            if terminal.seq <= event.seq {
+                return session_error(format!(
+                    "MCP response terminal at seq {} is not ordered after its response.started",
+                    terminal.seq
+                ));
+            }
+            if terminal.kind == "response.completed" {
+                let items = terminal
+                    .data
+                    .get("output_items")
+                    .ok_or_else(|| {
+                        session_message(
+                            terminal,
+                            "MCP-owned response.completed has no canonical output_items",
+                        )
+                    })?
+                    .as_array()
+                    .ok_or_else(|| {
+                        session_message(
+                            terminal,
+                            "MCP-owned response.completed has non-array canonical output_items",
+                        )
+                    })?;
+                let count = items
+                    .iter()
+                    .filter(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("function_call")
+                    })
+                    .count();
+                if count > MAX_MCP_CALLS_PER_RESPONSE_V1 {
+                    return session_error(format!(
+                        "MCP response.completed at seq {} exceeds the {MAX_MCP_CALLS_PER_RESPONSE_V1}-call limit",
+                        terminal.seq
+                    ));
+                }
+            }
+        }
+        if owned
+            .insert(
+                key,
+                OwnedResponseAttemptV2 {
+                    turn_id: turn_id.to_owned(),
+                    terminal,
+                },
+            )
+            .is_some()
+        {
+            return session_error(format!(
+                "MCP response attempt {attempt_id} for turn {turn_id} has duplicate registry claims"
+            ));
+        }
+    }
+    Ok(owned)
+}
 
+/// Extract durable MCP calls under the frozen v2 response-ownership rules.
+/// Ownership is derived from claimed starts first; calls are only a projection
+/// of completed owned attempts.
+fn durable_mcp_calls_v2(
+    events: &[JournalEvent],
+    activation: &Activation,
+) -> Result<HashMap<McpCallKey, DurableMcpCall>> {
+    let owned = owned_response_attempts_v2(events, activation)?;
+    let mut calls = HashMap::new();
+    let mut call_ids = HashMap::<String, McpCallKey>::new();
+    for attempt in owned.values() {
+        let Some(event) = attempt.terminal else {
+            continue;
+        };
+        if event.kind != "response.completed" {
+            continue;
+        }
+        let items = event
+            .data
+            .get("output_items")
+            .and_then(Value::as_array)
+            .expect("owned completed response was validated");
         for item in items {
             if item.get("type").and_then(Value::as_str) != Some("function_call") {
                 continue;
@@ -939,7 +989,7 @@ fn durable_mcp_calls_v2(
                 .ok_or_else(|| session_message(event, "MCP function_call has no valid call_id"))?;
             let arguments = durable_arguments(item, event, call_id)?;
             let key = McpCallKey {
-                turn_id: turn_id.to_owned(),
+                turn_id: attempt.turn_id.clone(),
                 call_id: call_id.to_owned(),
             };
             let call = DurableMcpCall {
@@ -951,13 +1001,14 @@ fn durable_mcp_calls_v2(
             };
             if let Some(previous) = call_ids.insert(call_id.to_owned(), key.clone()) {
                 return session_error(format!(
-                    "MCP call_id {call_id} is reused by turns {} and {turn_id}",
-                    previous.turn_id
+                    "MCP call_id {call_id} is reused by turns {} and {}",
+                    previous.turn_id, attempt.turn_id
                 ));
             }
             if calls.insert(key, call).is_some() {
                 return session_error(format!(
-                    "MCP call_id {call_id} appears more than once in turn {turn_id}"
+                    "MCP call_id {call_id} appears more than once in turn {}",
+                    attempt.turn_id
                 ));
             }
         }
@@ -1809,6 +1860,85 @@ mod tests {
     #[test]
     fn valid_mcp_call_chain_v2_binds_offline_provider_identity() {
         validate_mcp_call_chain_v2(&mcp_events_v2()).expect("valid MCP v2 chain");
+    }
+
+    #[test]
+    fn v2_claimed_response_owns_failed_and_unfinished_attempts() {
+        let mut unfinished = mcp_events_v2();
+        unfinished.truncate(3);
+        validate_mcp_call_chain_v2(&unfinished)
+            .expect("a claimed response may be unfinished in a crash prefix");
+        assert_eq!(
+            mcp_turn_ids(&unfinished).expect("owned turn"),
+            vec!["turn-1"]
+        );
+
+        let mut failed = unfinished.clone();
+        failed.push(event(
+            4,
+            Some("turn-1"),
+            "response.failed",
+            json!({"response_attempt_id":"attempt-1","error":"provider failed"}),
+        ));
+        validate_mcp_call_chain_v2(&failed)
+            .expect("failed claimed response remains an owned transaction");
+        assert_eq!(mcp_turn_ids(&failed).expect("owned turn"), vec!["turn-1"]);
+
+        failed.push(event(
+            5,
+            Some("turn-1"),
+            "response.failed",
+            json!({"response_attempt_id":"attempt-1","error":"duplicate"}),
+        ));
+        let error = validate_mcp_call_chain_v2(&failed)
+            .expect_err("a claimed response may have at most one terminal")
+            .to_string();
+        assert!(
+            error.contains("has 2 terminals"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn v2_claimed_builtin_only_response_is_still_owned() {
+        let mut events = mcp_events_v2();
+        events.truncate(4);
+        events[3].data["output_items"] = json!([{
+            "type":"function_call",
+            "call_id":"builtin-call",
+            "name":"read",
+            "arguments":"{}"
+        }]);
+        validate_mcp_call_chain_v2(&events)
+            .expect("MCP-owned responses with only built-in calls remain valid");
+        assert_eq!(mcp_turn_ids(&events).expect("owned turn"), vec!["turn-1"]);
+    }
+
+    #[test]
+    fn v2_claimed_start_requires_turn_and_attempt_identity() {
+        let mut missing_turn = mcp_events_v2();
+        missing_turn[2].turn_id = None;
+        let error = validate_mcp_call_chain_v2(&missing_turn)
+            .expect_err("claimed response.started must carry turn_id")
+            .to_string();
+        assert!(
+            error.contains("no valid turn_id"),
+            "unexpected error: {error}"
+        );
+
+        let mut missing_attempt = mcp_events_v2();
+        missing_attempt[2]
+            .data
+            .as_object_mut()
+            .unwrap()
+            .remove("response_attempt_id");
+        let error = validate_mcp_call_chain_v2(&missing_attempt)
+            .expect_err("claimed response.started must carry response_attempt_id")
+            .to_string();
+        assert!(
+            error.contains("no valid response_attempt_id"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
