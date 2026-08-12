@@ -7,8 +7,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::journal::{
-    MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, MCP_CALL_CHAIN_VALIDATOR_VERSION_V2, argument_digest_v1,
-    ensure_no_unstarted_mcp_calls, validate_mcp_call_chain,
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, MCP_CALL_CHAIN_VALIDATOR_VERSION_V2,
+    ValidatedDurableMcpCall, argument_digest_v1, ensure_no_unstarted_mcp_calls,
+    validate_mcp_call_chain, validated_durable_mcp_call,
 };
 use super::registry::{
     ApprovedMcpRegistry, ApprovedMcpResumeRegistry, McpRegistry, PreparedMcpRegistryCall,
@@ -579,7 +580,7 @@ impl McpExecutionCoordinator {
         let events = journal.read_events()?;
         validate_mcp_call_chain(&events)?;
         let activation_seq = validate_activation(&events, self)?;
-        let durable_call = provider_call_v1(&events, call.turn_id, call.call_id)?;
+        let durable_call = validated_durable_mcp_call(&events, call.turn_id, call.call_id)?;
         validate_call_after_activation(&durable_call, activation_seq, self)?;
         if durable_call.provider_name != call.provider_name {
             return Err(OxidraError::Session(
@@ -592,6 +593,11 @@ impl McpExecutionCoordinator {
             Err(error) => return Ok(PreparedCoordinatorCall::Rejected(error)),
         };
         let arguments_sha256 = argument_digest_v1(arguments.as_value())?;
+        if arguments_sha256 != durable_call.arguments_sha256 {
+            return Err(OxidraError::Session(
+                "validated MCP arguments no longer match their durable digest".to_owned(),
+            ));
+        }
         match self.registry.prepare_call(call.provider_name, arguments) {
             Ok(prepared) => Ok(PreparedCoordinatorCall::Ready {
                 arguments_sha256,
@@ -757,10 +763,10 @@ fn validate_dispatch_candidate(
     validate_mcp_call_chain(&events)?;
     let activation_seq = validate_activation(&events, coordinator)?;
 
-    let durable_call = provider_call_v1(&events, &approval.turn_id, &approval.call_id)?;
+    let durable_call = validated_durable_mcp_call(&events, &approval.turn_id, &approval.call_id)?;
     validate_call_after_activation(&durable_call, activation_seq, coordinator)?;
     if durable_call.provider_name != approval.provider_name
-        || argument_digest_v1(&durable_call.arguments)? != approval.arguments_sha256
+        || durable_call.arguments_sha256 != approval.arguments_sha256
         || argument_digest_v1(arguments)? != approval.arguments_sha256
     {
         return Err(OxidraError::Session(
@@ -799,7 +805,7 @@ fn validate_pre_start_terminal_candidate(
 ) -> Result<()> {
     validate_mcp_call_chain(&events)?;
     let activation_seq = validate_activation(&events, coordinator)?;
-    let durable_call = provider_call_v1(&events, call.turn_id, call.call_id)?;
+    let durable_call = validated_durable_mcp_call(&events, call.turn_id, call.call_id)?;
     validate_call_after_activation(&durable_call, activation_seq, coordinator)?;
     if durable_call.provider_name != call.provider_name {
         return Err(OxidraError::Session(
@@ -1022,17 +1028,8 @@ fn activation_policy(event: &JournalEvent) -> Result<McpCoordinatorPolicy> {
     }
 }
 
-struct DurableProviderCall {
-    provider_name: String,
-    arguments: Value,
-    registry_epoch_id: String,
-    registry_digest: String,
-    response_started_seq: u64,
-    response_completed_seq: u64,
-}
-
 fn validate_call_after_activation(
-    durable_call: &DurableProviderCall,
+    durable_call: &ValidatedDurableMcpCall,
     activation_seq: u64,
     coordinator: &McpExecutionCoordinator,
 ) -> Result<()> {
@@ -1051,129 +1048,6 @@ fn validate_call_after_activation(
         ));
     }
     Ok(())
-}
-
-fn provider_call_v1(
-    events: &[JournalEvent],
-    turn_id: &str,
-    call_id: &str,
-) -> Result<DurableProviderCall> {
-    let mut found = None;
-    for event in events.iter().filter(|event| {
-        event.turn_id.as_deref() == Some(turn_id) && event.kind == "response.completed"
-    }) {
-        let items = event
-            .data
-            .get("output_items")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "response.completed at seq {} has no output_items",
-                    event.seq
-                ))
-            })?;
-        for item in items {
-            if item.get("type").and_then(Value::as_str) != Some("function_call")
-                || item
-                    .get("call_id")
-                    .or_else(|| item.get("id"))
-                    .and_then(Value::as_str)
-                    != Some(call_id)
-            {
-                continue;
-            }
-            if found.is_some() {
-                return Err(OxidraError::Session(format!(
-                    "MCP call_id {call_id} appears more than once in turn {turn_id}"
-                )));
-            }
-            let provider_name = item
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    OxidraError::Session(format!("MCP call {call_id} has no Provider tool name"))
-                })?;
-            let arguments = match item.get("arguments") {
-                Some(Value::String(arguments)) => {
-                    serde_json::from_str(arguments).map_err(|error| {
-                        OxidraError::Session(format!(
-                            "MCP call {call_id} has invalid durable arguments: {error}"
-                        ))
-                    })?
-                }
-                Some(arguments) => arguments.clone(),
-                None => {
-                    return Err(OxidraError::Session(format!(
-                        "MCP call {call_id} has no durable arguments"
-                    )));
-                }
-            };
-            let response_attempt_id = event
-                .data
-                .get("response_attempt_id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    OxidraError::Session(format!(
-                        "response.completed at seq {} has no response_attempt_id",
-                        event.seq
-                    ))
-                })?;
-            let response_started = events
-                .iter()
-                .find(|candidate| {
-                    candidate.kind == "response.started"
-                        && candidate.turn_id.as_deref() == Some(turn_id)
-                        && candidate.seq < event.seq
-                        && candidate
-                            .data
-                            .get("response_attempt_id")
-                            .and_then(Value::as_str)
-                            == Some(response_attempt_id)
-                })
-                .ok_or_else(|| {
-                    OxidraError::Session(format!(
-                        "MCP call {call_id} has no matching response.started"
-                    ))
-                })?;
-            let registry_epoch_id = response_started
-                .data
-                .get("mcp_registry_epoch_id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    OxidraError::Session(format!(
-                        "response.started at seq {} has no MCP registry epoch",
-                        response_started.seq
-                    ))
-                })?;
-            let registry_digest = response_started
-                .data
-                .get("mcp_registry_digest")
-                .and_then(Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    OxidraError::Session(format!(
-                        "response.started at seq {} has no MCP registry digest",
-                        response_started.seq
-                    ))
-                })?;
-            found = Some(DurableProviderCall {
-                provider_name: provider_name.to_owned(),
-                arguments,
-                registry_epoch_id: registry_epoch_id.to_owned(),
-                registry_digest: registry_digest.to_owned(),
-                response_started_seq: response_started.seq,
-                response_completed_seq: event.seq,
-            });
-        }
-    }
-    found.ok_or_else(|| {
-        OxidraError::Session(format!(
-            "MCP call {call_id} is not present in turn {turn_id}"
-        ))
-    })
 }
 
 fn started_data(approval: &McpCallApprovalRequest, arguments: &Value) -> Value {

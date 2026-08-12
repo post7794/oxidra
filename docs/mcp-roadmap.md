@@ -236,10 +236,12 @@ projection 和 history 各自“碰巧做出相同判断”：
   声明选择 exact reducer，并拒绝未来版本，而不是读取可变默认值。
 - validator v2 先由 activation 之后、显式带同一 registry epoch/digest 的
   `response.started` 确定整个 response transaction 的 MCP 所有权；unfinished、failed、aborted
-  以及只含内置工具的 response 仍属于该 epoch。每个 owned attempt 至多一个 terminal；仅
-  completed terminal 要求 canonical `output_items`，且批次限制在区分 MCP/内置 binding 前
-  应用。activation 之前的同名普通工具保持历史语义，不会被未来 registry 追溯解释。v1 reader
-  保留原先按 MCP alias 识别 call 的冻结行为。
+  以及只含内置工具的 response 仍属于该 epoch。typed response envelope 保存 exact start、
+  `(turn_id, response_attempt_id)` 和 terminal；recovery `response.aborted` 必须使用冻结字段
+  profile、引用 exact start seq，普通 terminal 不能携带 recovery provenance。每个 attempt
+  至多一个 terminal；completed terminal 要求 canonical `output_items`，且批次限制在区分
+  MCP/内置 binding 前应用。activation 之前的同名普通工具保持历史语义，不会被未来 registry
+  追溯解释。v1 reader 保留原先按 MCP alias 识别 call 的冻结行为。
 - lifecycle 必须使用 canonical `call_id`。generic reducer 兼容的 `id` alias 不能结算 MCP
   call；turn/call/provider、参数 digest、started seq、registry/execution provenance 和 terminal
   状态迁移均由同一 validator 证明。
@@ -261,6 +263,9 @@ projection 和 history 各自“碰巧做出相同判断”：
   仅为剩余调用生成新的有界 marker。
 - schema profile v1 也是 validator v1 的冻结传递依赖；历史 `tool.started` 不读取未来默认
   profile。未知 call-chain、activation、provenance 或 profile 版本一律 fail closed。
+- coordinator 不再独立扫描 `response.completed`；它只消费 call-chain validator 按 activation
+  版本产出的 canonical durable-call snapshot，其中 Provider alias、参数及 digest、registry
+  epoch/digest 和 exact response start/completion seq 已由同一 response envelope 证明。
 
 call-chain validator 解决的是 durable 事实解释，不会自动恢复 live server。下一阶段仍需在 session
 reopen 后按已批准 execution plan 重建或替换 live registry epoch，并把实际 request 的

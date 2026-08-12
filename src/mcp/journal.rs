@@ -78,7 +78,24 @@ struct DurableMcpCall {
     provider_name: String,
     arguments: Value,
     arguments_sha256: String,
+    registry_epoch_id: String,
+    registry_digest: String,
+    response_started_seq: u64,
     response_seq: u64,
+}
+
+/// A Provider MCP call extracted by the validator selected by the durable
+/// registry activation. Coordinator code consumes this snapshot instead of
+/// independently reinterpreting `response.completed` payloads.
+#[derive(Clone, Debug)]
+pub(crate) struct ValidatedDurableMcpCall {
+    pub(crate) provider_name: String,
+    pub(crate) arguments: Value,
+    pub(crate) arguments_sha256: String,
+    pub(crate) registry_epoch_id: String,
+    pub(crate) registry_digest: String,
+    pub(crate) response_started_seq: u64,
+    pub(crate) response_completed_seq: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +208,283 @@ fn validate_mcp_call_chain_with_activation(
         validate_lifecycle_event_v1(event, call, activation, state, &recovery_authorities)?;
     }
 
+    Ok(())
+}
+
+const MAX_RESPONSE_STATUS_TEXT_BYTES_V2: usize = 16 * 1024;
+
+/// Validate the complete v2 response transaction before projecting any MCP
+/// calls.  The response start, not a discovered function call, owns the
+/// lifecycle.  Generic and MCP-claimed attempts share one per-turn active
+/// slot, so a second start cannot hide behind a later MCP projection.
+fn response_attempts_v2<'a>(
+    events: &'a [JournalEvent],
+    activation: &Activation,
+) -> Result<BTreeMap<(String, String), OwnedResponseAttemptV2<'a>>> {
+    let mut starts = HashMap::<(String, String), Vec<u64>>::new();
+    let mut active = HashMap::<String, (String, u64)>::new();
+    let mut terminal_counts = HashMap::<(String, String), u8>::new();
+    let mut owned = BTreeMap::new();
+    for event in events {
+        match event.kind.as_str() {
+            "response.started" => {
+                let Some(turn_id) = event.turn_id.as_deref() else {
+                    if event.seq > activation.seq {
+                        return Err(session_message(
+                            event,
+                            "response.started has no valid turn_id",
+                        ));
+                    }
+                    continue;
+                };
+                let Some(attempt_id) = event
+                    .data
+                    .get("response_attempt_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| valid_identity(value))
+                else {
+                    if event.seq > activation.seq {
+                        return Err(session_message(
+                            event,
+                            "response.started has no valid response_attempt_id",
+                        ));
+                    }
+                    continue;
+                };
+                let key = (turn_id.to_owned(), attempt_id.to_owned());
+                let matching_starts = starts.entry(key.clone()).or_default();
+                if event.seq > activation.seq && !matching_starts.is_empty() {
+                    return session_error(format!(
+                        "duplicate response.started for attempt {attempt_id} in turn {turn_id}"
+                    ));
+                }
+                matching_starts.push(event.seq);
+                if event.seq > activation.seq {
+                    if let Some((prior_attempt, prior_seq)) = active.get(turn_id) {
+                        return session_error(format!(
+                            "response.started at seq {} overlaps active attempt {prior_attempt} at seq {prior_seq} for turn {turn_id}",
+                            event.seq
+                        ));
+                    }
+                    active.insert(turn_id.to_owned(), (attempt_id.to_owned(), event.seq));
+                    let claims_mcp = event.data.get("mcp_registry_epoch_id").is_some()
+                        || event.data.get("mcp_registry_digest").is_some();
+                    if claims_mcp {
+                        validate_response_registry(event, activation)?;
+                        if owned
+                            .insert(
+                                key,
+                                OwnedResponseAttemptV2 {
+                                    start: event,
+                                    turn_id: turn_id.to_owned(),
+                                    response_attempt_id: attempt_id.to_owned(),
+                                    terminal: None,
+                                },
+                            )
+                            .is_some()
+                        {
+                            return session_error(format!(
+                                "MCP response attempt {attempt_id} for turn {turn_id} has duplicate registry claims"
+                            ));
+                        }
+                    }
+                } else if !active.contains_key(turn_id) {
+                    active.insert(turn_id.to_owned(), (attempt_id.to_owned(), event.seq));
+                }
+            }
+            kind if is_response_terminal(kind) => {
+                if event.seq <= activation.seq {
+                    if let (Some(turn_id), Some(attempt_id)) = (
+                        event.turn_id.as_deref(),
+                        event
+                            .data
+                            .get("response_attempt_id")
+                            .and_then(Value::as_str),
+                    ) {
+                        if active
+                            .get(turn_id)
+                            .is_some_and(|(active_attempt, _)| active_attempt == attempt_id)
+                        {
+                            active.remove(turn_id);
+                        }
+                    }
+                    continue;
+                }
+                let turn_id = event
+                    .turn_id
+                    .as_deref()
+                    .filter(|value| valid_identity(value))
+                    .ok_or_else(|| {
+                        session_message(event, "response terminal has no valid turn_id")
+                    })?;
+                let attempt_id = event
+                    .data
+                    .get("response_attempt_id")
+                    .and_then(Value::as_str)
+                    .filter(|value| valid_identity(value))
+                    .ok_or_else(|| {
+                        session_message(event, "response terminal has no valid response_attempt_id")
+                    })?;
+                let matching_starts = starts
+                    .get(&(turn_id.to_owned(), attempt_id.to_owned()))
+                    .ok_or_else(|| {
+                        session_message(event, "response terminal has no matching response.started")
+                    })?;
+                if matching_starts.len() != 1 {
+                    return session_error(format!(
+                        "{} at seq {} does not bind one unique response.started",
+                        event.kind, event.seq
+                    ));
+                }
+                let started_seq = matching_starts[0];
+                if started_seq >= event.seq {
+                    return session_error(format!(
+                        "{} at seq {} does not follow response.started seq {}",
+                        event.kind, event.seq, started_seq
+                    ));
+                }
+                let terminal_count = terminal_counts
+                    .entry((turn_id.to_owned(), attempt_id.to_owned()))
+                    .or_insert(0);
+                if *terminal_count >= 1 {
+                    return session_error(format!(
+                        "{} at seq {} leaves response attempt {attempt_id} in turn {turn_id} has 2 terminals",
+                        event.kind, event.seq
+                    ));
+                }
+                *terminal_count = 1;
+                match active.get(turn_id) {
+                    Some((active_attempt, _)) if active_attempt == attempt_id => {}
+                    _ => {
+                        return session_error(format!(
+                            "{} at seq {} does not terminate the active response attempt for turn {turn_id}",
+                            event.kind, event.seq
+                        ));
+                    }
+                }
+                let start_after_activation = started_seq > activation.seq;
+                validate_response_terminal_profile_v2(event, started_seq, start_after_activation)?;
+                if let Some(attempt) = owned.get_mut(&(turn_id.to_owned(), attempt_id.to_owned())) {
+                    if attempt.terminal.replace(event).is_some() {
+                        return session_error(format!(
+                            "MCP response attempt {attempt_id} for turn {turn_id} has more than one terminal"
+                        ));
+                    }
+                    validate_owned_completed_response_v2(attempt)?;
+                }
+                active.remove(turn_id);
+            }
+            _ => {}
+        }
+    }
+    Ok(owned)
+}
+
+fn validate_response_terminal_profile_v2(
+    event: &JournalEvent,
+    started_seq: u64,
+    enforce_status: bool,
+) -> Result<()> {
+    let data = object_data(event)?;
+    let has_recovered = data.contains_key("recovered");
+    let has_started_seq = data.contains_key("started_seq");
+    if event.kind == "response.aborted" && (has_recovered || has_started_seq) {
+        require_exact_keys(
+            data,
+            &["response_attempt_id", "started_seq", "reason", "recovered"],
+            event,
+        )?;
+        if data.get("recovered").and_then(Value::as_bool) != Some(true)
+            || data.get("started_seq").and_then(Value::as_u64) != Some(started_seq)
+            || data.get("reason").and_then(Value::as_str)
+                != Some(RECOVERED_RESPONSE_ABORT_REASON_V1)
+        {
+            return session_error(format!(
+                "recovered response.aborted at seq {} does not match its exact response.started seq {}",
+                event.seq, started_seq
+            ));
+        }
+    } else if has_recovered || has_started_seq {
+        return session_error(format!(
+            "non-recovery {} at seq {} carries response recovery provenance",
+            event.kind, event.seq
+        ));
+    }
+    if enforce_status {
+        match event.kind.as_str() {
+            "response.failed" => validate_response_status_text(data, "error", event),
+            "response.aborted" if !has_recovered && !has_started_seq => {
+                validate_response_status_text(data, "reason", event)
+            }
+            _ => Ok(()),
+        }
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_owned_completed_response_v2(attempt: &OwnedResponseAttemptV2<'_>) -> Result<()> {
+    let Some(terminal) = attempt.terminal else {
+        return Ok(());
+    };
+    if terminal
+        .data
+        .get("response_attempt_id")
+        .and_then(Value::as_str)
+        != Some(attempt.response_attempt_id.as_str())
+    {
+        return session_error(format!(
+            "{} at seq {} is not bound to owned response attempt {}",
+            terminal.kind, terminal.seq, attempt.response_attempt_id
+        ));
+    }
+    if terminal.kind != "response.completed" {
+        return Ok(());
+    }
+    let items = terminal
+        .data
+        .get("output_items")
+        .ok_or_else(|| {
+            session_message(
+                terminal,
+                "MCP-owned response.completed has no canonical output_items",
+            )
+        })?
+        .as_array()
+        .ok_or_else(|| {
+            session_message(
+                terminal,
+                "MCP-owned response.completed has non-array canonical output_items",
+            )
+        })?;
+    let count = items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .count();
+    if count > MAX_MCP_CALLS_PER_RESPONSE_V1 {
+        return session_error(format!(
+            "MCP response.completed at seq {} exceeds the {MAX_MCP_CALLS_PER_RESPONSE_V1}-call limit",
+            terminal.seq
+        ));
+    }
+    Ok(())
+}
+
+fn validate_response_status_text(
+    data: &Map<String, Value>,
+    field: &str,
+    event: &JournalEvent,
+) -> Result<()> {
+    if !data
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty() && value.len() <= MAX_RESPONSE_STATUS_TEXT_BYTES_V2)
+    {
+        return session_error(format!(
+            "{} at seq {} has no bounded non-empty {field}",
+            event.kind, event.seq
+        ));
+    }
     Ok(())
 }
 
@@ -320,6 +614,50 @@ pub(crate) fn call_chain_validator_version(events: &[JournalEvent]) -> Result<Op
 
 pub(crate) fn validate_mcp_call_chain(events: &[JournalEvent]) -> Result<()> {
     validate_mcp_call_chain_through_version(MCP_CALL_CHAIN_VALIDATOR_VERSION, events)
+}
+
+/// Return the unique durable MCP call selected by the activation's frozen
+/// call-chain validator. This first validates the complete lifecycle, then
+/// exposes the same canonical call projection used by that validator.
+pub(crate) fn validated_durable_mcp_call(
+    events: &[JournalEvent],
+    turn_id: &str,
+    call_id: &str,
+) -> Result<ValidatedDurableMcpCall> {
+    let version = call_chain_validator_version(events)?.ok_or_else(|| {
+        OxidraError::Session("MCP call lookup requires a durable registry activation".to_owned())
+    })?;
+    let activation = match version {
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => activation_v1(events)?,
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => activation_v2(events)?,
+        version => {
+            return session_error(format!(
+                "unsupported MCP call-chain validator version {version}"
+            ));
+        }
+    }
+    .expect("call-chain version implies an activation");
+    validate_mcp_call_chain_with_activation(events, &activation)?;
+    let key = McpCallKey {
+        turn_id: turn_id.to_owned(),
+        call_id: call_id.to_owned(),
+    };
+    let call = durable_mcp_calls(events, &activation)?
+        .remove(&key)
+        .ok_or_else(|| {
+            OxidraError::Session(format!(
+                "MCP call {call_id} is not present in turn {turn_id}"
+            ))
+        })?;
+    Ok(ValidatedDurableMcpCall {
+        provider_name: call.provider_name,
+        arguments: call.arguments,
+        arguments_sha256: call.arguments_sha256,
+        registry_epoch_id: call.registry_epoch_id,
+        registry_digest: call.registry_digest,
+        response_started_seq: call.response_started_seq,
+        response_completed_seq: call.response_seq,
+    })
 }
 
 pub(crate) fn mcp_turn_ids(events: &[JournalEvent]) -> Result<Vec<String>> {
@@ -810,6 +1148,9 @@ fn durable_mcp_calls_v1(
                 provider_name: provider_name.to_owned(),
                 arguments_sha256: argument_digest_v1(&arguments)?,
                 arguments,
+                registry_epoch_id: activation.registry_epoch_id.clone(),
+                registry_digest: activation.registry_digest.clone(),
+                response_started_seq: start.seq,
                 response_seq: event.seq,
             };
             if let Some(previous) = call_ids.insert(call_id.to_owned(), key.clone()) {
@@ -834,7 +1175,9 @@ fn durable_mcp_calls_v1(
 /// completed without any MCP function calls.
 #[derive(Clone, Debug)]
 struct OwnedResponseAttemptV2<'a> {
+    start: &'a JournalEvent,
     turn_id: String,
+    response_attempt_id: String,
     terminal: Option<&'a JournalEvent>,
 }
 
@@ -842,113 +1185,16 @@ fn owned_response_attempts_v2<'a>(
     events: &'a [JournalEvent],
     activation: &Activation,
 ) -> Result<BTreeMap<(String, String), OwnedResponseAttemptV2<'a>>> {
-    let starts = response_starts(events)?;
-    let terminals = response_terminals(events);
-    let mut owned = BTreeMap::new();
-    for event in events
-        .iter()
-        .filter(|event| event.kind == "response.started")
-    {
-        let claims_mcp = event.data.get("mcp_registry_epoch_id").is_some()
-            || event.data.get("mcp_registry_digest").is_some();
-        if !claims_mcp {
-            continue;
-        }
-        if event.seq <= activation.seq {
-            return session_error(format!(
-                "response.started at seq {} claims MCP registry state before activation",
-                event.seq
-            ));
-        }
-        let turn_id = event
-            .turn_id
-            .as_deref()
-            .filter(|value| valid_identity(value))
-            .ok_or_else(|| session_message(event, "MCP response.started has no valid turn_id"))?;
-        let attempt_id = event
-            .data
-            .get("response_attempt_id")
-            .and_then(Value::as_str)
-            .filter(|value| valid_identity(value))
-            .ok_or_else(|| {
-                session_message(
-                    event,
-                    "MCP response.started has no valid response_attempt_id",
-                )
-            })?;
-        validate_response_registry(event, activation)?;
-        let key = (turn_id.to_owned(), attempt_id.to_owned());
-        let matching_starts = starts.get(&key).expect("start index contains event");
-        if matching_starts.len() != 1 {
-            return session_error(format!(
-                "MCP response attempt {attempt_id} for turn {turn_id} has {} matching starts",
-                matching_starts.len()
-            ));
-        }
-        let matching_terminals = terminals.get(&key).cloned().unwrap_or_default();
-        if matching_terminals.len() > 1 {
-            return session_error(format!(
-                "MCP response attempt {attempt_id} for turn {turn_id} has {} terminals",
-                matching_terminals.len()
-            ));
-        }
-        let terminal = matching_terminals.into_iter().next();
-        if let Some(terminal) = terminal {
-            if terminal.seq <= event.seq {
-                return session_error(format!(
-                    "MCP response terminal at seq {} is not ordered after its response.started",
-                    terminal.seq
-                ));
-            }
-            if terminal.kind == "response.completed" {
-                let items = terminal
-                    .data
-                    .get("output_items")
-                    .ok_or_else(|| {
-                        session_message(
-                            terminal,
-                            "MCP-owned response.completed has no canonical output_items",
-                        )
-                    })?
-                    .as_array()
-                    .ok_or_else(|| {
-                        session_message(
-                            terminal,
-                            "MCP-owned response.completed has non-array canonical output_items",
-                        )
-                    })?;
-                let count = items
-                    .iter()
-                    .filter(|item| {
-                        item.get("type").and_then(Value::as_str) == Some("function_call")
-                    })
-                    .count();
-                if count > MAX_MCP_CALLS_PER_RESPONSE_V1 {
-                    return session_error(format!(
-                        "MCP response.completed at seq {} exceeds the {MAX_MCP_CALLS_PER_RESPONSE_V1}-call limit",
-                        terminal.seq
-                    ));
-                }
-            }
-        }
-        if owned
-            .insert(
-                key,
-                OwnedResponseAttemptV2 {
-                    turn_id: turn_id.to_owned(),
-                    terminal,
-                },
-            )
-            .is_some()
-        {
-            return session_error(format!(
-                "MCP response attempt {attempt_id} for turn {turn_id} has duplicate registry claims"
-            ));
-        }
-    }
-    Ok(owned)
+    response_attempts_v2(events, activation)
 }
 
+const RECOVERED_RESPONSE_ABORT_REASON_V1: &str =
+    "process stopped before a terminal response event was committed";
+
+/// Bind an MCP-owned response terminal to the exact durable start that owns
+/// the attempt. Recovery provenance is deliberately a closed profile: it is
+/// only valid on the recovery writer's `response.aborted` event, references
+/// the exact start sequence, and cannot be copied onto a live terminal.
 /// Extract durable MCP calls under the frozen v2 response-ownership rules.
 /// Ownership is derived from claimed starts first; calls are only a projection
 /// of completed owned attempts.
@@ -997,6 +1243,9 @@ fn durable_mcp_calls_v2(
                 provider_name: provider_name.to_owned(),
                 arguments_sha256: argument_digest_v1(&arguments)?,
                 arguments,
+                registry_epoch_id: activation.registry_epoch_id.clone(),
+                registry_digest: activation.registry_digest.clone(),
+                response_started_seq: attempt.start.seq,
                 response_seq: event.seq,
             };
             if let Some(previous) = call_ids.insert(call_id.to_owned(), key.clone()) {
@@ -1617,7 +1866,7 @@ fn require_exact_keys(
     let expected = expected.iter().copied().collect::<BTreeSet<_>>();
     if actual != expected {
         return session_error(format!(
-            "{} at seq {} does not match the frozen v1 schema",
+            "{} at seq {} does not match the required exact key profile",
             event.kind, event.seq
         ));
     }
@@ -1863,6 +2112,46 @@ mod tests {
     }
 
     #[test]
+    fn validated_call_reader_ignores_earlier_generic_raw_only_completion() {
+        let mut events = mcp_events_v2();
+        for event in &mut events[2..] {
+            event.seq += 2;
+        }
+        events[5].data["started_seq"] = Value::from(7);
+        events.insert(
+            2,
+            event(
+                3,
+                Some("turn-1"),
+                "response.started",
+                json!({"response_attempt_id":"generic-attempt"}),
+            ),
+        );
+        events.insert(
+            3,
+            event(
+                4,
+                Some("turn-1"),
+                "response.completed",
+                json!({
+                    "response_attempt_id":"generic-attempt",
+                    "raw_response":{"output":[{"type":"message","text":"generic"}]},
+                    "text":"generic",
+                    "usage":{},
+                }),
+            ),
+        );
+
+        validate_mcp_call_chain_v2(&events).expect("canonical v2 chain remains valid");
+        let call = validated_durable_mcp_call(&events, "turn-1", "call-1")
+            .expect("coordinator reader selects the later owned MCP response");
+        assert_eq!(call.provider_name, "mcp_fixture_echo_deadbeef");
+        assert_eq!(call.arguments, json!({"text":"hello"}));
+        assert_eq!(call.response_started_seq, 5);
+        assert_eq!(call.response_completed_seq, 6);
+    }
+
+    #[test]
     fn v2_claimed_response_owns_failed_and_unfinished_attempts() {
         let mut unfinished = mcp_events_v2();
         unfinished.truncate(3);
@@ -1897,6 +2186,203 @@ mod tests {
             error.contains("has 2 terminals"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn v2_recovered_response_terminal_binds_exact_start_and_frozen_profile() {
+        fn recovered_aborted() -> Vec<JournalEvent> {
+            let mut events = mcp_events_v2();
+            events.truncate(3);
+            events.push(event(
+                4,
+                Some("turn-1"),
+                "response.aborted",
+                json!({
+                    "response_attempt_id":"attempt-1",
+                    "started_seq":3,
+                    "reason":RECOVERED_RESPONSE_ABORT_REASON_V1,
+                    "recovered":true,
+                }),
+            ));
+            events
+        }
+
+        validate_mcp_call_chain_v2(&recovered_aborted())
+            .expect("literal recovery writer profile must be accepted");
+
+        let mut wrong_start = recovered_aborted();
+        wrong_start[3].data["started_seq"] = Value::from(103);
+        let error = validate_mcp_call_chain_v2(&wrong_start)
+            .expect_err("recovery terminal must reference the exact owned start")
+            .to_string();
+        assert!(error.contains("exact response.started seq 3"), "{error}");
+
+        type TerminalMutation = (&'static str, fn(&mut Map<String, Value>));
+        let mutations: [TerminalMutation; 3] = [
+            ("false recovered flag", |data| {
+                data.insert("recovered".to_owned(), Value::Bool(false));
+            }),
+            ("missing reason", |data| {
+                data.remove("reason");
+            }),
+            ("extra field", |data| {
+                data.insert("extra".to_owned(), Value::Bool(true));
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let mut events = recovered_aborted();
+            let data = events[3].data.as_object_mut().expect("terminal data");
+            mutate(data);
+            assert!(
+                validate_mcp_call_chain_v2(&events).is_err(),
+                "{name} must fail closed"
+            );
+        }
+
+        for kind in ["response.completed", "response.failed"] {
+            let mut events = mcp_events_v2();
+            events.truncate(4);
+            events[3].kind = kind.to_owned();
+            events[3].data["started_seq"] = Value::from(3);
+            events[3].data["recovered"] = Value::Bool(true);
+            assert!(
+                validate_mcp_call_chain_v2(&events).is_err(),
+                "non-recovery {kind} must reject recovery provenance"
+            );
+        }
+
+        let mut live_aborted = recovered_aborted();
+        live_aborted[3].data = json!({
+            "response_attempt_id":"attempt-1",
+            "reason":"cancelled",
+        });
+        validate_mcp_call_chain_v2(&live_aborted)
+            .expect("ordinary response.aborted remains a non-recovery terminal");
+    }
+
+    #[test]
+    fn v2_owned_response_rejects_unbound_terminal_identity() {
+        for replacement in [None, Some(""), Some("attempt-other")] {
+            let mut events = mcp_events_v2();
+            events.truncate(3);
+            let mut data = json!({"error":"provider failed"});
+            if let Some(attempt_id) = replacement {
+                data["response_attempt_id"] = Value::String(attempt_id.to_owned());
+            }
+            events.push(event(4, Some("turn-1"), "response.failed", data));
+            let error = validate_mcp_call_chain_v2(&events)
+                .expect_err("owned response terminal must bind the active exact attempt")
+                .to_string();
+            assert!(
+                error.contains("active MCP response attempt")
+                    || error.contains("no valid response_attempt_id")
+                    || error.contains("no matching response.started"),
+                "{error}"
+            );
+        }
+
+        let mut events = mcp_events_v2();
+        events.truncate(3);
+        events.push(event(
+            4,
+            Some("turn-1"),
+            "response.failed",
+            json!({"response_attempt_id":"attempt-1","error":"first"}),
+        ));
+        events.push(event(
+            5,
+            Some("turn-1"),
+            "response.started",
+            json!({
+                "response_attempt_id":"attempt-2",
+                "mcp_registry_epoch_id":events[0].data["registry_epoch_id"],
+                "mcp_registry_digest":events[0].data["registry_digest"],
+            }),
+        ));
+        events.push(event(
+            6,
+            Some("turn-1"),
+            "response.failed",
+            json!({"response_attempt_id":"attempt-2","error":"second"}),
+        ));
+        validate_mcp_call_chain_v2(&events)
+            .expect("sequential exact owned attempts on the same turn remain valid");
+    }
+
+    #[test]
+    fn v2_response_envelope_rejects_generic_recovery_and_overlapping_attempts() {
+        let mut generic_recovery = mcp_events_v2();
+        generic_recovery.truncate(1);
+        generic_recovery.push(event(
+            2,
+            Some("turn-generic"),
+            "response.started",
+            json!({"response_attempt_id":"generic-attempt"}),
+        ));
+        generic_recovery.push(event(
+            3,
+            Some("turn-generic"),
+            "response.aborted",
+            json!({
+                "response_attempt_id":"generic-attempt",
+                "started_seq":103,
+                "reason":RECOVERED_RESPONSE_ABORT_REASON_V1,
+                "recovered":true,
+            }),
+        ));
+        validate_mcp_call_chain_v2(&generic_recovery)
+            .expect_err("generic recovery provenance must bind its exact start");
+
+        for generic_first in [false, true] {
+            let mut events = mcp_events_v2();
+            events.truncate(1);
+            let epoch = events[0].data["registry_epoch_id"].clone();
+            let digest = events[0].data["registry_digest"].clone();
+            let generic = event(
+                2 + u64::from(!generic_first),
+                Some("turn-overlap"),
+                "response.started",
+                json!({"response_attempt_id":"generic-attempt"}),
+            );
+            let owned = event(
+                2 + u64::from(generic_first),
+                Some("turn-overlap"),
+                "response.started",
+                json!({
+                    "response_attempt_id":"owned-attempt",
+                    "mcp_registry_epoch_id":epoch,
+                    "mcp_registry_digest":digest,
+                }),
+            );
+            if generic_first {
+                events.extend([generic, owned]);
+            } else {
+                events.extend([owned, generic]);
+            }
+            validate_mcp_call_chain_v2(&events)
+                .expect_err("generic and owned attempts cannot overlap on one turn");
+        }
+    }
+
+    #[test]
+    fn v2_response_envelope_requires_status_payloads() {
+        for (kind, field) in [("response.failed", "error"), ("response.aborted", "reason")] {
+            for value in [
+                None,
+                Some(Value::String(String::new())),
+                Some(Value::Bool(true)),
+            ] {
+                let mut events = mcp_events_v2();
+                events.truncate(3);
+                let mut data = json!({"response_attempt_id":"attempt-1"});
+                if let Some(value) = value {
+                    data[field] = value;
+                }
+                events.push(event(4, Some("turn-1"), kind, data));
+                validate_mcp_call_chain_v2(&events)
+                    .expect_err("owned status terminal requires a bounded non-empty payload");
+            }
+        }
     }
 
     #[test]
