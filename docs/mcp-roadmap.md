@@ -245,11 +245,15 @@ projection 和 history 各自“碰巧做出相同判断”：
 - Agent 的 `response.failed.error` 与普通 `response.aborted.reason` writer 在首次 fsync 前使用
   validator v2 共用的 UTF-8 byte limit/truncation profile；Provider 错误可以比 durable status
   字段更大，但不能先写入一个冻结 reader 必然拒绝的 terminal。
-- Provider context-limit 使用独立的 intent v1：`response.failed` 绑定 exact
-  `response.started` seq、attempt、bounded error 与 context snapshot，随后
-  `context.limit_reached` 反向引用 exact intent seq。完整 pair 在首字节前预留 journal 容量并
-  只用一次 durability barrier；若 crash prefix 只保留完整 intent，session-open 会在任何其他
-  recovery 写入前验证并补全 projection，未知版本、字段漂移或 snapshot 不一致均 fail closed。
+- Provider context-limit 使用独立的 intent v1：其 error 的空值、16 KiB byte limit、UTF-8
+  截断边界和 `<truncated>` 后缀均由独立 v1 profile 冻结，不依赖 MCP 当前 status helper。
+  普通 `response.started` 只有在 Provider dispatch 前保护冻结的 1 MiB durable-outcome
+  headroom 后才可同步；一次性 admission capability 阻止其他 append 占用 reserve。
+  `response.failed` 绑定 exact `response.started` seq、attempt、bounded error 与 context
+  snapshot，随后 `context.limit_reached` 反向引用 exact intent seq，并只用一次 durability
+  barrier；若 crash prefix 只有 started，reserve 足以写 recovery abort + marker；若只保留完整
+  intent，session-open 会在任何其他 recovery 写入前验证并补全 projection。未知版本、字段漂移
+  或 snapshot 不一致均 fail closed。
 - lifecycle 必须使用 canonical `call_id`。generic reducer 兼容的 `id` alias 不能结算 MCP
   call；turn/call/provider、参数 digest、started seq、registry/execution provenance 和 terminal
   状态迁移均由同一 validator 证明。

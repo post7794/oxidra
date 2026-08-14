@@ -45,7 +45,7 @@ use crate::history::{
     validate_history_snapshot_after_compaction,
 };
 use crate::history_artifact::{HistoryArtifactReader, HistoryArtifactRequest};
-use crate::mcp::{MAX_MCP_CALLS_PER_RESPONSE, response_status_text_for_journal};
+use crate::mcp::MAX_MCP_CALLS_PER_RESPONSE;
 pub use crate::projection::project_events;
 use crate::projection::{
     SOURCE_PROJECTION_VERSION, project_checkpoint_and_tail_for_recovery_planning,
@@ -54,7 +54,7 @@ use crate::projection::{
     source_projection_supports_boundary_exclusions, validate_response_output_items,
 };
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
-use crate::session::{JournalEvent, SessionJournal};
+use crate::session::{JournalEvent, ProviderResponseDispatchAdmissionV1, SessionJournal};
 use crate::tools::{BuiltinTools, ToolContext};
 use crate::turn::{
     PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION, ProviderRequestSlotState,
@@ -526,18 +526,31 @@ impl Agent {
             self.ensure_provider_call_budget(turn_id)?;
             let response_attempt_id = Uuid::now_v7().to_string();
             let response_context = prepared_tools.context.audit_value()?;
-            let response_started = self.journal.append_and_sync(
-                "response.started",
-                Some(turn_id),
+            let mut response_admission = match self.journal.append_provider_response_started_v1(
+                turn_id,
                 json!({
                     "response_attempt_id": response_attempt_id,
                     "response_index": outcome.responses + 1,
                     "context": response_context.clone(),
                 }),
-            )?;
+            ) {
+                Ok(admission) => admission,
+                Err(admission_error) => {
+                    let cancellation = self.append_turn_cancelled(
+                        turn_id,
+                        "Provider dispatch was denied before response.started because durable outcome capacity could not be reserved",
+                    );
+                    if let Err(cancellation_error) = cancellation {
+                        return Err(OxidraError::Session(format!(
+                            "Provider dispatch admission failed ({admission_error}); the undispatched turn also could not be terminalized ({cancellation_error})"
+                        )));
+                    }
+                    return Err(admission_error);
+                }
+            };
             if let Err(error) = observer.on_response_started() {
                 let error = OxidraError::observer(error);
-                self.append_response_aborted(turn_id, &response_attempt_id, &error.to_string())?;
+                self.append_response_aborted(&mut response_admission, &error.to_string())?;
                 return Err(error);
             }
             let response = {
@@ -550,76 +563,51 @@ impl Agent {
             let turn = match response {
                 Ok(turn) => turn,
                 Err(OxidraError::Interrupted) => {
-                    self.append_response_aborted(turn_id, &response_attempt_id, "cancelled")?;
+                    self.append_response_aborted(&mut response_admission, "cancelled")?;
                     return Err(OxidraError::Interrupted);
                 }
                 Err(OxidraError::ResponseAborted(reason)) => {
-                    self.append_response_aborted(turn_id, &response_attempt_id, &reason)?;
+                    self.append_response_aborted(&mut response_admission, &reason)?;
                     return Err(OxidraError::ResponseAborted(reason));
                 }
                 Err(error @ OxidraError::Observer(_)) => {
-                    self.append_response_aborted(
-                        turn_id,
-                        &response_attempt_id,
-                        &error.to_string(),
-                    )?;
+                    self.append_response_aborted(&mut response_admission, &error.to_string())?;
                     return Err(error);
                 }
                 Err(OxidraError::ProviderContextLimit(reason)) => {
-                    self.journal.append_provider_context_limit_v1(
-                        turn_id,
-                        &response_attempt_id,
-                        response_started.seq,
-                        &reason,
-                        response_context,
-                    )?;
+                    self.journal
+                        .append_provider_context_limit_v1(&mut response_admission, &reason)?;
                     return Err(OxidraError::ProviderContextLimit(reason));
                 }
                 Err(error) => {
-                    self.journal.append_and_sync(
-                        "response.failed",
-                        Some(turn_id),
-                        json!({
-                            "response_attempt_id": response_attempt_id,
-                            "error": response_status_text_for_journal(&error.to_string()),
-                        }),
+                    self.journal.append_provider_response_failed_v1(
+                        &mut response_admission,
+                        &error.to_string(),
                     )?;
                     return Err(error);
                 }
             };
 
             if let Err(error) = validate_response_output_items(&turn.output_items) {
-                self.journal.append_and_sync(
-                    "response.failed",
-                    Some(turn_id),
-                    json!({
-                        "response_attempt_id": response_attempt_id,
-                        "error": response_status_text_for_journal(&error.to_string()),
-                    }),
+                self.journal.append_provider_response_failed_v1(
+                    &mut response_admission,
+                    &error.to_string(),
                 )?;
                 return Err(error);
             }
             if let Err(error) = validate_function_call_batch_for_response(&turn.output_items) {
-                self.journal.append_and_sync(
-                    "response.failed",
-                    Some(turn_id),
-                    json!({
-                        "response_attempt_id": response_attempt_id,
-                        "error": response_status_text_for_journal(&error.to_string()),
-                    }),
+                self.journal.append_provider_response_failed_v1(
+                    &mut response_admission,
+                    &error.to_string(),
                 )?;
                 return Err(error);
             }
             if let Err(error) =
                 validate_history_calls_for_response(&turn.tool_calls, &prepared_tools)
             {
-                self.journal.append_and_sync(
-                    "response.failed",
-                    Some(turn_id),
-                    json!({
-                        "response_attempt_id": response_attempt_id,
-                        "error": response_status_text_for_journal(&error.to_string()),
-                    }),
+                self.journal.append_provider_response_failed_v1(
+                    &mut response_admission,
+                    &error.to_string(),
                 )?;
                 return Err(error);
             }
@@ -644,9 +632,24 @@ impl Agent {
                     "covers_through_seq": response_seq,
                 });
             }
-            let response_event =
-                self.journal
-                    .append_and_sync("response.completed", Some(turn_id), response_data)?;
+            let response_event = match self
+                .journal
+                .append_provider_response_completed_v1(&mut response_admission, response_data)
+            {
+                Ok(event) => event,
+                Err(commit_error) => {
+                    let fallback = self.journal.append_provider_response_failed_v1(
+                        &mut response_admission,
+                        &format!("response completed but could not be committed: {commit_error}"),
+                    );
+                    if let Err(fallback_error) = fallback {
+                        return Err(OxidraError::Session(format!(
+                            "response commit failed ({commit_error}); reserved fallback terminal also failed ({fallback_error})"
+                        )));
+                    }
+                    return Err(commit_error);
+                }
+            };
             debug_assert_eq!(response_event.seq, response_seq);
             if is_final_response {
                 outcome.text = turn.text;
@@ -2085,18 +2088,11 @@ impl Agent {
 
     fn append_response_aborted(
         &mut self,
-        turn_id: &str,
-        response_attempt_id: &str,
+        admission: &mut ProviderResponseDispatchAdmissionV1,
         reason: &str,
     ) -> Result<()> {
-        self.journal.append_and_sync(
-            "response.aborted",
-            Some(turn_id),
-            json!({
-                "response_attempt_id": response_attempt_id,
-                "reason": response_status_text_for_journal(reason),
-            }),
-        )?;
+        self.journal
+            .append_provider_response_aborted_v1(admission, reason)?;
         Ok(())
     }
 
@@ -5579,6 +5575,154 @@ mod tests {
         assert_eq!(count_events(&events, "response.started"), 2);
         assert!(agent.pending_compaction_boundaries().unwrap().is_empty());
         assert!(agent.pending_context_turns().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_dispatch_is_denied_before_started_when_outcome_headroom_is_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let journal = store
+            .create_with_id(
+                "provider-outcome-admission-capacity",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(ContextLimitProvider::default());
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits {
+                context_window: Some(300),
+                reserve_tokens: 100,
+                context_window_source: ContextValueSource::Cli,
+                reserve_tokens_source: ContextValueSource::Cli,
+            },
+            None,
+            None,
+        );
+        let current_size = std::fs::metadata(agent.journal().journal_path())
+            .unwrap()
+            .len();
+        agent
+            .journal_mut()
+            .set_byte_limit_for_tests(current_size + 128 * 1024);
+
+        let error = agent
+            .run_turn(
+                "do not dispatch without durable outcome capacity",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .expect_err("dispatch admission must fail before Provider execution");
+        assert!(error.to_string().contains("outcome headroom"), "{error}");
+        assert!(provider.requests().is_empty());
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "response.started"), 0);
+        assert_eq!(count_events(&events, "turn.cancelled"), 1);
+        assert_eq!(count_events(&events, "user.message"), 1);
+
+        drop(agent);
+        let reopened = store
+            .open("provider-outcome-admission-capacity")
+            .expect("capacity denial must leave a reopenable terminal turn");
+        assert_eq!(
+            count_events(&reopened.read_events().unwrap(), "response.started"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_completed_response_consumes_reserved_failure_terminal() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let journal = store
+            .create_with_id(
+                "provider-completed-capacity-fallback",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn(
+            &"x".repeat(2 * 1024 * 1024),
+        )]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits {
+                context_window: Some(128_000),
+                reserve_tokens: 16_384,
+                context_window_source: ContextValueSource::Cli,
+                reserve_tokens_source: ContextValueSource::Cli,
+            },
+            None,
+            None,
+        );
+        let current_size = std::fs::metadata(agent.journal().journal_path())
+            .unwrap()
+            .len();
+        agent
+            .journal_mut()
+            .set_byte_limit_for_tests(current_size + 1536 * 1024);
+
+        let error = agent
+            .run_turn(
+                "return a response larger than the remaining journal capacity",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .expect_err("the oversized completed event must not be partially committed");
+        assert!(
+            error
+                .to_string()
+                .contains("journal transaction would exceed")
+        );
+        assert_eq!(provider.requests().len(), 1);
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "response.started"), 1);
+        assert_eq!(count_events(&events, "response.completed"), 0);
+        assert_eq!(count_events(&events, "response.failed"), 1);
+        assert!(
+            events
+                .iter()
+                .find(|event| event.kind == "response.failed")
+                .unwrap()
+                .data["error"]
+                .as_str()
+                .unwrap()
+                .contains("could not be committed")
+        );
+
+        drop(agent);
+        store
+            .open("provider-completed-capacity-fallback")
+            .expect("the bounded fallback terminal must leave a reopenable journal");
     }
 
     #[tokio::test]

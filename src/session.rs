@@ -24,7 +24,9 @@ use crate::event_kind::{
     is_compaction_lifecycle, is_compaction_terminal, is_response_terminal, is_tool_lifecycle,
     is_tool_terminal,
 };
-use crate::mcp::{MAX_MCP_CALLS_PER_RESPONSE, response_status_text_for_journal};
+use crate::mcp::{
+    MAX_MCP_CALLS_PER_RESPONSE, MAX_RESPONSE_STATUS_TEXT_BYTES_V2, response_status_text_for_journal,
+};
 use crate::turn::validate_provider_request_slots_v2;
 
 pub const JOURNAL_SCHEMA: u32 = 1;
@@ -42,7 +44,19 @@ const PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_FIELD: &str = "provider_context_limi
 const PROVIDER_CONTEXT_LIMIT_INTENT_SEQ_FIELD: &str = "provider_context_limit_intent_seq";
 const PROVIDER_CONTEXT_LIMIT_STARTED_SEQ_FIELD: &str = "response_started_seq";
 const PROVIDER_CONTEXT_LIMIT_ERROR_CODE: &str = "provider_context_limit";
+const MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1: usize = 16 * 1024;
+const PROVIDER_CONTEXT_LIMIT_EMPTY_ERROR_V1: &str = "unspecified response status";
+const PROVIDER_CONTEXT_LIMIT_TRUNCATION_SUFFIX_V1: &str = "<truncated>";
 const MAX_PROVIDER_CONTEXT_LIMIT_CONTEXT_BYTES_V1: usize = 64 * 1024;
+const MAX_PROVIDER_RESPONSE_STATUS_BYTES_FOR_OUTCOME_V1: usize = 16 * 1024;
+/// Frozen dispatch-admission reserve for one bounded response terminal, the
+/// two-event context-limit transaction, or crash recovery's abort + marker.
+/// The literal maximum profiles are serialized in a regression test; changing
+/// any accepted field budget requires a new admission version or a larger
+/// reserve before the writer can dispatch Provider code.
+const PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1: u64 = 1024 * 1024;
+const _: () =
+    assert!(MAX_RESPONSE_STATUS_TEXT_BYTES_V2 <= MAX_PROVIDER_RESPONSE_STATUS_BYTES_FOR_OUTCOME_V1);
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct JournalEvent {
@@ -298,6 +312,8 @@ impl SessionStore {
             next_seq: 1,
             recovery: RecoveryInfo::default(),
             poisoned: false,
+            byte_limit: MAX_SESSION_BYTES,
+            active_provider_response: None,
             mcp_resume_open_id: None,
             mcp_resume_eligibility_issued: false,
         };
@@ -306,6 +322,10 @@ impl SessionStore {
     }
 
     pub fn open(&self, session_id: &str) -> Result<SessionJournal> {
+        self.open_with_byte_limit(session_id, MAX_SESSION_BYTES)
+    }
+
+    fn open_with_byte_limit(&self, session_id: &str, byte_limit: u64) -> Result<SessionJournal> {
         validate_session_id(session_id)?;
         self.layout.ensure()?;
 
@@ -411,6 +431,8 @@ impl SessionStore {
             next_seq,
             recovery: RecoveryInfo::default(),
             poisoned: false,
+            byte_limit,
+            active_provider_response: None,
             // This nonce identifies the exact recovered journal handle that
             // authorized a later MCP resume.  A newly-created journal cannot
             // mint that capability, and reopening after dropping this handle
@@ -618,8 +640,29 @@ pub struct SessionJournal {
     next_seq: u64,
     recovery: RecoveryInfo,
     poisoned: bool,
+    byte_limit: u64,
+    active_provider_response: Option<ActiveProviderResponseReservationV1>,
     mcp_resume_open_id: Option<String>,
     mcp_resume_eligibility_issued: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveProviderResponseReservationV1 {
+    reservation_id: String,
+    turn_id: String,
+    response_attempt_id: String,
+    response_started_seq: u64,
+    context: Value,
+    headroom_bytes: u64,
+}
+
+/// One-shot capability proving that `response.started` was synced only after
+/// reserving enough journal space for every bounded immediate terminal and
+/// the crash-recovery abort transaction. The token is intentionally neither
+/// `Clone` nor constructible outside this module.
+pub(crate) struct ProviderResponseDispatchAdmissionV1 {
+    reservation_id: String,
+    consumed: bool,
 }
 
 impl SessionJournal {
@@ -641,6 +684,11 @@ impl SessionJournal {
 
     pub fn recovery_info(&self) -> &RecoveryInfo {
         &self.recovery
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_byte_limit_for_tests(&mut self, byte_limit: u64) {
+        self.byte_limit = byte_limit;
     }
 
     /// Produce the one-shot journal-gate capability required to start MCP
@@ -688,6 +736,12 @@ impl SessionJournal {
         data: Value,
     ) -> Result<JournalEvent> {
         self.ensure_healthy()?;
+        if self.active_provider_response.is_some() {
+            return Err(OxidraError::Session(
+                "an admitted Provider response must be terminalized through its dispatch capability"
+                    .to_owned(),
+            ));
+        }
         let kind = kind.into();
         if kind.trim().is_empty() {
             return Err(OxidraError::Session(
@@ -714,10 +768,11 @@ impl SessionJournal {
         if current_size
             .saturating_add(encoded.len() as u64)
             .saturating_add(1)
-            > MAX_SESSION_BYTES
+            > self.byte_limit
         {
             return Err(OxidraError::Session(format!(
-                "session journal would exceed the {MAX_SESSION_BYTES}-byte safety limit"
+                "session journal would exceed the {}-byte safety limit",
+                self.byte_limit
             )));
         }
         // Recovered journals need a read/write handle so Windows permits
@@ -744,9 +799,154 @@ impl SessionJournal {
         Ok(event)
     }
 
-    /// Commit the crash-recoverable Provider context-limit protocol.
+    /// Admit one Provider dispatch only after syncing `response.started` with
+    /// a protected durable-outcome reserve. No other generic append is allowed
+    /// until the returned capability commits exactly one response terminal.
+    pub(crate) fn append_provider_response_started_v1(
+        &mut self,
+        turn_id: &str,
+        data: Value,
+    ) -> Result<ProviderResponseDispatchAdmissionV1> {
+        self.ensure_healthy()?;
+        if self.active_provider_response.is_some() {
+            return Err(OxidraError::Session(
+                "a Provider response dispatch admission is already active".to_owned(),
+            ));
+        }
+        let durable_prefix = self.read_events()?;
+        ensure_provider_dispatch_recovery_profile_v1(&durable_prefix)?;
+        let response_attempt_id = data
+            .get("response_attempt_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                OxidraError::Session(
+                    "response.started has no response_attempt_id for dispatch admission".to_owned(),
+                )
+            })?
+            .to_owned();
+        let context = data.get("context").cloned().ok_or_else(|| {
+            OxidraError::Session(
+                "response.started has no context snapshot for dispatch admission".to_owned(),
+            )
+        })?;
+        let response_started_seq = self.next_seq();
+        validate_provider_context_limit_writer_input_v1(
+            turn_id,
+            &response_attempt_id,
+            response_started_seq,
+            &context,
+        )?;
+        response_started_seq.checked_add(3).ok_or_else(|| {
+            OxidraError::Session(
+                "journal sequence cannot represent a Provider outcome transaction".to_owned(),
+            )
+        })?;
+
+        let mut planned_seq = response_started_seq;
+        let started = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            "response.started",
+            Some(turn_id),
+            data,
+        )?;
+        let admission_limit = self
+            .byte_limit
+            .checked_sub(PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "session journal cannot reserve the {PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1}-byte Provider outcome headroom"
+                ))
+            })?;
+        self.append_prebuilt_batch_with_limit(&[started], admission_limit)?;
+
+        let reservation_id = Uuid::now_v7().to_string();
+        self.active_provider_response = Some(ActiveProviderResponseReservationV1 {
+            reservation_id: reservation_id.clone(),
+            turn_id: turn_id.to_owned(),
+            response_attempt_id,
+            response_started_seq,
+            context,
+            headroom_bytes: PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1,
+        });
+        Ok(ProviderResponseDispatchAdmissionV1 {
+            reservation_id,
+            consumed: false,
+        })
+    }
+
+    pub(crate) fn append_provider_response_failed_v1(
+        &mut self,
+        admission: &mut ProviderResponseDispatchAdmissionV1,
+        error: &str,
+    ) -> Result<JournalEvent> {
+        let active = self.active_provider_response_v1(admission)?.clone();
+        let error = provider_response_status_for_outcome_v1(error)?;
+        let mut planned_seq = self.next_seq();
+        let event = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            "response.failed",
+            Some(&active.turn_id),
+            json!({
+                "response_attempt_id": active.response_attempt_id,
+                "error": error,
+            }),
+        )?;
+        self.commit_provider_response_events_v1(admission, &[event.clone()], true)?;
+        Ok(event)
+    }
+
+    pub(crate) fn append_provider_response_aborted_v1(
+        &mut self,
+        admission: &mut ProviderResponseDispatchAdmissionV1,
+        reason: &str,
+    ) -> Result<JournalEvent> {
+        let active = self.active_provider_response_v1(admission)?.clone();
+        let reason = provider_response_status_for_outcome_v1(reason)?;
+        let mut planned_seq = self.next_seq();
+        let event = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            "response.aborted",
+            Some(&active.turn_id),
+            json!({
+                "response_attempt_id": active.response_attempt_id,
+                "reason": reason,
+            }),
+        )?;
+        self.commit_provider_response_events_v1(admission, &[event.clone()], true)?;
+        Ok(event)
+    }
+
+    pub(crate) fn append_provider_response_completed_v1(
+        &mut self,
+        admission: &mut ProviderResponseDispatchAdmissionV1,
+        data: Value,
+    ) -> Result<JournalEvent> {
+        let active = self.active_provider_response_v1(admission)?.clone();
+        if data.get("response_attempt_id").and_then(Value::as_str)
+            != Some(active.response_attempt_id.as_str())
+        {
+            return Err(OxidraError::Session(
+                "response.completed does not bind its admitted response attempt".to_owned(),
+            ));
+        }
+        let mut planned_seq = self.next_seq();
+        let event = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            "response.completed",
+            Some(&active.turn_id),
+            data,
+        )?;
+        self.commit_provider_response_events_v1(admission, &[event.clone()], false)?;
+        Ok(event)
+    }
+
+    /// Commit the crash-recoverable Provider context-limit protocol using the
+    /// capacity protected before Provider code was dispatched.
     ///
-    /// The complete pair is size-reserved before either line is written, and
     /// `response.failed` is serialized first as the authoritative intent. If
     /// this process stops after that complete line but before the audit event
     /// is durable, [`SessionStore::open`] reconstructs the exact
@@ -754,38 +954,41 @@ impl SessionJournal {
     /// `response.started`.
     pub(crate) fn append_provider_context_limit_v1(
         &mut self,
-        turn_id: &str,
-        response_attempt_id: &str,
-        response_started_seq: u64,
+        admission: &mut ProviderResponseDispatchAdmissionV1,
         reason: &str,
-        context: Value,
     ) -> Result<(JournalEvent, JournalEvent)> {
+        let active = self.active_provider_response_v1(admission)?.clone();
         validate_provider_context_limit_writer_input_v1(
-            turn_id,
-            response_attempt_id,
-            response_started_seq,
-            &context,
+            &active.turn_id,
+            &active.response_attempt_id,
+            active.response_started_seq,
+            &active.context,
         )?;
-        let error = response_status_text_for_journal(reason);
+        let error = provider_context_limit_error_for_journal_v1(reason);
         let mut planned_seq = self.next_seq();
         let failed = planned_recovery_event(
             self.session_id(),
             &mut planned_seq,
             "response.failed",
-            Some(turn_id),
+            Some(&active.turn_id),
             provider_context_limit_failed_data_v1(
-                response_attempt_id,
-                response_started_seq,
+                &active.response_attempt_id,
+                active.response_started_seq,
                 &error,
-                context.clone(),
+                active.context.clone(),
             ),
         )?;
         let limit = planned_recovery_event(
             self.session_id(),
             &mut planned_seq,
             "context.limit_reached",
-            Some(turn_id),
-            provider_context_limit_event_data_v1(response_attempt_id, failed.seq, &error, context),
+            Some(&active.turn_id),
+            provider_context_limit_event_data_v1(
+                &active.response_attempt_id,
+                failed.seq,
+                &error,
+                active.context,
+            ),
         )?;
         let mut prospective = self.read_events()?;
         prospective.extend([failed.clone(), limit.clone()]);
@@ -795,19 +998,56 @@ impl SessionJournal {
                     .to_owned(),
             ));
         }
-        validate_provider_context_limit_turns_v1(
-            &prospective,
-            &HashSet::from([turn_id.to_owned()]),
-        )?;
-        self.append_prebuilt_batch(&[failed.clone(), limit.clone()])?;
+        validate_provider_context_limit_turns_v1(&prospective, &HashSet::from([active.turn_id]))?;
+        self.commit_provider_response_events_v1(admission, &[failed.clone(), limit.clone()], true)?;
         Ok((failed, limit))
+    }
+
+    fn active_provider_response_v1(
+        &self,
+        admission: &ProviderResponseDispatchAdmissionV1,
+    ) -> Result<&ActiveProviderResponseReservationV1> {
+        if admission.consumed {
+            return Err(OxidraError::Session(
+                "Provider response dispatch admission was already consumed".to_owned(),
+            ));
+        }
+        self.active_provider_response
+            .as_ref()
+            .filter(|active| active.reservation_id == admission.reservation_id)
+            .ok_or_else(|| {
+                OxidraError::Session(
+                    "Provider response dispatch admission does not match the active journal reservation"
+                        .to_owned(),
+                )
+            })
+    }
+
+    fn commit_provider_response_events_v1(
+        &mut self,
+        admission: &mut ProviderResponseDispatchAdmissionV1,
+        events: &[JournalEvent],
+        must_fit_headroom: bool,
+    ) -> Result<()> {
+        let active = self.active_provider_response_v1(admission)?.clone();
+        let encoded_bytes = encoded_journal_events_bytes(events)?;
+        if must_fit_headroom && encoded_bytes > active.headroom_bytes {
+            return Err(OxidraError::Session(format!(
+                "Provider response terminal requires {encoded_bytes} bytes, exceeding its reserved {}-byte durable outcome headroom",
+                active.headroom_bytes
+            )));
+        }
+        self.append_prebuilt_batch_with_limit(events, self.byte_limit)?;
+        self.active_provider_response = None;
+        admission.consumed = true;
+        Ok(())
     }
 
     /// Append a fully prebuilt durable transaction after proving the exact
     /// encoded batch fits. No journal byte is written when the reservation
     /// fails, and successful batches use one durability barrier.
     fn append_prebuilt_batch(&mut self, events: &[JournalEvent]) -> Result<()> {
-        self.append_prebuilt_batch_with_limit(events, MAX_SESSION_BYTES)
+        self.append_prebuilt_batch_with_limit(events, self.byte_limit)
     }
 
     fn append_prebuilt_batch_with_limit(
@@ -852,7 +1092,7 @@ impl SessionJournal {
             .is_none_or(|size| size > byte_limit)
         {
             return Err(OxidraError::Session(format!(
-                "session journal transaction would exceed the {MAX_SESSION_BYTES}-byte safety limit"
+                "session journal transaction would exceed the {byte_limit}-byte safety limit"
             )));
         }
 
@@ -1356,6 +1596,41 @@ fn valid_provider_context_limit_identity_v1(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
 
+fn provider_context_limit_error_for_journal_v1(input: &str) -> String {
+    let input = if input.is_empty() {
+        PROVIDER_CONTEXT_LIMIT_EMPTY_ERROR_V1
+    } else {
+        input
+    };
+    if input.len() <= MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1 {
+        return input.to_owned();
+    }
+
+    let mut end = MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1
+        .saturating_sub(PROVIDER_CONTEXT_LIMIT_TRUNCATION_SUFFIX_V1.len())
+        .min(input.len());
+    while !input.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut output = input[..end].to_owned();
+    output.push_str(PROVIDER_CONTEXT_LIMIT_TRUNCATION_SUFFIX_V1);
+    output
+}
+
+fn provider_response_status_for_outcome_v1(input: &str) -> Result<String> {
+    let status = response_status_text_for_journal(input);
+    if status.len() > MAX_PROVIDER_RESPONSE_STATUS_BYTES_FOR_OUTCOME_V1 {
+        return Err(OxidraError::Session(format!(
+            "response status exceeds the frozen {MAX_PROVIDER_RESPONSE_STATUS_BYTES_FOR_OUTCOME_V1}-byte Provider outcome profile"
+        )));
+    }
+    Ok(status)
+}
+
+fn valid_provider_context_limit_error_v1(value: &str) -> bool {
+    provider_context_limit_error_for_journal_v1(value) == value
+}
+
 fn valid_provider_context_limit_context_v1(context: &Value) -> bool {
     context.is_object()
         && serde_json::to_vec(context)
@@ -1543,7 +1818,7 @@ fn provider_context_limit_recovery_actions_v1(
         let error = data
             .get("error")
             .and_then(Value::as_str)
-            .filter(|value| response_status_text_for_journal(value) == *value)
+            .filter(|value| valid_provider_context_limit_error_v1(value))
             .ok_or_else(|| {
                 OxidraError::Session(format!(
                     "provider context-limit intent at seq {} has no bounded non-empty error",
@@ -1976,6 +2251,160 @@ fn planned_recovery_event(
     Ok(event)
 }
 
+fn encoded_journal_events_bytes(events: &[JournalEvent]) -> Result<u64> {
+    events.iter().try_fold(0u64, |total, event| {
+        let event_len = u64::try_from(serde_json::to_vec(event)?.len())
+            .map_err(|_| OxidraError::Session("journal event is too large".to_owned()))?;
+        total
+            .checked_add(event_len)
+            .and_then(|size| size.checked_add(1))
+            .ok_or_else(|| OxidraError::Session("journal transaction size overflow".to_owned()))
+    })
+}
+
+#[cfg(test)]
+fn provider_response_outcome_headroom_required_v1(
+    session_id: &str,
+    turn_id: &str,
+    response_attempt_id: &str,
+    response_started_seq: u64,
+    context: Value,
+) -> Result<u64> {
+    let context_limit_error = "\0".repeat(MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1);
+    let generic_status = "\0".repeat(MAX_PROVIDER_RESPONSE_STATUS_BYTES_FOR_OUTCOME_V1);
+
+    let mut pair_seq = response_started_seq
+        .checked_add(1)
+        .ok_or_else(|| OxidraError::Session("journal sequence exhausted".to_owned()))?;
+    let failed = planned_recovery_event(
+        session_id,
+        &mut pair_seq,
+        "response.failed",
+        Some(turn_id),
+        provider_context_limit_failed_data_v1(
+            response_attempt_id,
+            response_started_seq,
+            &context_limit_error,
+            context.clone(),
+        ),
+    )?;
+    let limit = planned_recovery_event(
+        session_id,
+        &mut pair_seq,
+        "context.limit_reached",
+        Some(turn_id),
+        provider_context_limit_event_data_v1(
+            response_attempt_id,
+            failed.seq,
+            &context_limit_error,
+            context,
+        ),
+    )?;
+    let context_limit_bytes = encoded_journal_events_bytes(&[failed, limit])?;
+
+    let mut terminal_seq = response_started_seq
+        .checked_add(1)
+        .ok_or_else(|| OxidraError::Session("journal sequence exhausted".to_owned()))?;
+    let generic_failed = planned_recovery_event(
+        session_id,
+        &mut terminal_seq,
+        "response.failed",
+        Some(turn_id),
+        json!({
+            "response_attempt_id": response_attempt_id,
+            "error": generic_status,
+        }),
+    )?;
+    let generic_failed_bytes = encoded_journal_events_bytes(&[generic_failed])?;
+
+    let mut aborted_seq = response_started_seq
+        .checked_add(1)
+        .ok_or_else(|| OxidraError::Session("journal sequence exhausted".to_owned()))?;
+    let generic_aborted = planned_recovery_event(
+        session_id,
+        &mut aborted_seq,
+        "response.aborted",
+        Some(turn_id),
+        json!({
+            "response_attempt_id": response_attempt_id,
+            "reason": "\0".repeat(MAX_PROVIDER_RESPONSE_STATUS_BYTES_FOR_OUTCOME_V1),
+        }),
+    )?;
+    let generic_aborted_bytes = encoded_journal_events_bytes(&[generic_aborted])?;
+
+    let mut recovery_seq = response_started_seq
+        .checked_add(1)
+        .ok_or_else(|| OxidraError::Session("journal sequence exhausted".to_owned()))?;
+    let recovered_abort = planned_recovery_event(
+        session_id,
+        &mut recovery_seq,
+        "response.aborted",
+        Some(turn_id),
+        json!({
+            "response_attempt_id": response_attempt_id,
+            "started_seq": response_started_seq,
+            "reason": "process stopped before a terminal response event was committed",
+            "recovered": true,
+        }),
+    )?;
+    let recovery = RecoveryInfo {
+        truncated_tail: Some(TruncatedTail {
+            byte_count: u64::MAX,
+            sha256: "f".repeat(64),
+        }),
+        skipped_before_start: usize::MAX,
+        aborted_responses: usize::MAX,
+        aborted_compactions: usize::MAX,
+        failed_compaction_boundaries: usize::MAX,
+        checkpointed_compaction_boundaries: usize::MAX,
+        ..RecoveryInfo::default()
+    };
+    let marker = planned_recovery_event(
+        session_id,
+        &mut recovery_seq,
+        RECOVERY_KIND,
+        None,
+        recovery_marker_data(&recovery, &[])?,
+    )?;
+    let recovery_bytes = encoded_journal_events_bytes(&[recovered_abort, marker])?;
+
+    Ok(context_limit_bytes
+        .max(generic_failed_bytes)
+        .max(generic_aborted_bytes)
+        .max(recovery_bytes))
+}
+
+fn ensure_provider_dispatch_recovery_profile_v1(events: &[JournalEvent]) -> Result<()> {
+    if !provider_context_limit_recovery_actions_v1(events)?.is_empty() {
+        return Err(OxidraError::Session(
+            "Provider dispatch requires all context-limit intents to be recovered first".to_owned(),
+        ));
+    }
+    if !unfinished_responses(events)?.is_empty() {
+        return Err(OxidraError::Session(
+            "Provider dispatch requires every prior response attempt to be terminal".to_owned(),
+        ));
+    }
+    if !unfinished_compactions(events).is_empty() {
+        return Err(OxidraError::Session(
+            "Provider dispatch requires every compaction attempt to be terminal".to_owned(),
+        ));
+    }
+    if !compaction_boundary_recovery_actions(events)?.is_empty() {
+        return Err(OxidraError::Session(
+            "Provider dispatch requires every compaction boundary recovery action to be settled"
+                .to_owned(),
+        ));
+    }
+    if !pending_tools(events).is_empty() || !unstarted_tool_calls(events).is_empty() {
+        return Err(OxidraError::Session(
+            "Provider dispatch requires every prior tool call to have a durable lifecycle outcome"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn stage_recovery_event(
     session_id: &str,
     next_seq: &mut u64,
@@ -2304,6 +2733,8 @@ mod tests {
             next_seq: 1,
             recovery: RecoveryInfo::default(),
             poisoned: false,
+            byte_limit: MAX_SESSION_BYTES,
+            active_provider_response: None,
             mcp_resume_open_id: None,
             mcp_resume_eligibility_issued: false,
         };
@@ -2693,10 +3124,9 @@ mod tests {
             )
             .unwrap();
         let context = json!({"measurement":{"request_digest":"context-digest"}});
-        let started = journal
-            .append_and_sync(
-                "response.started",
-                Some("turn-context-limit"),
+        let mut admission = journal
+            .append_provider_response_started_v1(
+                "turn-context-limit",
                 json!({
                     "response_attempt_id":"attempt-context-limit",
                     "response_index":1,
@@ -2705,13 +3135,7 @@ mod tests {
             )
             .unwrap();
         journal
-            .append_provider_context_limit_v1(
-                "turn-context-limit",
-                "attempt-context-limit",
-                started.seq,
-                "context_length_exceeded",
-                context,
-            )
+            .append_provider_context_limit_v1(&mut admission, "context_length_exceeded")
             .unwrap();
         drop(journal);
 
@@ -2773,6 +3197,202 @@ mod tests {
     }
 
     #[test]
+    fn provider_context_limit_error_profile_v1_is_byte_exact_and_independent() {
+        assert_eq!(MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1, 16 * 1024);
+        assert_eq!(
+            provider_context_limit_error_for_journal_v1(""),
+            "unspecified response status"
+        );
+
+        let exact = "x".repeat(MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1);
+        assert_eq!(provider_context_limit_error_for_journal_v1(&exact), exact);
+
+        let oversized = "x".repeat(MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1 + 1);
+        let truncated = provider_context_limit_error_for_journal_v1(&oversized);
+        assert_eq!(truncated.len(), MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1);
+        assert!(truncated.ends_with("<truncated>"));
+        assert!(valid_provider_context_limit_error_v1(&truncated));
+
+        let multibyte = format!(
+            "{}zz",
+            "界".repeat(MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1 / 3)
+        );
+        let truncated = provider_context_limit_error_for_journal_v1(&multibyte);
+        assert!(truncated.len() <= MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1);
+        assert!(truncated.is_char_boundary(truncated.len()));
+        assert!(truncated.ends_with("<truncated>"));
+    }
+
+    #[test]
+    fn provider_dispatch_headroom_covers_frozen_bounded_outcomes() {
+        let context_overhead = serde_json::to_vec(&json!({"blob":""})).unwrap().len();
+        let context = json!({
+            "blob": "x".repeat(MAX_PROVIDER_CONTEXT_LIMIT_CONTEXT_BYTES_V1 - context_overhead),
+        });
+        assert_eq!(
+            serde_json::to_vec(&context).unwrap().len(),
+            MAX_PROVIDER_CONTEXT_LIMIT_CONTEXT_BYTES_V1
+        );
+        let required = provider_response_outcome_headroom_required_v1(
+            &"s".repeat(128),
+            &"t".repeat(128),
+            &"a".repeat(128),
+            u64::MAX - 3,
+            context,
+        )
+        .unwrap();
+        assert!(
+            required <= PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1,
+            "frozen bounded outcomes require {required} bytes"
+        );
+    }
+
+    #[test]
+    fn provider_dispatch_admission_is_exclusive_and_single_use() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("provider-dispatch-capability", header(temp.path()))
+            .unwrap();
+        journal
+            .append_and_sync(
+                "user.message",
+                Some("turn-provider"),
+                json!({
+                    "item":{"role":"user","content":"hello"},
+                    "turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let mut admission = journal
+            .append_provider_response_started_v1(
+                "turn-provider",
+                json!({
+                    "response_attempt_id":"attempt-provider",
+                    "response_index":1,
+                    "context":{"measurement":{"request_digest":"digest"}},
+                }),
+            )
+            .unwrap();
+
+        let append_error = journal
+            .append_and_sync("note", Some("turn-provider"), json!({"unsafe":true}))
+            .expect_err("generic appends must not consume protected headroom");
+        assert!(append_error.to_string().contains("dispatch capability"));
+
+        journal
+            .append_provider_response_failed_v1(&mut admission, "provider failed")
+            .unwrap();
+        let reuse_error = journal
+            .append_provider_response_failed_v1(&mut admission, "duplicate")
+            .expect_err("dispatch capability must be one-shot");
+        assert!(reuse_error.to_string().contains("already consumed"));
+        journal
+            .append_and_sync("note", Some("turn-provider"), json!({"safe":true}))
+            .expect("generic appends resume after terminal consumption");
+    }
+
+    #[test]
+    fn provider_dispatch_headroom_survives_crash_recovery_at_the_same_limit() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("provider-dispatch-recovery-headroom", header(temp.path()))
+            .unwrap();
+        journal
+            .append_and_sync(
+                "user.message",
+                Some("turn-provider"),
+                json!({
+                    "item":{"role":"user","content":"hello"},
+                    "turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let current_size = journal.file.metadata().unwrap().len();
+        let byte_limit = current_size + PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1 + 16 * 1024;
+        journal.set_byte_limit_for_tests(byte_limit);
+        let admission = journal
+            .append_provider_response_started_v1(
+                "turn-provider",
+                json!({
+                    "response_attempt_id":"attempt-provider",
+                    "response_index":1,
+                    "context":{"measurement":{"request_digest":"digest"}},
+                }),
+            )
+            .expect("the exact dispatch reserve must fit");
+        drop(admission);
+        drop(journal);
+
+        let reopened = store
+            .open_with_byte_limit("provider-dispatch-recovery-headroom", byte_limit)
+            .expect("the protected headroom must fit response.abort plus recovery marker");
+        let events = reopened.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "response.aborted"
+                        && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
+                })
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == RECOVERY_KIND)
+                .count(),
+            1
+        );
+        assert!(reopened.file.metadata().unwrap().len() <= byte_limit);
+    }
+
+    #[test]
+    fn provider_context_limit_pair_consumes_dispatch_time_headroom() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "provider-context-limit-dispatch-headroom",
+                header(temp.path()),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "user.message",
+                Some("turn-provider"),
+                json!({
+                    "item":{"role":"user","content":"hello"},
+                    "turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let current_size = journal.file.metadata().unwrap().len();
+        let byte_limit = current_size + PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1 + 16 * 1024;
+        journal.set_byte_limit_for_tests(byte_limit);
+        let mut admission = journal
+            .append_provider_response_started_v1(
+                "turn-provider",
+                json!({
+                    "response_attempt_id":"attempt-provider",
+                    "response_index":1,
+                    "context":{"measurement":{"request_digest":"digest"}},
+                }),
+            )
+            .expect("dispatch admission must reserve the complete bounded outcome");
+        journal
+            .append_provider_context_limit_v1(
+                &mut admission,
+                &"x".repeat(MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1 + 1),
+            )
+            .expect("the context-limit pair must fit the dispatch-time reserve");
+        assert!(journal.file.metadata().unwrap().len() <= byte_limit);
+        assert!(journal.active_provider_response.is_none());
+    }
+
+    #[test]
     fn provider_context_limit_writer_validates_the_exact_start_before_writing() {
         let temp = TempDir::new().unwrap();
         let store = SessionStore::new(temp.path()).unwrap();
@@ -2780,27 +3400,25 @@ mod tests {
             .create_with_id("provider-context-limit-writer", header(temp.path()))
             .unwrap();
         let context = json!({"measurement":{"request_digest":"context-digest"}});
-        let started = journal
-            .append_and_sync(
-                "response.started",
-                Some("turn-context-limit"),
+        let mut admission = journal
+            .append_provider_response_started_v1(
+                "turn-context-limit",
                 json!({
                     "response_attempt_id":"attempt-context-limit",
                     "response_index":1,
-                    "context":context,
+                    "context":context.clone(),
                 }),
             )
             .unwrap();
         let original_count = journal.read_events().unwrap().len();
+        journal
+            .active_provider_response
+            .as_mut()
+            .expect("active admission")
+            .context = json!({"measurement":{"request_digest":"different"}});
 
         let error = journal
-            .append_provider_context_limit_v1(
-                "turn-context-limit",
-                "attempt-context-limit",
-                started.seq,
-                "context_length_exceeded",
-                json!({"measurement":{"request_digest":"different"}}),
-            )
+            .append_provider_context_limit_v1(&mut admission, "context_length_exceeded")
             .expect_err("the writer must inherit the exact response.started context");
         assert!(error.to_string().contains("does not inherit"));
         assert_eq!(journal.read_events().unwrap().len(), original_count);
