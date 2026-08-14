@@ -24,13 +24,25 @@ use crate::event_kind::{
     is_compaction_lifecycle, is_compaction_terminal, is_response_terminal, is_tool_lifecycle,
     is_tool_terminal,
 };
-use crate::mcp::MAX_MCP_CALLS_PER_RESPONSE;
+use crate::mcp::{MAX_MCP_CALLS_PER_RESPONSE, response_status_text_for_journal};
 use crate::turn::validate_provider_request_slots_v2;
 
 pub const JOURNAL_SCHEMA: u32 = 1;
 pub const SESSION_STARTED_KIND: &str = "session.started";
 pub const RECOVERY_KIND: &str = "journal.recovered";
 const MAX_SESSION_BYTES: u64 = 256 * 1024 * 1024;
+
+/// A provider context-limit response is a two-event business transaction:
+/// the response terminal carries a durable intent and the following context
+/// event is its audit/reducer projection.  The intent version is deliberately
+/// independent from the turn reducer versions so a future profile can be
+/// added without changing the meaning of already-published turn validators.
+pub(crate) const PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_V1: u64 = 1;
+const PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_FIELD: &str = "provider_context_limit_intent_version";
+const PROVIDER_CONTEXT_LIMIT_INTENT_SEQ_FIELD: &str = "provider_context_limit_intent_seq";
+const PROVIDER_CONTEXT_LIMIT_STARTED_SEQ_FIELD: &str = "response_started_seq";
+const PROVIDER_CONTEXT_LIMIT_ERROR_CODE: &str = "provider_context_limit";
+const MAX_PROVIDER_CONTEXT_LIMIT_CONTEXT_BYTES_V1: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct JournalEvent {
@@ -318,6 +330,12 @@ impl SessionStore {
             normalized_missing_newline,
         } = scan;
         validate_events(&prospective_events, session_id)?;
+        let provider_context_limit_actions =
+            provider_context_limit_recovery_actions_v1(&prospective_events)?;
+        let provider_context_limit_recovery_turns = provider_context_limit_actions
+            .iter()
+            .map(|action| action.turn_id.clone())
+            .collect::<HashSet<_>>();
         let next_seq = match prospective_events.last() {
             Some(event) => event
                 .seq
@@ -381,6 +399,7 @@ impl SessionStore {
             aborted_compactions,
             failed_compaction_boundaries,
             checkpointed_compaction_boundaries,
+            recovered_provider_context_limits: provider_context_limit_actions.len(),
         };
 
         let mut journal = SessionJournal {
@@ -404,6 +423,26 @@ impl SessionStore {
         let original_event_count = prospective_events.len();
         let mut planned_events = Vec::new();
         let mut planned_seq = journal.next_seq();
+        for action in provider_context_limit_actions {
+            stage_recovery_event(
+                session_id,
+                &mut planned_seq,
+                &mut planned_events,
+                &mut prospective_events,
+                "context.limit_reached",
+                Some(&action.turn_id),
+                action.data,
+            )?;
+        }
+        if !provider_context_limit_recovery_actions_v1(&prospective_events)?.is_empty() {
+            return Err(OxidraError::Session(
+                "provider context-limit recovery did not reach a stable state".to_owned(),
+            ));
+        }
+        validate_provider_context_limit_turns_v1(
+            &prospective_events,
+            &provider_context_limit_recovery_turns,
+        )?;
         let recovered_unfinished_response = !unfinished_responses.is_empty();
         for response in unfinished_responses {
             stage_recovery_event(
@@ -520,7 +559,7 @@ impl SessionStore {
         planned_events.extend(mcp_recovery_events);
         crate::mcp::validate_mcp_call_chain(&prospective_events)?;
         validate_provider_request_slots_v2(&prospective_events, &mcp_turn_ids)?;
-        journal.append_recovery_batch(&planned_events)?;
+        journal.append_prebuilt_batch(&planned_events)?;
         journal.recovery = recovery;
         Ok(journal)
     }
@@ -542,11 +581,15 @@ pub struct RecoveryInfo {
     pub failed_compaction_boundaries: usize,
     #[serde(default)]
     pub checkpointed_compaction_boundaries: usize,
+    #[serde(default)]
+    pub recovered_provider_context_limits: usize,
 }
 
 impl RecoveryInfo {
     pub fn recovered(&self) -> bool {
-        self.marker_seq.is_some() || self.normalized_missing_newline
+        self.marker_seq.is_some()
+            || self.normalized_missing_newline
+            || self.recovered_provider_context_limits > 0
     }
 }
 
@@ -701,14 +744,73 @@ impl SessionJournal {
         Ok(event)
     }
 
-    /// Append a fully prebuilt recovery transaction after proving the exact
-    /// encoded batch fits. No journal byte is written when the reservation
-    /// fails, and successful batches use one durability barrier.
-    fn append_recovery_batch(&mut self, events: &[JournalEvent]) -> Result<()> {
-        self.append_recovery_batch_with_limit(events, MAX_SESSION_BYTES)
+    /// Commit the crash-recoverable Provider context-limit protocol.
+    ///
+    /// The complete pair is size-reserved before either line is written, and
+    /// `response.failed` is serialized first as the authoritative intent. If
+    /// this process stops after that complete line but before the audit event
+    /// is durable, [`SessionStore::open`] reconstructs the exact
+    /// `context.limit_reached` payload from the validated intent and its bound
+    /// `response.started`.
+    pub(crate) fn append_provider_context_limit_v1(
+        &mut self,
+        turn_id: &str,
+        response_attempt_id: &str,
+        response_started_seq: u64,
+        reason: &str,
+        context: Value,
+    ) -> Result<(JournalEvent, JournalEvent)> {
+        validate_provider_context_limit_writer_input_v1(
+            turn_id,
+            response_attempt_id,
+            response_started_seq,
+            &context,
+        )?;
+        let error = response_status_text_for_journal(reason);
+        let mut planned_seq = self.next_seq();
+        let failed = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            "response.failed",
+            Some(turn_id),
+            provider_context_limit_failed_data_v1(
+                response_attempt_id,
+                response_started_seq,
+                &error,
+                context.clone(),
+            ),
+        )?;
+        let limit = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            "context.limit_reached",
+            Some(turn_id),
+            provider_context_limit_event_data_v1(response_attempt_id, failed.seq, &error, context),
+        )?;
+        let mut prospective = self.read_events()?;
+        prospective.extend([failed.clone(), limit.clone()]);
+        if !provider_context_limit_recovery_actions_v1(&prospective)?.is_empty() {
+            return Err(OxidraError::Session(
+                "provider context-limit writer did not construct a complete v1 transaction"
+                    .to_owned(),
+            ));
+        }
+        validate_provider_context_limit_turns_v1(
+            &prospective,
+            &HashSet::from([turn_id.to_owned()]),
+        )?;
+        self.append_prebuilt_batch(&[failed.clone(), limit.clone()])?;
+        Ok((failed, limit))
     }
 
-    fn append_recovery_batch_with_limit(
+    /// Append a fully prebuilt durable transaction after proving the exact
+    /// encoded batch fits. No journal byte is written when the reservation
+    /// fails, and successful batches use one durability barrier.
+    fn append_prebuilt_batch(&mut self, events: &[JournalEvent]) -> Result<()> {
+        self.append_prebuilt_batch_with_limit(events, MAX_SESSION_BYTES)
+    }
+
+    fn append_prebuilt_batch_with_limit(
         &mut self,
         events: &[JournalEvent],
         byte_limit: u64,
@@ -727,7 +829,7 @@ impl SessionJournal {
                 || event.kind.trim().is_empty()
             {
                 return Err(OxidraError::Session(
-                    "invalid prebuilt recovery transaction".to_owned(),
+                    "invalid prebuilt journal transaction".to_owned(),
                 ));
             }
             expected_seq = expected_seq
@@ -739,7 +841,7 @@ impl SessionJournal {
                 .checked_add(event_len)
                 .and_then(|size| size.checked_add(1))
                 .ok_or_else(|| {
-                    OxidraError::Session("recovery transaction size overflow".to_owned())
+                    OxidraError::Session("journal transaction size overflow".to_owned())
                 })?;
         }
 
@@ -750,14 +852,14 @@ impl SessionJournal {
             .is_none_or(|size| size > byte_limit)
         {
             return Err(OxidraError::Session(format!(
-                "session recovery transaction would exceed the {MAX_SESSION_BYTES}-byte safety limit"
+                "session journal transaction would exceed the {MAX_SESSION_BYTES}-byte safety limit"
             )));
         }
 
         // The exact reservation above is complete before this first seek or
-        // write. Every valid on-disk prefix is replayable: markers precede the
-        // skips they authorize, so a crash merely leaves a smaller set for the
-        // next open to recover.
+        // write. Callers must order events so every complete-line prefix is
+        // replayable: recovery markers precede the skips they authorize, and
+        // the Provider context-limit intent precedes its derived audit event.
         let seek_result = self.file.seek(SeekFrom::End(0));
         self.finish_io(seek_result)?;
         for event in events {
@@ -1250,6 +1352,420 @@ fn string_field(data: &Value, fields: &[&str]) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn valid_provider_context_limit_identity_v1(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+fn valid_provider_context_limit_context_v1(context: &Value) -> bool {
+    context.is_object()
+        && serde_json::to_vec(context)
+            .is_ok_and(|encoded| encoded.len() <= MAX_PROVIDER_CONTEXT_LIMIT_CONTEXT_BYTES_V1)
+}
+
+fn validate_provider_context_limit_writer_input_v1(
+    turn_id: &str,
+    response_attempt_id: &str,
+    response_started_seq: u64,
+    context: &Value,
+) -> Result<()> {
+    if !valid_provider_context_limit_identity_v1(turn_id) {
+        return Err(OxidraError::Session(
+            "provider context-limit intent has an invalid turn_id".to_owned(),
+        ));
+    }
+    if !valid_provider_context_limit_identity_v1(response_attempt_id) {
+        return Err(OxidraError::Session(
+            "provider context-limit intent has an invalid response_attempt_id".to_owned(),
+        ));
+    }
+    if response_started_seq == 0 {
+        return Err(OxidraError::Session(
+            "provider context-limit intent has an invalid response_started_seq".to_owned(),
+        ));
+    }
+    if !valid_provider_context_limit_context_v1(context) {
+        return Err(OxidraError::Session(
+            "provider context-limit intent context must be a bounded object".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn provider_context_limit_failed_data_v1(
+    response_attempt_id: &str,
+    response_started_seq: u64,
+    error: &str,
+    context: Value,
+) -> Value {
+    json!({
+        "response_attempt_id": response_attempt_id,
+        "response_started_seq": response_started_seq,
+        "error": error,
+        "error_code": PROVIDER_CONTEXT_LIMIT_ERROR_CODE,
+        "provider_context_limit_intent_version": PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_V1,
+        "context": context,
+    })
+}
+
+fn provider_context_limit_event_data_v1(
+    response_attempt_id: &str,
+    provider_context_limit_intent_seq: u64,
+    error: &str,
+    context: Value,
+) -> Value {
+    json!({
+        "error": error,
+        "source": "provider",
+        "response_attempt_id": response_attempt_id,
+        "context": context,
+        "provider_context_limit_intent_version": PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_V1,
+        "provider_context_limit_intent_seq": provider_context_limit_intent_seq,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ProviderContextLimitRecoveryAction {
+    turn_id: String,
+    data: Value,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedProviderContextLimitIntentV1 {
+    failed_seq: u64,
+    turn_id: String,
+    response_attempt_id: String,
+    error: String,
+    context: Value,
+}
+
+/// Validate the complete provider context-limit transaction and return only
+/// the audit events that are absent from an otherwise valid crash prefix.
+///
+/// Legacy `response.failed(error_code=provider_context_limit)` events without
+/// the versioned intent field retain their historical meaning. Once any v1
+/// intent field is present, however, the literal v1 profile is authoritative
+/// and unknown or partial profiles fail before recovery writes begin.
+fn provider_context_limit_recovery_actions_v1(
+    events: &[JournalEvent],
+) -> Result<Vec<ProviderContextLimitRecoveryAction>> {
+    type Identity = (String, String);
+
+    let mut starts = HashMap::<Identity, Vec<&JournalEvent>>::new();
+    let mut terminals = HashMap::<Identity, Vec<&JournalEvent>>::new();
+    for event in events {
+        if !matches!(
+            event.kind.as_str(),
+            "response.started" | "response.completed" | "response.failed" | "response.aborted"
+        ) {
+            continue;
+        }
+        let (Some(turn_id), Some(response_attempt_id)) = (
+            event.turn_id.as_deref(),
+            event
+                .data
+                .get("response_attempt_id")
+                .and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        let identity = (turn_id.to_owned(), response_attempt_id.to_owned());
+        if event.kind == "response.started" {
+            starts.entry(identity).or_default().push(event);
+        } else {
+            terminals.entry(identity).or_default().push(event);
+        }
+    }
+
+    let mut intents = BTreeMap::<u64, ValidatedProviderContextLimitIntentV1>::new();
+    for event in events
+        .iter()
+        .filter(|event| event.kind == "response.failed")
+    {
+        let Some(data) = event.data.as_object() else {
+            continue;
+        };
+        let has_version = data.contains_key(PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_FIELD);
+        let has_started_seq = data.contains_key(PROVIDER_CONTEXT_LIMIT_STARTED_SEQ_FIELD);
+        if !has_version {
+            if has_started_seq {
+                return Err(OxidraError::Session(format!(
+                    "response.failed at seq {} carries a partial provider context-limit intent",
+                    event.seq
+                )));
+            }
+            continue;
+        }
+        let version = data
+            .get(PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_FIELD)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "response.failed at seq {} has no provider context-limit intent version",
+                    event.seq
+                ))
+            })?;
+        if version != PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_V1 {
+            return Err(OxidraError::Session(format!(
+                "unsupported provider context-limit intent version {version} at seq {}",
+                event.seq
+            )));
+        }
+        let turn_id = event
+            .turn_id
+            .as_deref()
+            .filter(|value| valid_provider_context_limit_identity_v1(value))
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "provider context-limit intent at seq {} has no valid turn_id",
+                    event.seq
+                ))
+            })?;
+        let response_attempt_id = data
+            .get("response_attempt_id")
+            .and_then(Value::as_str)
+            .filter(|value| valid_provider_context_limit_identity_v1(value))
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "provider context-limit intent at seq {} has no valid response_attempt_id",
+                    event.seq
+                ))
+            })?;
+        let response_started_seq = data
+            .get(PROVIDER_CONTEXT_LIMIT_STARTED_SEQ_FIELD)
+            .and_then(Value::as_u64)
+            .filter(|seq| *seq > 0)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "provider context-limit intent at seq {} has no valid response_started_seq",
+                    event.seq
+                ))
+            })?;
+        let error = data
+            .get("error")
+            .and_then(Value::as_str)
+            .filter(|value| response_status_text_for_journal(value) == *value)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "provider context-limit intent at seq {} has no bounded non-empty error",
+                    event.seq
+                ))
+            })?;
+        if data.get("error_code").and_then(Value::as_str) != Some(PROVIDER_CONTEXT_LIMIT_ERROR_CODE)
+        {
+            return Err(OxidraError::Session(format!(
+                "provider context-limit intent at seq {} has the wrong error_code",
+                event.seq
+            )));
+        }
+        let context = data
+            .get("context")
+            .filter(|value| valid_provider_context_limit_context_v1(value))
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "provider context-limit intent at seq {} has no bounded context object",
+                    event.seq
+                ))
+            })?;
+        let expected = provider_context_limit_failed_data_v1(
+            response_attempt_id,
+            response_started_seq,
+            error,
+            context.clone(),
+        );
+        if event.data != expected {
+            return Err(OxidraError::Session(format!(
+                "provider context-limit intent at seq {} does not match the frozen v1 profile",
+                event.seq
+            )));
+        }
+
+        let identity = (turn_id.to_owned(), response_attempt_id.to_owned());
+        let matching_starts = starts.get(&identity).map(Vec::as_slice).unwrap_or_default();
+        if matching_starts.len() != 1 || matching_starts[0].seq != response_started_seq {
+            return Err(OxidraError::Session(format!(
+                "provider context-limit intent at seq {} does not bind one exact response.started seq {}",
+                event.seq, response_started_seq
+            )));
+        }
+        let start = matching_starts[0];
+        if start.seq >= event.seq || start.data.get("context") != Some(context) {
+            return Err(OxidraError::Session(format!(
+                "provider context-limit intent at seq {} does not inherit its response.started context",
+                event.seq
+            )));
+        }
+        let matching_terminals = terminals
+            .get(&identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if matching_terminals.len() != 1 || matching_terminals[0].seq != event.seq {
+            return Err(OxidraError::Session(format!(
+                "provider context-limit intent at seq {} is not the unique response terminal",
+                event.seq
+            )));
+        }
+        intents.insert(
+            event.seq,
+            ValidatedProviderContextLimitIntentV1 {
+                failed_seq: event.seq,
+                turn_id: turn_id.to_owned(),
+                response_attempt_id: response_attempt_id.to_owned(),
+                error: error.to_owned(),
+                context: context.clone(),
+            },
+        );
+    }
+
+    let mut limits_by_identity = HashMap::<Identity, Vec<&JournalEvent>>::new();
+    let mut completed_intents = HashMap::<u64, &JournalEvent>::new();
+    for event in events
+        .iter()
+        .filter(|event| event.kind == "context.limit_reached")
+    {
+        let Some(data) = event.data.as_object() else {
+            continue;
+        };
+        if let (Some(turn_id), Some(response_attempt_id)) = (
+            event.turn_id.as_deref(),
+            data.get("response_attempt_id").and_then(Value::as_str),
+        ) {
+            limits_by_identity
+                .entry((turn_id.to_owned(), response_attempt_id.to_owned()))
+                .or_default()
+                .push(event);
+        }
+
+        let has_version = data.contains_key(PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_FIELD);
+        let has_intent_seq = data.contains_key(PROVIDER_CONTEXT_LIMIT_INTENT_SEQ_FIELD);
+        if !has_version && !has_intent_seq {
+            continue;
+        }
+        if !has_version || !has_intent_seq {
+            return Err(OxidraError::Session(format!(
+                "context.limit_reached at seq {} carries a partial provider context-limit intent binding",
+                event.seq
+            )));
+        }
+        let version = data
+            .get(PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_FIELD)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "context.limit_reached at seq {} has no provider context-limit intent version",
+                    event.seq
+                ))
+            })?;
+        if version != PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_V1 {
+            return Err(OxidraError::Session(format!(
+                "unsupported provider context-limit intent version {version} at seq {}",
+                event.seq
+            )));
+        }
+        let intent_seq = data
+            .get(PROVIDER_CONTEXT_LIMIT_INTENT_SEQ_FIELD)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "context.limit_reached at seq {} has no provider context-limit intent seq",
+                    event.seq
+                ))
+            })?;
+        let intent = intents.get(&intent_seq).ok_or_else(|| {
+            OxidraError::Session(format!(
+                "context.limit_reached at seq {} references unknown provider context-limit intent seq {intent_seq}",
+                event.seq
+            ))
+        })?;
+        if event.turn_id.as_deref() != Some(intent.turn_id.as_str())
+            || event.seq <= intent.failed_seq
+        {
+            return Err(OxidraError::Session(format!(
+                "context.limit_reached at seq {} does not follow its exact provider context-limit intent",
+                event.seq
+            )));
+        }
+        let expected = provider_context_limit_event_data_v1(
+            &intent.response_attempt_id,
+            intent.failed_seq,
+            &intent.error,
+            intent.context.clone(),
+        );
+        if event.data != expected {
+            return Err(OxidraError::Session(format!(
+                "context.limit_reached at seq {} does not match its frozen provider context-limit intent",
+                event.seq
+            )));
+        }
+        if completed_intents.insert(intent_seq, event).is_some() {
+            return Err(OxidraError::Session(format!(
+                "provider context-limit intent at seq {intent_seq} has more than one context.limit_reached event"
+            )));
+        }
+    }
+
+    let mut actions = Vec::new();
+    for intent in intents.values() {
+        let identity = (intent.turn_id.clone(), intent.response_attempt_id.clone());
+        let matching_limits = limits_by_identity
+            .get(&identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if matching_limits.is_empty() {
+            actions.push(ProviderContextLimitRecoveryAction {
+                turn_id: intent.turn_id.clone(),
+                data: provider_context_limit_event_data_v1(
+                    &intent.response_attempt_id,
+                    intent.failed_seq,
+                    &intent.error,
+                    intent.context.clone(),
+                ),
+            });
+            continue;
+        }
+        if matching_limits.len() != 1
+            || completed_intents
+                .get(&intent.failed_seq)
+                .is_none_or(|event| event.seq != matching_limits[0].seq)
+        {
+            return Err(OxidraError::Session(format!(
+                "provider context-limit intent at seq {} has an ambiguous context.limit_reached projection",
+                intent.failed_seq
+            )));
+        }
+    }
+    Ok(actions)
+}
+
+fn validate_provider_context_limit_turns_v1(
+    events: &[JournalEvent],
+    turn_ids: &HashSet<String>,
+) -> Result<()> {
+    if turn_ids.is_empty() {
+        return Ok(());
+    }
+    let mut scoped = HashMap::<&str, Vec<JournalEvent>>::new();
+    for event in events {
+        let Some(turn_id) = event.turn_id.as_deref() else {
+            continue;
+        };
+        if turn_ids.contains(turn_id) {
+            scoped.entry(turn_id).or_default().push(event.clone());
+        }
+    }
+    for turn_id in turn_ids {
+        let events = scoped
+            .get(turn_id.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        crate::turn::validate_turn_recovery(events).map_err(|error| {
+            OxidraError::Session(format!(
+                "provider context-limit transaction for turn {turn_id} fails the canonical turn recovery reducer: {error}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct UnstartedTool {
     response_seq: u64,
@@ -1691,6 +2207,52 @@ mod tests {
         SessionHeader::new(root, "test-model")
     }
 
+    fn append_provider_context_limit_intent_prefix(
+        journal: &mut SessionJournal,
+        turn_id: &str,
+        response_attempt_id: &str,
+    ) -> (JournalEvent, JournalEvent, Value) {
+        journal
+            .append_and_sync(
+                "user.message",
+                Some(turn_id),
+                json!({
+                    "item":{"role":"user","content":"oversized prompt"},
+                    "turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let context = json!({
+            "measurement": {"request_digest": "context-digest"},
+            "estimated_next_input_tokens": 1_000_000,
+            "tools_event_seq": 1,
+        });
+        let started = journal
+            .append_and_sync(
+                "response.started",
+                Some(turn_id),
+                json!({
+                    "response_attempt_id":response_attempt_id,
+                    "response_index":1,
+                    "context":context.clone(),
+                }),
+            )
+            .unwrap();
+        let failed = journal
+            .append_and_sync(
+                "response.failed",
+                Some(turn_id),
+                provider_context_limit_failed_data_v1(
+                    response_attempt_id,
+                    started.seq,
+                    "context_length_exceeded",
+                    context.clone(),
+                ),
+            )
+            .unwrap();
+        (started, failed, context)
+    }
+
     #[test]
     fn creates_layout_and_round_trips_raw_events() {
         let temp = TempDir::new().unwrap();
@@ -2018,6 +2580,362 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].started_seq, 2);
         assert_eq!(pending[0].call_id.as_deref(), Some("call-3"));
+    }
+
+    #[test]
+    fn reopens_provider_context_limit_intent_as_one_pending_audit_event() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("provider-context-limit-intent", header(temp.path()))
+            .unwrap();
+        let (_started, failed, context) = append_provider_context_limit_intent_prefix(
+            &mut journal,
+            "turn-context-limit",
+            "attempt-context-limit",
+        );
+        drop(journal);
+
+        let recovered = store.open("provider-context-limit-intent").unwrap();
+        assert_eq!(
+            recovered.recovery_info().recovered_provider_context_limits,
+            1
+        );
+        assert_eq!(recovered.recovery_info().aborted_responses, 0);
+        assert!(recovered.recovery_info().recovered());
+        let events = recovered.read_events().unwrap();
+        let limits = events
+            .iter()
+            .filter(|event| event.kind == "context.limit_reached")
+            .collect::<Vec<_>>();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].turn_id.as_deref(), Some("turn-context-limit"));
+        assert_eq!(
+            limits[0].data,
+            provider_context_limit_event_data_v1(
+                "attempt-context-limit",
+                failed.seq,
+                "context_length_exceeded",
+                context,
+            )
+        );
+        crate::turn::validate_turn_recovery(&events)
+            .expect("recovered context limit must satisfy the turn recovery reducer");
+        drop(recovered);
+
+        let reopened = store.open("provider-context-limit-intent").unwrap();
+        assert_eq!(
+            reopened.recovery_info().recovered_provider_context_limits,
+            0
+        );
+        assert_eq!(
+            reopened
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "context.limit_reached")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reopens_provider_context_limit_after_truncating_partial_audit_event() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("provider-context-limit-partial", header(temp.path()))
+            .unwrap();
+        append_provider_context_limit_intent_prefix(
+            &mut journal,
+            "turn-context-limit",
+            "attempt-context-limit",
+        );
+        journal
+            .file
+            .write_all(br#"{"schema":1,"seq":5,"kind":"context.limit_reached"#)
+            .unwrap();
+        journal.sync().unwrap();
+        drop(journal);
+
+        let recovered = store.open("provider-context-limit-partial").unwrap();
+        assert!(recovered.recovery_info().truncated_tail.is_some());
+        assert_eq!(
+            recovered.recovery_info().recovered_provider_context_limits,
+            1
+        );
+        assert_eq!(
+            recovered
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "context.limit_reached")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn complete_provider_context_limit_transaction_is_not_duplicated() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("provider-context-limit-complete", header(temp.path()))
+            .unwrap();
+        journal
+            .append_and_sync(
+                "user.message",
+                Some("turn-context-limit"),
+                json!({
+                    "item":{"role":"user","content":"oversized prompt"},
+                    "turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let context = json!({"measurement":{"request_digest":"context-digest"}});
+        let started = journal
+            .append_and_sync(
+                "response.started",
+                Some("turn-context-limit"),
+                json!({
+                    "response_attempt_id":"attempt-context-limit",
+                    "response_index":1,
+                    "context":context.clone(),
+                }),
+            )
+            .unwrap();
+        journal
+            .append_provider_context_limit_v1(
+                "turn-context-limit",
+                "attempt-context-limit",
+                started.seq,
+                "context_length_exceeded",
+                context,
+            )
+            .unwrap();
+        drop(journal);
+
+        let reopened = store.open("provider-context-limit-complete").unwrap();
+        assert_eq!(
+            reopened.recovery_info().recovered_provider_context_limits,
+            0
+        );
+        assert_eq!(
+            reopened
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "context.limit_reached")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn provider_context_limit_intent_v1_literal_profile_is_frozen() {
+        assert_eq!(PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_V1, 1);
+        let context = json!({
+            "measurement":{"request_digest":"frozen-context-digest"},
+            "estimated_next_input_tokens":1234,
+        });
+        assert_eq!(
+            provider_context_limit_failed_data_v1(
+                "attempt-frozen",
+                17,
+                "context_length_exceeded",
+                context.clone(),
+            ),
+            json!({
+                "response_attempt_id":"attempt-frozen",
+                "response_started_seq":17,
+                "error":"context_length_exceeded",
+                "error_code":"provider_context_limit",
+                "provider_context_limit_intent_version":1,
+                "context":context,
+            })
+        );
+        assert_eq!(
+            provider_context_limit_event_data_v1(
+                "attempt-frozen",
+                18,
+                "context_length_exceeded",
+                context.clone(),
+            ),
+            json!({
+                "error":"context_length_exceeded",
+                "source":"provider",
+                "response_attempt_id":"attempt-frozen",
+                "context":context,
+                "provider_context_limit_intent_version":1,
+                "provider_context_limit_intent_seq":18,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_context_limit_writer_validates_the_exact_start_before_writing() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("provider-context-limit-writer", header(temp.path()))
+            .unwrap();
+        let context = json!({"measurement":{"request_digest":"context-digest"}});
+        let started = journal
+            .append_and_sync(
+                "response.started",
+                Some("turn-context-limit"),
+                json!({
+                    "response_attempt_id":"attempt-context-limit",
+                    "response_index":1,
+                    "context":context,
+                }),
+            )
+            .unwrap();
+        let original_count = journal.read_events().unwrap().len();
+
+        let error = journal
+            .append_provider_context_limit_v1(
+                "turn-context-limit",
+                "attempt-context-limit",
+                started.seq,
+                "context_length_exceeded",
+                json!({"measurement":{"request_digest":"different"}}),
+            )
+            .expect_err("the writer must inherit the exact response.started context");
+        assert!(error.to_string().contains("does not inherit"));
+        assert_eq!(journal.read_events().unwrap().len(), original_count);
+    }
+
+    #[test]
+    fn provider_context_limit_pair_reserves_capacity_before_the_intent_write() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("provider-context-limit-capacity", header(temp.path()))
+            .unwrap();
+        let context = json!({"measurement":{"request_digest":"context-digest"}});
+        let started = journal
+            .append_and_sync(
+                "response.started",
+                Some("turn-context-limit"),
+                json!({
+                    "response_attempt_id":"attempt-context-limit",
+                    "response_index":1,
+                    "context":context.clone(),
+                }),
+            )
+            .unwrap();
+        let mut next_seq = journal.next_seq();
+        let failed = planned_recovery_event(
+            journal.session_id(),
+            &mut next_seq,
+            "response.failed",
+            Some("turn-context-limit"),
+            provider_context_limit_failed_data_v1(
+                "attempt-context-limit",
+                started.seq,
+                "context_length_exceeded",
+                context.clone(),
+            ),
+        )
+        .unwrap();
+        let limit = planned_recovery_event(
+            journal.session_id(),
+            &mut next_seq,
+            "context.limit_reached",
+            Some("turn-context-limit"),
+            provider_context_limit_event_data_v1(
+                "attempt-context-limit",
+                failed.seq,
+                "context_length_exceeded",
+                context,
+            ),
+        )
+        .unwrap();
+        let original_size = journal.file.metadata().unwrap().len();
+        let original_seq = journal.next_seq();
+        let first_event_bytes = serde_json::to_vec(&failed).unwrap().len() as u64 + 1;
+
+        let error = journal
+            .append_prebuilt_batch_with_limit(&[failed, limit], original_size + first_event_bytes)
+            .expect_err("capacity for only the intent must reject the whole pair");
+        assert!(
+            error
+                .to_string()
+                .contains("journal transaction would exceed")
+        );
+        assert_eq!(journal.file.metadata().unwrap().len(), original_size);
+        assert_eq!(journal.next_seq(), original_seq);
+    }
+
+    #[test]
+    fn malformed_provider_context_limit_intents_fail_before_recovery_writes() {
+        for suffix in ["unknown-version", "missing-context", "changed-context"] {
+            let temp = TempDir::new().unwrap();
+            let store = SessionStore::new(temp.path()).unwrap();
+            let session_id = format!("provider-context-limit-{suffix}");
+            let mut journal = store
+                .create_with_id(&session_id, header(temp.path()))
+                .unwrap();
+            journal
+                .append_and_sync(
+                    "user.message",
+                    Some("turn-context-limit"),
+                    json!({
+                        "item":{"role":"user","content":"oversized prompt"},
+                        "turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION,
+                    }),
+                )
+                .unwrap();
+            let context = json!({
+                "measurement":{"request_digest":"context-digest"},
+                "estimated_next_input_tokens":1_000_000,
+            });
+            let started = journal
+                .append_and_sync(
+                    "response.started",
+                    Some("turn-context-limit"),
+                    json!({
+                        "response_attempt_id":"attempt-context-limit",
+                        "response_index":1,
+                        "context":context.clone(),
+                    }),
+                )
+                .unwrap();
+            let mut data = provider_context_limit_failed_data_v1(
+                "attempt-context-limit",
+                started.seq,
+                "context_length_exceeded",
+                context,
+            );
+            match suffix {
+                "unknown-version" => {
+                    data[PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_FIELD] = Value::from(2);
+                }
+                "missing-context" => {
+                    data.as_object_mut().unwrap().remove("context");
+                }
+                "changed-context" => {
+                    data["context"]["estimated_next_input_tokens"] = Value::from(42);
+                }
+                _ => unreachable!("fixed mutation table"),
+            }
+            journal
+                .append_and_sync("response.failed", Some("turn-context-limit"), data)
+                .unwrap();
+            let original_count = journal.read_events().unwrap().len();
+            drop(journal);
+
+            let error = match store.open(&session_id) {
+                Ok(_) => panic!("malformed intent {suffix} must fail closed"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("provider context-limit intent"),
+                "unexpected {suffix} error: {error}"
+            );
+            assert_eq!(store.inspect(&session_id).unwrap().len(), original_count);
+        }
     }
 
     #[test]
@@ -2497,10 +3415,10 @@ mod tests {
         let original_seq = journal.next_seq();
 
         let error = journal
-            .append_recovery_batch_with_limit(&events, original_size + first_event_bytes)
+            .append_prebuilt_batch_with_limit(&events, original_size + first_event_bytes)
             .expect_err("the complete transaction must not fit")
             .to_string();
-        assert!(error.contains("recovery transaction would exceed"));
+        assert!(error.contains("journal transaction would exceed"));
         assert_eq!(journal.file.metadata().unwrap().len(), original_size);
         assert_eq!(journal.next_seq(), original_seq);
         assert!(!journal.poisoned);

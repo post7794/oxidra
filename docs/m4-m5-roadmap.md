@@ -243,7 +243,7 @@ usage-anchor 修正若得到非正值，或锚点的真实 usage 与同版本估
 2. 达到 trigger，在安全 turn 边界选择一个连续旧前缀；同一个 request boundary 最多执行一次 compaction。
 3. Provider 完成后，先用候选 summary + tail 重建 prepared request；只有估算达到 target 才允许提交 checkpoint。
 4. 仍高于 target 时写 `compaction.failed`，保留上一有效 checkpoint 并终止当前请求；不能在同一 boundary 换 cutoff 再试。
-5. checkpoint 提交后重建普通请求并发送。若 Provider 仍报告 context limit，写 `response.failed` 与 `context.limit_reached`，保留 checkpoint 和 pending turn，不能循环 compact，不静默截断。
+5. checkpoint 提交后重建普通请求并发送。若 Provider 仍报告 context limit，先写带 v1 recovery intent 的 `response.failed`，再写由该 intent 派生的 `context.limit_reached`，保留 checkpoint 和 pending turn，不能循环 compact，不静默截断。两条 JSONL 在首字节写入前按完整事务预留容量；任意只保留完整首条的 crash prefix 都能在 reopen 时从 exact `response.started`、intent 和 context snapshot 唯一补全第二条。
 
 cutoff 不得进入最近两个完整 turn，当前开放 turn 也永不被覆盖。这是不可侵犯的安全下限，不是“必定能装下”的容量保证。若 checkpoint summary、最近两个完整 turn、当前开放 turn、当前 instructions 和 tools 仍无法达到可发送范围，则不生成不安全 checkpoint，记录明确原因并终止当前请求。不能切开 function call 与 function_call_output，也不能靠静默丢弃大工具输出兜底。
 
@@ -251,7 +251,7 @@ cutoff 不得进入最近两个完整 turn，当前开放 turn 也永不被覆�
 
 每次新建或 resume 都以当前解析出的 provider、model、context、instructions 和 tools 为运行真相；历史快照只供审计，不能复活旧配置。追加独立的 `context.configured`，保存 model、provider protocol、`provider_usage_domain`、window、reserve、usable、trigger、target、各字段来源和 measurement/estimator/request-shape version。
 
-为使 anchor 请求可重建，每次启动和 canonical tool 集合变化时追加 `context.tools`，保存完整 canonical tool schemas 与 digest；`response.started` 引用对应的 instructions/tools epoch，并保存本次完整请求估算与 digest、序列化请求字节数、请求可见的 journal seq、checkpoint/cutoff、使用的锚点 response seq、真实 anchor input、anchor estimate、有符号差值和最终 `next_input`。Provider 报告 context limit 时，`context.limit_reached` 保存同一组决策字段、response attempt 和来源。API key、endpoint 中的凭据/query 等秘密不得写入 journal。
+为使 anchor 请求可重建，每次启动和 canonical tool 集合变化时追加 `context.tools`，保存完整 canonical tool schemas 与 digest；`response.started` 引用对应的 instructions/tools epoch，并保存本次完整请求估算与 digest、序列化请求字节数、请求可见的 journal seq、checkpoint/cutoff、使用的锚点 response seq、真实 anchor input、anchor estimate、有符号差值和最终 `next_input`。Provider 报告 context limit 时，`response.failed` v1 intent 绑定 exact start seq、attempt、bounded error 和相同 context snapshot；`context.limit_reached` 保存同一组决策字段、来源以及 exact intent seq。API key、endpoint 中的凭据/query 等秘密不得写入 journal。
 
 ### 3.3 Compaction 单位与边界
 
@@ -469,7 +469,7 @@ M4 当前按实际使用数据推迟，本节不再是 M5 第一版的实现前�
 
 - Provider 失败、取消、空 summary、summary 超限或校验失败：写 failed/aborted，不启用半成品 checkpoint，并停止当前请求。
 - 最新 checkpoint 的 parent、cutoff 或 digest 不合法：明确报 session 错误，不能静默换回全量投影继续请求。
-- compaction 后的普通请求仍被 Provider 判定 context 超限：写 `response.failed` 与 `context.limit_reached` 并停止。
+- compaction 后的普通请求仍被 Provider 判定 context 超限：提交可恢复的 v1 `response.failed` intent 与其 `context.limit_reached` projection 并停止；完整首条、缺失或残缺第二条的前缀由 session-open 补全。
 - 无可压缩完整前缀，或最近两个完整 turn 与当前开放 turn 本身已无法安全装入：写明原因并停止。
 - 不在同一个 request boundary 连续尝试不同 prompt、不同 cutoff 或不同模型。
 - 停止后保留状态；显式 retry/abandon 必须留下可审计事件，不能静默修改旧 journal。
@@ -478,7 +478,7 @@ compaction 本质上是有损操作。可靠性来自保留原文、保守保留
 
 “保留供重试”必须有可执行协议：
 
-1. 唯一共享的 turn-recovery reducer 校验 `turn.abandoned` 与 `turn.retry_started`。两者必须满足 `user.message < context.limit_reached < control event`，引用对应 user seq，不能指向已完成 turn，不能重复；retry intent 还必须带固定版本、唯一 ID，并引用当前最新 limit。Provider 来源的 limit 必须用 `response_attempt_id` 绑定同 turn、更早的 `response.failed`。Agent pending、projection 和 history 都只能消费这个 reducer 的验证结果，伪造控制事件一律 fail closed。
+1. 唯一共享的 turn-recovery reducer 校验 `turn.abandoned` 与 `turn.retry_started`。两者必须满足 `user.message < context.limit_reached < control event`，引用对应 user seq，不能指向已完成 turn，不能重复；retry intent 还必须带固定版本、唯一 ID，并引用当前最新 limit。Provider 来源的 limit 必须用 `response_attempt_id` 绑定同 turn、更早的 `response.failed`。新 writer 的 failed terminal 同时携带独立版本的 context-limit recovery intent；session-open 在任何 recovery 写入前验证 exact start/terminal/context、未知版本和完整字段 profile，缺失 projection 时把 canonical `context.limit_reached` 纳入同一个预留 recovery batch。Agent pending、projection 和 history 只消费补全后的既有 turn reducer 结果，伪造控制事件一律 fail closed。
 2. `run_turn` 在追加新 `user.message` 前检查 pending；存在 pending 时返回明确错误，因此 `-p --resume` 不会继续叠加新消息，也不会再次毒化 session。
 3. `--retry-pending --resume <ID>` 先同步写入 `turn.retry_started`，再在原 `turn_id` 和原 `user.message` 上继续，不重复追加 prompt，也不需要用 abandon 模拟 retry。崩溃若发生在 intent sync 后、Provider dispatch 前，resume 复用同一 intent；若 response attempt 已开始后崩溃，统一恢复为 `response.aborted`，下一次显式 retry 写入新的 intent 后继续。
 4. `--abandon-pending --resume <ID>` 只追加经 reducer 校验的 `turn.abandoned`；之后可以在同一次进程中用 `-p` 提交替代 prompt，或进入 REPL。该事件只改变 projection/history，不删除 journal 原文。
@@ -527,7 +527,7 @@ source projection v1-v3 保持原始字节与接受/拒绝语义；source projec
 
 1. 已实现真实 Provider `compact_once` 内核：复用已注册的六类 v1 协议、无 tools、8192 输出上限、完整 raw response/usage 提交，并让 Agent 在有效 checkpoint 存在时实际使用 checkpoint + tail projection。默认关闭的实验入口已经接入。
 2. 已实现当前 session、最新 checkpoint 覆盖前缀内的 `history_search` / `history_turn` / `history_artifact`：同一 request boundary 只读一次 journal，schema 和执行器绑定同一不可变 snapshot；确定性检索、引用、cursor、artifact schema v1/v2 校验和单 turn 配额已经接入 Agent 主循环。
-3. 已实现 model-aware context 配置、prepared-request 精确 request-shape 测量、`context.configured` / `context.tools` / `response.started` / `context.limit_reached` 审计、真实 usage 差分锚点，以及 Provider context-limit 的 retry/abandon E2E。估算只用于 telemetry 和显式 opt-in compaction planning；普通请求不再被 heuristic 伪装成 hard limit 拦截。
+3. 已实现 model-aware context 配置、prepared-request 精确 request-shape 测量、`context.configured` / `context.tools` / `response.started` / `context.limit_reached` 审计、真实 usage 差分锚点，以及 Provider context-limit 的 retry/abandon E2E。context-limit writer 使用容量预留的 v1 intent transaction；session-open 能从完整 `response.failed` 加缺失/残缺 audit 行的 crash prefix 恢复且不重复。估算只用于 telemetry 和显式 opt-in compaction planning；普通请求不再被 heuristic 伪装成 hard limit 拦截。
 4. 已完成内核级连续两次真实 `compact_once`，并加入 compaction request-boundary v1-v5 的数据模型、provider-attempt/checkpoint 绑定、fail-closed 纯 reducer、版本化 request-slot 状态机、旧 checkpointed budget terminal 的原子兼容迁移、bound Provider 调用和 session-open 恢复：失败 child 不替换 parent checkpoint，随后以同一候选显式重试可形成合法子链，最终 projection 只使用最新 summary + tail。Agent/CLI pending 管理、projection/history abandon 语义，以及“retry intent 已同步但新 attempt 尚未写入”、“legacy budget migration 已 fsync 但正常 response 尚未开始”和“resolved_without_checkpoint 已 fsync 但 normal response 尚未开始”三个窗口的跨进程强杀恢复 E2E 已完成；后两者由新 CLI 进程继续同一 prompt，且不会重复写 migration intent、resolution、checkpoint 或原 user message。
 5. 已接入默认关闭的自动 preflight/trigger 实验入口，并完成 Provider context-limit after-checkpoint、retry/replan、no-checkpoint resolution、legacy budget migration 和 CLI resume/强杀恢复闭环。
 6. 已加入 `examples/compaction_drift.rs` 与不可变 fixture/metric 版本：使用 production prompt、低权限 envelope、无 tools 和 8192 输出上限，对父摘要连续执行至少 10 次真实重摘要，并保存 Provider usage domain、prompt/envelope/request-chain hash、raw response、usage 和逐事实/分类保留指标。rescore 模式只有在逐轮 input/summary hash 与当前 prompt/envelope 完全匹配时才能复用 live 输出，不产生新 Provider 调用。
@@ -555,7 +555,7 @@ source projection v1-v3 保持原始字节与接受/拒绝语义；source projec
 - 单独 `compaction.started` 恢复为 aborted，partial summary 不使用。
 - 现有 journal sync/损坏尾行测试继续通过；进程级故障注入覆盖真实 `compact_once` 的 started 已同步、Provider 已完成但 checkpoint 尚未落盘、checkpoint 已同步三个窗口，证明恢复不启用未提交 summary。
 - compaction usage 和时间完整写入 checkpoint；M4 推迟期间不做累计预算判断。
-- 压缩失败、无候选或压缩后无法达到 target 时终止当前请求；同一 boundary 不循环 compact。Provider context-limit retry 使用既有持久化 intent；compaction boundary v1-v5 独立记录 started/checkpointed/failed/retry/resolve/abandon，boundary v4 只承载严格限定的 legacy budget migration，boundary v5 支持严格证据绑定的 no-checkpoint resolution，并始终保持原 user message。Agent/CLI pending 管理、projection/history abandon 语义和跨进程闭环 E2E 已实现。source projection v4 已表达 boundary abandon，并由字面量 fixture 证明 v3 仍保留旧 prompt、v4 才排除整 turn；历史 v1-v3 checkpoint 的安全 barrier 继续按其持久化版本执行。
+- 压缩失败、无候选或压缩后无法达到 target 时终止当前请求；同一 boundary 不循环 compact。Provider context-limit retry 使用既有持久化 intent；Provider failure 自身还携带独立的 context-limit intent v1，使 `response.failed` 已完整而 `context.limit_reached` 缺失/残缺的 crash prefix 可唯一补全。compaction boundary v1-v5 独立记录 started/checkpointed/failed/retry/resolve/abandon，boundary v4 只承载严格限定的 legacy budget migration，boundary v5 支持严格证据绑定的 no-checkpoint resolution，并始终保持原 user message。Agent/CLI pending 管理、projection/history abandon 语义和跨进程闭环 E2E 已实现。source projection v4 已表达 boundary abandon，并由字面量 fixture 证明 v3 仍保留旧 prompt、v4 才排除整 turn；历史 v1-v3 checkpoint 的安全 barrier 继续按其持久化版本执行。
 - history 三个工具只访问最新 checkpoint 覆盖前缀，使用稳定排序、带引用分页和硬输出配额；无 checkpoint 时不额外暴露历史。
 - history cursor、排序、分页、artifact ID/hash 授权和当前用户 turn 累计配额均有确定性测试；崩溃/resume 不重置配额，耗尽后移除 history schemas。
 - 同一 journal 在不同 render/折叠设置下生成完全相同的 Provider projection 字节。

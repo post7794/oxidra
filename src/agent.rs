@@ -525,13 +525,14 @@ impl Agent {
             outcome.context = Some(context.clone());
             self.ensure_provider_call_budget(turn_id)?;
             let response_attempt_id = Uuid::now_v7().to_string();
-            self.journal.append_and_sync(
+            let response_context = prepared_tools.context.audit_value()?;
+            let response_started = self.journal.append_and_sync(
                 "response.started",
                 Some(turn_id),
                 json!({
                     "response_attempt_id": response_attempt_id,
                     "response_index": outcome.responses + 1,
-                    "context": prepared_tools.context.audit_value()?,
+                    "context": response_context.clone(),
                 }),
             )?;
             if let Err(error) = observer.on_response_started() {
@@ -565,24 +566,12 @@ impl Agent {
                     return Err(error);
                 }
                 Err(OxidraError::ProviderContextLimit(reason)) => {
-                    self.journal.append_and_sync(
-                        "response.failed",
-                        Some(turn_id),
-                        json!({
-                            "response_attempt_id": response_attempt_id,
-                            "error": response_status_text_for_journal(&reason),
-                            "error_code": "provider_context_limit",
-                        }),
-                    )?;
-                    self.journal.append_and_sync(
-                        "context.limit_reached",
-                        Some(turn_id),
-                        json!({
-                            "error": response_status_text_for_journal(&reason),
-                            "source": "provider",
-                            "response_attempt_id": response_attempt_id,
-                            "context": prepared_tools.context.audit_value()?,
-                        }),
+                    self.journal.append_provider_context_limit_v1(
+                        turn_id,
+                        &response_attempt_id,
+                        response_started.seq,
+                        &reason,
+                        response_context,
                     )?;
                     return Err(OxidraError::ProviderContextLimit(reason));
                 }
@@ -4144,6 +4133,54 @@ mod tests {
         (user.seq, limit.seq)
     }
 
+    fn append_provider_context_limit_intent_prefix(
+        journal: &mut SessionJournal,
+        turn_id: &str,
+        prompt: &str,
+    ) {
+        journal
+            .append_and_sync(
+                "user.message",
+                Some(turn_id),
+                json!({
+                    "item":{"role":"user","content":prompt},
+                    "turn_boundary_version":TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let context = json!({
+            "measurement":{"request_digest":"context-intent-digest"},
+            "estimated_next_input_tokens":1_000_000,
+            "tools_event_seq":1,
+        });
+        let started = journal
+            .append_and_sync(
+                "response.started",
+                Some(turn_id),
+                json!({
+                    "response_attempt_id":"attempt-context-intent",
+                    "response_index":1,
+                    "context":context.clone(),
+                }),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "response.failed",
+                Some(turn_id),
+                json!({
+                    "response_attempt_id":"attempt-context-intent",
+                    "response_started_seq":started.seq,
+                    "error":"context_length_exceeded",
+                    "error_code":"provider_context_limit",
+                    "provider_context_limit_intent_version":
+                        crate::session::PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_V1,
+                    "context":context,
+                }),
+            )
+            .unwrap();
+    }
+
     fn append_open_compaction_boundary(
         journal: &mut SessionJournal,
         turn_id: &str,
@@ -5591,13 +5628,31 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, OxidraError::ProviderContextLimit(_)));
         assert_eq!(provider.requests().len(), 1);
-        let event = agent
-            .journal()
-            .read_events()
-            .unwrap()
-            .into_iter()
+        let events = agent.journal().read_events().unwrap();
+        let started = events
+            .iter()
+            .find(|event| event.kind == "response.started")
+            .unwrap();
+        let failed = events
+            .iter()
+            .find(|event| event.kind == "response.failed")
+            .unwrap();
+        let event = events
+            .iter()
             .find(|event| event.kind == "context.limit_reached")
             .unwrap();
+        assert_eq!(
+            failed.data["provider_context_limit_intent_version"],
+            crate::session::PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_V1
+        );
+        assert_eq!(failed.data["response_started_seq"], started.seq);
+        assert_eq!(failed.data["context"], started.data["context"]);
+        assert_eq!(
+            event.data["provider_context_limit_intent_version"],
+            crate::session::PROVIDER_CONTEXT_LIMIT_INTENT_VERSION_V1
+        );
+        assert_eq!(event.data["provider_context_limit_intent_seq"], failed.seq);
+        assert_eq!(event.data["context"], failed.data["context"]);
         assert!(event.data["context"]["measurement"]["request_digest"].is_string());
         assert!(event.data["context"]["estimated_next_input_tokens"].is_u64());
         assert!(event.data["context"]["tools_event_seq"].is_u64());
@@ -5624,6 +5679,143 @@ mod tests {
             1,
             "a blocked resume must not append another user message"
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_provider_context_limit_intent_blocks_new_prompt_and_retries_original() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "context-limit-intent-retry-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        append_provider_context_limit_intent_prefix(
+            &mut journal,
+            "limited-turn",
+            "original oversized prompt",
+        );
+        drop(journal);
+
+        let journal = store.open("context-limit-intent-retry-test").unwrap();
+        assert_eq!(journal.recovery_info().recovered_provider_context_limits, 1);
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("retried original")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let pending = agent.pending_context_turns().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].prompt, "original oversized prompt");
+        let error = agent
+            .run_turn(
+                "replacement must be blocked",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OxidraError::ApprovalRequired(_)));
+        assert!(provider.requests().is_empty());
+        assert_eq!(
+            count_events(&agent.journal().read_events().unwrap(), "user.message"),
+            1
+        );
+
+        let outcome = agent
+            .retry_pending_context_turn(
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "retried original");
+        assert!(agent.pending_context_turns().unwrap().is_empty());
+        assert_eq!(provider.requests().len(), 1);
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "context.limit_reached"), 1);
+        assert_eq!(count_events(&events, "turn.retry_started"), 1);
+    }
+
+    #[tokio::test]
+    async fn recovered_provider_context_limit_intent_can_be_abandoned() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "context-limit-intent-abandon-test",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        append_provider_context_limit_intent_prefix(
+            &mut journal,
+            "limited-turn",
+            "original oversized prompt",
+        );
+        drop(journal);
+
+        let journal = store.open("context-limit-intent-abandon-test").unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let provider = Arc::new(RecordingProvider::new([final_turn("replacement accepted")]));
+        let mut agent = Agent::new(
+            provider.clone(),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            agent
+                .abandon_pending_context_turns("replace the oversized request")
+                .unwrap(),
+            1
+        );
+        assert!(agent.pending_context_turns().unwrap().is_empty());
+        let outcome = agent
+            .run_turn(
+                "replacement prompt",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut DenyApproval,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.text, "replacement accepted");
+        assert_eq!(provider.requests().len(), 1);
+        let events = agent.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "turn.abandoned"), 1);
+        assert_eq!(count_events(&events, "user.message"), 2);
     }
 
     #[tokio::test]

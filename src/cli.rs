@@ -561,6 +561,12 @@ fn validate_resumed_session(
             recovery.aborted_responses
         );
     }
+    if recovery.recovered_provider_context_limits > 0 {
+        eprintln!(
+            "Recovered {} Provider context-limit audit event(s) from durable response intent.",
+            recovery.recovered_provider_context_limits
+        );
+    }
     if recovery.aborted_compactions > 0 {
         eprintln!(
             "Recovered {} unterminated compaction attempt(s) as aborted.",

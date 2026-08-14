@@ -125,7 +125,8 @@ provided for the current process.
 At the end of each completed turn, stderr prints the model, accumulated token
 usage, and the approximate context size for the next request. The estimate is
 telemetry, not a tokenizer-backed hard limit. A structured Provider context
-limit becomes a recoverable pending turn. In an interactive TTY, edit
+limit becomes a recoverable pending turn; its durable failure intent can
+reconstruct a missing or partial audit event after a crash. In an interactive TTY, edit
 replacement lines are shown in red/green; `-p` and redirected output remain
 plain text.
 
