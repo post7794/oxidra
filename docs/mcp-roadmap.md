@@ -247,13 +247,25 @@ projection 和 history 各自“碰巧做出相同判断”：
   字段更大，但不能先写入一个冻结 reader 必然拒绝的 terminal。
 - Provider context-limit 使用独立的 intent v1：其 error 的空值、16 KiB byte limit、UTF-8
   截断边界和 `<truncated>` 后缀均由独立 v1 profile 冻结，不依赖 MCP 当前 status helper。
-  普通 `response.started` 只有在 Provider dispatch 前保护冻结的 1 MiB durable-outcome
-  headroom 后才可同步；一次性 admission capability 阻止其他 append 占用 reserve。
+  新 turn 在首次 `user.message` fsync 前先取得冻结的 1 MiB turn transaction admission；容量
+  不足时 journal 不产生该 user event，也不进入 preparation、compaction 或 Provider dispatch。
+  普通 `response.started` 只有在 Provider dispatch 前取得 typed durable-outcome admission 后才可
+  同步；只有确定的 pre-start capacity denial 可以消费 turn reserve 写 bounded cancellation，
+  protocol、sequence、serialization、poison 或 I/O 错误均 fail closed，不能伪装成容量不足。
   `response.failed` 绑定 exact `response.started` seq、attempt、bounded error 与 context
   snapshot，随后 `context.limit_reached` 反向引用 exact intent seq，并只用一次 durability
   barrier；若 crash prefix 只有 started，reserve 足以写 recovery abort + marker；若只保留完整
   intent，session-open 会在任何其他 recovery 写入前验证并补全 projection。未知版本、字段漂移
   或 snapshot 不一致均 fail closed。
+- turn、普通 response 与 compaction 的 admission capability 都是一次性 guard；若 future 在首次
+  terminal 前被 timeout/drop/abort，guard 的 `Drop` 会把当前 journal handle 标记为
+  reopen-required。该 handle 不得继续读取或追加；关闭后由统一 session-open reducer按磁盘上
+  实际完整 prefix补 bare-turn cancellation、response/compaction abort 和必要 marker/boundary repair。
+- compaction Provider dispatch 在 `compaction.started` 前保护冻结的 2 MiB bounded
+  outcome/recovery headroom。attempt terminal 与可选 boundary terminal 作为一个预构建
+  transaction、一次 durability barrier提交；full checkpoint 或 raw-response audit 容量不足时
+  primary transaction 零写入，并用同一 capability提交带 raw-response byte count/SHA-256 的
+  bounded `compaction.failed`，不会把已执行 attempt 留给无空间可用的后续恢复。
 - lifecycle 必须使用 canonical `call_id`。generic reducer 兼容的 `id` alias 不能结算 MCP
   call；turn/call/provider、参数 digest、started seq、registry/execution provenance 和 terminal
   状态迁移均由同一 validator 证明。
@@ -273,6 +285,12 @@ projection 和 history 各自“碰巧做出相同判断”：
   marker。marker authorization、pending/unstarted identity 与 slot call 状态均使用一次构建的
   索引，恢复主路径受限为 journal/call 数量的线性扫描。恢复中途再次崩溃时，下一次 reopen
   仅为剩余调用生成新的有界 marker。
+- 上述 turn/attempt admission 只证明首个 user intent、Provider terminal 与 compaction terminal
+  有 bounded 收尾空间；它**尚未**授权 `response.completed` 携带的整批未启动 tool calls。
+  在 Agent MCP glue 前必须冻结 response-batch admission：把 ordered call count、arguments 总编码
+  大小和最坏 recovery/finalization transaction 一并纳入 commit 条件，或者改用 compact batch
+  terminal。否则一个合法的 4096-call completed response 仍可能占满 journal，随后 crash recovery
+  无空间写 marker/skip；固定 1 MiB turn reserve 不能替代按 batch 大小计算的 durable ownership。
 - schema profile v1 也是 validator v1 的冻结传递依赖；历史 `tool.started` 不读取未来默认
   profile。未知 call-chain、activation、provenance 或 profile 版本一律 fail closed。
 - coordinator 不再独立扫描 `response.completed`；它只消费 call-chain validator 按 activation

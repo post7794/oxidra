@@ -54,7 +54,9 @@ use crate::projection::{
     source_projection_supports_boundary_exclusions, validate_response_output_items,
 };
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
-use crate::session::{JournalEvent, ProviderResponseDispatchAdmissionV1, SessionJournal};
+use crate::session::{
+    DispatchAdmissionErrorV1, JournalEvent, ProviderResponseDispatchAdmissionV1, SessionJournal,
+};
 use crate::tools::{BuiltinTools, ToolContext};
 use crate::turn::{
     PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION, ProviderRequestSlotState,
@@ -453,18 +455,36 @@ impl Agent {
             "role": "user",
             "content": prompt,
         });
-        let user_event = self.journal.append_and_sync(
-            "user.message",
-            Some(&turn_id),
-            json!({
-                "item": user_item,
-                "turn_boundary_version": TURN_BOUNDARY_VERSION,
-            }),
-        )?;
-        let turn_start_seq = user_event.seq;
+        let mut turn_admission = self
+            .journal
+            .append_user_message_with_turn_admission_v1(
+                &turn_id,
+                json!({
+                    "item": user_item,
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .map_err(DispatchAdmissionErrorV1::into_error)?;
+        let turn_start_seq = self.journal.next_seq().checked_sub(1).ok_or_else(|| {
+            OxidraError::Session("admitted user.message has no durable sequence".to_owned())
+        })?;
 
-        self.run_existing_turn(&turn_id, turn_start_seq, cancellation, observer, approval)
-            .await
+        let result = self
+            .run_existing_turn(&turn_id, turn_start_seq, cancellation, observer, approval)
+            .await;
+        let cancellation_reason = result.as_ref().err().map(ToString::to_string);
+        if let Err(settle_error) = self
+            .journal
+            .finish_turn_transaction_v1(&mut turn_admission, cancellation_reason.as_deref())
+        {
+            return match result {
+                Ok(_) => Err(settle_error),
+                Err(run_error) => Err(OxidraError::Session(format!(
+                    "turn execution failed ({run_error}); durable turn settlement also failed ({settle_error})"
+                ))),
+            };
+        }
+        result
     }
 
     /// 从已同步的 user.message 继续执行；retry 恢复使用它避免重复追加 prompt。
@@ -535,17 +555,12 @@ impl Agent {
                 }),
             ) {
                 Ok(admission) => admission,
-                Err(admission_error) => {
-                    let cancellation = self.append_turn_cancelled(
-                        turn_id,
-                        "Provider dispatch was denied before response.started because durable outcome capacity could not be reserved",
-                    );
-                    if let Err(cancellation_error) = cancellation {
-                        return Err(OxidraError::Session(format!(
-                            "Provider dispatch admission failed ({admission_error}); the undispatched turn also could not be terminalized ({cancellation_error})"
-                        )));
-                    }
-                    return Err(admission_error);
+                Err(DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(error)) => {
+                    return Err(error);
+                }
+                Err(DispatchAdmissionErrorV1::Fatal(error)) => {
+                    self.journal.mark_reopen_required();
+                    return Err(error);
                 }
             };
             if let Err(error) = observer.on_response_started() {
@@ -3474,6 +3489,7 @@ mod tests {
     use crate::session::{JournalEvent, SessionHeader, SessionStore};
     use crate::turn::{CompletionEvidence, TurnState, segment_turns};
     use crate::types::AssistantTurn;
+    use tokio::sync::Notify;
 
     struct FinalResponseProvider;
 
@@ -3482,6 +3498,10 @@ mod tests {
     struct ObserverEventProvider;
 
     struct ProviderFailureProvider;
+
+    struct PendingResponseProvider {
+        entered: Arc<Notify>,
+    }
 
     #[derive(Default)]
     struct CancellationAwareCompactionProvider {
@@ -3615,6 +3635,19 @@ mod tests {
             Err(OxidraError::Provider(
                 "injected compaction provider failure".to_owned(),
             ))
+        }
+    }
+
+    #[async_trait]
+    impl ResponseProvider for PendingResponseProvider {
+        async fn respond(
+            &self,
+            _request: ResponseRequest,
+            _observer: &mut dyn StreamObserver,
+            _cancellation: CancellationToken,
+        ) -> Result<AssistantTurn> {
+            self.entered.notify_one();
+            std::future::pending::<Result<AssistantTurn>>().await
         }
     }
 
@@ -5632,8 +5665,8 @@ mod tests {
         assert!(provider.requests().is_empty());
         let events = agent.journal().read_events().unwrap();
         assert_eq!(count_events(&events, "response.started"), 0);
-        assert_eq!(count_events(&events, "turn.cancelled"), 1);
-        assert_eq!(count_events(&events, "user.message"), 1);
+        assert_eq!(count_events(&events, "turn.cancelled"), 0);
+        assert_eq!(count_events(&events, "user.message"), 0);
 
         drop(agent);
         let reopened = store
@@ -5643,6 +5676,48 @@ mod tests {
             count_events(&reopened.read_events().unwrap(), "response.started"),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_run_turn_during_provider_await_requires_reopen() {
+        let entered = Arc::new(Notify::new());
+        let provider = Arc::new(PendingResponseProvider {
+            entered: Arc::clone(&entered),
+        });
+        let (temp, mut agent) = automatic_compaction_test_agent_with_provider(
+            "provider-admission-future-drop",
+            0,
+            0,
+            provider,
+            false,
+        );
+        let mut observer = NoopObserver;
+        let mut approval = DenyApproval;
+        let mut future = Box::pin(agent.run_turn(
+            "wait until the Provider request is in flight",
+            CancellationToken::new(),
+            &mut observer,
+            &mut approval,
+        ));
+        tokio::select! {
+            () = entered.notified() => {}
+            result = &mut future => panic!("Provider should remain pending, got {result:?}"),
+        }
+        drop(future);
+
+        let error = agent
+            .journal()
+            .read_events()
+            .expect_err("an abnormally dropped dispatch capability must poison normal reuse");
+        assert!(error.to_string().contains("reopen"));
+        drop(agent);
+
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let reopened = store.open("provider-admission-future-drop").unwrap();
+        let events = reopened.read_events().unwrap();
+        assert_eq!(count_events(&events, "response.started"), 1);
+        assert_eq!(count_events(&events, "response.aborted"), 1);
+        assert_eq!(count_events(&events, "turn.cancelled"), 0);
     }
 
     #[tokio::test]

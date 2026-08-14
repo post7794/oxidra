@@ -195,7 +195,12 @@ fn force_kill_after_each_synced_turn_boundary_is_recoverable() {
         let recovered = journal.read_events().expect("read recovered journal");
         drop(journal);
 
-        assert_recovered_state(sync_point, &recovered, recovery.aborted_responses);
+        assert_recovered_state(
+            sync_point,
+            &recovered,
+            recovery.aborted_responses,
+            recovery.cancelled_turns,
+        );
     }
 }
 
@@ -2197,6 +2202,7 @@ fn assert_recovered_state(
     sync_point: SyncPoint,
     events: &[oxidra::session::JournalEvent],
     aborted_responses: usize,
+    cancelled_turns: usize,
 ) {
     let turns = segment_turns(events).expect("segment recovered journal");
     let prefixes = complete_prefix_candidates(events).expect("derive recovered cutoffs");
@@ -2206,18 +2212,26 @@ fn assert_recovered_state(
             assert!(turns.is_empty());
             assert!(prefixes.is_empty());
             assert_eq!(aborted_responses, 0);
+            assert_eq!(cancelled_turns, 0);
         }
         SyncPoint::UserMessage => {
             assert_eq!(turns.len(), 1);
-            assert_eq!(turns[0].state, TurnState::OpenTail);
+            assert_eq!(turns[0].state, TurnState::Cancelled);
             assert!(prefixes.is_empty());
             assert_eq!(aborted_responses, 0);
+            assert_eq!(cancelled_turns, 1);
+            assert!(events.iter().any(|event| {
+                event.kind == "turn.cancelled"
+                    && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
+            }));
+            assert!(events.iter().any(|event| event.kind == "journal.recovered"));
         }
         SyncPoint::ResponseStarted => {
             assert_eq!(turns.len(), 1);
             assert_eq!(turns[0].state, TurnState::Aborted);
             assert!(prefixes.is_empty());
             assert_eq!(aborted_responses, 1);
+            assert_eq!(cancelled_turns, 0);
             assert_eq!(
                 events
                     .iter()
@@ -2241,6 +2255,7 @@ fn assert_recovered_state(
                 }]
             );
             assert_eq!(aborted_responses, 0);
+            assert_eq!(cancelled_turns, 0);
         }
         SyncPoint::TurnCompleted => {
             assert_eq!(turns.len(), 1);
@@ -2256,6 +2271,7 @@ fn assert_recovered_state(
                 }]
             );
             assert_eq!(aborted_responses, 0);
+            assert_eq!(cancelled_turns, 0);
         }
     }
 }

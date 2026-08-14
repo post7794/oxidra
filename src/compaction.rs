@@ -26,7 +26,10 @@ use crate::projection::{
     source_projection_supports_boundary_exclusions, validate_response_output_items,
 };
 use crate::provider::{ResponseProvider, ResponseRequest, StreamObserver, parse_usage};
-use crate::session::{JournalEvent, SessionJournal};
+use crate::session::{
+    CompactionProviderDispatchAdmissionV1, DispatchAdmissionErrorV1, DurableOutcomeCommitErrorV1,
+    JournalEvent, SessionJournal,
+};
 use crate::turn::{
     CompletionEvidence, ProviderRequestSlotState, TURN_BOUNDARY_VALIDATOR_VERSION, TurnState,
     complete_prefix_candidates_for_version, is_provider_slot_event_kind,
@@ -38,6 +41,9 @@ pub const COMPACTION_STARTED_KIND: &str = "compaction.started";
 pub const COMPACTION_CHECKPOINT_KIND: &str = "compaction.checkpoint";
 pub const COMPACTION_FAILED_KIND: &str = "compaction.failed";
 pub const COMPACTION_ABORTED_KIND: &str = "compaction.aborted";
+const MAX_COMPACTION_OUTCOME_STATUS_BYTES_V1: usize = 16 * 1024;
+const COMPACTION_OUTCOME_EMPTY_STATUS_V1: &str = "unspecified compaction status";
+const COMPACTION_OUTCOME_TRUNCATION_SUFFIX_V1: &str = "<truncated>";
 
 // The provider attempt lifecycle above is not sufficient to recover the
 // *user turn* that caused an automatic compaction.  A process can stop before
@@ -3583,29 +3589,44 @@ where
         model: model.to_owned(),
         extra,
     };
-    let started_event = journal.append_and_sync(
-        COMPACTION_STARTED_KIND,
-        None,
-        serde_json::to_value(&started)?,
-    )?;
+    let mut compaction_admission = match journal
+        .append_compaction_started_v1(serde_json::to_value(&started)?)
+    {
+        Ok(admission) => admission,
+        Err(DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(error)) => {
+            if let Err(boundary_error) = append_boundary_failure_if_bound(
+                journal,
+                boundary,
+                None,
+                "capacity_denied",
+                &error.to_string(),
+            ) {
+                return Err(OxidraError::Session(format!(
+                    "compaction dispatch capacity admission failed ({error}); its undispatched boundary also could not be settled ({boundary_error})"
+                )));
+            }
+            return Err(error);
+        }
+        Err(DispatchAdmissionErrorV1::Fatal(error)) => return Err(error),
+    };
+    let started_seq = journal.next_seq().checked_sub(1).ok_or_else(|| {
+        OxidraError::Session("admitted compaction.started has no durable sequence".to_owned())
+    })?;
 
     if cancellation.is_cancelled() {
         let message = "compaction was cancelled before the Provider request";
-        append_compaction_terminal(
+        commit_compaction_terminal_v1(
             journal,
-            COMPACTION_ABORTED_KIND,
-            &attempt_id,
-            started_event.seq,
-            "cancelled",
-            message,
-            Map::new(),
-        )?;
-        append_boundary_failure_if_bound(
-            journal,
-            boundary,
-            Some(&attempt_id),
-            "cancelled",
-            message,
+            &mut compaction_admission,
+            CompactionTerminalSpecV1 {
+                boundary,
+                kind: COMPACTION_ABORTED_KIND,
+                attempt_id: &attempt_id,
+                started_seq,
+                code: "cancelled",
+                message,
+                extra: Map::new(),
+            },
         )?;
         return Err(OxidraError::Interrupted);
     }
@@ -3648,21 +3669,18 @@ where
                 }
                 _ => (COMPACTION_FAILED_KIND, "local_error"),
             };
-            append_compaction_terminal(
+            commit_compaction_terminal_v1(
                 journal,
-                kind,
-                &attempt_id,
-                started_event.seq,
-                code,
-                &error.to_string(),
-                Map::new(),
-            )?;
-            append_boundary_failure_if_bound(
-                journal,
-                boundary,
-                Some(&attempt_id),
-                code,
-                &error.to_string(),
+                &mut compaction_admission,
+                CompactionTerminalSpecV1 {
+                    boundary,
+                    kind,
+                    attempt_id: &attempt_id,
+                    started_seq,
+                    code,
+                    message: &error.to_string(),
+                    extra: Map::new(),
+                },
             )?;
             return Err(error);
         }
@@ -3670,21 +3688,18 @@ where
 
     if cancellation.is_cancelled() {
         let message = "compaction was cancelled before checkpoint validation";
-        append_compaction_terminal(
+        commit_compaction_terminal_v1(
             journal,
-            COMPACTION_ABORTED_KIND,
-            &attempt_id,
-            started_event.seq,
-            "cancelled",
-            message,
-            compaction_response_audit(&turn, duration_ms),
-        )?;
-        append_boundary_failure_if_bound(
-            journal,
-            boundary,
-            Some(&attempt_id),
-            "cancelled",
-            message,
+            &mut compaction_admission,
+            CompactionTerminalSpecV1 {
+                boundary,
+                kind: COMPACTION_ABORTED_KIND,
+                attempt_id: &attempt_id,
+                started_seq,
+                code: "cancelled",
+                message,
+                extra: compaction_response_audit(&turn, duration_ms),
+            },
         )?;
         return Err(OxidraError::Interrupted);
     }
@@ -3692,67 +3707,60 @@ where
     let (summary, usage) = match validate_compaction_turn(&turn, candidate.usage_contract_version) {
         Ok(validated) => validated,
         Err(error) => {
-            append_compaction_terminal(
+            commit_compaction_terminal_v1(
                 journal,
-                COMPACTION_FAILED_KIND,
-                &attempt_id,
-                started_event.seq,
-                "invalid_response",
-                &error.to_string(),
-                compaction_response_audit(&turn, duration_ms),
-            )?;
-            append_boundary_failure_if_bound(
-                journal,
-                boundary,
-                Some(&attempt_id),
-                "invalid_response",
-                &error.to_string(),
+                &mut compaction_admission,
+                CompactionTerminalSpecV1 {
+                    boundary,
+                    kind: COMPACTION_FAILED_KIND,
+                    attempt_id: &attempt_id,
+                    started_seq,
+                    code: "invalid_response",
+                    message: &error.to_string(),
+                    extra: compaction_response_audit(&turn, duration_ms),
+                },
             )?;
             return Err(error);
         }
     };
     if let Err(error) = validate_summary_before_commit(&summary) {
-        append_compaction_terminal(
+        commit_compaction_terminal_v1(
             journal,
-            COMPACTION_FAILED_KIND,
-            &attempt_id,
-            started_event.seq,
-            "post_validation_failed",
-            &error.to_string(),
-            compaction_response_audit(&turn, duration_ms),
-        )?;
-        append_boundary_failure_if_bound(
-            journal,
-            boundary,
-            Some(&attempt_id),
-            "post_validation_failed",
-            &error.to_string(),
+            &mut compaction_admission,
+            CompactionTerminalSpecV1 {
+                boundary,
+                kind: COMPACTION_FAILED_KIND,
+                attempt_id: &attempt_id,
+                started_seq,
+                code: "post_validation_failed",
+                message: &error.to_string(),
+                extra: compaction_response_audit(&turn, duration_ms),
+            },
         )?;
         return Err(error);
     }
     if cancellation.is_cancelled() {
         let message = "compaction was cancelled before checkpoint commit";
-        append_compaction_terminal(
+        commit_compaction_terminal_v1(
             journal,
-            COMPACTION_ABORTED_KIND,
-            &attempt_id,
-            started_event.seq,
-            "cancelled",
-            message,
-            compaction_response_audit(&turn, duration_ms),
-        )?;
-        append_boundary_failure_if_bound(
-            journal,
-            boundary,
-            Some(&attempt_id),
-            "cancelled",
-            message,
+            &mut compaction_admission,
+            CompactionTerminalSpecV1 {
+                boundary,
+                kind: COMPACTION_ABORTED_KIND,
+                attempt_id: &attempt_id,
+                started_seq,
+                code: "cancelled",
+                message,
+                extra: compaction_response_audit(&turn, duration_ms),
+            },
         )?;
         return Err(OxidraError::Interrupted);
     }
 
+    let omitted_checkpoint_audit =
+        omitted_compaction_audit_v1(&compaction_response_audit(&turn, duration_ms));
     let mut checkpoint = Checkpoint {
-        attempt_id,
+        attempt_id: attempt_id.clone(),
         checkpoint_id: Uuid::now_v7().to_string(),
         parent_checkpoint_id: candidate.parent_checkpoint_id.clone(),
         covers_through_seq: candidate.covers_through_seq,
@@ -3771,24 +3779,56 @@ where
         journal_seq: 0,
         extra: Map::new(),
     };
-    let checkpoint_event = journal.append_and_sync(
-        COMPACTION_CHECKPOINT_KIND,
-        None,
-        serde_json::to_value(&checkpoint)?,
-    )?;
-    checkpoint.journal_seq = checkpoint_event.seq;
-    if let Some(boundary) = boundary {
-        journal.append_and_sync(
-            COMPACTION_BOUNDARY_CHECKPOINTED_KIND,
-            None,
+    let checkpoint_seq = journal.next_seq();
+    let boundary_terminal = boundary
+        .map(|boundary| {
             serde_json::to_value(CompactionBoundaryCheckpointed {
                 boundary_id: boundary.boundary_id.clone(),
                 checkpoint_id: checkpoint.checkpoint_id.clone(),
-                checkpoint_seq: checkpoint_event.seq,
+                checkpoint_seq,
                 extra: Map::new(),
-            })?,
-        )?;
-    }
+            })
+            .map(|data| (COMPACTION_BOUNDARY_CHECKPOINTED_KIND, data))
+            .map_err(OxidraError::from)
+        })
+        .transpose()?;
+    let committed = match journal.commit_compaction_outcome_v1(
+        &mut compaction_admission,
+        COMPACTION_CHECKPOINT_KIND,
+        serde_json::to_value(&checkpoint)?,
+        boundary_terminal,
+        false,
+    ) {
+        Ok(events) => events,
+        Err(DurableOutcomeCommitErrorV1::Fatal(error)) => return Err(error),
+        Err(DurableOutcomeCommitErrorV1::CapacityDenied(error)) => {
+            let fallback_message = format!(
+                "validated compaction response could not be committed as a checkpoint: {error}"
+            );
+            if let Err(fallback_error) = commit_compaction_terminal_v1(
+                journal,
+                &mut compaction_admission,
+                CompactionTerminalSpecV1 {
+                    boundary,
+                    kind: COMPACTION_FAILED_KIND,
+                    attempt_id: &attempt_id,
+                    started_seq,
+                    code: "checkpoint_commit_capacity",
+                    message: &fallback_message,
+                    extra: omitted_checkpoint_audit,
+                },
+            ) {
+                return Err(OxidraError::Session(format!(
+                    "checkpoint commit failed ({error}); reserved compaction failure also failed ({fallback_error})"
+                )));
+            }
+            return Err(error);
+        }
+    };
+    let checkpoint_event = committed.first().ok_or_else(|| {
+        OxidraError::Session("compaction checkpoint transaction committed no event".to_owned())
+    })?;
+    checkpoint.journal_seq = checkpoint_event.seq;
     Ok(checkpoint)
 }
 
@@ -4066,27 +4106,147 @@ pub fn validate_recorded_compaction_response(
     Ok(summary)
 }
 
-fn append_compaction_terminal(
-    journal: &mut SessionJournal,
-    kind: &str,
+fn compaction_status_for_outcome_v1(input: &str) -> String {
+    let input = if input.is_empty() {
+        COMPACTION_OUTCOME_EMPTY_STATUS_V1
+    } else {
+        input
+    };
+    if input.len() <= MAX_COMPACTION_OUTCOME_STATUS_BYTES_V1 {
+        return input.to_owned();
+    }
+    let mut end = MAX_COMPACTION_OUTCOME_STATUS_BYTES_V1
+        .saturating_sub(COMPACTION_OUTCOME_TRUNCATION_SUFFIX_V1.len())
+        .min(input.len());
+    while !input.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut output = input[..end].to_owned();
+    output.push_str(COMPACTION_OUTCOME_TRUNCATION_SUFFIX_V1);
+    output
+}
+
+fn compaction_failure_data_v1(
     attempt_id: &str,
     started_seq: u64,
     code: &str,
     message: &str,
     mut extra: Map<String, Value>,
-) -> Result<()> {
+) -> Result<Value> {
     extra.insert("started_seq".to_owned(), json!(started_seq));
-    journal.append_and_sync(
+    serde_json::to_value(CompactionFailure {
+        attempt_id: attempt_id.to_owned(),
+        code: compaction_status_for_outcome_v1(code),
+        message: compaction_status_for_outcome_v1(message),
+        extra,
+    })
+    .map_err(OxidraError::from)
+}
+
+fn compaction_boundary_failure_data_v1(
+    boundary: Option<&CompactionBoundary>,
+    attempt_id: &str,
+    code: &str,
+    message: &str,
+) -> Result<Option<Value>> {
+    boundary
+        .map(|boundary| {
+            serde_json::to_value(CompactionBoundaryFailed {
+                boundary_id: boundary.boundary_id.clone(),
+                code: compaction_status_for_outcome_v1(code),
+                message: compaction_status_for_outcome_v1(message),
+                attempt_id: Some(attempt_id.to_owned()),
+                extra: Map::new(),
+            })
+            .map_err(OxidraError::from)
+        })
+        .transpose()
+}
+
+fn omitted_compaction_audit_v1(extra: &Map<String, Value>) -> Map<String, Value> {
+    let mut omitted = Map::new();
+    omitted.insert("response_audit_omitted".to_owned(), json!(true));
+    if let Some(duration_ms) = extra.get("duration_ms") {
+        omitted.insert("duration_ms".to_owned(), duration_ms.clone());
+    }
+    if let Some(raw_response) = extra.get("raw_response") {
+        if let Ok(encoded) = serde_json::to_vec(raw_response) {
+            omitted.insert("raw_response_bytes".to_owned(), json!(encoded.len()));
+            omitted.insert(
+                "raw_response_sha256".to_owned(),
+                json!(hex::encode(Sha256::digest(encoded))),
+            );
+        }
+    }
+    omitted
+}
+
+struct CompactionTerminalSpecV1<'a> {
+    boundary: Option<&'a CompactionBoundary>,
+    kind: &'a str,
+    attempt_id: &'a str,
+    started_seq: u64,
+    code: &'a str,
+    message: &'a str,
+    extra: Map<String, Value>,
+}
+
+fn commit_compaction_terminal_v1(
+    journal: &mut SessionJournal,
+    admission: &mut CompactionProviderDispatchAdmissionV1,
+    spec: CompactionTerminalSpecV1<'_>,
+) -> Result<()> {
+    let CompactionTerminalSpecV1 {
+        boundary,
         kind,
-        None,
-        serde_json::to_value(CompactionFailure {
-            attempt_id: attempt_id.to_owned(),
-            code: code.to_owned(),
-            message: message.to_owned(),
-            extra,
-        })?,
-    )?;
-    Ok(())
+        attempt_id,
+        started_seq,
+        code,
+        message,
+        extra,
+    } = spec;
+    let primary =
+        compaction_failure_data_v1(attempt_id, started_seq, code, message, extra.clone())?;
+    let boundary_data = compaction_boundary_failure_data_v1(boundary, attempt_id, code, message)?;
+    let primary_boundary = boundary_data
+        .clone()
+        .map(|data| (COMPACTION_BOUNDARY_FAILED_KIND, data));
+    match journal.commit_compaction_outcome_v1(
+        admission,
+        kind,
+        primary,
+        primary_boundary,
+        extra.is_empty(),
+    ) {
+        Ok(_) => Ok(()),
+        Err(DurableOutcomeCommitErrorV1::Fatal(error)) => Err(error),
+        Err(DurableOutcomeCommitErrorV1::CapacityDenied(primary_error)) => {
+            let fallback = compaction_failure_data_v1(
+                attempt_id,
+                started_seq,
+                code,
+                message,
+                omitted_compaction_audit_v1(&extra),
+            )?;
+            let fallback_boundary =
+                boundary_data.map(|data| (COMPACTION_BOUNDARY_FAILED_KIND, data));
+            journal
+                .commit_compaction_outcome_v1(
+                    admission,
+                    kind,
+                    fallback,
+                    fallback_boundary,
+                    true,
+                )
+                .map(|_| ())
+                .map_err(|fallback_error| {
+                    OxidraError::Session(format!(
+                        "compaction outcome commit failed ({primary_error}); reserved fallback also failed ({})",
+                        fallback_error.into_error()
+                    ))
+                })
+        }
+    }
 }
 
 fn compaction_response_audit(turn: &AssistantTurn, duration_ms: u64) -> Map<String, Value> {
@@ -4542,6 +4702,7 @@ mod tests {
     struct RecordingCompactionProvider {
         request: Mutex<Option<ResponseRequest>>,
         usage: Value,
+        raw_padding: usize,
     }
 
     impl RecordingCompactionProvider {
@@ -4558,7 +4719,14 @@ mod tests {
             Self {
                 request: Mutex::new(None),
                 usage,
+                raw_padding: 0,
             }
+        }
+
+        fn with_raw_padding(padding: usize) -> Self {
+            let mut provider = Self::new(20);
+            provider.raw_padding = padding;
+            provider
         }
     }
 
@@ -4587,6 +4755,7 @@ mod tests {
                 "status": "completed",
                 "output": output_items,
                 "usage": self.usage.clone(),
+                "provider_padding": "x".repeat(self.raw_padding),
             });
             Ok(AssistantTurn {
                 raw_response,
@@ -5009,6 +5178,133 @@ mod tests {
             chain.latest().expect("latest checkpoint").checkpoint_id,
             checkpoint.checkpoint_id
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_admission_denies_before_provider_when_outcome_headroom_is_unavailable() {
+        let (_temp, mut journal, candidate) = compaction_journal();
+        let current_size = journal
+            .journal_path()
+            .metadata()
+            .expect("journal metadata")
+            .len();
+        journal.set_byte_limit_for_tests(current_size + 128 * 1024);
+        let provider = RecordingCompactionProvider::new(20);
+        let error = compact_once(
+            &provider,
+            &mut journal,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .expect_err("compaction must be denied before Provider dispatch");
+        assert!(error.to_string().contains("outcome headroom"));
+        assert!(
+            provider
+                .request
+                .lock()
+                .expect("provider request lock")
+                .is_none()
+        );
+        assert!(
+            !journal
+                .read_events()
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == COMPACTION_STARTED_KIND)
+        );
+    }
+
+    #[test]
+    fn compaction_started_crash_recovery_fits_the_dispatch_time_reserve() {
+        let (temp, mut journal, candidate) = compaction_journal();
+        let current_size = journal
+            .journal_path()
+            .metadata()
+            .expect("journal metadata")
+            .len();
+        let byte_limit = current_size + 2 * 1024 * 1024 + 128 * 1024;
+        journal.set_byte_limit_for_tests(byte_limit);
+        let started = CompactionStarted {
+            attempt_id: "attempt-reserved-crash".to_owned(),
+            parent_checkpoint_id: candidate.parent_checkpoint_id.clone(),
+            covers_through_seq: candidate.covers_through_seq,
+            source: candidate.source.clone(),
+            source_digest: candidate.source_digest.clone(),
+            instructions: compaction_instructions(candidate.prompt_version)
+                .unwrap()
+                .to_owned(),
+            prompt_version: candidate.prompt_version,
+            summary_envelope_version: candidate.summary_envelope_version,
+            source_projection_version: candidate.source_projection_version,
+            turn_boundary_validator_version: candidate.turn_boundary_validator_version,
+            source_digest_version: candidate.source_digest_version,
+            usage_contract_version: candidate.usage_contract_version,
+            model: "test-model".to_owned(),
+            extra: Map::new(),
+        };
+        let admission = journal
+            .append_compaction_started_v1(serde_json::to_value(started).unwrap())
+            .expect("compaction start should fit with its recovery reserve");
+        drop(admission);
+        drop(journal);
+
+        let store = SessionStore::new(temp.path()).unwrap();
+        let reopened = store.open("compact-once-test").unwrap();
+        assert_eq!(reopened.recovery_info().aborted_compactions, 1);
+        assert!(reopened.read_events().unwrap().iter().any(|event| {
+            event.kind == COMPACTION_ABORTED_KIND
+                && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
+        }));
+        assert!(reopened.journal_path().metadata().unwrap().len() <= byte_limit);
+    }
+
+    #[tokio::test]
+    async fn oversized_checkpoint_uses_reserved_bounded_failure_terminal() {
+        let (_temp, mut journal, candidate) = compaction_journal();
+        let current_size = journal
+            .journal_path()
+            .metadata()
+            .expect("journal metadata")
+            .len();
+        journal.set_byte_limit_for_tests(current_size + 2 * 1024 * 1024 + 16 * 1024);
+        let provider = RecordingCompactionProvider::with_raw_padding(3 * 1024 * 1024);
+        let error = compact_once(
+            &provider,
+            &mut journal,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .expect_err("an oversized checkpoint must fall back to a bounded failure");
+        assert!(error.to_string().contains("would exceed"));
+        let events = journal.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == COMPACTION_STARTED_KIND)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == COMPACTION_CHECKPOINT_KIND)
+                .count(),
+            0
+        );
+        let failed = events
+            .iter()
+            .find(|event| event.kind == COMPACTION_FAILED_KIND)
+            .expect("bounded failure terminal");
+        assert_eq!(failed.data["response_audit_omitted"], true);
+        drop(journal);
     }
 
     #[tokio::test]

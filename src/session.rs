@@ -4,6 +4,10 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
@@ -14,11 +18,11 @@ use uuid::Uuid;
 
 use crate::compaction::{
     COMPACTION_ABORTED_KIND, COMPACTION_BOUNDARY_CHECKPOINTED_KIND,
-    COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_STARTED_KIND, CompactionBoundaryRecoveryAction,
-    compaction_boundary_recovery_actions,
+    COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_CHECKPOINT_KIND, COMPACTION_FAILED_KIND,
+    COMPACTION_STARTED_KIND, CompactionBoundary, CompactionBoundaryRecoveryAction,
+    CompactionBoundaryState, compaction_boundary_recovery_actions, validate_checkpoint_chain,
+    validate_compaction_boundary_chain,
 };
-#[cfg(test)]
-use crate::compaction::{COMPACTION_CHECKPOINT_KIND, COMPACTION_FAILED_KIND};
 use crate::error::{OxidraError, Result};
 use crate::event_kind::{
     is_compaction_lifecycle, is_compaction_terminal, is_response_terminal, is_tool_lifecycle,
@@ -27,7 +31,7 @@ use crate::event_kind::{
 use crate::mcp::{
     MAX_MCP_CALLS_PER_RESPONSE, MAX_RESPONSE_STATUS_TEXT_BYTES_V2, response_status_text_for_journal,
 };
-use crate::turn::validate_provider_request_slots_v2;
+use crate::turn::{TurnState, segment_turns, validate_provider_request_slots_v2};
 
 pub const JOURNAL_SCHEMA: u32 = 1;
 pub const SESSION_STARTED_KIND: &str = "session.started";
@@ -49,6 +53,16 @@ const PROVIDER_CONTEXT_LIMIT_EMPTY_ERROR_V1: &str = "unspecified response status
 const PROVIDER_CONTEXT_LIMIT_TRUNCATION_SUFFIX_V1: &str = "<truncated>";
 const MAX_PROVIDER_CONTEXT_LIMIT_CONTEXT_BYTES_V1: usize = 64 * 1024;
 const MAX_PROVIDER_RESPONSE_STATUS_BYTES_FOR_OUTCOME_V1: usize = 16 * 1024;
+const MAX_TURN_STATUS_BYTES_V1: usize = 16 * 1024;
+const TURN_STATUS_EMPTY_V1: &str = "unspecified turn status";
+const TURN_STATUS_TRUNCATION_SUFFIX_V1: &str = "<truncated>";
+/// Frozen reserve acquired before the first durable event of a new user turn.
+/// It covers a bounded same-process cancellation or the crash-recovery
+/// cancellation plus `journal.recovered`. Nested Provider attempts may require
+/// a larger reserve, but ordinary appends can never consume this floor while
+/// the turn capability remains active.
+const TURN_OUTCOME_HEADROOM_BYTES_V1: u64 = 1024 * 1024;
+const COMPACTION_OUTCOME_HEADROOM_BYTES_V1: u64 = 2 * 1024 * 1024;
 /// Frozen dispatch-admission reserve for one bounded response terminal, the
 /// two-event context-limit transaction, or crash recovery's abort + marker.
 /// The literal maximum profiles are serialized in a regression test; changing
@@ -312,8 +326,11 @@ impl SessionStore {
             next_seq: 1,
             recovery: RecoveryInfo::default(),
             poisoned: false,
+            reopen_required: Arc::new(AtomicBool::new(false)),
             byte_limit: MAX_SESSION_BYTES,
+            active_turn: None,
             active_provider_response: None,
+            active_compaction: None,
             mcp_resume_open_id: None,
             mcp_resume_eligibility_issued: false,
         };
@@ -395,6 +412,18 @@ impl SessionStore {
                     && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
             })
             .count();
+        let previously_cancelled_turns = prospective_events
+            .iter()
+            .filter(|event| {
+                event.kind == "turn.cancelled"
+                    && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
+                    && event
+                        .data
+                        .get("turn_outcome_admission_version")
+                        .and_then(Value::as_u64)
+                        == Some(1)
+            })
+            .count();
         crate::mcp::validate_mcp_call_chain(&prospective_events)?;
         let unstarted_tools = unstarted_tool_calls(&prospective_events);
         // Build every authorization payload before the first recovery write.
@@ -420,6 +449,7 @@ impl SessionStore {
             failed_compaction_boundaries,
             checkpointed_compaction_boundaries,
             recovered_provider_context_limits: provider_context_limit_actions.len(),
+            cancelled_turns: previously_cancelled_turns,
         };
 
         let mut journal = SessionJournal {
@@ -431,8 +461,11 @@ impl SessionStore {
             next_seq,
             recovery: RecoveryInfo::default(),
             poisoned: false,
+            reopen_required: Arc::new(AtomicBool::new(false)),
             byte_limit,
+            active_turn: None,
             active_provider_response: None,
+            active_compaction: None,
             // This nonce identifies the exact recovered journal handle that
             // authorized a later MCP resume.  A newly-created journal cannot
             // mint that capability, and reopening after dropping this handle
@@ -546,17 +579,9 @@ impl SessionStore {
             .saturating_add(recovered_boundaries.checkpointed);
         let mcp_turn_ids = crate::mcp::mcp_turn_ids(&prospective_events)?;
         validate_provider_request_slots_v2(&prospective_events, &mcp_turn_ids)?;
-        recovery.marker_seq = matching_recovery_marker(
-            &prospective_events[..original_event_count],
-            &recovery.in_doubt,
-            recovery.skipped_before_start,
-            recovery.aborted_responses,
-            recovery.aborted_compactions,
-            recovery.failed_compaction_boundaries,
-            recovery.checkpointed_compaction_boundaries,
-        );
-
-        let marker_required_without_tools = unstarted_tools.is_empty()
+        recovery.marker_seq =
+            matching_recovery_marker(&prospective_events[..original_event_count], &recovery);
+        let provisional_marker_required_without_tools = unstarted_tools.is_empty()
             && (recovery.truncated_tail.is_some()
                 || recovered_unfinished_response
                 || recovered_unfinished_compaction
@@ -566,7 +591,28 @@ impl SessionStore {
                 || (recovery.aborted_compactions > 0 && recovery.marker_seq.is_none())
                 || (recovery.failed_compaction_boundaries > 0 && recovery.marker_seq.is_none())
                 || (recovery.checkpointed_compaction_boundaries > 0
-                    && recovery.marker_seq.is_none()));
+                    && recovery.marker_seq.is_none())
+                || (recovery.cancelled_turns > 0 && recovery.marker_seq.is_none()));
+        let mut provisional_recovery = recovery.clone();
+        let provisional_mcp_events = plan_mcp_recovery_events(
+            journal.session_id(),
+            planned_seq,
+            &mut provisional_recovery,
+            &unstarted_tools,
+            provisional_marker_required_without_tools,
+        )?;
+        let mut after_lifecycle_recovery = prospective_events.clone();
+        after_lifecycle_recovery.extend(provisional_mcp_events);
+        let recoverable_turns = recoverable_open_turns_v1(&after_lifecycle_recovery)?;
+        recovery.cancelled_turns = recovery
+            .cancelled_turns
+            .saturating_add(recoverable_turns.len());
+        let recovered_open_turn = !recoverable_turns.is_empty();
+        recovery.marker_seq =
+            matching_recovery_marker(&prospective_events[..original_event_count], &recovery);
+        let marker_required_without_tools = unstarted_tools.is_empty()
+            && (provisional_marker_required_without_tools
+                || (!recoverable_turns.is_empty() && recovery.marker_seq.is_none()));
         // Freeze every recovery event before any transaction byte is written.
         // This includes generic aborts, compaction boundary terminals, MCP
         // markers and all authorized skips.
@@ -577,10 +623,35 @@ impl SessionStore {
             &unstarted_tools,
             marker_required_without_tools,
         )?;
+        if let Some(last) = mcp_recovery_events.last() {
+            planned_seq = last
+                .seq
+                .checked_add(1)
+                .ok_or_else(|| OxidraError::Session("journal sequence exhausted".to_owned()))?;
+        }
         prospective_events.extend(mcp_recovery_events.iter().cloned());
         planned_events.extend(mcp_recovery_events);
+        for turn in recoverable_turns {
+            stage_recovery_event(
+                session_id,
+                &mut planned_seq,
+                &mut planned_events,
+                &mut prospective_events,
+                "turn.cancelled",
+                Some(&turn.turn_id),
+                json!({
+                    "reason": "process stopped before the user turn acquired a durable outcome owner",
+                    "user_message_seq": turn.user_message_seq,
+                    "turn_outcome_admission_version": 1,
+                    "recovered": true,
+                }),
+            )?;
+        }
         crate::mcp::validate_mcp_call_chain(&prospective_events)?;
         validate_provider_request_slots_v2(&prospective_events, &mcp_turn_ids)?;
+        if recovered_open_turn {
+            segment_turns(&prospective_events)?;
+        }
         journal.append_prebuilt_batch(&planned_events)?;
         journal.recovery = recovery;
         Ok(journal)
@@ -605,6 +676,8 @@ pub struct RecoveryInfo {
     pub checkpointed_compaction_boundaries: usize,
     #[serde(default)]
     pub recovered_provider_context_limits: usize,
+    #[serde(default)]
+    pub cancelled_turns: usize,
 }
 
 impl RecoveryInfo {
@@ -612,6 +685,7 @@ impl RecoveryInfo {
         self.marker_seq.is_some()
             || self.normalized_missing_newline
             || self.recovered_provider_context_limits > 0
+            || self.cancelled_turns > 0
     }
 }
 
@@ -640,10 +714,21 @@ pub struct SessionJournal {
     next_seq: u64,
     recovery: RecoveryInfo,
     poisoned: bool,
+    reopen_required: Arc<AtomicBool>,
     byte_limit: u64,
+    active_turn: Option<ActiveTurnReservationV1>,
     active_provider_response: Option<ActiveProviderResponseReservationV1>,
+    active_compaction: Option<ActiveCompactionReservationV1>,
     mcp_resume_open_id: Option<String>,
     mcp_resume_eligibility_issued: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveTurnReservationV1 {
+    reservation_id: String,
+    turn_id: String,
+    user_message_seq: u64,
+    headroom_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -656,13 +741,104 @@ struct ActiveProviderResponseReservationV1 {
     headroom_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveCompactionReservationV1 {
+    reservation_id: String,
+    attempt_id: String,
+    started_seq: u64,
+    boundary: Option<Value>,
+    headroom_bytes: u64,
+}
+
 /// One-shot capability proving that `response.started` was synced only after
 /// reserving enough journal space for every bounded immediate terminal and
 /// the crash-recovery abort transaction. The token is intentionally neither
 /// `Clone` nor constructible outside this module.
+#[derive(Debug)]
 pub(crate) struct ProviderResponseDispatchAdmissionV1 {
     reservation_id: String,
     consumed: bool,
+    reopen_required: Arc<AtomicBool>,
+}
+
+/// One-shot capability proving that a new turn's `user.message` was synced
+/// only after protecting enough capacity to settle a pre-dispatch failure or
+/// crash. The token is deliberately owned by the `run_turn` future: abnormal
+/// future destruction marks the journal handle reopen-required.
+#[derive(Debug)]
+pub(crate) struct TurnTransactionAdmissionV1 {
+    reservation_id: String,
+    consumed: bool,
+    reopen_required: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompactionProviderDispatchAdmissionV1 {
+    reservation_id: String,
+    consumed: bool,
+    reopen_required: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+pub(crate) enum DispatchAdmissionErrorV1 {
+    CapacityDeniedBeforeStart(OxidraError),
+    Fatal(OxidraError),
+}
+
+#[derive(Debug)]
+pub(crate) enum DurableOutcomeCommitErrorV1 {
+    CapacityDenied(OxidraError),
+    Fatal(OxidraError),
+}
+
+impl DurableOutcomeCommitErrorV1 {
+    pub(crate) fn into_error(self) -> OxidraError {
+        match self {
+            Self::CapacityDenied(error) | Self::Fatal(error) => error,
+        }
+    }
+}
+
+impl DispatchAdmissionErrorV1 {
+    pub(crate) fn into_error(self) -> OxidraError {
+        match self {
+            Self::CapacityDeniedBeforeStart(error) | Self::Fatal(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchAdmissionErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CapacityDeniedBeforeStart(error) | Self::Fatal(error) => {
+                std::fmt::Display::fmt(error, formatter)
+            }
+        }
+    }
+}
+
+impl Drop for ProviderResponseDispatchAdmissionV1 {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.reopen_required.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for TurnTransactionAdmissionV1 {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.reopen_required.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for CompactionProviderDispatchAdmissionV1 {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.reopen_required.store(true, Ordering::Release);
+        }
+    }
 }
 
 impl SessionJournal {
@@ -721,6 +897,10 @@ impl SessionJournal {
         Ok(open_id)
     }
 
+    pub(crate) fn mark_reopen_required(&self) {
+        self.reopen_required.store(true, Ordering::Release);
+    }
+
     pub fn header(&self) -> Result<Option<SessionHeader>> {
         self.read_events()?
             .into_iter()
@@ -742,6 +922,23 @@ impl SessionJournal {
                     .to_owned(),
             ));
         }
+        if self.active_compaction.is_some() {
+            return Err(OxidraError::Session(
+                "an admitted compaction attempt must be terminalized through its dispatch capability"
+                    .to_owned(),
+            ));
+        }
+        let byte_limit = self.generic_append_byte_limit_v1()?;
+        self.append_with_limit(kind, turn_id, data, byte_limit)
+    }
+
+    fn append_with_limit(
+        &mut self,
+        kind: impl Into<String>,
+        turn_id: Option<&str>,
+        data: Value,
+        byte_limit: u64,
+    ) -> Result<JournalEvent> {
         let kind = kind.into();
         if kind.trim().is_empty() {
             return Err(OxidraError::Session(
@@ -768,11 +965,11 @@ impl SessionJournal {
         if current_size
             .saturating_add(encoded.len() as u64)
             .saturating_add(1)
-            > self.byte_limit
+            > byte_limit
         {
             return Err(OxidraError::Session(format!(
                 "session journal would exceed the {}-byte safety limit",
-                self.byte_limit
+                byte_limit
             )));
         }
         // Recovered journals need a read/write handle so Windows permits
@@ -788,6 +985,21 @@ impl SessionJournal {
         Ok(event)
     }
 
+    fn generic_append_byte_limit_v1(&self) -> Result<u64> {
+        match &self.active_turn {
+            Some(active) => self
+                .byte_limit
+                .checked_sub(active.headroom_bytes)
+                .ok_or_else(|| {
+                    OxidraError::Session(format!(
+                        "session journal cannot protect the {}-byte turn outcome headroom",
+                        active.headroom_bytes
+                    ))
+                }),
+            None => Ok(self.byte_limit),
+        }
+    }
+
     pub fn append_and_sync(
         &mut self,
         kind: impl Into<String>,
@@ -799,6 +1011,159 @@ impl SessionJournal {
         Ok(event)
     }
 
+    /// Start a new user turn only after protecting enough space to recover or
+    /// cancel every crash prefix that precedes the first Provider dispatch.
+    pub(crate) fn append_user_message_with_turn_admission_v1(
+        &mut self,
+        turn_id: &str,
+        data: Value,
+    ) -> std::result::Result<TurnTransactionAdmissionV1, DispatchAdmissionErrorV1> {
+        self.ensure_healthy()
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        if self.active_turn.is_some()
+            || self.active_provider_response.is_some()
+            || self.active_compaction.is_some()
+        {
+            return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                "a durable turn or Provider response admission is already active".to_owned(),
+            )));
+        }
+
+        let user_message_seq = self.next_seq();
+        user_message_seq.checked_add(2).ok_or_else(|| {
+            DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                "journal sequence cannot represent a recoverable user turn".to_owned(),
+            ))
+        })?;
+        let mut planned_seq = user_message_seq;
+        let user_event = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            "user.message",
+            Some(turn_id),
+            data,
+        )
+        .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        let mut prospective = self
+            .read_events()
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        prospective.push(user_event.clone());
+        segment_turns(&prospective).map_err(DispatchAdmissionErrorV1::Fatal)?;
+
+        let admission_limit = self
+            .byte_limit
+            .checked_sub(TURN_OUTCOME_HEADROOM_BYTES_V1)
+            .ok_or_else(|| {
+                DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(OxidraError::Session(
+                    format!(
+                        "session journal cannot reserve the {TURN_OUTCOME_HEADROOM_BYTES_V1}-byte turn outcome headroom"
+                    ),
+                ))
+            })?;
+        if !self
+            .preflight_prebuilt_batch_capacity(&[user_event.clone()], admission_limit)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?
+        {
+            return Err(DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(
+                OxidraError::Session(format!(
+                    "session journal cannot append user.message while preserving the {TURN_OUTCOME_HEADROOM_BYTES_V1}-byte turn outcome headroom"
+                )),
+            ));
+        }
+        self.append_prebuilt_batch_with_limit(&[user_event], admission_limit)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+
+        let reservation_id = Uuid::now_v7().to_string();
+        self.active_turn = Some(ActiveTurnReservationV1 {
+            reservation_id: reservation_id.clone(),
+            turn_id: turn_id.to_owned(),
+            user_message_seq,
+            headroom_bytes: TURN_OUTCOME_HEADROOM_BYTES_V1,
+        });
+        Ok(TurnTransactionAdmissionV1 {
+            reservation_id,
+            consumed: false,
+            reopen_required: Arc::clone(&self.reopen_required),
+        })
+    }
+
+    /// Release a turn admission after proving that the durable turn is already
+    /// owned by a terminal or explicit retry/abandon protocol. If the caller
+    /// returns an error before such an owner exists, consume the protected
+    /// reserve with one bounded `turn.cancelled` event.
+    pub(crate) fn finish_turn_transaction_v1(
+        &mut self,
+        admission: &mut TurnTransactionAdmissionV1,
+        cancellation_reason: Option<&str>,
+    ) -> Result<()> {
+        let active = self.active_turn_v1(admission)?.clone();
+        let events = self.read_events()?;
+        if turn_transaction_is_settled_v1(&events, &active.turn_id, active.user_message_seq)? {
+            self.active_turn = None;
+            admission.consumed = true;
+            return Ok(());
+        }
+
+        let Some(reason) = cancellation_reason else {
+            return Err(OxidraError::Session(format!(
+                "turn {} returned successfully without a durable terminal or recovery owner",
+                active.turn_id
+            )));
+        };
+        let reason = bounded_status_text_v1(
+            reason,
+            MAX_TURN_STATUS_BYTES_V1,
+            TURN_STATUS_EMPTY_V1,
+            TURN_STATUS_TRUNCATION_SUFFIX_V1,
+        );
+        let mut planned_seq = self.next_seq();
+        let cancelled = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            "turn.cancelled",
+            Some(&active.turn_id),
+            json!({
+                "reason": reason,
+                "user_message_seq": active.user_message_seq,
+                "turn_outcome_admission_version": 1,
+            }),
+        )?;
+        let encoded_bytes = encoded_journal_events_bytes(&[cancelled.clone()])?;
+        if encoded_bytes > active.headroom_bytes {
+            return Err(OxidraError::Session(format!(
+                "turn cancellation requires {encoded_bytes} bytes, exceeding its reserved {}-byte outcome headroom",
+                active.headroom_bytes
+            )));
+        }
+        let mut prospective = events;
+        prospective.push(cancelled.clone());
+        segment_turns(&prospective)?;
+        self.append_prebuilt_batch_with_limit(&[cancelled], self.byte_limit)?;
+        self.active_turn = None;
+        admission.consumed = true;
+        Ok(())
+    }
+
+    fn active_turn_v1(
+        &self,
+        admission: &TurnTransactionAdmissionV1,
+    ) -> Result<&ActiveTurnReservationV1> {
+        if admission.consumed {
+            return Err(OxidraError::Session(
+                "turn transaction admission was already consumed".to_owned(),
+            ));
+        }
+        self.active_turn
+            .as_ref()
+            .filter(|active| active.reservation_id == admission.reservation_id)
+            .ok_or_else(|| {
+                OxidraError::Session(
+                    "turn transaction admission does not match the active journal reservation"
+                        .to_owned(),
+                )
+            })
+    }
+
     /// Admit one Provider dispatch only after syncing `response.started` with
     /// a protected durable-outcome reserve. No other generic append is allowed
     /// until the returned capability commits exactly one response terminal.
@@ -806,28 +1171,45 @@ impl SessionJournal {
         &mut self,
         turn_id: &str,
         data: Value,
-    ) -> Result<ProviderResponseDispatchAdmissionV1> {
-        self.ensure_healthy()?;
+    ) -> std::result::Result<ProviderResponseDispatchAdmissionV1, DispatchAdmissionErrorV1> {
+        self.ensure_healthy()
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
         if self.active_provider_response.is_some() {
-            return Err(OxidraError::Session(
+            return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
                 "a Provider response dispatch admission is already active".to_owned(),
-            ));
+            )));
         }
-        let durable_prefix = self.read_events()?;
-        ensure_provider_dispatch_recovery_profile_v1(&durable_prefix)?;
+        if self.active_compaction.is_some() {
+            return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                "a compaction dispatch admission is already active".to_owned(),
+            )));
+        }
+        if let Some(active_turn) = &self.active_turn {
+            if active_turn.turn_id != turn_id {
+                return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                    "Provider response admission does not belong to the active turn transaction"
+                        .to_owned(),
+                )));
+            }
+        }
+        let durable_prefix = self
+            .read_events()
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        ensure_provider_dispatch_recovery_profile_v1(&durable_prefix)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
         let response_attempt_id = data
             .get("response_attempt_id")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                OxidraError::Session(
+                DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
                     "response.started has no response_attempt_id for dispatch admission".to_owned(),
-                )
+                ))
             })?
             .to_owned();
         let context = data.get("context").cloned().ok_or_else(|| {
-            OxidraError::Session(
+            DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
                 "response.started has no context snapshot for dispatch admission".to_owned(),
-            )
+            ))
         })?;
         let response_started_seq = self.next_seq();
         validate_provider_context_limit_writer_input_v1(
@@ -835,11 +1217,12 @@ impl SessionJournal {
             &response_attempt_id,
             response_started_seq,
             &context,
-        )?;
+        )
+        .map_err(DispatchAdmissionErrorV1::Fatal)?;
         response_started_seq.checked_add(3).ok_or_else(|| {
-            OxidraError::Session(
+            DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
                 "journal sequence cannot represent a Provider outcome transaction".to_owned(),
-            )
+            ))
         })?;
 
         let mut planned_seq = response_started_seq;
@@ -849,16 +1232,37 @@ impl SessionJournal {
             "response.started",
             Some(turn_id),
             data,
-        )?;
+        )
+        .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        let protected_headroom =
+            self.active_turn
+                .as_ref()
+                .map_or(PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1, |turn| {
+                    turn.headroom_bytes
+                        .max(PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1)
+                });
         let admission_limit = self
             .byte_limit
-            .checked_sub(PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1)
+            .checked_sub(protected_headroom)
             .ok_or_else(|| {
-                OxidraError::Session(format!(
-                    "session journal cannot reserve the {PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1}-byte Provider outcome headroom"
+                DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(OxidraError::Session(
+                    format!(
+                        "session journal cannot reserve the {protected_headroom}-byte Provider outcome headroom"
+                    ),
                 ))
             })?;
-        self.append_prebuilt_batch_with_limit(&[started], admission_limit)?;
+        if !self
+            .preflight_prebuilt_batch_capacity(&[started.clone()], admission_limit)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?
+        {
+            return Err(DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(
+                OxidraError::Session(format!(
+                    "session journal cannot append response.started while preserving the {protected_headroom}-byte Provider outcome headroom"
+                )),
+            ));
+        }
+        self.append_prebuilt_batch_with_limit(&[started], admission_limit)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
 
         let reservation_id = Uuid::now_v7().to_string();
         self.active_provider_response = Some(ActiveProviderResponseReservationV1 {
@@ -872,6 +1276,7 @@ impl SessionJournal {
         Ok(ProviderResponseDispatchAdmissionV1 {
             reservation_id,
             consumed: false,
+            reopen_required: Arc::clone(&self.reopen_required),
         })
     }
 
@@ -1037,10 +1442,247 @@ impl SessionJournal {
                 active.headroom_bytes
             )));
         }
-        self.append_prebuilt_batch_with_limit(events, self.byte_limit)?;
+        let byte_limit = if must_fit_headroom {
+            self.byte_limit
+        } else {
+            self.generic_append_byte_limit_v1()?
+        };
+        self.append_prebuilt_batch_with_limit(events, byte_limit)?;
         self.active_provider_response = None;
         admission.consumed = true;
         Ok(())
+    }
+
+    /// Admit one compaction Provider dispatch after syncing the exact
+    /// `compaction.started` intent while protecting a bounded failure/recovery
+    /// transaction. Boundary-owned attempts bind that same durable boundary
+    /// into the capability.
+    pub(crate) fn append_compaction_started_v1(
+        &mut self,
+        data: Value,
+    ) -> std::result::Result<CompactionProviderDispatchAdmissionV1, DispatchAdmissionErrorV1> {
+        self.ensure_healthy()
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        if self.active_provider_response.is_some() || self.active_compaction.is_some() {
+            return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                "a Provider dispatch admission is already active".to_owned(),
+            )));
+        }
+        let attempt_id = data
+            .get("attempt_id")
+            .and_then(Value::as_str)
+            .filter(|value| valid_provider_context_limit_identity_v1(value))
+            .ok_or_else(|| {
+                DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                    "compaction.started has no valid attempt_id for dispatch admission".to_owned(),
+                ))
+            })?
+            .to_owned();
+        let boundary = data.get("boundary").cloned();
+        if let Some(active_turn) = &self.active_turn {
+            let boundary_turn_id = boundary
+                .as_ref()
+                .and_then(|value| value.get("turn_id"))
+                .and_then(Value::as_str);
+            let boundary_user_seq = boundary
+                .as_ref()
+                .and_then(|value| value.get("user_message_seq"))
+                .and_then(Value::as_u64);
+            if boundary_turn_id != Some(active_turn.turn_id.as_str())
+                || boundary_user_seq != Some(active_turn.user_message_seq)
+            {
+                return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                    "compaction dispatch does not bind the active turn transaction".to_owned(),
+                )));
+            }
+        }
+
+        let durable_prefix = self
+            .read_events()
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        ensure_compaction_dispatch_recovery_profile_v1(&durable_prefix, boundary.as_ref())
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        let started_seq = self.next_seq();
+        started_seq.checked_add(3).ok_or_else(|| {
+            DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                "journal sequence cannot represent a compaction outcome transaction".to_owned(),
+            ))
+        })?;
+        let mut planned_seq = started_seq;
+        let started = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            COMPACTION_STARTED_KIND,
+            None,
+            data,
+        )
+        .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        let mut prospective = durable_prefix;
+        prospective.push(started.clone());
+        validate_checkpoint_chain(&prospective).map_err(DispatchAdmissionErrorV1::Fatal)?;
+        validate_compaction_boundary_chain(&prospective)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+
+        let protected_headroom =
+            self.active_turn
+                .as_ref()
+                .map_or(COMPACTION_OUTCOME_HEADROOM_BYTES_V1, |turn| {
+                    turn.headroom_bytes
+                        .max(COMPACTION_OUTCOME_HEADROOM_BYTES_V1)
+                });
+        let admission_limit = self
+            .byte_limit
+            .checked_sub(protected_headroom)
+            .ok_or_else(|| {
+                DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(OxidraError::Session(
+                    format!(
+                        "session journal cannot reserve the {protected_headroom}-byte compaction outcome headroom"
+                    ),
+                ))
+            })?;
+        if !self
+            .preflight_prebuilt_batch_capacity(&[started.clone()], admission_limit)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?
+        {
+            return Err(DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(
+                OxidraError::Session(format!(
+                    "session journal cannot append compaction.started while preserving the {protected_headroom}-byte compaction outcome headroom"
+                )),
+            ));
+        }
+        self.append_prebuilt_batch_with_limit(&[started], admission_limit)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+
+        let reservation_id = Uuid::now_v7().to_string();
+        self.active_compaction = Some(ActiveCompactionReservationV1 {
+            reservation_id: reservation_id.clone(),
+            attempt_id,
+            started_seq,
+            boundary,
+            headroom_bytes: COMPACTION_OUTCOME_HEADROOM_BYTES_V1,
+        });
+        Ok(CompactionProviderDispatchAdmissionV1 {
+            reservation_id,
+            consumed: false,
+            reopen_required: Arc::clone(&self.reopen_required),
+        })
+    }
+
+    /// Commit one complete compaction attempt transaction. Capacity denial is
+    /// reported before the first byte so the caller may consume the same
+    /// capability with a bounded failure fallback; all other failures are
+    /// fatal and must not trigger a second write attempt.
+    pub(crate) fn commit_compaction_outcome_v1(
+        &mut self,
+        admission: &mut CompactionProviderDispatchAdmissionV1,
+        compaction_kind: &str,
+        compaction_data: Value,
+        boundary_terminal: Option<(&str, Value)>,
+        must_fit_headroom: bool,
+    ) -> std::result::Result<Vec<JournalEvent>, DurableOutcomeCommitErrorV1> {
+        let active = self
+            .active_compaction_v1(admission)
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?
+            .clone();
+        if !matches!(
+            compaction_kind,
+            COMPACTION_CHECKPOINT_KIND | COMPACTION_FAILED_KIND | COMPACTION_ABORTED_KIND
+        ) {
+            return Err(DurableOutcomeCommitErrorV1::Fatal(OxidraError::Session(
+                "invalid compaction outcome kind".to_owned(),
+            )));
+        }
+        if compaction_data.get("attempt_id").and_then(Value::as_str)
+            != Some(active.attempt_id.as_str())
+        {
+            return Err(DurableOutcomeCommitErrorV1::Fatal(OxidraError::Session(
+                "compaction outcome does not bind its admitted attempt".to_owned(),
+            )));
+        }
+        if compaction_kind != COMPACTION_CHECKPOINT_KIND
+            && compaction_data.get("started_seq").and_then(Value::as_u64)
+                != Some(active.started_seq)
+        {
+            return Err(DurableOutcomeCommitErrorV1::Fatal(OxidraError::Session(
+                "compaction failure does not bind its exact admitted start".to_owned(),
+            )));
+        }
+        if active.boundary.is_some() != boundary_terminal.is_some() {
+            return Err(DurableOutcomeCommitErrorV1::Fatal(OxidraError::Session(
+                "compaction outcome does not settle its admitted boundary".to_owned(),
+            )));
+        }
+
+        let mut planned_seq = self.next_seq();
+        let terminal = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            compaction_kind,
+            None,
+            compaction_data,
+        )
+        .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        let mut events = vec![terminal];
+        if let Some((kind, data)) = boundary_terminal {
+            events.push(
+                planned_recovery_event(self.session_id(), &mut planned_seq, kind, None, data)
+                    .map_err(DurableOutcomeCommitErrorV1::Fatal)?,
+            );
+        }
+
+        let mut prospective = self
+            .read_events()
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        prospective.extend(events.iter().cloned());
+        validate_checkpoint_chain(&prospective).map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        validate_compaction_boundary_chain(&prospective)
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        let encoded_bytes =
+            encoded_journal_events_bytes(&events).map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        if must_fit_headroom && encoded_bytes > active.headroom_bytes {
+            return Err(DurableOutcomeCommitErrorV1::Fatal(OxidraError::Session(
+                format!(
+                    "bounded compaction outcome requires {encoded_bytes} bytes, exceeding its reserved {}-byte headroom",
+                    active.headroom_bytes
+                ),
+            )));
+        }
+        if !self
+            .preflight_prebuilt_batch_capacity(&events, self.byte_limit)
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?
+        {
+            return Err(DurableOutcomeCommitErrorV1::CapacityDenied(
+                OxidraError::Session(format!(
+                    "compaction outcome transaction would exceed the {}-byte safety limit",
+                    self.byte_limit
+                )),
+            ));
+        }
+        self.append_prebuilt_batch_with_limit(&events, self.byte_limit)
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        self.active_compaction = None;
+        admission.consumed = true;
+        Ok(events)
+    }
+
+    fn active_compaction_v1(
+        &self,
+        admission: &CompactionProviderDispatchAdmissionV1,
+    ) -> Result<&ActiveCompactionReservationV1> {
+        if admission.consumed {
+            return Err(OxidraError::Session(
+                "compaction dispatch admission was already consumed".to_owned(),
+            ));
+        }
+        self.active_compaction
+            .as_ref()
+            .filter(|active| active.reservation_id == admission.reservation_id)
+            .ok_or_else(|| {
+                OxidraError::Session(
+                    "compaction dispatch admission does not match the active journal reservation"
+                        .to_owned(),
+                )
+            })
     }
 
     /// Append a fully prebuilt durable transaction after proving the exact
@@ -1048,6 +1690,42 @@ impl SessionJournal {
     /// fails, and successful batches use one durability barrier.
     fn append_prebuilt_batch(&mut self, events: &[JournalEvent]) -> Result<()> {
         self.append_prebuilt_batch_with_limit(events, self.byte_limit)
+    }
+
+    /// Validate and size a prebuilt transaction without writing any byte.
+    /// `false` is the only capacity-denial result; malformed state,
+    /// serialization, metadata, and I/O failures remain fatal and must not be
+    /// rewritten by callers as a benign admission denial.
+    fn preflight_prebuilt_batch_capacity(
+        &mut self,
+        events: &[JournalEvent],
+        byte_limit: u64,
+    ) -> Result<bool> {
+        self.ensure_healthy()?;
+        if events.is_empty() {
+            return Ok(true);
+        }
+        let mut expected_seq = self.next_seq;
+        for event in events {
+            if event.schema != JOURNAL_SCHEMA
+                || event.session_id != self.session_id
+                || event.seq != expected_seq
+                || event.kind.trim().is_empty()
+            {
+                return Err(OxidraError::Session(
+                    "invalid prebuilt journal transaction".to_owned(),
+                ));
+            }
+            expected_seq = expected_seq
+                .checked_add(1)
+                .ok_or_else(|| OxidraError::Session("journal sequence exhausted".to_owned()))?;
+        }
+        let encoded_bytes = encoded_journal_events_bytes(events)?;
+        let metadata_result = self.file.metadata();
+        let current_size = self.finish_io(metadata_result)?.len();
+        Ok(current_size
+            .checked_add(encoded_bytes)
+            .is_some_and(|size| size <= byte_limit))
     }
 
     fn append_prebuilt_batch_with_limit(
@@ -1147,6 +1825,12 @@ impl SessionJournal {
         if self.poisoned {
             return Err(OxidraError::Session(
                 "journal write state is indeterminate after an I/O error; close and reopen the session"
+                    .to_owned(),
+            ));
+        }
+        if self.reopen_required.load(Ordering::Acquire) {
+            return Err(OxidraError::Session(
+                "a durable transaction capability was dropped before terminalization; close and reopen the session"
                     .to_owned(),
             ));
         }
@@ -1596,25 +2280,28 @@ fn valid_provider_context_limit_identity_v1(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
 
-fn provider_context_limit_error_for_journal_v1(input: &str) -> String {
-    let input = if input.is_empty() {
-        PROVIDER_CONTEXT_LIMIT_EMPTY_ERROR_V1
-    } else {
-        input
-    };
-    if input.len() <= MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1 {
+fn bounded_status_text_v1(input: &str, max_bytes: usize, empty: &str, suffix: &str) -> String {
+    let input = if input.is_empty() { empty } else { input };
+    if input.len() <= max_bytes {
         return input.to_owned();
     }
 
-    let mut end = MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1
-        .saturating_sub(PROVIDER_CONTEXT_LIMIT_TRUNCATION_SUFFIX_V1.len())
-        .min(input.len());
+    let mut end = max_bytes.saturating_sub(suffix.len()).min(input.len());
     while !input.is_char_boundary(end) {
         end = end.saturating_sub(1);
     }
     let mut output = input[..end].to_owned();
-    output.push_str(PROVIDER_CONTEXT_LIMIT_TRUNCATION_SUFFIX_V1);
+    output.push_str(suffix);
     output
+}
+
+fn provider_context_limit_error_for_journal_v1(input: &str) -> String {
+    bounded_status_text_v1(
+        input,
+        MAX_PROVIDER_CONTEXT_LIMIT_ERROR_BYTES_V1,
+        PROVIDER_CONTEXT_LIMIT_EMPTY_ERROR_V1,
+        PROVIDER_CONTEXT_LIMIT_TRUNCATION_SUFFIX_V1,
+    )
 }
 
 fn provider_response_status_for_outcome_v1(input: &str) -> Result<String> {
@@ -2063,6 +2750,99 @@ struct UnfinishedCompaction {
     attempt_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RecoverableOpenTurnV1 {
+    turn_id: String,
+    user_message_seq: u64,
+}
+
+fn turn_transaction_is_settled_v1(
+    events: &[JournalEvent],
+    turn_id: &str,
+    user_message_seq: u64,
+) -> Result<bool> {
+    let turns = segment_turns(events)?;
+    let turn = turns
+        .iter()
+        .find(|turn| turn.turn_id == turn_id)
+        .ok_or_else(|| {
+            OxidraError::Session(format!(
+                "turn transaction {turn_id} has no durable user.message"
+            ))
+        })?;
+    if turn.covers_from_seq != user_message_seq {
+        return Err(OxidraError::Session(format!(
+            "turn transaction {turn_id} expected user.message seq {user_message_seq}, found {}",
+            turn.covers_from_seq
+        )));
+    }
+    if turn.state != TurnState::OpenTail {
+        return Ok(true);
+    }
+
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    Ok(boundary_chain.pending().iter().any(|boundary| {
+        boundary.boundary.turn_id == turn_id
+            && boundary.boundary.user_message_seq == user_message_seq
+    }))
+}
+
+fn recoverable_open_turns_v1(events: &[JournalEvent]) -> Result<Vec<RecoverableOpenTurnV1>> {
+    let user_messages = events
+        .iter()
+        .filter(|event| event.kind == "user.message")
+        .filter_map(|event| {
+            event.turn_id.as_ref().map(|turn_id| RecoverableOpenTurnV1 {
+                turn_id: turn_id.clone(),
+                user_message_seq: event.seq,
+            })
+        })
+        .collect::<Vec<_>>();
+    if user_messages.is_empty() {
+        return Ok(Vec::new());
+    }
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    Ok(user_messages
+        .into_iter()
+        .filter(|turn| {
+            !boundary_chain.pending().iter().any(|boundary| {
+                boundary.boundary.turn_id == turn.turn_id
+                    && boundary.boundary.user_message_seq == turn.user_message_seq
+            })
+        })
+        .filter(|turn| {
+            !events.iter().any(|event| {
+                event.seq > turn.user_message_seq
+                    && event.turn_id.as_deref() == Some(turn.turn_id.as_str())
+                    && matches!(
+                        event.kind.as_str(),
+                        "response.started"
+                            | "response.completed"
+                            | "response.failed"
+                            | "response.aborted"
+                            | "turn.completed"
+                            | "turn.cancelled"
+                            | "turn.abandoned"
+                            | "turn.retry_started"
+                            | "agent.stalled"
+                            | "agent.limit_reached"
+                            | "context.limit_reached"
+                            | "tool.started"
+                            | "tool.completed"
+                            | "tool.failed"
+                            | "tool.in_doubt"
+                            | "tool.in_doubt_resolved"
+                            | "tool.skipped_due_to_recovery"
+                            | "tool.skipped_due_to_cancel"
+                            | "tool.skipped_due_to_limit"
+                            | "tool.skipped_due_to_in_doubt"
+                            | "tool.skipped_due_to_stalled"
+                    )
+            })
+        })
+        .collect())
+}
+
 fn unfinished_responses(events: &[JournalEvent]) -> Result<Vec<UnfinishedResponse>> {
     // A response attempt is scoped to its turn.  Keeping only the attempt ID
     // here would let a terminal from one turn settle an unfinished response
@@ -2405,6 +3185,71 @@ fn ensure_provider_dispatch_recovery_profile_v1(events: &[JournalEvent]) -> Resu
     Ok(())
 }
 
+fn ensure_compaction_dispatch_recovery_profile_v1(
+    events: &[JournalEvent],
+    boundary_value: Option<&Value>,
+) -> Result<()> {
+    if !provider_context_limit_recovery_actions_v1(events)?.is_empty() {
+        return Err(OxidraError::Session(
+            "compaction dispatch requires all context-limit intents to be recovered first"
+                .to_owned(),
+        ));
+    }
+    if !unfinished_responses(events)?.is_empty() {
+        return Err(OxidraError::Session(
+            "compaction dispatch requires every response attempt to be terminal".to_owned(),
+        ));
+    }
+    if !unfinished_compactions(events).is_empty() {
+        return Err(OxidraError::Session(
+            "compaction dispatch requires every prior compaction attempt to be terminal".to_owned(),
+        ));
+    }
+    if !pending_tools(events).is_empty() || !unstarted_tool_calls(events).is_empty() {
+        return Err(OxidraError::Session(
+            "compaction dispatch requires every tool call to have a durable lifecycle outcome"
+                .to_owned(),
+        ));
+    }
+
+    let boundary_actions = compaction_boundary_recovery_actions(events)?;
+    match boundary_value {
+        None if !boundary_actions.is_empty() => Err(OxidraError::Session(
+            "unbound compaction dispatch cannot bypass a pending boundary recovery action"
+                .to_owned(),
+        )),
+        None => Ok(()),
+        Some(value) => {
+            let boundary: CompactionBoundary =
+                serde_json::from_value(value.clone()).map_err(|error| {
+                    OxidraError::Session(format!(
+                        "invalid compaction boundary in dispatch admission: {error}"
+                    ))
+                })?;
+            let chain = validate_compaction_boundary_chain(events)?;
+            let pending = chain.latest_pending().ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "compaction boundary {} is not pending at dispatch admission",
+                    boundary.boundary_id
+                ))
+            })?;
+            if pending.boundary != boundary || pending.state != CompactionBoundaryState::Started {
+                return Err(OxidraError::Session(format!(
+                    "compaction boundary {} is not the current unattempted boundary",
+                    boundary.boundary_id
+                )));
+            }
+            if boundary_actions.len() != 1 {
+                return Err(OxidraError::Session(format!(
+                    "compaction boundary {} has an ambiguous pre-dispatch recovery state",
+                    boundary.boundary_id
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
 fn stage_recovery_event(
     session_id: &str,
     next_seq: &mut u64,
@@ -2489,26 +3334,19 @@ fn plan_mcp_recovery_events(
     Ok(events)
 }
 
-fn matching_recovery_marker(
-    events: &[JournalEvent],
-    in_doubt: &[InDoubtTool],
-    skipped_before_start: usize,
-    aborted_responses: usize,
-    aborted_compactions: usize,
-    failed_compaction_boundaries: usize,
-    checkpointed_compaction_boundaries: usize,
-) -> Option<u64> {
-    if in_doubt.is_empty()
-        && skipped_before_start == 0
-        && aborted_responses == 0
-        && aborted_compactions == 0
-        && failed_compaction_boundaries == 0
-        && checkpointed_compaction_boundaries == 0
+fn matching_recovery_marker(events: &[JournalEvent], recovery: &RecoveryInfo) -> Option<u64> {
+    if recovery.in_doubt.is_empty()
+        && recovery.skipped_before_start == 0
+        && recovery.aborted_responses == 0
+        && recovery.aborted_compactions == 0
+        && recovery.failed_compaction_boundaries == 0
+        && recovery.checkpointed_compaction_boundaries == 0
+        && recovery.cancelled_turns == 0
     {
         return None;
     }
 
-    let expected_in_doubt_keys = sorted_in_doubt_keys(in_doubt);
+    let expected_in_doubt_keys = sorted_in_doubt_keys(&recovery.in_doubt);
 
     events
         .iter()
@@ -2543,12 +3381,19 @@ fn matching_recovery_marker(
                 .and_then(Value::as_u64)
                 .unwrap_or_default()
                 as usize;
+            let marked_cancelled_turns = event
+                .data
+                .get("cancelled_turns")
+                .and_then(Value::as_u64)
+                .unwrap_or_default() as usize;
             (sorted_in_doubt_keys(&marked) == expected_in_doubt_keys
-                && marked_skipped == skipped_before_start
-                && marked_aborted == aborted_responses
-                && marked_aborted_compactions == aborted_compactions
-                && marked_failed_compaction_boundaries == failed_compaction_boundaries
-                && marked_checkpointed_compaction_boundaries == checkpointed_compaction_boundaries)
+                && marked_skipped == recovery.skipped_before_start
+                && marked_aborted == recovery.aborted_responses
+                && marked_aborted_compactions == recovery.aborted_compactions
+                && marked_failed_compaction_boundaries == recovery.failed_compaction_boundaries
+                && marked_checkpointed_compaction_boundaries
+                    == recovery.checkpointed_compaction_boundaries
+                && marked_cancelled_turns == recovery.cancelled_turns)
                 .then_some(event.seq)
         })
 }
@@ -2590,6 +3435,8 @@ fn recovery_marker_data(
             "compaction_boundary_failed"
         } else if recovery.checkpointed_compaction_boundaries > 0 {
             "compaction_boundary_checkpointed"
+        } else if recovery.cancelled_turns > 0 {
+            "turn_cancelled"
         } else if recovery.skipped_before_start > 0 {
             "tool_not_started"
         } else {
@@ -2602,6 +3449,7 @@ fn recovery_marker_data(
         "aborted_compactions": recovery.aborted_compactions,
         "failed_compaction_boundaries": recovery.failed_compaction_boundaries,
         "checkpointed_compaction_boundaries": recovery.checkpointed_compaction_boundaries,
+        "cancelled_turns": recovery.cancelled_turns,
     });
     if !unstarted_tools.is_empty() {
         let authorizations = recovery_authorizations(unstarted_tools)?;
@@ -2733,8 +3581,11 @@ mod tests {
             next_seq: 1,
             recovery: RecoveryInfo::default(),
             poisoned: false,
+            reopen_required: Arc::new(AtomicBool::new(false)),
             byte_limit: MAX_SESSION_BYTES,
+            active_turn: None,
             active_provider_response: None,
+            active_compaction: None,
             mcp_resume_open_id: None,
             mcp_resume_eligibility_issued: false,
         };
@@ -3390,6 +4241,200 @@ mod tests {
             .expect("the context-limit pair must fit the dispatch-time reserve");
         assert!(journal.file.metadata().unwrap().len() <= byte_limit);
         assert!(journal.active_provider_response.is_none());
+    }
+
+    #[test]
+    fn turn_admission_denies_provider_before_user_message_when_only_terminal_headroom_fits() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("turn-admission-before-provider", header(temp.path()))
+            .unwrap();
+        let base = journal.file.metadata().unwrap().len();
+        journal.set_byte_limit_for_tests(base + TURN_OUTCOME_HEADROOM_BYTES_V1 + 4096);
+
+        let mut turn_admission = journal
+            .append_user_message_with_turn_admission_v1(
+                "turn-admission",
+                json!({
+                    "item":{"role":"user","content":"hello"},
+                    "turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .expect("user.message should fit while preserving turn headroom");
+        let after_user = journal.file.metadata().unwrap().len();
+        journal.set_byte_limit_for_tests(after_user + TURN_OUTCOME_HEADROOM_BYTES_V1 - 1);
+        let error = journal
+            .append_provider_response_started_v1(
+                "turn-admission",
+                json!({
+                    "response_attempt_id":"attempt-admission",
+                    "response_index":1,
+                    "context":{"measurement":{"request_digest":"digest"}},
+                }),
+            )
+            .expect_err(
+                "Provider dispatch must be denied when its own outcome reserve no longer fits",
+            );
+        assert!(matches!(
+            error,
+            DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(_)
+        ));
+        journal
+            .finish_turn_transaction_v1(
+                &mut turn_admission,
+                Some("Provider outcome capacity denied"),
+            )
+            .unwrap();
+        let events = journal.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "user.message")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "response.started")
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "turn.cancelled")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_provider_admission_is_fatal_and_writes_no_fake_capacity_cancellation() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("provider-admission-fatal", header(temp.path()))
+            .unwrap();
+        let mut turn_admission = journal
+            .append_user_message_with_turn_admission_v1(
+                "turn-fatal",
+                json!({
+                    "item":{"role":"user","content":"hello"},
+                    "turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let event_count = journal.read_events().unwrap().len();
+        let error = journal
+            .append_provider_response_started_v1(
+                "turn-fatal",
+                json!({
+                    "response_attempt_id":"attempt-fatal",
+                    "response_index":1,
+                }),
+            )
+            .expect_err("missing context is a fatal protocol error, not capacity denial");
+        assert!(matches!(error, DispatchAdmissionErrorV1::Fatal(_)));
+        let events = journal.read_events().unwrap();
+        assert_eq!(events.len(), event_count);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "turn.cancelled")
+                .count(),
+            0
+        );
+        journal
+            .finish_turn_transaction_v1(&mut turn_admission, Some("test cleanup"))
+            .unwrap();
+    }
+
+    #[test]
+    fn dropping_an_unfinished_turn_capability_requires_reopen_and_recovery() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("turn-admission-drop", header(temp.path()))
+            .unwrap();
+        let admission = journal
+            .append_user_message_with_turn_admission_v1(
+                "turn-drop",
+                json!({
+                    "item":{"role":"user","content":"hello"},
+                    "turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        drop(admission);
+        let error = journal
+            .read_events()
+            .expect_err("dropping the capability must not leave a silently reusable handle");
+        assert!(error.to_string().contains("reopen"));
+        drop(journal);
+
+        let reopened = store.open("turn-admission-drop").unwrap();
+        let events = reopened.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "turn.cancelled")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == RECOVERY_KIND)
+                .count(),
+            1
+        );
+        assert_eq!(reopened.recovery_info().cancelled_turns, 1);
+    }
+
+    #[test]
+    fn dropping_an_unfinished_response_capability_requires_reopen() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("response-admission-drop", header(temp.path()))
+            .unwrap();
+        journal
+            .append_and_sync(
+                "user.message",
+                Some("turn-response-drop"),
+                json!({
+                    "item":{"role":"user","content":"hello"},
+                    "turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let admission = journal
+            .append_provider_response_started_v1(
+                "turn-response-drop",
+                json!({
+                    "response_attempt_id":"attempt-response-drop",
+                    "response_index":1,
+                    "context":{"measurement":{"request_digest":"digest"}},
+                }),
+            )
+            .unwrap();
+        drop(admission);
+        assert!(journal.read_events().is_err());
+        drop(journal);
+        let reopened = store.open("response-admission-drop").unwrap();
+        let events = reopened.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == "response.aborted"
+                        && event.data.get("recovered").and_then(Value::as_bool) == Some(true)
+                })
+                .count(),
+            1
+        );
     }
 
     #[test]
