@@ -393,7 +393,6 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         3,
         "only approved single-use permits may reach the MCP transport"
     );
-    let durable_epoch = coordinator.registry_epoch_id().to_owned();
     let durable_session_id = journal.session_id().to_owned();
     coordinator.shutdown().await;
     drop(coordinator);
@@ -402,56 +401,92 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     let mut reopened = store
         .open(&durable_session_id)
         .expect("reopen and recover MCP coordinator journal");
-    let resume_eligibility = reopened
-        .mcp_resume_eligibility()
-        .expect("mint resume eligibility after journal recovery");
-    let resumed_registry = McpRegistry::connect_for_resume(
-        &approved,
-        ["read", "edit", "write", "shell", "remember"]
-            .into_iter()
-            .map(str::to_owned),
-        resume_eligibility,
-        &CancellationToken::new(),
-    )
-    .await
-    .expect("reconnect the approved MCP registry");
-    let duplicate_eligibility = reopened
+    let log_before_blocked_resume = fs::read(&log).expect("read log before blocked resume");
+    let resume_error = reopened
         .mcp_resume_eligibility()
         .err()
-        .expect("one recovered journal handle can authorize only one MCP startup");
-    assert!(duplicate_eligibility.to_string().contains("already issued"));
-    assert_eq!(resumed_registry.digest(), expected_registry_digest);
-    let resumed_digest = resumed_registry.digest().to_owned();
-    let approved_resumed_registry = resumed_registry
-        .approve_surface(&resumed_digest)
-        .expect("reapprove the unchanged MCP surface");
-    let mut resumed = McpExecutionCoordinator::resume(approved_resumed_registry, &reopened)
-        .expect("resume the durable MCP registry epoch");
-    assert_eq!(resumed.registry_epoch_id(), durable_epoch);
-    assert_eq!(resumed.registry_digest(), expected_registry_digest);
-    resumed.shutdown().await;
-    drop(resumed);
+        .expect("unresolved in-doubt tools must block resume eligibility");
+    assert!(resume_error.to_string().contains("explicitly resolved"));
+    assert_eq!(
+        fs::read(&log).expect("read log after blocked resume"),
+        log_before_blocked_resume,
+        "the journal gate must reject unresolved in-doubt tools before MCP startup"
+    );
     drop(reopened);
 
     let collision =
         McpRegistry::connect(&approved, [provider_name], &CancellationToken::new()).await;
     assert!(matches!(collision, Err(error) if error.to_string().contains("tool name collision")));
+}
+
+#[tokio::test]
+async fn resume_rechecks_in_doubt_after_registry_start() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP resume integration test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP resume fixture");
+    let root = directory.path().join("project");
+    fs::create_dir_all(&root).expect("create MCP resume project");
+    let script = root.join("server.py");
+    let log = root.join("server.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP resume fixture");
+    let config_path = root.join("mcp.toml");
+    fs::write(&config_path, project_config(&python, &script, &log, false))
+        .expect("write MCP resume config");
+    let config = McpProjectConfig::load(
+        &root,
+        &config_path
+            .canonicalize()
+            .expect("canonicalize MCP resume config"),
+    )
+    .expect("load MCP resume config");
+    let approved = config
+        .approve_execution(config.execution_plan_digest())
+        .expect("approve MCP resume execution plan");
+    let registry = McpRegistry::connect(
+        &approved,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("connect MCP resume registry");
+    let registry_digest = registry.digest().to_owned();
+    let store =
+        SessionStore::new(directory.path().join("data")).expect("create MCP resume session store");
+    let mut journal = store
+        .create(SessionHeader::new(&root, "mcp-resume"))
+        .expect("create MCP resume journal");
+    let mut coordinator = McpExecutionCoordinator::activate(
+        registry
+            .approve_surface(&registry_digest)
+            .expect("approve MCP resume surface"),
+        &mut journal,
+    )
+    .expect("activate MCP resume coordinator");
+    let durable_epoch = coordinator.registry_epoch_id().to_owned();
+    let session_id = journal.session_id().to_owned();
+    coordinator.shutdown().await;
+    drop(coordinator);
+    drop(journal);
 
     let original_sha = config.source_sha256().to_owned();
-    let log_before_mismatched_resume = fs::read(&log).expect("read log before mismatched resume");
+    let mut reopened = store
+        .open(&session_id)
+        .expect("open MCP journal before mismatched resume");
+    let eligibility = reopened
+        .mcp_resume_eligibility()
+        .expect("mint eligibility for mismatched resume");
     fs::write(&config_path, project_config(&python, &script, &log, true))
-        .expect("rewrite MCP project config");
-    let changed = McpProjectConfig::load(&root, &config_path).expect("reload changed config");
+        .expect("rewrite MCP resume config");
+    let changed = McpProjectConfig::load(&root, &config_path).expect("load changed resume config");
     assert_ne!(changed.source_sha256(), original_sha);
     let approved_changed = changed
         .approve_execution(changed.execution_plan_digest())
-        .expect("approve changed execution plan");
-    let mut reopened = store
-        .open(&durable_session_id)
-        .expect("reopen before mismatched resume attempt");
-    let eligibility = reopened
-        .mcp_resume_eligibility()
-        .expect("mint eligibility for mismatched resume attempt");
+        .expect("approve changed resume plan");
+    let log_before_mismatch = fs::read(&log).expect("read log before mismatched resume");
     let mismatch = McpRegistry::connect_for_resume(
         &approved_changed,
         ["read", "edit", "write", "shell", "remember"]
@@ -471,9 +506,279 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     assert!(mismatch.to_string().contains("durable registry activation"));
     assert_eq!(
         fs::read(&log).expect("read log after mismatched resume"),
-        log_before_mismatched_resume,
+        log_before_mismatch,
         "resume config mismatch must be rejected before MCP code executes"
     );
+    drop(reopened);
+    fs::write(&config_path, project_config(&python, &script, &log, false))
+        .expect("restore MCP resume config");
+
+    let mut reopened = store
+        .open(&session_id)
+        .expect("open clean MCP resume journal");
+    let eligibility = reopened
+        .mcp_resume_eligibility()
+        .expect("mint clean MCP resume eligibility");
+    let resumed_registry = McpRegistry::connect_for_resume(
+        &approved,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        eligibility,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("connect clean MCP resume registry");
+    let approved_resumed_registry = resumed_registry
+        .approve_surface(&registry_digest)
+        .expect("approve clean MCP resume surface");
+    let mut resumed = McpExecutionCoordinator::resume(approved_resumed_registry, &reopened)
+        .expect("resume clean MCP registry epoch");
+    assert_eq!(resumed.registry_epoch_id(), durable_epoch);
+    assert_eq!(resumed.registry_digest(), registry_digest);
+    resumed.shutdown().await;
+    drop(resumed);
+    drop(reopened);
+
+    let mut reopened = store
+        .open(&session_id)
+        .expect("reopen before final MCP resume validation");
+    let eligibility = reopened
+        .mcp_resume_eligibility()
+        .expect("mint MCP eligibility before final validation drift");
+    let resumed_registry = McpRegistry::connect_for_resume(
+        &approved,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        eligibility,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("start registry for final resume validation");
+
+    let started = reopened
+        .append_and_sync(
+            "tool.started",
+            None,
+            json!({
+                "call_id":"late-in-doubt-call",
+                "tool":"builtin-fixture",
+                "arguments":{},
+            }),
+        )
+        .expect("append late generic tool start");
+    reopened
+        .append_and_sync(
+            "tool.in_doubt",
+            None,
+            json!({
+                "started_seq":started.seq,
+                "call_id":"late-in-doubt-call",
+                "tool":"builtin-fixture",
+                "output":{"error":{"code":"in_doubt","message":"fixture"}},
+                "is_error":true,
+                "error_code":"in_doubt",
+            }),
+        )
+        .expect("append late generic in-doubt terminal");
+    let approved_resumed_registry = resumed_registry
+        .approve_surface(&registry_digest)
+        .expect("approve unchanged MCP resume surface");
+    let resume_error = McpExecutionCoordinator::resume(approved_resumed_registry, &reopened)
+        .err()
+        .expect("final resume validation must reject newly in-doubt state");
+    assert!(resume_error.to_string().contains("explicitly resolved"));
+}
+
+#[tokio::test]
+async fn dropping_started_execute_call_requires_reopen_but_unpolled_and_terminal_calls_do_not() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP drop-guard integration test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP drop-guard fixture");
+    let root = directory.path().join("project");
+    fs::create_dir_all(&root).expect("create MCP drop-guard project");
+    let script = root.join("server.py");
+    let log = root.join("server.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP drop-guard fixture");
+    let config_path = root.join("mcp.toml");
+    fs::write(&config_path, project_config(&python, &script, &log, false))
+        .expect("write MCP drop-guard config");
+    let config = McpProjectConfig::load(
+        &root,
+        &config_path
+            .canonicalize()
+            .expect("canonicalize MCP drop-guard config"),
+    )
+    .expect("load MCP drop-guard config");
+    let approved = config
+        .approve_execution(config.execution_plan_digest())
+        .expect("approve MCP drop-guard execution plan");
+    let registry = McpRegistry::connect(
+        &approved,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("connect MCP drop-guard registry");
+    let provider_name = registry
+        .bindings()
+        .next()
+        .expect("MCP drop-guard binding")
+        .provider_name
+        .clone();
+    let registry_digest = registry.digest().to_owned();
+    let store = SessionStore::new(directory.path().join("data"))
+        .expect("create MCP drop-guard session store");
+    let mut journal = store
+        .create(SessionHeader::new(&root, "mcp-drop-guard"))
+        .expect("create MCP drop-guard journal");
+    let mut coordinator = McpExecutionCoordinator::activate(
+        registry
+            .approve_surface(&registry_digest)
+            .expect("approve MCP drop-guard surface"),
+        &mut journal,
+    )
+    .expect("activate MCP drop-guard coordinator");
+    let turn_id = "drop-guard-turn";
+    journal
+        .append_and_sync(
+            "user.message",
+            Some(turn_id),
+            json!({"text":"exercise MCP drop guard", "turn_boundary_version":TURN_BOUNDARY_VERSION}),
+        )
+        .expect("append MCP drop-guard user message");
+    append_provider_call(
+        &mut journal,
+        turn_id,
+        "unpolled-response",
+        "unpolled-call",
+        &provider_name,
+        &json!({"text":"unpolled"}),
+    );
+
+    let cancellation = CancellationToken::new();
+    let mut approval = AllowMcpApproval;
+    let unpolled = coordinator.execute_call(
+        &mut journal,
+        McpCallIdentity::new(turn_id, "unpolled-call", &provider_name),
+        &cancellation,
+        &mut approval,
+    );
+    drop(unpolled);
+    assert!(
+        journal
+            .read_events()
+            .expect("unpolled execute_call must leave the journal healthy")
+            .iter()
+            .all(|event| event.kind != "tool.started")
+    );
+
+    coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(turn_id, "unpolled-call", &provider_name),
+            &CancellationToken::new(),
+            &mut AllowMcpApproval,
+        )
+        .await
+        .expect("normally terminalized MCP call");
+    journal
+        .read_events()
+        .expect("normal MCP terminal must not poison the journal");
+
+    append_provider_call(
+        &mut journal,
+        turn_id,
+        "dropped-response",
+        "dropped-call",
+        &provider_name,
+        &json!({"text":"__hang__"}),
+    );
+    let calls_before = tool_call_count(&log);
+    let cancellation = CancellationToken::new();
+    let mut approval = AllowMcpApproval;
+    let mut started_future = Box::pin(coordinator.execute_call(
+        &mut journal,
+        McpCallIdentity::new(turn_id, "dropped-call", &provider_name),
+        &cancellation,
+        &mut approval,
+    ));
+    tokio::select! {
+        result = &mut started_future => {
+            result.expect_err("hanging MCP call unexpectedly returned successfully");
+            panic!("hanging MCP call completed before it could be dropped");
+        }
+        () = wait_for_tool_call_count(&log, calls_before + 1) => {}
+    }
+    drop(started_future);
+    let poisoned = journal
+        .read_events()
+        .expect_err("dropping a started MCP call must require reopen");
+    assert!(
+        poisoned
+            .to_string()
+            .contains("dropped before terminalization")
+    );
+
+    let session_id = journal.session_id().to_owned();
+    drop(journal);
+    let mut reopened = store
+        .open(&session_id)
+        .expect("reopen and recover dropped MCP call");
+    let pending = reopened.in_doubt().expect("read recovered in-doubt set");
+    assert_eq!(pending.len(), 1);
+    let resume_error = reopened
+        .mcp_resume_eligibility()
+        .err()
+        .expect("recovered in-doubt call must block MCP startup");
+    assert!(resume_error.to_string().contains("explicitly resolved"));
+
+    reopened
+        .resolve_all_in_doubt_as_failed(&pending)
+        .expect("resolve the recovered in-doubt call");
+    let retry_turn = "drop-guard-retry-turn";
+    reopened
+        .append_and_sync(
+            "user.message",
+            Some(retry_turn),
+            json!({"text":"retry after dropped MCP transport", "turn_boundary_version":TURN_BOUNDARY_VERSION}),
+        )
+        .expect("append retry user message");
+    append_provider_call(
+        &mut reopened,
+        retry_turn,
+        "retry-response",
+        "retry-call",
+        &provider_name,
+        &json!({"text":"after-drop"}),
+    );
+    let calls_before_poisoned_retry = tool_call_count(&log);
+    let retry_error = coordinator
+        .execute_call(
+            &mut reopened,
+            McpCallIdentity::new(retry_turn, "retry-call", &provider_name),
+            &CancellationToken::new(),
+            &mut AllowMcpApproval,
+        )
+        .await
+        .expect_err("the abandoned coordinator transport must never be reused");
+    assert!(
+        retry_error
+            .to_string()
+            .contains("shut it down and reconnect")
+    );
+    assert_eq!(
+        tool_call_count(&log),
+        calls_before_poisoned_retry,
+        "a poisoned coordinator must reject before another MCP request is sent"
+    );
+
+    coordinator.shutdown().await;
 }
 
 struct AllowMcpApproval;
@@ -597,6 +902,28 @@ fn active_registry_digest(journal: &oxidra::session::SessionJournal) -> String {
         .expect("MCP registry activation digest")
 }
 
+fn tool_call_count(log: &Path) -> usize {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == "tools/call")
+        .count()
+}
+
+async fn wait_for_tool_call_count(log: &Path, expected: usize) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if tool_call_count(log) >= expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "MCP fixture did not receive the expected tools/call request"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn execution_digest_mismatch_cannot_start_a_server() {
     let Some(python) = find_python() else {
@@ -678,6 +1005,7 @@ fn find_python() -> Option<PathBuf> {
 const PYTHON_FIXTURE: &str = r#"
 import json
 import sys
+import time
 
 log_path = sys.argv[1]
 
@@ -728,6 +1056,15 @@ for line in sys.stdin:
         })
     elif method == "tools/call":
         text = message.get("params", {}).get("arguments", {}).get("text", "")
+        if text == "__hang__":
+            time.sleep(30)
+            reply(message, {
+                "resultType": "complete",
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": {"text": text},
+                "isError": False,
+            })
+            continue
         if text == "__rpc_error__":
             reply(message, error={"code": -32001, "message": "fixture call failed after dispatch"})
             continue

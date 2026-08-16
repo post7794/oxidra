@@ -24,8 +24,9 @@ use crate::compaction::{
     CompactionBoundaryStarted, CompactionBoundaryState, CompactionCandidate, CompactionContext,
     CompactionSelection, CompactionStarted, MAX_COMPACTION_OUTPUT_TOKENS,
     MIN_RECENT_COMPLETE_TURNS, SUMMARY_ENVELOPE_VERSION, ValidatedCompactionBoundary,
-    attempt_boundary, compact_once_for_boundary, compact_replay_once_for_boundary,
-    ensure_checkpointed_boundary_request_ready, ensure_compaction_boundary_turn_request_ready,
+    attempt_boundary, compact_once_for_boundary_with_turn_admission,
+    compact_replay_once_for_boundary, ensure_checkpointed_boundary_request_ready,
+    ensure_compaction_boundary_turn_request_ready,
     ensure_resolved_without_checkpoint_boundary_request_ready, rebuild_failed_boundary_candidate,
     select_compaction_candidate, validate_checkpoint_chain, validate_compaction_boundary_chain,
     validate_replay_compaction_candidate,
@@ -45,7 +46,7 @@ use crate::history::{
     validate_history_snapshot_after_compaction,
 };
 use crate::history_artifact::{HistoryArtifactReader, HistoryArtifactRequest};
-use crate::mcp::MAX_MCP_CALLS_PER_RESPONSE;
+use crate::mcp::{MAX_MCP_CALLS_PER_RESPONSE, validated_durable_mcp_calls_for_turn};
 pub use crate::projection::project_events;
 use crate::projection::{
     SOURCE_PROJECTION_VERSION, project_checkpoint_and_tail_for_recovery_planning,
@@ -55,7 +56,8 @@ use crate::projection::{
 };
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{
-    DispatchAdmissionErrorV1, JournalEvent, ProviderResponseDispatchAdmissionV1, SessionJournal,
+    DispatchAdmissionErrorV1, JournalEvent, McpRecoverySkipV1, ProviderResponseDispatchAdmissionV1,
+    SessionJournal, TurnTransactionAdmissionV1,
 };
 use crate::tools::{BuiltinTools, ToolContext};
 use crate::turn::{
@@ -330,6 +332,27 @@ enum RecoveryActionV1 {
     },
 }
 
+impl RecoveryActionV1 {
+    fn turn_identity(&self) -> (&str, u64) {
+        match self {
+            Self::RetryContext { retry, .. } => (&retry.turn_id, retry.user_message_seq),
+            Self::ResumeCheckpointed(boundary)
+            | Self::ResumeResolvedWithoutCheckpoint(boundary) => (
+                &boundary.boundary.turn_id,
+                boundary.boundary.user_message_seq,
+            ),
+            Self::ResumeBudgetLimitedCheckpoint { retry } => {
+                (&retry.boundary.turn_id, retry.boundary.user_message_seq)
+            }
+            Self::ReplayFailedBoundary { retry, .. }
+            | Self::ReplanFailedBoundary { retry, .. }
+            | Self::ResolveFailedBoundaryWithoutCheckpoint { retry, .. } => {
+                (&retry.boundary.turn_id, retry.boundary.user_message_seq)
+            }
+        }
+    }
+}
+
 struct RecoveryPlanV1 {
     snapshot: Vec<JournalEvent>,
     action: RecoveryActionV1,
@@ -470,12 +493,27 @@ impl Agent {
         })?;
 
         let result = self
-            .run_existing_turn(&turn_id, turn_start_seq, cancellation, observer, approval)
+            .run_existing_turn(
+                &turn_id,
+                turn_start_seq,
+                &turn_admission,
+                cancellation,
+                observer,
+                approval,
+            )
             .await;
+        self.finish_admitted_turn_result(&mut turn_admission, result)
+    }
+
+    fn finish_admitted_turn_result(
+        &mut self,
+        admission: &mut TurnTransactionAdmissionV1,
+        result: Result<TurnOutcome>,
+    ) -> Result<TurnOutcome> {
         let cancellation_reason = result.as_ref().err().map(ToString::to_string);
         if let Err(settle_error) = self
             .journal
-            .finish_turn_transaction_v1(&mut turn_admission, cancellation_reason.as_deref())
+            .finish_turn_transaction_v1(admission, cancellation_reason.as_deref())
         {
             return match result {
                 Ok(_) => Err(settle_error),
@@ -492,6 +530,7 @@ impl Agent {
         &mut self,
         turn_id: &str,
         turn_start_seq: u64,
+        turn_admission: &TurnTransactionAdmissionV1,
         cancellation: CancellationToken,
         observer: &mut dyn AgentObserver,
         approval: &mut dyn ApprovalHandler,
@@ -499,6 +538,7 @@ impl Agent {
         self.run_existing_turn_with_accounting(
             turn_id,
             turn_start_seq,
+            turn_admission,
             cancellation,
             observer,
             approval,
@@ -512,6 +552,7 @@ impl Agent {
         &mut self,
         turn_id: &str,
         turn_start_seq: u64,
+        turn_admission: &TurnTransactionAdmissionV1,
         cancellation: CancellationToken,
         observer: &mut dyn AgentObserver,
         approval: &mut dyn ApprovalHandler,
@@ -532,6 +573,7 @@ impl Agent {
                 .prepare_request_with_automatic_compaction(
                     turn_id,
                     turn_start_seq,
+                    turn_admission,
                     cancellation.clone(),
                     observer,
                     &mut outcome.usage,
@@ -547,6 +589,7 @@ impl Agent {
             let response_attempt_id = Uuid::now_v7().to_string();
             let response_context = prepared_tools.context.audit_value()?;
             let mut response_admission = match self.journal.append_provider_response_started_v1(
+                turn_admission,
                 turn_id,
                 json!({
                     "response_attempt_id": response_attempt_id,
@@ -1384,146 +1427,162 @@ impl Agent {
                 "journal changed after recovery planning".to_owned(),
             ));
         }
-        match action {
-            RecoveryActionV1::RetryContext {
-                retry,
-                retry_intent,
-            } => {
-                self.ensure_provider_call_budget(&retry.turn_id)?;
-                self.retry_pending_context_turn_from_snapshot(
-                    &snapshot,
-                    &retry,
+        let (turn_id, user_message_seq) = {
+            let (turn_id, user_message_seq) = action.turn_identity();
+            (turn_id.to_owned(), user_message_seq)
+        };
+        let mut turn_admission = self
+            .journal
+            .admit_turn_continuation_v1(&turn_id, user_message_seq)
+            .map_err(DispatchAdmissionErrorV1::into_error)?;
+        let result = async {
+            match action {
+                RecoveryActionV1::RetryContext {
+                    retry,
                     retry_intent,
-                    cancellation,
-                    observer,
-                    approval,
-                )
-                .await
-            }
-            RecoveryActionV1::ResumeCheckpointed(boundary) => {
-                self.run_existing_turn(
-                    &boundary.boundary.turn_id,
-                    boundary.boundary.user_message_seq,
-                    cancellation,
-                    observer,
-                    approval,
-                )
-                .await
-            }
-            RecoveryActionV1::ResumeResolvedWithoutCheckpoint(boundary) => {
-                self.run_existing_turn(
-                    &boundary.boundary.turn_id,
-                    boundary.boundary.user_message_seq,
-                    cancellation,
-                    observer,
-                    approval,
-                )
-                .await
-            }
-            RecoveryActionV1::ResumeBudgetLimitedCheckpoint { retry } => {
-                let replacement = retry.boundary.clone();
-                self.ensure_provider_call_budget(&replacement.turn_id)?;
-                self.journal.append_and_sync(
-                    COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
-                    None,
-                    serde_json::to_value(retry)?,
-                )?;
-                if let Err(error) = observer.on_compaction_budget_recovery_intent_synced() {
-                    return Err(OxidraError::observer(error));
+                } => {
+                    self.ensure_provider_call_budget(&retry.turn_id)?;
+                    self.retry_pending_context_turn_from_snapshot(
+                        &snapshot,
+                        &retry,
+                        retry_intent,
+                        &turn_admission,
+                        cancellation,
+                        observer,
+                        approval,
+                    )
+                    .await
                 }
-                self.run_existing_turn(
-                    &replacement.turn_id,
-                    replacement.user_message_seq,
-                    cancellation,
-                    observer,
-                    approval,
-                )
-                .await
-            }
-            RecoveryActionV1::ReplayFailedBoundary {
-                context_retry_intent,
-                retry,
-                candidate,
-                continuation,
-            } => {
-                let replacement = retry.boundary.clone();
-                self.ensure_provider_call_budget(&replacement.turn_id)?;
-                if let Some(intent) = context_retry_intent {
+                RecoveryActionV1::ResumeCheckpointed(boundary) => {
+                    self.run_existing_turn(
+                        &boundary.boundary.turn_id,
+                        boundary.boundary.user_message_seq,
+                        &turn_admission,
+                        cancellation,
+                        observer,
+                        approval,
+                    )
+                    .await
+                }
+                RecoveryActionV1::ResumeResolvedWithoutCheckpoint(boundary) => {
+                    self.run_existing_turn(
+                        &boundary.boundary.turn_id,
+                        boundary.boundary.user_message_seq,
+                        &turn_admission,
+                        cancellation,
+                        observer,
+                        approval,
+                    )
+                    .await
+                }
+                RecoveryActionV1::ResumeBudgetLimitedCheckpoint { retry } => {
+                    let replacement = retry.boundary.clone();
+                    self.ensure_provider_call_budget(&replacement.turn_id)?;
                     self.journal.append_and_sync(
-                        "turn.retry_started",
-                        Some(&replacement.turn_id),
-                        intent,
+                        COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
+                        None,
+                        serde_json::to_value(retry)?,
                     )?;
+                    if let Err(error) = observer.on_compaction_budget_recovery_intent_synced() {
+                        return Err(OxidraError::observer(error));
+                    }
+                    self.run_existing_turn(
+                        &replacement.turn_id,
+                        replacement.user_message_seq,
+                        &turn_admission,
+                        cancellation,
+                        observer,
+                        approval,
+                    )
+                    .await
                 }
-                self.journal.append_and_sync(
-                    COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
-                    None,
-                    serde_json::to_value(retry)?,
-                )?;
-                let mut compaction_observer = SilentCompactionObserver;
-                let checkpoint = compact_replay_once_for_boundary(
-                    self.provider.as_ref(),
-                    &mut self.journal,
-                    &replacement,
-                    &candidate,
-                    &self.context_runtime.model,
-                    &mut compaction_observer,
-                    cancellation.clone(),
-                    move |summary| continuation.validate_summary(summary),
-                )
-                .await?;
-                let mut usage = Usage::default();
-                accumulate_usage_value(&mut usage, &checkpoint.usage)?;
-                self.run_existing_turn_with_accounting(
-                    &replacement.turn_id,
-                    replacement.user_message_seq,
-                    cancellation,
-                    observer,
-                    approval,
-                    usage,
-                )
-                .await
-            }
-            RecoveryActionV1::ReplanFailedBoundary {
-                context_retry_intent,
-                retry,
-                current_context,
-            } => {
-                let replacement = retry.boundary.clone();
-                self.ensure_provider_call_budget(&replacement.turn_id)?;
-                if let Some(intent) = context_retry_intent {
+                RecoveryActionV1::ReplayFailedBoundary {
+                    context_retry_intent,
+                    retry,
+                    candidate,
+                    continuation,
+                } => {
+                    let replacement = retry.boundary.clone();
+                    self.ensure_provider_call_budget(&replacement.turn_id)?;
+                    if let Some(intent) = context_retry_intent {
+                        self.journal.append_and_sync(
+                            "turn.retry_started",
+                            Some(&replacement.turn_id),
+                            intent,
+                        )?;
+                    }
                     self.journal.append_and_sync(
-                        "turn.retry_started",
-                        Some(&replacement.turn_id),
-                        intent,
+                        COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+                        None,
+                        serde_json::to_value(retry)?,
                     )?;
-                }
-                self.journal.append_and_sync(
-                    COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
-                    None,
-                    serde_json::to_value(&retry)?,
-                )?;
-
-                if let Err(error) = observer.on_compaction_recovery_intent_synced() {
-                    self.append_automatic_compaction_preflight_failure(
+                    let mut compaction_observer = SilentCompactionObserver;
+                    let checkpoint = compact_replay_once_for_boundary(
+                        self.provider.as_ref(),
+                        &mut self.journal,
+                        Some(&turn_admission),
                         &replacement,
-                        "observer_failed",
-                        &error.to_string(),
-                    )?;
-                    return Err(error);
+                        &candidate,
+                        &self.context_runtime.model,
+                        &mut compaction_observer,
+                        cancellation.clone(),
+                        move |summary| continuation.validate_summary(summary),
+                    )
+                    .await?;
+                    let mut usage = Usage::default();
+                    accumulate_usage_value(&mut usage, &checkpoint.usage)?;
+                    self.run_existing_turn_with_accounting(
+                        &replacement.turn_id,
+                        replacement.user_message_seq,
+                        &turn_admission,
+                        cancellation,
+                        observer,
+                        approval,
+                        usage,
+                    )
+                    .await
                 }
-
-                if cancellation.is_cancelled() {
-                    self.append_automatic_compaction_preflight_failure(
-                        &replacement,
-                        "cancelled",
-                        "automatic compaction recovery was cancelled before candidate planning",
+                RecoveryActionV1::ReplanFailedBoundary {
+                    context_retry_intent,
+                    retry,
+                    current_context,
+                } => {
+                    let replacement = retry.boundary.clone();
+                    self.ensure_provider_call_budget(&replacement.turn_id)?;
+                    if let Some(intent) = context_retry_intent {
+                        self.journal.append_and_sync(
+                            "turn.retry_started",
+                            Some(&replacement.turn_id),
+                            intent,
+                        )?;
+                    }
+                    self.journal.append_and_sync(
+                        COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+                        None,
+                        serde_json::to_value(&retry)?,
                     )?;
-                    return Err(OxidraError::Interrupted);
-                }
 
-                let plan =
-                    match self.build_automatic_compaction_plan_v1(replacement, *current_context) {
+                    if let Err(error) = observer.on_compaction_recovery_intent_synced() {
+                        self.append_automatic_compaction_preflight_failure(
+                            &replacement,
+                            "observer_failed",
+                            &error.to_string(),
+                        )?;
+                        return Err(error);
+                    }
+
+                    if cancellation.is_cancelled() {
+                        self.append_automatic_compaction_preflight_failure(
+                            &replacement,
+                            "cancelled",
+                            "automatic compaction recovery was cancelled before candidate planning",
+                        )?;
+                        return Err(OxidraError::Interrupted);
+                    }
+
+                    let plan = match self
+                        .build_automatic_compaction_plan_v1(replacement, *current_context)
+                    {
                         Ok(plan) => plan,
                         Err(error) => {
                             self.append_automatic_compaction_preflight_failure(
@@ -1534,133 +1593,141 @@ impl Agent {
                             return Err(error);
                         }
                     };
-                let AutomaticCompactionPlanV1 {
-                    snapshot: plan_snapshot,
-                    boundary: planned_boundary,
-                    selection,
-                    mut continuations,
-                    ..
-                } = plan;
-                if self.journal.read_events()? != plan_snapshot {
-                    let error = OxidraError::Session(
-                        "journal changed after automatic compaction recovery planning".to_owned(),
-                    );
-                    self.append_automatic_compaction_preflight_failure(
-                        &planned_boundary,
-                        "snapshot_changed",
-                        &error.to_string(),
-                    )?;
-                    return Err(error);
-                }
-                let candidate = match selection {
-                    CompactionSelection::Selected(candidate) => candidate,
-                    CompactionSelection::Unavailable(reason) => {
-                        let message = format!(
-                            "automatic compaction recovery has no safe candidate: {reason}"
+                    let AutomaticCompactionPlanV1 {
+                        snapshot: plan_snapshot,
+                        boundary: planned_boundary,
+                        selection,
+                        mut continuations,
+                        ..
+                    } = plan;
+                    if self.journal.read_events()? != plan_snapshot {
+                        let error = OxidraError::Session(
+                            "journal changed after automatic compaction recovery planning"
+                                .to_owned(),
                         );
                         self.append_automatic_compaction_preflight_failure(
                             &planned_boundary,
-                            "no_candidate",
-                            &message,
+                            "snapshot_changed",
+                            &error.to_string(),
                         )?;
-                        return Err(OxidraError::Limit(message));
+                        return Err(error);
                     }
-                };
-                let Some(continuation) = continuations.remove(&candidate.covers_through_seq) else {
-                    let error = OxidraError::Session(format!(
-                        "selected compaction cutoff {} has no prepared continuation",
-                        candidate.covers_through_seq
-                    ));
-                    self.append_automatic_compaction_preflight_failure(
-                        &planned_boundary,
-                        "invalid_plan",
-                        &error.to_string(),
-                    )?;
-                    return Err(error);
-                };
+                    let candidate = match selection {
+                        CompactionSelection::Selected(candidate) => candidate,
+                        CompactionSelection::Unavailable(reason) => {
+                            let message = format!(
+                                "automatic compaction recovery has no safe candidate: {reason}"
+                            );
+                            self.append_automatic_compaction_preflight_failure(
+                                &planned_boundary,
+                                "no_candidate",
+                                &message,
+                            )?;
+                            return Err(OxidraError::Limit(message));
+                        }
+                    };
+                    let Some(continuation) = continuations.remove(&candidate.covers_through_seq)
+                    else {
+                        let error = OxidraError::Session(format!(
+                            "selected compaction cutoff {} has no prepared continuation",
+                            candidate.covers_through_seq
+                        ));
+                        self.append_automatic_compaction_preflight_failure(
+                            &planned_boundary,
+                            "invalid_plan",
+                            &error.to_string(),
+                        )?;
+                        return Err(error);
+                    };
 
-                let mut compaction_observer = SilentCompactionObserver;
-                let checkpoint = compact_once_for_boundary(
-                    self.provider.as_ref(),
-                    &mut self.journal,
-                    &planned_boundary,
-                    &candidate,
-                    &self.context_runtime.model,
-                    &mut compaction_observer,
-                    cancellation.clone(),
-                    move |summary| continuation.validate_summary(summary),
-                )
-                .await?;
-                let mut usage = Usage::default();
-                accumulate_usage_value(&mut usage, &checkpoint.usage)?;
-                self.run_existing_turn_with_accounting(
-                    &planned_boundary.turn_id,
-                    planned_boundary.user_message_seq,
-                    cancellation,
-                    observer,
-                    approval,
-                    usage,
-                )
-                .await
-            }
-            RecoveryActionV1::ResolveFailedBoundaryWithoutCheckpoint {
-                context_retry_intent,
-                retry,
-                resolution,
-            } => {
-                let replacement = retry.boundary.clone();
-                self.ensure_provider_call_budget(&replacement.turn_id)?;
-                if let Some(intent) = context_retry_intent {
+                    let mut compaction_observer = SilentCompactionObserver;
+                    let checkpoint = compact_once_for_boundary_with_turn_admission(
+                        self.provider.as_ref(),
+                        &mut self.journal,
+                        &turn_admission,
+                        &planned_boundary,
+                        &candidate,
+                        &self.context_runtime.model,
+                        &mut compaction_observer,
+                        cancellation.clone(),
+                        move |summary| continuation.validate_summary(summary),
+                    )
+                    .await?;
+                    let mut usage = Usage::default();
+                    accumulate_usage_value(&mut usage, &checkpoint.usage)?;
+                    self.run_existing_turn_with_accounting(
+                        &planned_boundary.turn_id,
+                        planned_boundary.user_message_seq,
+                        &turn_admission,
+                        cancellation,
+                        observer,
+                        approval,
+                        usage,
+                    )
+                    .await
+                }
+                RecoveryActionV1::ResolveFailedBoundaryWithoutCheckpoint {
+                    context_retry_intent,
+                    retry,
+                    resolution,
+                } => {
+                    let replacement = retry.boundary.clone();
+                    self.ensure_provider_call_budget(&replacement.turn_id)?;
+                    if let Some(intent) = context_retry_intent {
+                        self.journal.append_and_sync(
+                            "turn.retry_started",
+                            Some(&replacement.turn_id),
+                            intent,
+                        )?;
+                    }
                     self.journal.append_and_sync(
-                        "turn.retry_started",
-                        Some(&replacement.turn_id),
-                        intent,
+                        COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
+                        None,
+                        serde_json::to_value(&retry)?,
                     )?;
-                }
-                self.journal.append_and_sync(
-                    COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
-                    None,
-                    serde_json::to_value(&retry)?,
-                )?;
-                let events = self.journal.read_events()?;
-                if events.last().map(|event| event.seq)
-                    != Some(resolution.measured_request_through_seq)
-                {
-                    self.append_automatic_compaction_preflight_failure(
-                        &replacement,
-                        "snapshot_changed",
-                        "journal changed before resolved-without-checkpoint commit",
+                    let events = self.journal.read_events()?;
+                    if events.last().map(|event| event.seq)
+                        != Some(resolution.measured_request_through_seq)
+                    {
+                        self.append_automatic_compaction_preflight_failure(
+                            &replacement,
+                            "snapshot_changed",
+                            "journal changed before resolved-without-checkpoint commit",
+                        )?;
+                        return Err(OxidraError::Session(
+                            "journal changed before resolved-without-checkpoint commit".to_owned(),
+                        ));
+                    }
+                    let data = serde_json::to_value(&resolution)?;
+                    validate_next_compaction_boundary_event(
+                        &events,
+                        COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
+                        data.clone(),
                     )?;
-                    return Err(OxidraError::Session(
-                        "journal changed before resolved-without-checkpoint commit".to_owned(),
-                    ));
+                    self.journal.append_and_sync(
+                        COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
+                        None,
+                        data,
+                    )?;
+                    observer.on_compaction_resolution_synced()?;
+                    observer.on_compaction(&format!(
+                        "compaction skipped after remeasurement: context {} below trigger {}",
+                        resolution.estimated_input_tokens, resolution.trigger_tokens
+                    ))?;
+                    self.run_existing_turn(
+                        &replacement.turn_id,
+                        replacement.user_message_seq,
+                        &turn_admission,
+                        cancellation,
+                        observer,
+                        approval,
+                    )
+                    .await
                 }
-                let data = serde_json::to_value(&resolution)?;
-                validate_next_compaction_boundary_event(
-                    &events,
-                    COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
-                    data.clone(),
-                )?;
-                self.journal.append_and_sync(
-                    COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
-                    None,
-                    data,
-                )?;
-                observer.on_compaction_resolution_synced()?;
-                observer.on_compaction(&format!(
-                    "compaction skipped after remeasurement: context {} below trigger {}",
-                    resolution.estimated_input_tokens, resolution.trigger_tokens
-                ))?;
-                self.run_existing_turn(
-                    &replacement.turn_id,
-                    replacement.user_message_seq,
-                    cancellation,
-                    observer,
-                    approval,
-                )
-                .await
             }
         }
+        .await;
+        self.finish_admitted_turn_result(&mut turn_admission, result)
     }
 
     /// 持久化 retry intent 后在原 turn 上继续，崩溃恢复不会重复追加 prompt。
@@ -1687,22 +1754,31 @@ impl Agent {
             ));
         };
         self.ensure_provider_call_budget(&retry.turn_id)?;
-        self.retry_pending_context_turn_from_snapshot(
-            &snapshot,
-            &retry,
-            retry_intent,
-            cancellation,
-            observer,
-            approval,
-        )
-        .await
+        let mut turn_admission = self
+            .journal
+            .admit_turn_continuation_v1(&retry.turn_id, retry.user_message_seq)
+            .map_err(DispatchAdmissionErrorV1::into_error)?;
+        let result = self
+            .retry_pending_context_turn_from_snapshot(
+                &snapshot,
+                &retry,
+                retry_intent,
+                &turn_admission,
+                cancellation,
+                observer,
+                approval,
+            )
+            .await;
+        self.finish_admitted_turn_result(&mut turn_admission, result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn retry_pending_context_turn_from_snapshot(
         &mut self,
         snapshot: &[JournalEvent],
         retry: &PendingContextTurn,
         retry_intent: Option<Value>,
+        turn_admission: &TurnTransactionAdmissionV1,
         cancellation: CancellationToken,
         observer: &mut dyn AgentObserver,
         approval: &mut dyn ApprovalHandler,
@@ -1719,6 +1795,7 @@ impl Agent {
         self.run_existing_turn(
             &retry.turn_id,
             retry.user_message_seq,
+            turn_admission,
             cancellation,
             observer,
             approval,
@@ -2078,7 +2155,37 @@ impl Agent {
             "stalled" => ("tool.skipped_due_to_stalled", "stalled"),
             _ => ("tool.skipped_due_to_limit", "limit_reached"),
         };
+        let events = self.journal.read_events()?;
+        let mut durable_mcp_calls = validated_durable_mcp_calls_for_turn(&events, turn_id)?;
+        let mut mcp_skips = Vec::new();
+        let mut generic_calls = Vec::new();
         for call in calls {
+            let Some(durable) = durable_mcp_calls.remove(&call.id) else {
+                generic_calls.push(call);
+                continue;
+            };
+            if durable.provider_name != call.name || durable.arguments != call.arguments {
+                self.journal.mark_reopen_required();
+                return Err(OxidraError::Session(format!(
+                    "in-memory tool call {} does not match its durable MCP binding",
+                    call.id
+                )));
+            }
+            mcp_skips.push(McpRecoverySkipV1 {
+                response_seq: durable.response_completed_seq,
+                call_id: call.id.clone(),
+                tool_name: durable.provider_name,
+                arguments: durable.arguments,
+            });
+        }
+        if let Err(error) = self
+            .journal
+            .append_mcp_recovery_skips_v1(turn_id, &mcp_skips)
+        {
+            self.journal.mark_reopen_required();
+            return Err(error);
+        }
+        for call in generic_calls {
             self.journal.append_and_sync(
                 kind,
                 Some(turn_id),
@@ -2219,6 +2326,7 @@ impl Agent {
         &mut self,
         turn_id: &str,
         user_message_seq: u64,
+        turn_admission: &TurnTransactionAdmissionV1,
         cancellation: CancellationToken,
         observer: &mut dyn AgentObserver,
         usage: &mut Usage,
@@ -2397,9 +2505,10 @@ impl Agent {
         }
 
         let mut compaction_observer = SilentCompactionObserver;
-        let checkpoint = compact_once_for_boundary(
+        let checkpoint = compact_once_for_boundary_with_turn_admission(
             self.provider.as_ref(),
             &mut self.journal,
+            turn_admission,
             &boundary,
             &candidate,
             &self.context_runtime.model,
@@ -4418,6 +4527,12 @@ mod tests {
 
     struct FailingStartObserver;
 
+    struct FailingApproval;
+
+    struct FailingToolCompletedObserver {
+        failed: bool,
+    }
+
     struct FailingCompactionRecoveryIntentObserver;
 
     struct CancelAfterCheckpointObserver {
@@ -4439,6 +4554,53 @@ mod tests {
 
         fn on_message(&mut self, _message: &str) -> Result<()> {
             Ok(())
+        }
+    }
+
+    impl AgentObserver for FailingToolCompletedObserver {
+        fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+            if !self.failed {
+                self.failed = true;
+                return Err(OxidraError::Config(
+                    "tool renderer failed after durable completion".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+
+        fn on_message(&mut self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ApprovalHandler for FailingApproval {
+        async fn approve_shell(
+            &mut self,
+            _command: &str,
+            _cancellation: &CancellationToken,
+        ) -> Result<bool> {
+            Err(OxidraError::observer(OxidraError::Config(
+                "approval backend failed".to_owned(),
+            )))
+        }
+
+        async fn approve_memory(
+            &mut self,
+            _content: &str,
+            _cancellation: &CancellationToken,
+        ) -> Result<bool> {
+            Err(OxidraError::observer(OxidraError::Config(
+                "approval backend failed".to_owned(),
+            )))
         }
     }
 
@@ -6638,6 +6800,7 @@ mod tests {
         let error = compact_replay_once_for_boundary(
             &ProviderFailureProvider,
             &mut journal,
+            None,
             &boundary,
             &candidate,
             "test-model",
@@ -7782,6 +7945,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_failure_settles_unstarted_batch_before_turn_cancelled() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let journal = store
+            .create_with_id(
+                "approval-batch-settlement",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let calls = vec![
+            ToolCall {
+                id: "shell-call-1".to_owned(),
+                name: "shell".to_owned(),
+                arguments: json!({"command":"echo one"}),
+            },
+            ToolCall {
+                id: "shell-call-2".to_owned(),
+                name: "shell".to_owned(),
+                arguments: json!({"command":"echo two"}),
+            },
+        ];
+        let provider = Arc::new(RecordingProvider::new([tool_turn(calls)]));
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let error = agent
+            .run_turn(
+                "run two shell calls",
+                CancellationToken::new(),
+                &mut NoopObserver,
+                &mut FailingApproval,
+            )
+            .await
+            .expect_err("approval failure should abort the turn");
+        assert!(matches!(
+            error,
+            OxidraError::Session(_) | OxidraError::Observer(_)
+        ));
+        let events = agent.journal().read_events().unwrap();
+        let skip_seqs = events
+            .iter()
+            .filter(|event| event.kind == "tool.skipped_due_to_cancel")
+            .map(|event| event.seq)
+            .collect::<Vec<_>>();
+        assert_eq!(skip_seqs.len(), 2);
+        let cancelled_seq = events
+            .iter()
+            .find(|event| event.kind == "turn.cancelled")
+            .map(|event| event.seq)
+            .expect("turn cancellation must be durable");
+        assert!(skip_seqs.iter().all(|seq| *seq < cancelled_seq));
+
+        drop(agent);
+        let reopened = store
+            .open("approval-batch-settlement")
+            .expect("the settled batch must remain reopenable");
+        let reopened_events = reopened.read_events().unwrap();
+        assert_eq!(
+            reopened_events
+                .iter()
+                .filter(|event| event.kind == "turn.cancelled")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_failure_after_tool_terminal_skips_only_remaining_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let journal = store
+            .create_with_id(
+                "observer-tool-terminal-settlement",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let calls = vec![
+            ToolCall {
+                id: "unknown-call-1".to_owned(),
+                name: "unknown-tool".to_owned(),
+                arguments: json!({}),
+            },
+            ToolCall {
+                id: "unknown-call-2".to_owned(),
+                name: "unknown-tool".to_owned(),
+                arguments: json!({}),
+            },
+        ];
+        let provider = Arc::new(RecordingProvider::new([tool_turn(calls)]));
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+        let mut observer = FailingToolCompletedObserver { failed: false };
+
+        agent
+            .run_turn(
+                "call two unknown tools",
+                CancellationToken::new(),
+                &mut observer,
+                &mut DenyApproval,
+            )
+            .await
+            .expect_err("observer failure should stop the turn");
+        let events = agent.journal().read_events().unwrap();
+        let completed = events
+            .iter()
+            .find(|event| event.kind == "tool.completed")
+            .expect("first tool terminal must remain durable");
+        assert_eq!(completed.data["call_id"], "unknown-call-1");
+        let skipped = events
+            .iter()
+            .filter(|event| event.kind == "tool.skipped_due_to_cancel")
+            .collect::<Vec<_>>();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].data["call_id"], "unknown-call-2");
+        let cancelled = events
+            .iter()
+            .find(|event| event.kind == "turn.cancelled")
+            .expect("turn cancellation must follow call settlement");
+        assert!(completed.seq < skipped[0].seq && skipped[0].seq < cancelled.seq);
+
+        drop(agent);
+        store
+            .open("observer-tool-terminal-settlement")
+            .expect("the ordered terminal batch must reopen");
+    }
+
+    #[tokio::test]
     async fn history_cancellation_and_local_io_errors_have_known_terminals() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
@@ -7894,6 +8218,153 @@ mod tests {
                 && event.data["error_code"] == "history_error"
         }));
         assert!(agent.journal().in_doubt().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_remaining_skipped_uses_mcp_recovery_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let mut journal = store
+            .create_with_id(
+                "agent-mcp-live-skip",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+
+        let epoch = "0190f5e6-7b00-7abc-8000-000000000002";
+        let registry_digest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let execution_plan_digest =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let config_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        journal
+            .append_and_sync(
+                "mcp.registry.activated",
+                None,
+                json!({
+                    "coordinator_version": 2,
+                    "call_chain_validator_version": 2,
+                    "coordinator_id": "0190f5e6-7b00-7abc-8000-000000000001",
+                    "registry_epoch_id": epoch,
+                    "registry_version": 1,
+                    "stdio_kernel_version": 1,
+                    "schema_profile_version": 1,
+                    "config_sha256": config_sha256,
+                    "execution_plan_digest": execution_plan_digest,
+                    "registry_digest": registry_digest,
+                    "bindings": [{
+                        "provider_name": "mcp_fixture_echo_deadbeef",
+                        "server_name": "fixture",
+                        "raw_tool_name": "echo",
+                        "protocol_version": "2026-07-28"
+                    }]
+                }),
+            )
+            .unwrap();
+
+        let turn_id = "turn-agent-mcp-skip";
+        let mut turn_admission = journal
+            .append_user_message_with_turn_admission_v1(
+                turn_id,
+                json!({
+                    "item": {"role": "user", "content": "run MCP tools"},
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                }),
+            )
+            .unwrap();
+        let arguments = json!({"text": "hello"});
+        let second_arguments = json!({"text": "world"});
+        let mut response_admission = journal
+            .append_provider_response_started_v1(
+                &turn_admission,
+                turn_id,
+                json!({
+                    "response_attempt_id": "attempt-agent-mcp-skip",
+                    "response_index": 1,
+                    "mcp_registry_epoch_id": epoch,
+                    "mcp_registry_digest": registry_digest,
+                    "context": {"measurement": {"request_digest": "digest"}},
+                }),
+            )
+            .unwrap();
+        journal
+            .append_provider_response_completed_v1(
+                &mut response_admission,
+                json!({
+                    "response_attempt_id": "attempt-agent-mcp-skip",
+                    "raw_response": {"output": [
+                        {"type": "function_call", "call_id": "mcp-call-1", "name": "mcp_fixture_echo_deadbeef", "arguments": serde_json::to_string(&arguments).unwrap()},
+                        {"type": "function_call", "call_id": "mcp-call-2", "name": "mcp_fixture_echo_deadbeef", "arguments": serde_json::to_string(&second_arguments).unwrap()}
+                    ]},
+                    "output_items": [
+                        {"type": "function_call", "call_id": "mcp-call-1", "name": "mcp_fixture_echo_deadbeef", "arguments": serde_json::to_string(&arguments).unwrap()},
+                        {"type": "function_call", "call_id": "mcp-call-2", "name": "mcp_fixture_echo_deadbeef", "arguments": serde_json::to_string(&second_arguments).unwrap()}
+                    ],
+                    "text": "",
+                    "usage": {},
+                    "unknown_stream_events": []
+                }),
+            )
+            .unwrap();
+
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            Arc::new(FinalResponseProvider),
+            journal,
+            tools,
+            "",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+        let calls = vec![
+            ToolCall {
+                id: "mcp-call-1".to_owned(),
+                name: "mcp_fixture_echo_deadbeef".to_owned(),
+                arguments: arguments.clone(),
+            },
+            ToolCall {
+                id: "mcp-call-2".to_owned(),
+                name: "mcp_fixture_echo_deadbeef".to_owned(),
+                arguments: second_arguments.clone(),
+            },
+        ];
+        agent
+            .mark_remaining_skipped(turn_id, &calls, "cancelled")
+            .unwrap();
+        agent
+            .journal_mut()
+            .finish_turn_transaction_v1(&mut turn_admission, Some("cancelled"))
+            .unwrap();
+
+        let events = agent.journal().read_events().unwrap();
+        crate::mcp::validate_mcp_call_chain(&events).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "tool.skipped_due_to_recovery")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "tool.skipped_due_to_cancel")
+                .count(),
+            0
+        );
+        drop(agent);
+
+        let reopened = store.open("agent-mcp-live-skip").unwrap();
+        crate::mcp::validate_mcp_call_chain(&reopened.read_events().unwrap()).unwrap();
     }
 
     #[tokio::test]

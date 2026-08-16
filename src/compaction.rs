@@ -28,7 +28,7 @@ use crate::projection::{
 use crate::provider::{ResponseProvider, ResponseRequest, StreamObserver, parse_usage};
 use crate::session::{
     CompactionProviderDispatchAdmissionV1, DispatchAdmissionErrorV1, DurableOutcomeCommitErrorV1,
-    JournalEvent, SessionJournal,
+    JournalEvent, SessionJournal, TurnTransactionAdmissionV1,
 };
 use crate::turn::{
     CompletionEvidence, ProviderRequestSlotState, TURN_BOUNDARY_VALIDATOR_VERSION, TurnState,
@@ -3424,6 +3424,7 @@ where
         candidate,
         model,
         None,
+        None,
         observer,
         cancellation,
         CandidateDispatchPolicy::CurrentWriter,
@@ -3459,6 +3460,42 @@ where
         candidate,
         model,
         Some(boundary),
+        None,
+        observer,
+        cancellation,
+        CandidateDispatchPolicy::CurrentWriter,
+        validate_summary_before_commit,
+    )
+    .await
+}
+
+/// Run a boundary-owned compaction attempt while proving that the active turn
+/// admission is the same durable reservation that authorized the Provider
+/// dispatch.  The public boundary helper intentionally has no capability
+/// parameter and therefore fails closed when a live turn admission exists;
+/// normal Agent paths must use this crate-private variant.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn compact_once_for_boundary_with_turn_admission<F>(
+    provider: &dyn ResponseProvider,
+    journal: &mut SessionJournal,
+    turn_admission: &TurnTransactionAdmissionV1,
+    boundary: &CompactionBoundary,
+    candidate: &CompactionCandidate,
+    model: &str,
+    observer: &mut dyn StreamObserver,
+    cancellation: CancellationToken,
+    validate_summary_before_commit: F,
+) -> Result<Checkpoint>
+where
+    F: FnOnce(&str) -> Result<()>,
+{
+    compact_once_impl(
+        provider,
+        journal,
+        candidate,
+        model,
+        Some(boundary),
+        Some(turn_admission),
         observer,
         cancellation,
         CandidateDispatchPolicy::CurrentWriter,
@@ -3477,6 +3514,7 @@ where
 pub(crate) async fn compact_replay_once_for_boundary<F>(
     provider: &dyn ResponseProvider,
     journal: &mut SessionJournal,
+    turn_admission: Option<&TurnTransactionAdmissionV1>,
     boundary: &CompactionBoundary,
     candidate: &CompactionCandidate,
     model: &str,
@@ -3493,6 +3531,7 @@ where
         candidate,
         model,
         Some(boundary),
+        turn_admission,
         observer,
         cancellation,
         CandidateDispatchPolicy::RecordedReplay,
@@ -3508,6 +3547,7 @@ async fn compact_once_impl<F>(
     candidate: &CompactionCandidate,
     model: &str,
     boundary: Option<&CompactionBoundary>,
+    turn_admission: Option<&TurnTransactionAdmissionV1>,
     observer: &mut dyn StreamObserver,
     cancellation: CancellationToken,
     candidate_policy: CandidateDispatchPolicy,
@@ -3517,6 +3557,11 @@ where
     F: FnOnce(&str) -> Result<()>,
 {
     let events = journal.read_events()?;
+    // Validate the caller's turn capability before any preflight failure can
+    // append a boundary terminal.  Checking only at compaction.started would
+    // let a capability-free caller mutate an active turn's durable boundary
+    // without ever receiving a Provider dispatch admission.
+    journal.validate_compaction_dispatch_owner_v1(turn_admission, boundary)?;
     if let Some(boundary) = boundary {
         validate_boundary_dispatch(&events, boundary)?;
     }
@@ -3590,7 +3635,7 @@ where
         extra,
     };
     let mut compaction_admission = match journal
-        .append_compaction_started_v1(serde_json::to_value(&started)?)
+        .append_compaction_started_v1(turn_admission, serde_json::to_value(&started)?)
     {
         Ok(admission) => admission,
         Err(DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(error)) => {
@@ -5218,6 +5263,74 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn active_turn_compaction_requires_exact_turn_capability() {
+        let (_temp, mut journal, candidate) = compaction_journal();
+        let user_message_seq = journal.next_seq();
+        let turn_admission = journal
+            .append_user_message_with_turn_admission_v1(
+                "boundary-turn-capability",
+                json!({
+                    "turn_boundary_version": TURN_BOUNDARY_VERSION,
+                    "item": {
+                        "role": "user",
+                        "content": "continue after capability-bound compaction",
+                    },
+                }),
+            )
+            .expect("admit active turn");
+        let boundary = CompactionBoundary::new(
+            "boundary-capability",
+            "boundary-turn-capability",
+            user_message_seq,
+        );
+        journal
+            .append_and_sync(
+                COMPACTION_BOUNDARY_STARTED_KIND,
+                None,
+                serde_json::to_value(CompactionBoundaryStarted {
+                    boundary: boundary.clone(),
+                    trigger: "context_trigger".to_owned(),
+                    extra: Map::new(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+
+        let provider = RecordingCompactionProvider::new(20);
+        let before = journal.read_events().unwrap();
+        let error = compact_once_for_boundary(
+            &provider,
+            &mut journal,
+            &boundary,
+            &candidate,
+            "",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .expect_err("capability-free helper must not mutate an active turn boundary");
+        assert!(error.to_string().contains("turn admission capability"));
+        assert_eq!(journal.read_events().unwrap(), before);
+        assert!(provider.request.lock().unwrap().is_none());
+
+        compact_once_for_boundary_with_turn_admission(
+            &provider,
+            &mut journal,
+            &turn_admission,
+            &boundary,
+            &candidate,
+            "test-model",
+            &mut NoopStreamObserver,
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .expect("the exact turn capability authorizes the compaction Provider dispatch");
+        assert!(provider.request.lock().unwrap().is_some());
+    }
+
     #[test]
     fn compaction_started_crash_recovery_fits_the_dispatch_time_reserve() {
         let (temp, mut journal, candidate) = compaction_journal();
@@ -5247,7 +5360,7 @@ mod tests {
             extra: Map::new(),
         };
         let admission = journal
-            .append_compaction_started_v1(serde_json::to_value(started).unwrap())
+            .append_compaction_started_v1(None, serde_json::to_value(started).unwrap())
             .expect("compaction start should fit with its recovery reserve");
         drop(admission);
         drop(journal);

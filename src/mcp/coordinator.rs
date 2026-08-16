@@ -3,6 +3,10 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -141,6 +145,7 @@ pub struct McpExecutionCoordinator {
     session_id: String,
     activation_seq: u64,
     registry: McpRegistry,
+    dispatch_poisoned: Arc<AtomicBool>,
 }
 
 /// Opaque proof that a durable session was opened, recovered and reduced
@@ -179,6 +184,7 @@ impl<'journal> McpResumeEligibility<'journal> {
         let events = journal.read_events()?;
         validate_mcp_call_chain(&events)?;
         ensure_no_unstarted_mcp_calls(&events)?;
+        ensure_no_unresolved_in_doubt_tools(journal)?;
         let activation = durable_activation(&events)?;
         let policy = activation_policy(activation)?;
         let activation_seq = activation.seq;
@@ -294,6 +300,7 @@ impl McpExecutionCoordinator {
             session_id: journal.session_id().to_owned(),
             activation_seq: event.seq,
             registry,
+            dispatch_poisoned: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -314,6 +321,7 @@ impl McpExecutionCoordinator {
         let events = journal.read_events()?;
         validate_mcp_call_chain(&events)?;
         ensure_no_unstarted_mcp_calls(&events)?;
+        ensure_no_unresolved_in_doubt_tools(journal)?;
         let activation = durable_activation(&events)?;
         if activation_policy(activation)? != resume_permit.policy
             || activation.seq != resume_permit.activation_seq
@@ -344,6 +352,7 @@ impl McpExecutionCoordinator {
             session_id: journal.session_id().to_owned(),
             activation_seq: activation.seq,
             registry,
+            dispatch_poisoned: Arc::new(AtomicBool::new(false)),
         };
         validate_activation(&events, &coordinator)?;
         Ok(coordinator)
@@ -386,6 +395,7 @@ impl McpExecutionCoordinator {
         cancellation: &CancellationToken,
         approval: &mut dyn McpCallApprovalHandler,
     ) -> Result<ToolResult> {
+        self.ensure_dispatch_healthy()?;
         self.require_bound_journal(journal)?;
         validate_call_identity(call.turn_id, call.call_id, call.provider_name)?;
 
@@ -486,6 +496,9 @@ impl McpExecutionCoordinator {
             Some(call.turn_id),
             started_data(&approved_call.request, approved_call.prepared.arguments()),
         )?;
+        let started_seq = started.seq;
+        let mut started_guard =
+            McpStartedCallGuard::new(journal, Arc::clone(&self.dispatch_poisoned));
         let permit = DispatchPermit {
             permit_version: self.policy.dispatch_permit_version,
             coordinator_id: self.coordinator_id.clone(),
@@ -499,7 +512,7 @@ impl McpExecutionCoordinator {
             protocol_version: approved_call.prepared.binding().protocol_version.clone(),
             server_attempt_id: approved_call.prepared.server_attempt_id().to_owned(),
             arguments_sha256,
-            started_seq: started.seq,
+            started_seq,
         };
 
         if cancellation.is_cancelled() {
@@ -508,15 +521,17 @@ impl McpExecutionCoordinator {
                 "cancelled",
                 "MCP call was cancelled before dispatch",
             );
-            journal.append_and_sync(
-                "tool.cancelled",
-                Some(call.turn_id),
-                terminal_data(&approved_call.request, started.seq, &result, true),
-            )?;
+            started_guard.terminalize(|journal| {
+                journal.append_and_sync(
+                    "tool.cancelled",
+                    Some(call.turn_id),
+                    terminal_data(&approved_call.request, started_seq, &result, true),
+                )?;
+                Ok(())
+            })?;
             return Ok(result);
         }
 
-        let started_seq = started.seq;
         let ApprovedMcpCall { request, prepared } = approved_call;
         let dispatched = self.registry.dispatch(permit, prepared, cancellation).await;
         match dispatched {
@@ -528,30 +543,38 @@ impl McpExecutionCoordinator {
                     is_error,
                     error_code: is_error.then(|| "mcp_tool_error".to_owned()),
                 };
-                journal.append_and_sync(
-                    "tool.completed",
-                    Some(call.turn_id),
-                    terminal_data(&request, started_seq, &result, false),
-                )?;
+                started_guard.terminalize(|journal| {
+                    journal.append_and_sync(
+                        "tool.completed",
+                        Some(call.turn_id),
+                        terminal_data(&request, started_seq, &result, false),
+                    )?;
+                    Ok(())
+                })?;
                 Ok(result)
             }
             Err(error) if error.in_doubt || error.interrupted => {
                 let result = ToolResult::error(call.call_id, "in_doubt", error.message);
-                journal.append_and_sync(
-                    "tool.in_doubt",
-                    Some(call.turn_id),
-                    terminal_data(&request, started_seq, &result, false),
-                )?;
+                started_guard.terminalize(|journal| {
+                    journal.append_and_sync(
+                        "tool.in_doubt",
+                        Some(call.turn_id),
+                        terminal_data(&request, started_seq, &result, false),
+                    )?;
+                    Ok(())
+                })?;
                 Ok(result)
             }
-            Err(error) => self.commit_known_failure(
-                journal,
-                call,
-                error.code,
-                error.message,
-                Some(&request),
-                Some(started_seq),
-            ),
+            Err(error) => started_guard.terminalize(|journal| {
+                self.commit_known_failure(
+                    journal,
+                    call,
+                    error.code,
+                    error.message,
+                    Some(&request),
+                    Some(started_seq),
+                )
+            }),
         }
     }
 
@@ -564,11 +587,22 @@ impl McpExecutionCoordinator {
         Ok(())
     }
 
+    fn ensure_dispatch_healthy(&self) -> Result<()> {
+        if self.dispatch_poisoned.load(Ordering::Acquire) {
+            return Err(OxidraError::Session(
+                "MCP coordinator dispatch was abandoned after tool.started; shut it down and reconnect before dispatching another call"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn prepare_durable_call(
         &self,
         journal: &SessionJournal,
         call: McpCallIdentity<'_>,
     ) -> Result<PreparedCoordinatorCall> {
+        self.ensure_dispatch_healthy()?;
         self.require_bound_journal(journal)?;
         validate_call_identity(call.turn_id, call.call_id, call.provider_name)?;
         if !journal.in_doubt()?.is_empty() {
@@ -669,6 +703,40 @@ impl McpExecutionCoordinator {
     }
 }
 
+struct McpStartedCallGuard<'journal> {
+    journal: &'journal mut SessionJournal,
+    dispatch_poisoned: Arc<AtomicBool>,
+    terminalized: bool,
+}
+
+impl<'journal> McpStartedCallGuard<'journal> {
+    fn new(journal: &'journal mut SessionJournal, dispatch_poisoned: Arc<AtomicBool>) -> Self {
+        Self {
+            journal,
+            dispatch_poisoned,
+            terminalized: false,
+        }
+    }
+
+    fn terminalize<T>(
+        &mut self,
+        commit: impl FnOnce(&mut SessionJournal) -> Result<T>,
+    ) -> Result<T> {
+        let result = commit(self.journal)?;
+        self.terminalized = true;
+        Ok(result)
+    }
+}
+
+impl Drop for McpStartedCallGuard<'_> {
+    fn drop(&mut self) {
+        if !self.terminalized {
+            self.journal.mark_reopen_required();
+            self.dispatch_poisoned.store(true, Ordering::Release);
+        }
+    }
+}
+
 struct ApprovedMcpCall {
     request: McpCallApprovalRequest,
     prepared: PreparedMcpRegistryCall,
@@ -751,6 +819,17 @@ fn validate_call_identity(turn_id: &str, call_id: &str, provider_name: &str) -> 
         }
     }
     Ok(())
+}
+
+fn ensure_no_unresolved_in_doubt_tools(journal: &SessionJournal) -> Result<()> {
+    let pending = journal.in_doubt()?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    Err(OxidraError::Session(format!(
+        "MCP resume is blocked until every in-doubt tool is explicitly resolved ({} unresolved)",
+        pending.len()
+    )))
 }
 
 fn validate_dispatch_candidate(

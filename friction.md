@@ -191,7 +191,9 @@ journal，但尚未进入 CLI 参数、Agent approval 或 `context.tools`，因�
 
 下一步是 CLI execution trust 与 Agent approval：把 session-open 产生的 resume capability、
 execution-plan approval 和 discovery 后的 registry epoch/digest 接入 `context.tools`，再让
-Agent 只通过 coordinator 的一次性 dispatch permit 执行调用，并补 in-doubt 人工解决入口。
+Agent 只通过 coordinator 的一次性 dispatch permit 执行调用。现有 CLI 已能通过 typed、
+批量同步的 resolution transaction 处理 durable `in_doubt`；Agent MCP glue 需要复用这条
+唯一事实源，而不是再实现一套 MCP 专用终态 writer。
 完整顺序与 release gate 见 `docs/mcp-roadmap.md`；不能把 kernel 的存在误报为已完成
 用户入口。
 

@@ -714,43 +714,7 @@ fn resolve_reported_in_doubt(
     journal: &mut SessionJournal,
     pending: Vec<InDoubtTool>,
 ) -> Result<()> {
-    for tool in pending {
-        resolve_one_in_doubt(journal, tool)?;
-    }
-    Ok(())
-}
-
-fn resolve_one_in_doubt(journal: &mut SessionJournal, tool: InDoubtTool) -> Result<()> {
-    let call_id = tool
-        .call_id
-        .as_deref()
-        .ok_or_else(|| {
-            OxidraError::Session(format!(
-                "cannot resolve in-doubt tool at seq {} without a call_id",
-                tool.started_seq
-            ))
-        })?
-        .to_owned();
-    let tool_name = in_doubt_tool_name(&tool).unwrap_or("unknown").to_owned();
-    let output = json!({
-        "error": {
-            "code": "in_doubt",
-            "message": "tool side effects were unknown after interruption; user inspected the state and chose to continue treating the call as failed"
-        }
-    });
-    journal.append_and_sync(
-        "tool.in_doubt_resolved",
-        tool.turn_id.as_deref(),
-        json!({
-            "started_seq": tool.started_seq,
-            "call_id": call_id,
-            "tool": tool_name,
-            "output": output,
-            "is_error": true,
-            "error_code": "in_doubt",
-            "resolution": "user_treated_as_failed",
-        }),
-    )?;
+    journal.resolve_all_in_doubt_as_failed(&pending)?;
     Ok(())
 }
 

@@ -640,9 +640,25 @@ pub(crate) fn validated_durable_mcp_call(
     turn_id: &str,
     call_id: &str,
 ) -> Result<ValidatedDurableMcpCall> {
-    let version = call_chain_validator_version(events)?.ok_or_else(|| {
-        OxidraError::Session("MCP call lookup requires a durable registry activation".to_owned())
-    })?;
+    validated_durable_mcp_call_if_present(events, turn_id, call_id)?.ok_or_else(|| {
+        OxidraError::Session(format!(
+            "MCP call {call_id} is not present in turn {turn_id}"
+        ))
+    })
+}
+
+/// Return a validated MCP call when the exact Provider call is owned by the
+/// durable activation, or `None` for a built-in/non-MCP call.  The complete
+/// chain is still validated before classification so callers cannot downgrade
+/// a malformed MCP prefix to a generic lifecycle event.
+pub(crate) fn validated_durable_mcp_call_if_present(
+    events: &[JournalEvent],
+    turn_id: &str,
+    call_id: &str,
+) -> Result<Option<ValidatedDurableMcpCall>> {
+    let Some(version) = call_chain_validator_version(events)? else {
+        return Ok(None);
+    };
     let activation = match version {
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => activation_v1(events)?,
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => activation_v2(events)?,
@@ -658,14 +674,10 @@ pub(crate) fn validated_durable_mcp_call(
         turn_id: turn_id.to_owned(),
         call_id: call_id.to_owned(),
     };
-    let call = durable_mcp_calls(events, &activation)?
-        .remove(&key)
-        .ok_or_else(|| {
-            OxidraError::Session(format!(
-                "MCP call {call_id} is not present in turn {turn_id}"
-            ))
-        })?;
-    Ok(ValidatedDurableMcpCall {
+    let Some(call) = durable_mcp_calls(events, &activation)?.remove(&key) else {
+        return Ok(None);
+    };
+    Ok(Some(ValidatedDurableMcpCall {
         provider_name: call.provider_name,
         arguments: call.arguments,
         arguments_sha256: call.arguments_sha256,
@@ -673,7 +685,48 @@ pub(crate) fn validated_durable_mcp_call(
         registry_digest: call.registry_digest,
         response_started_seq: call.response_started_seq,
         response_completed_seq: call.response_seq,
-    })
+    }))
+}
+
+/// Validate once and return all canonical MCP calls belonging to one turn.
+/// Agent skip/recovery paths use this batch projection so classifying a wide
+/// response does not re-run the complete reducer for every sibling call.
+pub(crate) fn validated_durable_mcp_calls_for_turn(
+    events: &[JournalEvent],
+    turn_id: &str,
+) -> Result<HashMap<String, ValidatedDurableMcpCall>> {
+    let Some(version) = call_chain_validator_version(events)? else {
+        return Ok(HashMap::new());
+    };
+    let activation = match version {
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => activation_v1(events)?,
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => activation_v2(events)?,
+        version => {
+            return session_error(format!(
+                "unsupported MCP call-chain validator version {version}"
+            ));
+        }
+    }
+    .expect("call-chain version implies an activation");
+    validate_mcp_call_chain_with_activation(events, &activation)?;
+    Ok(durable_mcp_calls(events, &activation)?
+        .into_iter()
+        .filter(|(key, _)| key.turn_id == turn_id)
+        .map(|(key, call)| {
+            (
+                key.call_id,
+                ValidatedDurableMcpCall {
+                    provider_name: call.provider_name,
+                    arguments: call.arguments,
+                    arguments_sha256: call.arguments_sha256,
+                    registry_epoch_id: call.registry_epoch_id,
+                    registry_digest: call.registry_digest,
+                    response_started_seq: call.response_started_seq,
+                    response_completed_seq: call.response_seq,
+                },
+            )
+        })
+        .collect())
 }
 
 pub(crate) fn mcp_turn_ids(events: &[JournalEvent]) -> Result<Vec<String>> {

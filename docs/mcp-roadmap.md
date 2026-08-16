@@ -219,6 +219,8 @@ resume 的启动顺序由类型而不是注释约定：只有 `SessionStore::ope
 `McpExecutionCoordinator::resume` 不接受普通 `connect` 产生的 `ApprovedMcpRegistry`。eligibility
 同时绑定 open-handle nonce、session、activation seq/版本、config SHA、execution-plan digest、
 registry epoch/digest；配置不一致会在执行任何 MCP 代码前失败，同一 open handle 不能重复启动。
+未解决的 `tool.in_doubt` 同样会在 eligibility 签发前阻止 MCP 启动；discovery 后、coordinator
+重新绑定 registry 前还会再次检查当前 journal，避免启动期间的状态漂移绕过恢复门槛。
 但 Agent 尚未消费该 reader，也尚未把 `context.tools` snapshot writer 改为在
 `response.started` 填充上述 registry epoch 字段。Agent 必须从同一 prepared request snapshot
 写入这些字段，证明 Provider request 所使用的 `context.tools`、返回 call、approval、started
@@ -261,6 +263,10 @@ projection 和 history 各自“碰巧做出相同判断”：
   terminal 前被 timeout/drop/abort，guard 的 `Drop` 会把当前 journal handle 标记为
   reopen-required。该 handle 不得继续读取或追加；关闭后由统一 session-open reducer按磁盘上
   实际完整 prefix补 bare-turn cancellation、response/compaction abort 和必要 marker/boundary repair。
+  coordinator 的 MCP dispatch 也在 `tool.started` fsync 后持有同类 guard；future/task 若在
+  terminal 前被丢弃，只能 fail-stop 并 reopen，不能在 `Drop` 中猜测副作用后补写成功或失败；
+  同一个 live coordinator/stdio transport 也会永久 poison，只允许 shutdown，必须重新 connect/
+  resume 后才能 dispatch，避免迟到 response 被误归属给下一次调用。
 - compaction Provider dispatch 在 `compaction.started` 前保护冻结的 2 MiB bounded
   outcome/recovery headroom。attempt terminal 与可选 boundary terminal 作为一个预构建
   transaction、一次 durability barrier提交；full checkpoint 或 raw-response audit 容量不足时
@@ -273,7 +279,9 @@ projection 和 history 各自“碰巧做出相同判断”：
   能由 `journal.recovered` marker 授权的 `tool.skipped_due_to_recovery` 关闭，并绑定原始
   response seq、参数 digest 和 marker 中的 exact unstarted-call authorization；同时要求
   `response_seq < recovery_marker_seq < skip_seq`。其他 generic `tool.skipped_due_to_*` 在
-  v1 中不能结算 MCP call。
+  v1 中不能结算 MCP call。live cancellation、tool limit、stall 和 sibling in-doubt 收尾也先按
+  durable binding 区分 MCP 与内置调用：MCP siblings 统一以 marker + recovery skip 批量结算，
+  内置调用才保留 generic skip kind，父 turn terminal 必须排在全部子调用 outcome 之后。
 - 同一 Provider response attempt 必须只有一个 terminal；session recovery 会先在内存中构造
   response/compaction abort、boundary terminal、recovery marker 与全部 skip 的完整 prospective
   transaction，并在首笔 journal 写入前运行 call-chain 与批量 generic Provider slot v2
@@ -283,14 +291,16 @@ projection 和 history 各自“碰巧做出相同判断”：
   v1 在该限制发布前可接受更大的历史批次，因此 recovery 不修改 v1 接受集合，而是先完整
   预检 authorization，再按每个 marker 至多 4096 条分片写入；每个自动 skip 只绑定其所属
   marker。marker authorization、pending/unstarted identity 与 slot call 状态均使用一次构建的
-  索引，恢复主路径受限为 journal/call 数量的线性扫描。恢复中途再次崩溃时，下一次 reopen
-  仅为剩余调用生成新的有界 marker。
-- 上述 turn/attempt admission 只证明首个 user intent、Provider terminal 与 compaction terminal
-  有 bounded 收尾空间；它**尚未**授权 `response.completed` 携带的整批未启动 tool calls。
-  在 Agent MCP glue 前必须冻结 response-batch admission：把 ordered call count、arguments 总编码
-  大小和最坏 recovery/finalization transaction 一并纳入 commit 条件，或者改用 compact batch
-  terminal。否则一个合法的 4096-call completed response 仍可能占满 journal，随后 crash recovery
-  无空间写 marker/skip；固定 1 MiB turn reserve 不能替代按 batch 大小计算的 durable ownership。
+  索引；in-doubt lineage 在一次前向扫描中维护按 started seq 排序的 pending map，每个 marker
+  只处理自身 payload，不再为每个 marker 复制、排序完整 pending 集合。恢复中途再次崩溃时，
+  下一次 reopen 仅为剩余调用生成新的有界 marker。
+- `response.completed` 产生 function-call batch 时，active turn capability 会在首次 fsync 前按
+  durable output 重新计算 marker、全部未启动 skip、in-doubt resolution slots 和父 turn
+  finalization 的 recovery debt；journal 只有在仍能保留该 headroom 时才接受 completed event。
+  retry/resume continuation 必须重新取得同一 turn admission，不能在无 reserve 状态下写批次。
+  后续 `tool.started`/`tool.in_doubt` 会把新增 lifecycle debt计入同一 reservation；只有所有子调用
+  已结算，或 debt 原子转移为 explicit in-doubt resolution headroom 后，父 turn 才能 terminalize
+  并释放容量。固定 1 MiB 只是批次出现前的 floor，不再被当作 4096-call recovery 的上限。
 - schema profile v1 也是 validator v1 的冻结传递依赖；历史 `tool.started` 不读取未来默认
   profile。未知 call-chain、activation、provenance 或 profile 版本一律 fail closed。
 - coordinator 不再独立扫描 `response.completed`；它只消费 call-chain validator 按 activation
