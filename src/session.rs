@@ -1338,7 +1338,6 @@ impl SessionJournal {
         crate::mcp::validate_mcp_call_chain(&prospective)
             .map_err(DispatchAdmissionErrorV1::Fatal)?;
 
-        let pending = pending_tools(&prospective);
         let unstarted = unstarted_tool_calls(&prospective);
         // Without an active turn admission there is no owner capable of
         // transferring recovery debt for sibling calls after this standalone
@@ -1350,19 +1349,13 @@ impl SessionJournal {
                     .to_owned(),
             )));
         }
-        let recovery_headroom =
-            in_doubt_transaction_headroom_v1(self.session_id(), &prospective, &pending, &unstarted)
-                .map_err(DispatchAdmissionErrorV1::Fatal)?;
-        let mut protected_headroom = MCP_TOOL_OUTCOME_HEADROOM_BYTES_V1
-            .checked_add(recovery_headroom)
-            .ok_or_else(|| {
-                DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
-                    "MCP tool outcome recovery debt overflow".to_owned(),
-                ))
-            })?;
-        if let Some(active_turn) = &self.active_turn {
-            protected_headroom = protected_headroom.max(active_turn.headroom_bytes);
-        }
+        let protected_headroom = mcp_tool_dispatch_required_headroom_v1(
+            self.session_id(),
+            &mut prospective,
+            &started,
+            self.active_turn.as_ref(),
+        )
+        .map_err(DispatchAdmissionErrorV1::Fatal)?;
         let admission_limit = self
             .byte_limit
             .checked_sub(protected_headroom)
@@ -1445,32 +1438,27 @@ impl SessionJournal {
         prospective.push(terminal.clone());
         crate::mcp::validate_mcp_call_chain(&prospective)?;
 
-        let pending = pending_tools(&prospective);
-        let unstarted = unstarted_tool_calls(&prospective);
-        let recovery_headroom = in_doubt_transaction_headroom_v1(
-            self.session_id(),
-            &prospective,
-            &pending,
-            &unstarted,
-        )?;
-        let mut residual_headroom = recovery_headroom;
         if let Some(active_turn) = &self.active_turn {
             if active_turn.turn_id != active.turn_id {
                 return Err(OxidraError::Session(
                     "MCP terminal does not belong to the active turn transaction".to_owned(),
                 ));
             }
-            let turn_headroom =
-                TURN_OUTCOME_HEADROOM_BYTES_V1.max(active_turn_recovery_headroom_v1(
-                    self.session_id(),
-                    &prospective,
-                    &active.turn_id,
-                    active_turn.user_message_seq,
-                )?);
-            residual_headroom = residual_headroom.max(turn_headroom);
         }
+        let pending = pending_tools(&prospective);
+        let residual_headroom = mcp_tool_terminal_residual_headroom_v1(
+            self.session_id(),
+            &prospective,
+            self.active_turn.as_ref(),
+        )?;
 
         let terminal_bytes = encoded_journal_events_bytes(std::slice::from_ref(&terminal))?;
+        if terminal_bytes > MCP_TOOL_OUTCOME_HEADROOM_BYTES_V1 {
+            self.mark_reopen_required();
+            return Err(OxidraError::Session(format!(
+                "MCP terminal requires {terminal_bytes} bytes, exceeding its frozen {MCP_TOOL_OUTCOME_HEADROOM_BYTES_V1}-byte outcome profile"
+            )));
+        }
         if terminal_bytes
             .checked_add(residual_headroom)
             .is_none_or(|required| required > active.headroom_bytes)
@@ -2322,6 +2310,23 @@ impl SessionJournal {
             data,
         )
         .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        let refreshed_turn_headroom = active_turn_recovery_headroom_v1(
+            &self.session_id,
+            &durable_prefix,
+            &active_turn.turn_id,
+            active_turn.user_message_seq,
+        )
+        .map(|required| TURN_OUTCOME_HEADROOM_BYTES_V1.max(required))
+        .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        // The writer must never fsync a Provider start that the frozen MCP
+        // reducer would reject on the next open.  In particular, a partial or
+        // mismatched registry claim must fail before the external Provider is
+        // dispatched; otherwise the admission token can only preserve bytes,
+        // not the journal's semantic recoverability.
+        let mut prospective = durable_prefix;
+        prospective.push(started.clone());
+        crate::mcp::validate_mcp_call_chain(&prospective)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
         let outcome_headroom = provider_response_outcome_headroom_required_v1(
             self.session_id(),
             turn_id,
@@ -2337,14 +2342,6 @@ impl SessionJournal {
                 ),
             )));
         }
-        let refreshed_turn_headroom = active_turn_recovery_headroom_v1(
-            &self.session_id,
-            &durable_prefix,
-            &active_turn.turn_id,
-            active_turn.user_message_seq,
-        )
-        .map(|required| TURN_OUTCOME_HEADROOM_BYTES_V1.max(required))
-        .map_err(DispatchAdmissionErrorV1::Fatal)?;
         let protected_headroom = refreshed_turn_headroom
             .checked_add(outcome_headroom)
             .and_then(|size| size.checked_add(self.recovery_headroom_bytes))
@@ -2561,6 +2558,13 @@ impl SessionJournal {
                 "Provider response terminal does not match the active turn transaction".to_owned(),
             ));
         }
+        let mut prospective = self.read_events()?;
+        prospective.extend(events.iter().cloned());
+        // Keep the production writer's acceptance set inside the frozen MCP
+        // reader's acceptance set.  This is deliberately before any append;
+        // callers may still use the same admission to write the bounded
+        // response.failed fallback when a completed response is malformed.
+        crate::mcp::validate_mcp_call_chain(&prospective)?;
         let encoded_bytes = encoded_journal_events_bytes(events)?;
         if must_fit_headroom && encoded_bytes > active.headroom_bytes {
             return Err(OxidraError::Session(format!(
@@ -2579,8 +2583,6 @@ impl SessionJournal {
                 })?
         } else {
             let turn = active_turn.clone();
-            let mut prospective = self.read_events()?;
-            prospective.extend(events.iter().cloned());
             provider_request_slot_state_for_version(
                 PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
                 &prospective,
@@ -4487,6 +4489,127 @@ fn active_turn_recovery_headroom_v1(
         .ok_or_else(|| OxidraError::Session("turn recovery debt overflow".to_owned()))
 }
 
+/// Return the recovery debt that remains after one MCP tool terminal.  This is
+/// intentionally shared by pre-dispatch admission and terminal commit: the
+/// former must reserve the same post-terminal state that the latter will
+/// actually consume, rather than guessing from the current global pending set.
+fn mcp_tool_terminal_residual_headroom_v1(
+    session_id: &str,
+    events: &[JournalEvent],
+    active_turn: Option<&ActiveTurnReservationV1>,
+) -> Result<u64> {
+    let pending = pending_tools(events);
+    let unstarted = unstarted_tool_calls(events);
+    let mut residual = in_doubt_transaction_headroom_v1(session_id, events, &pending, &unstarted)?;
+    if let Some(active_turn) = active_turn {
+        let turn_headroom = TURN_OUTCOME_HEADROOM_BYTES_V1.max(active_turn_recovery_headroom_v1(
+            session_id,
+            events,
+            &active_turn.turn_id,
+            active_turn.user_message_seq,
+        )?);
+        residual = residual.max(turn_headroom);
+    }
+    Ok(residual)
+}
+
+/// Build a valid, bounded-shape terminal for admission accounting.  The
+/// payload is not written; it only lets the reservation calculate the exact
+/// recovery state after each frozen immediate-outcome branch.
+fn planned_mcp_tool_terminal_profile_v1(
+    session_id: &str,
+    started: &JournalEvent,
+    kind: &str,
+) -> Result<JournalEvent> {
+    let turn_id = started.turn_id.as_deref().ok_or_else(|| {
+        OxidraError::Session("MCP tool.started profile has no turn_id".to_owned())
+    })?;
+    let call_id = started.data.get("call_id").cloned().ok_or_else(|| {
+        OxidraError::Session("MCP tool.started profile has no call_id".to_owned())
+    })?;
+    let tool =
+        started.data.get("tool").cloned().ok_or_else(|| {
+            OxidraError::Session("MCP tool.started profile has no tool".to_owned())
+        })?;
+    let mut data = match kind {
+        "tool.completed" => json!({
+            "started_seq": started.seq,
+            "call_id": call_id,
+            "tool": tool,
+            "output": {"ok": true},
+            "is_error": false,
+            "error_code": Value::Null,
+            "before_dispatch": false,
+        }),
+        "tool.in_doubt" => json!({
+            "started_seq": started.seq,
+            "call_id": call_id,
+            "tool": tool,
+            "output": {"error": {"code": "in_doubt", "message": "unknown"}},
+            "is_error": true,
+            "error_code": "in_doubt",
+            "before_dispatch": false,
+        }),
+        "tool.cancelled" => json!({
+            "started_seq": started.seq,
+            "call_id": call_id,
+            "tool": tool,
+            "output": {"error": {"code": "cancelled", "message": "cancelled"}},
+            "is_error": true,
+            "error_code": "cancelled",
+            "before_dispatch": true,
+        }),
+        _ => {
+            return Err(OxidraError::Session(
+                "unsupported MCP terminal profile".to_owned(),
+            ));
+        }
+    };
+    if let Some(provenance) = started.data.get("mcp") {
+        data["mcp"] = provenance.clone();
+    }
+    let mut next_seq = started
+        .seq
+        .checked_add(1)
+        .ok_or_else(|| OxidraError::Session("journal sequence exhausted".to_owned()))?;
+    planned_recovery_event(session_id, &mut next_seq, kind, Some(turn_id), data)
+}
+
+/// Compute the complete durable reserve required before an MCP process is
+/// allowed to run.  A crash immediately after `tool.started` and every
+/// bounded live terminal branch are separate valid prefixes; the reserve must
+/// cover the worst of them, with terminal bytes added to the debt that remains
+/// after that branch.
+fn mcp_tool_dispatch_required_headroom_v1(
+    session_id: &str,
+    events_after_started: &mut Vec<JournalEvent>,
+    started: &JournalEvent,
+    active_turn: Option<&ActiveTurnReservationV1>,
+) -> Result<u64> {
+    let crash_debt =
+        mcp_tool_terminal_residual_headroom_v1(session_id, events_after_started, active_turn)?;
+    let prior_debt = active_turn.map_or(0, |turn| turn.headroom_bytes);
+    let mut required = crash_debt.max(prior_debt);
+
+    for kind in ["tool.completed", "tool.cancelled", "tool.in_doubt"] {
+        let terminal = planned_mcp_tool_terminal_profile_v1(session_id, started, kind)?;
+        events_after_started.push(terminal);
+        let branch_result = (|| {
+            crate::mcp::validate_mcp_call_chain(events_after_started)?;
+            mcp_tool_terminal_residual_headroom_v1(session_id, events_after_started, active_turn)
+        })();
+        events_after_started.pop();
+        let residual = branch_result?;
+        let branch_debt = MCP_TOOL_OUTCOME_HEADROOM_BYTES_V1
+            .checked_add(residual)
+            .ok_or_else(|| {
+                OxidraError::Session("MCP tool outcome recovery debt overflow".to_owned())
+            })?;
+        required = required.max(branch_debt);
+    }
+    Ok(required)
+}
+
 fn in_doubt_resolution_headroom_v1(session_id: &str, tools: &[InDoubtTool]) -> Result<u64> {
     tools.iter().try_fold(0u64, |total, tool| {
         total
@@ -5643,6 +5766,56 @@ mod tests {
             .unwrap()
     }
 
+    fn append_test_mcp_activation_v2(
+        journal: &mut SessionJournal,
+    ) -> (&'static str, &'static str, &'static str) {
+        let epoch = "0190f5e6-7b00-7abc-8000-000000000202";
+        let digest = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let provider_name = "mcp_fixture_echo_deadbeef";
+        journal
+            .append_and_sync(
+                "mcp.registry.activated",
+                None,
+                json!({
+                    "coordinator_version":2,
+                    "call_chain_validator_version":2,
+                    "coordinator_id":"0190f5e6-7b00-7abc-8000-000000000201",
+                    "registry_epoch_id":epoch,
+                    "registry_version":1,
+                    "stdio_kernel_version":1,
+                    "schema_profile_version":1,
+                    "config_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "execution_plan_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "registry_digest":digest,
+                    "bindings":[{
+                        "provider_name":provider_name,
+                        "server_name":"fixture",
+                        "raw_tool_name":"echo",
+                        "protocol_version":"2026-07-28",
+                    }],
+                }),
+            )
+            .unwrap();
+        (epoch, digest, provider_name)
+    }
+
+    fn test_mcp_provenance_v2(epoch: &str, digest: &str, arguments: &Value) -> Value {
+        json!({
+            "execution_coordinator_version":2,
+            "dispatch_permit_version":1,
+            "argument_digest_version":1,
+            "registry_version":1,
+            "registry_epoch_id":epoch,
+            "registry_digest":digest,
+            "execution_plan_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "server_name":"fixture",
+            "raw_tool_name":"echo",
+            "protocol_version":"2026-07-28",
+            "server_attempt_id":"0190f5e6-7b00-7abc-8000-000000000203",
+            "arguments_sha256":crate::mcp::argument_digest_v1(arguments).unwrap(),
+        })
+    }
+
     fn append_provider_context_limit_intent_prefix(
         journal: &mut SessionJournal,
         turn_id: &str,
@@ -6607,6 +6780,196 @@ mod tests {
     }
 
     #[test]
+    fn active_turn_mcp_in_doubt_consumes_its_predispatch_reserve_at_exact_limit() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("active-turn-mcp-in-doubt", header(temp.path()))
+            .unwrap();
+        let (epoch, digest, provider_name) = append_test_mcp_activation_v2(&mut journal);
+        let mut turn_admission = admit_test_turn(&mut journal, "turn-active-mcp-in-doubt");
+        let arguments = json!({});
+        let provenance = test_mcp_provenance_v2(epoch, digest, &arguments);
+        let mut response_admission = journal
+            .append_provider_response_started_v1(
+                &turn_admission,
+                "turn-active-mcp-in-doubt",
+                json!({
+                    "response_attempt_id":"attempt-active-mcp-in-doubt",
+                    "response_index":1,
+                    "context":{"measurement":{"request_digest":"digest"}},
+                    "mcp_registry_epoch_id":epoch,
+                    "mcp_registry_digest":digest,
+                }),
+            )
+            .unwrap();
+        journal
+            .append_provider_response_completed_v1(
+                &mut response_admission,
+                json!({
+                    "response_attempt_id":"attempt-active-mcp-in-doubt",
+                    "output_items":[{
+                        "type":"function_call",
+                        "call_id":"call-active-mcp-in-doubt",
+                        "name":provider_name,
+                        "arguments":"{}",
+                    }],
+                }),
+            )
+            .unwrap();
+
+        let mut tool_admission = journal
+            .append_mcp_tool_started_v1(
+                "turn-active-mcp-in-doubt",
+                json!({
+                    "call_id":"call-active-mcp-in-doubt",
+                    "tool":provider_name,
+                    "arguments":arguments,
+                    "mcp":provenance.clone(),
+                }),
+            )
+            .unwrap();
+        let started_seq = tool_admission.started_seq();
+        let reserved = journal
+            .active_mcp_tool
+            .as_ref()
+            .expect("active MCP reserve")
+            .headroom_bytes;
+        let current_size = journal.file.metadata().unwrap().len();
+        let exact_limit = current_size + reserved;
+        journal.set_byte_limit_for_tests(exact_limit);
+
+        journal
+            .commit_mcp_tool_terminal_v1(
+                &mut tool_admission,
+                "tool.in_doubt",
+                json!({
+                    "started_seq":started_seq,
+                    "call_id":"call-active-mcp-in-doubt",
+                    "tool":provider_name,
+                    "output":{"error":{"code":"in_doubt","message":"side effect is unknown"}},
+                    "is_error":true,
+                    "error_code":"in_doubt",
+                    "before_dispatch":false,
+                    "mcp":provenance,
+                }),
+            )
+            .expect("the pre-dispatch reserve must cover the bounded in-doubt terminal");
+        journal
+            .finish_turn_transaction_v1(&mut turn_admission, Some("tool side effect unknown"))
+            .unwrap();
+        let pending = journal.in_doubt().unwrap();
+        assert_eq!(pending.len(), 1);
+        journal.resolve_all_in_doubt_v1(&pending).unwrap();
+        assert_eq!(journal.recovery_headroom_bytes, 0);
+        drop(journal);
+        store
+            .open_with_byte_limit("active-turn-mcp-in-doubt", exact_limit)
+            .expect("the exact-limit transaction must reopen cleanly");
+    }
+
+    #[test]
+    fn active_turn_mcp_completed_call_preserves_sibling_recovery_debt() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("active-turn-mcp-sibling-debt", header(temp.path()))
+            .unwrap();
+        let (epoch, digest, provider_name) = append_test_mcp_activation_v2(&mut journal);
+        let mut turn_admission = admit_test_turn(&mut journal, "turn-active-mcp-sibling");
+        let arguments = json!({});
+        let first_provenance = test_mcp_provenance_v2(epoch, digest, &arguments);
+        let mut response_admission = journal
+            .append_provider_response_started_v1(
+                &turn_admission,
+                "turn-active-mcp-sibling",
+                json!({
+                    "response_attempt_id":"attempt-active-mcp-sibling",
+                    "response_index":1,
+                    "context":{"measurement":{"request_digest":"digest"}},
+                    "mcp_registry_epoch_id":epoch,
+                    "mcp_registry_digest":digest,
+                }),
+            )
+            .unwrap();
+        journal
+            .append_provider_response_completed_v1(
+                &mut response_admission,
+                json!({
+                    "response_attempt_id":"attempt-active-mcp-sibling",
+                    "output_items":[
+                        {
+                            "type":"function_call",
+                            "call_id":"call-active-mcp-first",
+                            "name":provider_name,
+                            "arguments":"{}",
+                        },
+                        {
+                            "type":"function_call",
+                            "call_id":"call-active-mcp-second",
+                            "name":provider_name,
+                            "arguments":"{}",
+                        },
+                    ],
+                }),
+            )
+            .unwrap();
+
+        let mut tool_admission = journal
+            .append_mcp_tool_started_v1(
+                "turn-active-mcp-sibling",
+                json!({
+                    "call_id":"call-active-mcp-first",
+                    "tool":provider_name,
+                    "arguments":arguments,
+                    "mcp":first_provenance.clone(),
+                }),
+            )
+            .unwrap();
+        let started_seq = tool_admission.started_seq();
+        let reserved = journal
+            .active_mcp_tool
+            .as_ref()
+            .expect("active MCP reserve")
+            .headroom_bytes;
+        let exact_limit = journal.file.metadata().unwrap().len() + reserved;
+        journal.set_byte_limit_for_tests(exact_limit);
+        journal
+            .commit_mcp_tool_terminal_v1(
+                &mut tool_admission,
+                "tool.completed",
+                json!({
+                    "started_seq":started_seq,
+                    "call_id":"call-active-mcp-first",
+                    "tool":provider_name,
+                    "output":{"structuredContent":{"blob":"x".repeat(50 * 1024)}},
+                    "is_error":false,
+                    "error_code":null,
+                    "before_dispatch":false,
+                    "mcp":first_provenance,
+                }),
+            )
+            .expect("the bounded complete result must fit beside sibling recovery debt");
+        journal
+            .finish_turn_transaction_v1(&mut turn_admission, Some("second call not dispatched"))
+            .unwrap();
+        assert!(journal.in_doubt().unwrap().is_empty());
+        assert_eq!(
+            journal
+                .read_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "tool.skipped_due_to_recovery")
+                .count(),
+            1
+        );
+        drop(journal);
+        store
+            .open_with_byte_limit("active-turn-mcp-sibling-debt", exact_limit)
+            .expect("sibling recovery must fit the same dispatch reservation");
+    }
+
+    #[test]
     fn provider_dispatch_admission_is_exclusive_and_single_use() {
         let temp = TempDir::new().unwrap();
         let store = SessionStore::new(temp.path()).unwrap();
@@ -6885,6 +7248,108 @@ mod tests {
         journal
             .finish_turn_transaction_v1(&mut turn_admission, Some("test cleanup"))
             .unwrap();
+    }
+
+    #[test]
+    fn partial_mcp_registry_claim_is_rejected_before_provider_start_is_written() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("provider-partial-mcp-claim", header(temp.path()))
+            .unwrap();
+        let (epoch, _, _) = append_test_mcp_activation_v2(&mut journal);
+        let mut turn_admission = admit_test_turn(&mut journal, "turn-partial-mcp-claim");
+        let before = journal.read_events().unwrap();
+
+        let error = journal
+            .append_provider_response_started_v1(
+                &turn_admission,
+                "turn-partial-mcp-claim",
+                json!({
+                    "response_attempt_id":"attempt-partial-mcp-claim",
+                    "response_index":1,
+                    "context":{"measurement":{"request_digest":"digest"}},
+                    "mcp_registry_epoch_id":epoch,
+                }),
+            )
+            .expect_err("a partial registry claim must fail before Provider dispatch");
+        assert!(matches!(error, DispatchAdmissionErrorV1::Fatal(_)));
+        assert_eq!(journal.read_events().unwrap(), before);
+
+        journal
+            .finish_turn_transaction_v1(&mut turn_admission, Some("invalid MCP registry claim"))
+            .unwrap();
+    }
+
+    #[test]
+    fn malformed_mcp_completed_response_is_rejected_before_fsync_and_can_fallback() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("provider-malformed-mcp-completed", header(temp.path()))
+            .unwrap();
+        let (epoch, digest, _) = append_test_mcp_activation_v2(&mut journal);
+        let mut turn_admission = admit_test_turn(&mut journal, "turn-malformed-mcp-completed");
+        let mut response_admission = journal
+            .append_provider_response_started_v1(
+                &turn_admission,
+                "turn-malformed-mcp-completed",
+                json!({
+                    "response_attempt_id":"attempt-malformed-mcp-completed",
+                    "response_index":1,
+                    "context":{"measurement":{"request_digest":"digest"}},
+                    "mcp_registry_epoch_id":epoch,
+                    "mcp_registry_digest":digest,
+                }),
+            )
+            .unwrap();
+        let before = journal.read_events().unwrap();
+
+        let error = journal
+            .append_provider_response_completed_v1(
+                &mut response_admission,
+                json!({
+                    "response_attempt_id":"attempt-malformed-mcp-completed",
+                    "raw_response":{"output":[]},
+                    "text":"",
+                    "usage":{},
+                }),
+            )
+            .expect_err("MCP-owned completion requires canonical output_items");
+        assert!(
+            error.to_string().contains("canonical output_items"),
+            "{error}"
+        );
+        assert_eq!(journal.read_events().unwrap(), before);
+
+        journal
+            .append_provider_response_failed_v1(
+                &mut response_admission,
+                "malformed MCP Provider completion",
+            )
+            .expect("the still-live admission must authorize a bounded failure fallback");
+        journal
+            .finish_turn_transaction_v1(&mut turn_admission, None)
+            .unwrap();
+        drop(journal);
+
+        let reopened = store.open("provider-malformed-mcp-completed").unwrap();
+        let events = reopened.read_events().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "response.completed")
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "response.failed")
+                .count(),
+            1
+        );
+        crate::mcp::validate_mcp_call_chain(&events).unwrap();
     }
 
     #[test]
