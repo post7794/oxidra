@@ -21,7 +21,7 @@ use super::registry::{
 use super::{McpCallError, PreflightedJsonValue};
 use crate::compaction::validate_compaction_boundary_chain;
 use crate::error::{OxidraError, Result};
-use crate::session::{JOURNAL_SCHEMA, JournalEvent, SessionJournal};
+use crate::session::{JOURNAL_SCHEMA, JournalEvent, McpToolDispatchAdmissionV1, SessionJournal};
 use crate::turn::{ProviderRequestSlotState, provider_request_slot_state_for_version};
 use crate::types::{ToolDefinition, ToolResult};
 use crate::untrusted_display;
@@ -491,14 +491,15 @@ impl McpExecutionCoordinator {
             approved_call.prepared.arguments(),
         )?;
 
-        let started = journal.append_and_sync(
-            "tool.started",
-            Some(call.turn_id),
-            started_data(&approved_call.request, approved_call.prepared.arguments()),
-        )?;
-        let started_seq = started.seq;
+        let admission = journal
+            .append_mcp_tool_started_v1(
+                call.turn_id,
+                started_data(&approved_call.request, approved_call.prepared.arguments()),
+            )
+            .map_err(|error| error.into_error())?;
+        let started_seq = admission.started_seq();
         let mut started_guard =
-            McpStartedCallGuard::new(journal, Arc::clone(&self.dispatch_poisoned));
+            McpStartedCallGuard::new(journal, admission, Arc::clone(&self.dispatch_poisoned));
         let permit = DispatchPermit {
             permit_version: self.policy.dispatch_permit_version,
             coordinator_id: self.coordinator_id.clone(),
@@ -521,10 +522,10 @@ impl McpExecutionCoordinator {
                 "cancelled",
                 "MCP call was cancelled before dispatch",
             );
-            started_guard.terminalize(|journal| {
-                journal.append_and_sync(
+            started_guard.terminalize(|journal, admission| {
+                journal.commit_mcp_tool_terminal_v1(
+                    admission,
                     "tool.cancelled",
-                    Some(call.turn_id),
                     terminal_data(&approved_call.request, started_seq, &result, true),
                 )?;
                 Ok(())
@@ -543,10 +544,10 @@ impl McpExecutionCoordinator {
                     is_error,
                     error_code: is_error.then(|| "mcp_tool_error".to_owned()),
                 };
-                started_guard.terminalize(|journal| {
-                    journal.append_and_sync(
+                started_guard.terminalize(|journal, admission| {
+                    journal.commit_mcp_tool_terminal_v1(
+                        admission,
                         "tool.completed",
-                        Some(call.turn_id),
                         terminal_data(&request, started_seq, &result, false),
                     )?;
                     Ok(())
@@ -555,25 +556,24 @@ impl McpExecutionCoordinator {
             }
             Err(error) if error.in_doubt || error.interrupted => {
                 let result = ToolResult::error(call.call_id, "in_doubt", error.message);
-                started_guard.terminalize(|journal| {
-                    journal.append_and_sync(
+                started_guard.terminalize(|journal, admission| {
+                    journal.commit_mcp_tool_terminal_v1(
+                        admission,
                         "tool.in_doubt",
-                        Some(call.turn_id),
                         terminal_data(&request, started_seq, &result, false),
                     )?;
                     Ok(())
                 })?;
                 Ok(result)
             }
-            Err(error) => started_guard.terminalize(|journal| {
-                self.commit_known_failure(
-                    journal,
-                    call,
-                    error.code,
-                    error.message,
-                    Some(&request),
-                    Some(started_seq),
-                )
+            Err(error) => started_guard.terminalize(|journal, admission| {
+                let result = ToolResult::error(call.call_id, error.code, error.message);
+                journal.commit_mcp_tool_terminal_v1(
+                    admission,
+                    "tool.completed",
+                    terminal_data(&request, started_seq, &result, false),
+                )?;
+                Ok(result)
             }),
         }
     }
@@ -705,18 +705,24 @@ impl McpExecutionCoordinator {
 
 struct McpStartedCallGuard<'journal> {
     journal: &'journal mut SessionJournal,
+    admission: McpToolDispatchAdmissionV1,
     dispatch_poisoned: Arc<AtomicBool>,
     terminalized: bool,
 }
 
 impl<'journal> McpStartedCallGuard<'journal> {
-    fn new(journal: &'journal mut SessionJournal, dispatch_poisoned: Arc<AtomicBool>) -> Self {
+    fn new(
+        journal: &'journal mut SessionJournal,
+        admission: McpToolDispatchAdmissionV1,
+        dispatch_poisoned: Arc<AtomicBool>,
+    ) -> Self {
         // `tool.started` is already durable when this guard is created.  Arm
         // the coordinator poison before returning so leaking/forgetting the
         // future cannot make the old transport reusable without a terminal.
         dispatch_poisoned.store(true, Ordering::Release);
         Self {
             journal,
+            admission,
             dispatch_poisoned,
             terminalized: false,
         }
@@ -724,9 +730,9 @@ impl<'journal> McpStartedCallGuard<'journal> {
 
     fn terminalize<T>(
         &mut self,
-        commit: impl FnOnce(&mut SessionJournal) -> Result<T>,
+        commit: impl FnOnce(&mut SessionJournal, &mut McpToolDispatchAdmissionV1) -> Result<T>,
     ) -> Result<T> {
-        let result = commit(self.journal)?;
+        let result = commit(self.journal, &mut self.admission)?;
         self.terminalized = true;
         self.dispatch_poisoned.store(false, Ordering::Release);
         Ok(result)

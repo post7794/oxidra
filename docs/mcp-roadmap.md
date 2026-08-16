@@ -195,6 +195,11 @@ McpRegistry::approve_surface(expected digest)
   permit 绑定 turn/call、provider/raw tool identity、registry epoch/digest、协议版本、server
   attempt、参数 digest、coordinator ID 和 durable started seq；registry 与 session 在发送前
   再核对 authority、binding、attempt 和参数。
+- `tool.started` 本身由一次性的 MCP dispatch admission 写入：在任何 `tools/call` 请求前，
+  journal 同时保留有界 terminal 空间和从 prospective prefix 计算出的完整 crash-recovery
+  debt；terminal 必须通过同一 capability 绑定 exact `started_seq`。没有 active turn admission
+  的 standalone coordinator 仅接受不存在其他 unstarted sibling 的单调用 response；多调用
+  batch 必须由 turn admission 持有并转移其 recovery debt，不能借 standalone reserve 绕过。
 - validated complete result 写 `tool.completed`；请求可能写出但没有 validated complete
   result 时写 `tool.in_doubt`；dispatch 前的已知拒绝不会产生 `tool.started`；started 后的
   已知失败 terminal 必须引用 `started_seq`。terminal fsync 报错会 poison 当前 journal

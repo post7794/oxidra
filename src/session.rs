@@ -72,6 +72,14 @@ const COMPACTION_OUTCOME_HEADROOM_BYTES_V1: u64 = 2 * 1024 * 1024;
 /// any accepted field budget requires a new admission version or a larger
 /// reserve before the writer can dispatch Provider code.
 const PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1: u64 = 1024 * 1024;
+/// Frozen reserve for one standalone MCP dispatch.  A coordinator call may
+/// be admitted without an active Provider turn reservation, so this reserve
+/// covers the largest bounded immediate terminal in addition to the
+/// prospective crash-recovery debt computed from the whole journal prefix.
+/// The MCP transport caps complete results at 50 KiB and coordinator
+/// diagnostics use bounded status profiles; one MiB leaves room for the
+/// journal envelope without depending on a caller's output value.
+const MCP_TOOL_OUTCOME_HEADROOM_BYTES_V1: u64 = 1024 * 1024;
 /// Minimum per-call terminal slot retained for an explicit in-doubt
 /// resolution.  The actual reservation is larger when the durable call/tool
 /// identity itself is larger: provider call IDs are not currently bounded by
@@ -361,6 +369,7 @@ impl SessionStore {
             active_turn: None,
             active_provider_response: None,
             active_compaction: None,
+            active_mcp_tool: None,
             recovery_headroom_bytes: 0,
             mcp_resume_open_id: None,
             mcp_resume_eligibility_issued: false,
@@ -498,6 +507,7 @@ impl SessionStore {
             active_turn: None,
             active_provider_response: None,
             active_compaction: None,
+            active_mcp_tool: None,
             recovery_headroom_bytes: 0,
             // This nonce identifies the exact recovered journal handle that
             // authorized a later MCP resume.  A newly-created journal cannot
@@ -825,6 +835,7 @@ pub struct SessionJournal {
     active_turn: Option<ActiveTurnReservationV1>,
     active_provider_response: Option<ActiveProviderResponseReservationV1>,
     active_compaction: Option<ActiveCompactionReservationV1>,
+    active_mcp_tool: Option<ActiveMcpToolReservationV1>,
     /// Capacity retained after reopen for explicit in-doubt resolutions.
     recovery_headroom_bytes: u64,
     mcp_resume_open_id: Option<String>,
@@ -859,6 +870,14 @@ struct ActiveCompactionReservationV1 {
     headroom_bytes: u64,
 }
 
+#[derive(Clone, Debug)]
+struct ActiveMcpToolReservationV1 {
+    reservation_id: String,
+    turn_id: String,
+    started_seq: u64,
+    headroom_bytes: u64,
+}
+
 /// One-shot capability proving that `response.started` was synced only after
 /// reserving enough journal space for every bounded immediate terminal and
 /// the crash-recovery abort transaction. The token is intentionally neither
@@ -884,6 +903,19 @@ pub(crate) struct TurnTransactionAdmissionV1 {
 #[derive(Debug)]
 pub(crate) struct CompactionProviderDispatchAdmissionV1 {
     reservation_id: String,
+    consumed: bool,
+    reopen_required: Arc<AtomicBool>,
+}
+
+/// One-shot capability proving that a standalone MCP `tool.started` event
+/// was synced only after reserving space for its bounded terminal and every
+/// prospective crash-recovery event. Dropping it poisons the journal handle
+/// so a caller cannot continue appending after an abandoned external dispatch.
+#[derive(Debug)]
+pub(crate) struct McpToolDispatchAdmissionV1 {
+    reservation_id: String,
+    turn_id: String,
+    started_seq: u64,
     consumed: bool,
     reopen_required: Arc<AtomicBool>,
 }
@@ -947,6 +979,20 @@ impl Drop for CompactionProviderDispatchAdmissionV1 {
         if !self.consumed {
             self.reopen_required.store(true, Ordering::Release);
         }
+    }
+}
+
+impl Drop for McpToolDispatchAdmissionV1 {
+    fn drop(&mut self) {
+        if !self.consumed {
+            self.reopen_required.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl McpToolDispatchAdmissionV1 {
+    pub(crate) fn started_seq(&self) -> u64 {
+        self.started_seq
     }
 }
 
@@ -1025,6 +1071,12 @@ impl SessionJournal {
         data: Value,
     ) -> Result<JournalEvent> {
         self.ensure_healthy()?;
+        if self.active_mcp_tool.is_some() {
+            return Err(OxidraError::Session(
+                "an admitted MCP tool call must be terminalized through its dispatch capability"
+                    .to_owned(),
+            ));
+        }
         if self.active_provider_response.is_some() {
             return Err(OxidraError::Session(
                 "an admitted Provider response must be terminalized through its dispatch capability"
@@ -1234,6 +1286,241 @@ impl SessionJournal {
         Ok(event)
     }
 
+    /// Admit one MCP tool dispatch after syncing its exact `tool.started`
+    /// intent while protecting both a bounded immediate terminal and the
+    /// complete prospective crash-recovery transaction.  The recovery debt
+    /// is derived from the whole journal prefix so standalone calls cannot
+    /// ignore still-unstarted siblings from the same Provider response.
+    pub(crate) fn append_mcp_tool_started_v1(
+        &mut self,
+        turn_id: &str,
+        data: Value,
+    ) -> std::result::Result<McpToolDispatchAdmissionV1, DispatchAdmissionErrorV1> {
+        self.ensure_healthy()
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        if self.recovery_headroom_bytes > 0 {
+            return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                "MCP dispatch is blocked until every in-doubt tool is resolved".to_owned(),
+            )));
+        }
+        if self.active_provider_response.is_some()
+            || self.active_compaction.is_some()
+            || self.active_mcp_tool.is_some()
+        {
+            return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                "another durable dispatch admission is already active".to_owned(),
+            )));
+        }
+        if self
+            .active_turn
+            .as_ref()
+            .is_some_and(|active| active.turn_id != turn_id)
+        {
+            return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                "MCP dispatch does not belong to the active turn transaction".to_owned(),
+            )));
+        }
+
+        let mut prospective = self
+            .read_events()
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        let started_seq = self.next_seq();
+        let mut planned_seq = started_seq;
+        let started = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            "tool.started",
+            Some(turn_id),
+            data,
+        )
+        .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        prospective.push(started.clone());
+        crate::mcp::validate_mcp_call_chain(&prospective)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+
+        let pending = pending_tools(&prospective);
+        let unstarted = unstarted_tool_calls(&prospective);
+        // Without an active turn admission there is no owner capable of
+        // transferring recovery debt for sibling calls after this standalone
+        // call terminalizes.  Keep the standalone surface single-call rather
+        // than misusing `recovery_headroom_bytes` as a batch reservation.
+        if self.active_turn.is_none() && !unstarted.is_empty() {
+            return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                "standalone MCP dispatch requires a single-call Provider response or an active turn admission"
+                    .to_owned(),
+            )));
+        }
+        let recovery_headroom =
+            in_doubt_transaction_headroom_v1(self.session_id(), &prospective, &pending, &unstarted)
+                .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        let mut protected_headroom = MCP_TOOL_OUTCOME_HEADROOM_BYTES_V1
+            .checked_add(recovery_headroom)
+            .ok_or_else(|| {
+                DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                    "MCP tool outcome recovery debt overflow".to_owned(),
+                ))
+            })?;
+        if let Some(active_turn) = &self.active_turn {
+            protected_headroom = protected_headroom.max(active_turn.headroom_bytes);
+        }
+        let admission_limit = self
+            .byte_limit
+            .checked_sub(protected_headroom)
+            .ok_or_else(|| {
+                DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(OxidraError::Session(
+                    format!(
+                        "session journal cannot reserve the {protected_headroom}-byte MCP outcome and recovery headroom"
+                    ),
+                ))
+            })?;
+        if !self
+            .preflight_prebuilt_batch_capacity(std::slice::from_ref(&started), admission_limit)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?
+        {
+            return Err(DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(
+                OxidraError::Session(format!(
+                    "session journal cannot append tool.started while preserving the {protected_headroom}-byte MCP outcome and recovery headroom"
+                )),
+            ));
+        }
+        self.append_prebuilt_batch_with_limit(std::slice::from_ref(&started), admission_limit)
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        if let Some(active_turn) = self.active_turn.as_mut() {
+            active_turn.headroom_bytes = protected_headroom;
+            active_turn.lifecycle_margin_reserved = true;
+        }
+
+        let reservation_id = Uuid::now_v7().to_string();
+        self.active_mcp_tool = Some(ActiveMcpToolReservationV1 {
+            reservation_id: reservation_id.clone(),
+            turn_id: turn_id.to_owned(),
+            started_seq,
+            headroom_bytes: protected_headroom,
+        });
+        Ok(McpToolDispatchAdmissionV1 {
+            reservation_id,
+            turn_id: turn_id.to_owned(),
+            started_seq,
+            consumed: false,
+            reopen_required: Arc::clone(&self.reopen_required),
+        })
+    }
+
+    /// Commit the sole terminal authorized by an MCP dispatch admission.
+    /// The event must fit the pre-dispatch reservation together with any
+    /// remaining sibling/in-doubt recovery debt; otherwise the handle is left
+    /// fail-closed for process-boundary recovery.
+    pub(crate) fn commit_mcp_tool_terminal_v1(
+        &mut self,
+        admission: &mut McpToolDispatchAdmissionV1,
+        kind: &str,
+        data: Value,
+    ) -> Result<JournalEvent> {
+        let active = self.active_mcp_tool_v1(admission)?.clone();
+        if !matches!(kind, "tool.completed" | "tool.cancelled" | "tool.in_doubt") {
+            return Err(OxidraError::Session(
+                "invalid MCP dispatch terminal kind".to_owned(),
+            ));
+        }
+        if admission.turn_id != active.turn_id || admission.started_seq != active.started_seq {
+            return Err(OxidraError::Session(
+                "MCP dispatch admission no longer matches its exact tool.started".to_owned(),
+            ));
+        }
+        if data.get("started_seq").and_then(Value::as_u64) != Some(active.started_seq) {
+            return Err(OxidraError::Session(
+                "MCP terminal does not reference its exact admitted tool.started".to_owned(),
+            ));
+        }
+
+        let mut planned_seq = self.next_seq();
+        let terminal = planned_recovery_event(
+            self.session_id(),
+            &mut planned_seq,
+            kind,
+            Some(&active.turn_id),
+            data,
+        )?;
+        let mut prospective = self.read_events()?;
+        prospective.push(terminal.clone());
+        crate::mcp::validate_mcp_call_chain(&prospective)?;
+
+        let pending = pending_tools(&prospective);
+        let unstarted = unstarted_tool_calls(&prospective);
+        let recovery_headroom = in_doubt_transaction_headroom_v1(
+            self.session_id(),
+            &prospective,
+            &pending,
+            &unstarted,
+        )?;
+        let mut residual_headroom = recovery_headroom;
+        if let Some(active_turn) = &self.active_turn {
+            if active_turn.turn_id != active.turn_id {
+                return Err(OxidraError::Session(
+                    "MCP terminal does not belong to the active turn transaction".to_owned(),
+                ));
+            }
+            let turn_headroom =
+                TURN_OUTCOME_HEADROOM_BYTES_V1.max(active_turn_recovery_headroom_v1(
+                    self.session_id(),
+                    &prospective,
+                    &active.turn_id,
+                    active_turn.user_message_seq,
+                )?);
+            residual_headroom = residual_headroom.max(turn_headroom);
+        }
+
+        let terminal_bytes = encoded_journal_events_bytes(std::slice::from_ref(&terminal))?;
+        if terminal_bytes
+            .checked_add(residual_headroom)
+            .is_none_or(|required| required > active.headroom_bytes)
+        {
+            self.mark_reopen_required();
+            return Err(OxidraError::Session(format!(
+                "MCP terminal plus recovery debt exceeds its {}-byte dispatch reservation",
+                active.headroom_bytes
+            )));
+        }
+        let commit_limit = self.limit_preserving_headroom_v1(residual_headroom)?;
+        if !self.preflight_prebuilt_batch_capacity(std::slice::from_ref(&terminal), commit_limit)? {
+            self.mark_reopen_required();
+            return Err(OxidraError::Session(
+                "MCP terminal no longer fits its dispatch reservation".to_owned(),
+            ));
+        }
+        self.append_prebuilt_batch_with_limit(std::slice::from_ref(&terminal), commit_limit)?;
+
+        if let Some(active_turn) = self.active_turn.as_mut() {
+            active_turn.headroom_bytes = residual_headroom;
+        } else if residual_headroom > 0 {
+            self.recovery_headroom_bytes = residual_headroom;
+            self.recovery.in_doubt = pending;
+        }
+        self.active_mcp_tool = None;
+        admission.consumed = true;
+        Ok(terminal)
+    }
+
+    fn active_mcp_tool_v1(
+        &self,
+        admission: &McpToolDispatchAdmissionV1,
+    ) -> Result<&ActiveMcpToolReservationV1> {
+        if admission.consumed {
+            return Err(OxidraError::Session(
+                "MCP tool dispatch admission was already consumed".to_owned(),
+            ));
+        }
+        self.active_mcp_tool
+            .as_ref()
+            .filter(|active| active.reservation_id == admission.reservation_id)
+            .ok_or_else(|| {
+                OxidraError::Session(
+                    "MCP tool dispatch admission does not match the active journal reservation"
+                        .to_owned(),
+                )
+            })
+    }
+
     /// Atomically settle selected unstarted MCP siblings under a fresh
     /// recovery marker.  Live cancellation/limit/in-doubt paths cannot use
     /// generic skip kinds because the MCP reducer requires the same marker
@@ -1247,7 +1534,10 @@ impl SessionJournal {
         if calls.is_empty() {
             return Ok(());
         }
-        if self.active_provider_response.is_some() || self.active_compaction.is_some() {
+        if self.active_provider_response.is_some()
+            || self.active_compaction.is_some()
+            || self.active_mcp_tool.is_some()
+        {
             return Err(OxidraError::Session(
                 "MCP recovery skips require every Provider dispatch capability to be settled"
                     .to_owned(),
@@ -1345,6 +1635,7 @@ impl SessionJournal {
         if self.active_turn.is_some()
             || self.active_provider_response.is_some()
             || self.active_compaction.is_some()
+            || self.active_mcp_tool.is_some()
         {
             return Err(OxidraError::Session(
                 "in-doubt resolution requires every live dispatch capability to be suspended"
@@ -1504,6 +1795,7 @@ impl SessionJournal {
         if self.active_turn.is_some()
             || self.active_provider_response.is_some()
             || self.active_compaction.is_some()
+            || self.active_mcp_tool.is_some()
         {
             return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
                 "a durable turn or Provider response admission is already active".to_owned(),
@@ -1589,6 +1881,7 @@ impl SessionJournal {
         if self.active_turn.is_some()
             || self.active_provider_response.is_some()
             || self.active_compaction.is_some()
+            || self.active_mcp_tool.is_some()
         {
             return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
                 "a durable turn or Provider dispatch admission is already active".to_owned(),
@@ -1670,7 +1963,10 @@ impl SessionJournal {
         cancellation_reason: Option<&str>,
     ) -> Result<()> {
         let active = self.active_turn_v1(admission)?.clone();
-        if self.active_provider_response.is_some() || self.active_compaction.is_some() {
+        if self.active_provider_response.is_some()
+            || self.active_compaction.is_some()
+            || self.active_mcp_tool.is_some()
+        {
             return Err(OxidraError::Session(
                 "turn transaction cannot be finalized while a Provider dispatch capability is active"
                     .to_owned(),
@@ -1954,6 +2250,11 @@ impl SessionJournal {
         if self.active_compaction.is_some() {
             return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
                 "a compaction dispatch admission is already active".to_owned(),
+            )));
+        }
+        if self.active_mcp_tool.is_some() {
+            return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                "an MCP tool dispatch admission is already active".to_owned(),
             )));
         }
         let active_turn = self
@@ -2371,7 +2672,10 @@ impl SessionJournal {
                 "compaction dispatch is blocked until every in-doubt tool is resolved".to_owned(),
             )));
         }
-        if self.active_provider_response.is_some() || self.active_compaction.is_some() {
+        if self.active_provider_response.is_some()
+            || self.active_compaction.is_some()
+            || self.active_mcp_tool.is_some()
+        {
             return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
                 "a Provider dispatch admission is already active".to_owned(),
             )));
@@ -5441,6 +5745,7 @@ mod tests {
             active_turn: None,
             active_provider_response: None,
             active_compaction: None,
+            active_mcp_tool: None,
             recovery_headroom_bytes: 0,
             mcp_resume_open_id: None,
             mcp_resume_eligibility_issued: false,
@@ -6231,6 +6536,74 @@ mod tests {
             required <= PROVIDER_RESPONSE_OUTCOME_HEADROOM_BYTES_V1,
             "frozen bounded outcomes require {required} bytes"
         );
+    }
+
+    #[test]
+    fn standalone_mcp_dispatch_denies_start_without_complete_outcome_headroom() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("standalone-mcp-capacity", header(temp.path()))
+            .unwrap();
+        let current_size = journal.file.metadata().unwrap().len();
+        journal.set_byte_limit_for_tests(current_size + MCP_TOOL_OUTCOME_HEADROOM_BYTES_V1);
+
+        let error = journal
+            .append_mcp_tool_started_v1(
+                "standalone-turn",
+                json!({"call_id":"standalone-call","tool":"read","arguments":{}}),
+            )
+            .expect_err("tool.started must not commit without full outcome/recovery headroom");
+        assert!(matches!(
+            error,
+            DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(_)
+        ));
+        assert!(
+            journal
+                .read_events()
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "tool.started")
+        );
+    }
+
+    #[test]
+    fn standalone_mcp_in_doubt_transfers_reserve_to_resolution() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("standalone-mcp-in-doubt", header(temp.path()))
+            .unwrap();
+        let mut admission = journal
+            .append_mcp_tool_started_v1(
+                "standalone-turn",
+                json!({"call_id":"standalone-call","tool":"read","arguments":{}}),
+            )
+            .unwrap();
+        let started_seq = admission.started_seq();
+        journal
+            .commit_mcp_tool_terminal_v1(
+                &mut admission,
+                "tool.in_doubt",
+                json!({
+                    "started_seq":started_seq,
+                    "call_id":"standalone-call",
+                    "tool":"read",
+                    "output":{"error":{"code":"in_doubt","message":"side effect is unknown"}},
+                    "is_error":true,
+                    "error_code":"in_doubt",
+                }),
+            )
+            .unwrap();
+
+        let pending = journal.in_doubt().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(journal.recovery_headroom_bytes > 0);
+        journal
+            .resolve_all_in_doubt_v1(&pending)
+            .expect("the live standalone reserve must authorize exact resolution");
+        assert_eq!(journal.recovery_headroom_bytes, 0);
+        assert!(journal.in_doubt().unwrap().is_empty());
     }
 
     #[test]

@@ -329,15 +329,17 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("a known post-dispatch failure is durably terminal");
     assert_eq!(output_limit.error_code.as_deref(), Some("output_limit"));
 
-    append_provider_calls(
+    // Standalone coordinator dispatch admits one-call responses only; a
+    // multi-call batch must be owned by an active Agent turn admission.  The
+    // in-doubt outcome itself is enough to block a later call, so keep this
+    // low-level fixture single-call and exercise the same fail-closed gate.
+    append_provider_call(
         &mut journal,
         turn_id,
         "in-doubt-response",
+        "in-doubt-call",
         &provider_name,
-        &[
-            ("in-doubt-call", json!({"text":"__rpc_error__"})),
-            ("blocked-call", json!({"text":"must-not-dispatch"})),
-        ],
+        &json!({"text":"__rpc_error__"}),
     );
     let in_doubt = coordinator
         .execute_call(
