@@ -66,10 +66,10 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const CANCEL_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_JSON_LINE_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
-const MAX_TOOL_RESULT_BYTES: usize = 50 * 1024;
 /// Versioned model-facing projection for a completed MCP result.  The raw
 /// protocol result remains an audit value; only this bounded text envelope is
 /// eligible to enter a Provider `function_call_output` item.
+pub const MAX_MCP_RAW_RESULT_BYTES_V1: usize = 50 * 1024;
 pub const MCP_MODEL_OUTPUT_PROFILE_VERSION_V1: u32 = 1;
 pub const MCP_MODEL_OUTPUT_TRUST_V1: &str = "untrusted_mcp_tool_output";
 pub const MAX_MCP_MODEL_OUTPUT_BYTES_V1: usize = 50 * 1024;
@@ -285,6 +285,8 @@ impl McpModelOutputV1 {
     /// raw protocol callers should use [`Self::from_raw_result_v1`] to derive
     /// the envelope instead of constructing it by hand.
     pub(crate) fn from_value_v1(value: &Value) -> std::result::Result<Self, String> {
+        preflight_mcp_result_tree_v1(value)?;
+        ensure_json_within_limit(value, MAX_MCP_MODEL_OUTPUT_BYTES_V1)?;
         let output: Self = serde_json::from_value(value.clone())
             .map_err(|error| format!("invalid MCP model output envelope: {error}"))?;
         output.validate()?;
@@ -298,6 +300,7 @@ impl McpModelOutputV1 {
     }
 
     pub(crate) fn from_raw_result_v1(result: &Value) -> std::result::Result<Self, String> {
+        preflight_mcp_result_tree_v1(result)?;
         let is_error = match result.get("isError") {
             Some(Value::Bool(value)) => *value,
             Some(_) => return Err("MCP tools/call result has invalid isError".to_owned()),
@@ -365,10 +368,6 @@ impl McpModelOutputV1 {
         Ok(output)
     }
 
-    fn from_tool_result(result: &Value) -> std::result::Result<Self, String> {
-        Self::from_raw_result_v1(result)
-    }
-
     fn validate(&self) -> std::result::Result<(), String> {
         if self.profile_version != MCP_MODEL_OUTPUT_PROFILE_VERSION_V1 {
             return Err(format!(
@@ -425,16 +424,6 @@ impl McpModelOutputV1 {
     }
 }
 
-/// Result of a successful, post-dispatch MCP call.  The two views are kept
-/// separate so callers cannot accidentally use the raw protocol object as a
-/// model-facing output.  The low-level compatibility API still returns the
-/// raw value; the coordinator consumes this typed pair.
-#[derive(Clone, Debug, PartialEq)]
-pub(super) struct McpToolCallResult {
-    pub(super) raw_result: Value,
-    pub(super) model_output: McpModelOutputV1,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpTool {
     pub definition: ToolDefinition,
@@ -461,6 +450,19 @@ pub(super) struct PreflightedJsonValue {
     value: Option<Value>,
     preflight: Option<std::result::Result<(), schema::ValidationError>>,
 }
+
+/// Owns a parsed MCP result across async cancellation boundaries.  The wire
+/// byte cap alone is not enough: a small deeply nested JSON tree can otherwise
+/// recurse during serializer/clone/drop after the dispatch future is aborted.
+/// This wrapper performs an O(depth) frame scan before any result projection
+/// and releases the tree iteratively.
+pub(super) struct BoundedMcpJsonValue {
+    value: Option<Value>,
+}
+
+const MAX_MCP_RESULT_DEPTH_RUNTIME: usize = 256;
+const MAX_MCP_RESULT_DEPTH_V1: usize = 128;
+const MAX_MCP_RESULT_NODES_V1: usize = 16_384;
 
 pub(super) struct ValidatedMcpArguments {
     value: Option<Value>,
@@ -507,6 +509,106 @@ impl PreflightedJsonValue {
             value: self.value.take(),
         })
     }
+}
+
+impl BoundedMcpJsonValue {
+    fn new(value: Value) -> Self {
+        Self { value: Some(value) }
+    }
+
+    fn as_value(&self) -> &Value {
+        self.value.as_ref().expect("bounded MCP result")
+    }
+
+    fn into_value(mut self) -> Value {
+        self.value.take().expect("bounded MCP result")
+    }
+
+    fn ensure_valid(&mut self) -> std::result::Result<(), McpCallError> {
+        if let Err(error) =
+            preflight_mcp_result_tree(self.as_value(), MAX_MCP_RESULT_DEPTH_RUNTIME, usize::MAX)
+        {
+            return Err(McpCallError {
+                code: "protocol_error",
+                message: error,
+                in_doubt: true,
+                interrupted: false,
+            });
+        }
+        if let Err(error) = ensure_json_within_limit(self.as_value(), MAX_MCP_RAW_RESULT_BYTES_V1) {
+            return Err(McpCallError {
+                code: "output_limit",
+                message: error,
+                in_doubt: true,
+                interrupted: false,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BoundedMcpJsonValue {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            drop_json_value_iteratively(value);
+        }
+    }
+}
+
+pub(super) fn preflight_mcp_result_tree_v1(value: &Value) -> std::result::Result<(), String> {
+    preflight_mcp_result_tree(value, MAX_MCP_RESULT_DEPTH_V1, MAX_MCP_RESULT_NODES_V1)
+}
+
+fn preflight_mcp_result_tree(
+    value: &Value,
+    max_depth: usize,
+    max_nodes: usize,
+) -> std::result::Result<(), String> {
+    let mut nodes = 0usize;
+    let mut pending = vec![McpResultFrame::Value(value, 0)];
+    while let Some(frame) = pending.pop() {
+        match frame {
+            McpResultFrame::Value(value, depth) => {
+                if depth > max_depth {
+                    return Err(format!("MCP result exceeds validation depth {max_depth}"));
+                }
+                nodes = nodes.saturating_add(1);
+                if nodes > max_nodes {
+                    return Err(format!(
+                        "MCP result exceeds validation node budget {max_nodes}"
+                    ));
+                }
+                match value {
+                    Value::Array(values) => {
+                        pending.push(McpResultFrame::Array(values.iter(), depth + 1));
+                    }
+                    Value::Object(values) => {
+                        pending.push(McpResultFrame::Object(values.iter(), depth + 1));
+                    }
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+                }
+            }
+            McpResultFrame::Array(mut values, depth) => {
+                if let Some(value) = values.next() {
+                    pending.push(McpResultFrame::Array(values, depth));
+                    pending.push(McpResultFrame::Value(value, depth));
+                }
+            }
+            McpResultFrame::Object(mut values, depth) => {
+                if let Some((_, value)) = values.next() {
+                    pending.push(McpResultFrame::Object(values, depth));
+                    pending.push(McpResultFrame::Value(value, depth));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+enum McpResultFrame<'a> {
+    Value(&'a Value, usize),
+    Array(std::slice::Iter<'a, Value>, usize),
+    Object(serde_json::map::Iter<'a>, usize),
 }
 
 impl Drop for PreflightedJsonValue {
@@ -695,7 +797,7 @@ impl McpStdioSession {
                 Ok(arguments) => self
                     .dispatch_prepared_tool(name, arguments, cancellation)
                     .await
-                    .map(|result| result.raw_result),
+                    .map(BoundedMcpJsonValue::into_value),
                 Err(error) => Err(error),
             }
         }
@@ -739,7 +841,7 @@ impl McpStdioSession {
         name: &str,
         arguments: ValidatedMcpArguments,
         cancellation: &CancellationToken,
-    ) -> std::result::Result<McpToolCallResult, McpCallError> {
+    ) -> std::result::Result<BoundedMcpJsonValue, McpCallError> {
         let Some(tool) = self.tools.iter().find(|tool| tool.definition.name == name) else {
             return Err(McpCallError {
                 code: "not_found",
@@ -787,8 +889,16 @@ impl McpStdioSession {
                 return Err(call_error);
             }
         };
+        let mut result = BoundedMcpJsonValue::new(result);
+        if let Err(error) = result.ensure_valid() {
+            if let Some(mut transport) = self.transport.take() {
+                transport.terminate().await;
+            }
+            return Err(error);
+        }
+        let result_value = result.as_value();
         if self.era == McpProtocolEra::Modern
-            && result.get("resultType").and_then(Value::as_str) != Some("complete")
+            && result_value.get("resultType").and_then(Value::as_str) != Some("complete")
         {
             if let Some(mut transport) = self.transport.take() {
                 transport.terminate().await;
@@ -804,7 +914,7 @@ impl McpStdioSession {
             });
         }
         if let Err(error) =
-            validate_tool_call_result(&self.config.name, &result, output_schema.as_ref())
+            validate_tool_call_result(&self.config.name, result_value, output_schema.as_ref())
         {
             if let Some(mut transport) = self.transport.take() {
                 transport.terminate().await;
@@ -816,64 +926,7 @@ impl McpStdioSession {
                 interrupted: false,
             });
         }
-        let encoded = match serde_json::to_vec(&result) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                if let Some(mut transport) = self.transport.take() {
-                    transport.terminate().await;
-                }
-                return Err(McpCallError {
-                    code: "protocol_error",
-                    message: format!("cannot serialize MCP tool result: {error}"),
-                    // The server has already processed the request.  A local
-                    // result encoding failure cannot prove that no side effect
-                    // occurred, and the old stream must not be reused.
-                    in_doubt: true,
-                    interrupted: false,
-                });
-            }
-        };
-        if encoded.len() > MAX_TOOL_RESULT_BYTES {
-            if let Some(mut transport) = self.transport.take() {
-                transport.terminate().await;
-            }
-            return Err(McpCallError {
-                code: "output_limit",
-                message: format!(
-                    "MCP server {} tool result exceeds {MAX_TOOL_RESULT_BYTES} bytes",
-                    self.config.name
-                ),
-                // The complete result was received, but it cannot enter the
-                // bounded durable/model profile.  Treat the post-dispatch
-                // outcome conservatively; callers must explicitly resolve it
-                // before another MCP call is admitted.  The stream is closed
-                // so no later call can consume stale or late protocol state.
-                in_doubt: true,
-                interrupted: false,
-            });
-        }
-        let model_output = match McpModelOutputV1::from_tool_result(&result) {
-            Ok(output) => output,
-            Err(error) => {
-                if let Some(mut transport) = self.transport.take() {
-                    transport.terminate().await;
-                }
-                return Err(McpCallError {
-                    code: "output_projection_error",
-                    message: untrusted_display::text_for_display(&error),
-                    // The server has already processed the request.  A
-                    // model-facing projection failure cannot prove that no
-                    // side effect occurred, so the call is in doubt and the
-                    // old stream is never reused.
-                    in_doubt: true,
-                    interrupted: false,
-                });
-            }
-        };
-        Ok(McpToolCallResult {
-            raw_result: result,
-            model_output,
-        })
+        Ok(result)
     }
 
     pub async fn shutdown(&mut self) {
@@ -1416,7 +1469,7 @@ impl Transport {
                     }
                 }
             };
-            let message: Value =
+            let mut message: Value =
                 serde_json::from_slice(trim_ascii_end(&line)).map_err(|error| {
                     ClientError::Protocol {
                         message: format!("non-JSON data on MCP stdout: {error}"),
@@ -1450,12 +1503,15 @@ impl Transport {
                     after_send: true,
                 });
             }
-            if let Some(error) = message.get("error") {
-                return Err(ClientError::Rpc(error.clone()));
+            if let Some(error) = message
+                .as_object_mut()
+                .and_then(|object| object.remove("error"))
+            {
+                return Err(ClientError::Rpc(error));
             }
             return message
-                .get("result")
-                .cloned()
+                .as_object_mut()
+                .and_then(|object| object.remove("result"))
                 .ok_or_else(|| ClientError::Protocol {
                     message: "MCP response has neither result nor error".to_owned(),
                     after_send: true,
@@ -1998,7 +2054,7 @@ mod tests {
 
     #[test]
     fn model_output_v1_projects_only_ordered_text_blocks() {
-        let output = McpModelOutputV1::from_tool_result(&json!({
+        let output = McpModelOutputV1::from_raw_result_v1(&json!({
             "content": [
                 {"type":"text", "text":"first"},
                 {"type":"text", "text":"second"}
@@ -2036,7 +2092,7 @@ mod tests {
             json!({"type":"text", "text":"ok", "annotations":{}}),
             json!({"type":"text", "text":42}),
         ] {
-            let error = McpModelOutputV1::from_tool_result(&json!({"content":[item]}))
+            let error = McpModelOutputV1::from_raw_result_v1(&json!({"content":[item]}))
                 .expect_err("non-canonical MCP content must not be projected");
             assert!(error.contains("content item"), "{error}");
         }
@@ -2045,11 +2101,31 @@ mod tests {
     #[test]
     fn model_output_v1_enforces_serialized_size_budget() {
         let text = "x".repeat(MAX_MCP_MODEL_OUTPUT_BYTES_V1);
-        let error = McpModelOutputV1::from_tool_result(&json!({
+        let error = McpModelOutputV1::from_raw_result_v1(&json!({
             "content":[{"type":"text", "text":text}]
         }))
         .expect_err("oversized model envelope must fail closed");
         assert!(error.contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn model_output_v1_bounds_item_count_before_copying_text() {
+        let items = (0..4_097)
+            .map(|_| json!({"type":"text", "text":"x"}))
+            .collect::<Vec<_>>();
+        let error = McpModelOutputV1::from_raw_result_v1(&json!({"content":items}))
+            .expect_err("wide text content must hit the item budget");
+        assert!(error.contains("items"), "{error}");
+    }
+
+    #[test]
+    fn model_output_v1_bounds_text_bytes_before_copying_text() {
+        let text = "x".repeat(MAX_MCP_MODEL_OUTPUT_TEXT_BYTES_V1 + 1);
+        let error = McpModelOutputV1::from_raw_result_v1(&json!({
+            "content":[{"type":"text", "text":text}]
+        }))
+        .expect_err("text content must hit the pre-copy byte budget");
+        assert!(error.contains("text content"), "{error}");
     }
 
     #[test]

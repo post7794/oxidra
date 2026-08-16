@@ -5,6 +5,7 @@
 //! the activation, durable Provider call and every started/terminal edge.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
@@ -33,6 +34,9 @@ const MCP_TOOL_REGISTRY_VERSION_V1: u64 = 1;
 const MCP_STDIO_KERNEL_VERSION_V1: u64 = 1;
 const MCP_SCHEMA_PROFILE_VERSION_V1: u64 = 1;
 const MCP_REGISTRY_ACTIVATED_KIND: &str = "mcp.registry.activated";
+const MAX_MCP_RAWLESS_ERROR_MESSAGE_BYTES_V3: usize = 16 * 1024;
+const MCP_RAWLESS_COMPLETION_CODES_V3: &[&str] =
+    &["dispatch_permit_invalid", "not_found", "transport_closed"];
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct McpCallKey {
@@ -2232,9 +2236,19 @@ fn validate_lifecycle_event_v3(
                 *state = CallState::Terminal;
             }
             CallState::Started { seq, provenance } => {
-                validate_post_start_completed_outer_profile_v3(event)?;
                 validate_started_terminal_v3(event, *seq, provenance, call, activation)?;
-                validate_completed_result_v3(event)?;
+                if event.data.get("mcp_raw_result").is_some() {
+                    validate_post_start_completed_outer_profile_v3(event)?;
+                    validate_completed_result_v3(event)?;
+                } else {
+                    // A post-dispatch transport/coordination failure may have
+                    // no protocol result to audit.  It is still a completed
+                    // lifecycle edge, but only the bounded, self-consistent
+                    // error profile is allowed; a raw-less success must not
+                    // be mistaken for a validated MCP result.
+                    validate_post_start_terminal_outer_profile_v3(event, false)?;
+                    validate_known_error_result_v3(event)?;
+                }
                 *state = CallState::Terminal;
             }
             _ => return invalid_transition(event, state),
@@ -2986,32 +3000,41 @@ fn validate_completed_result_v3(event: &JournalEvent) -> Result<()> {
             "post-dispatch v3 tool.completed has no mcp_raw_result audit value",
         )
     })?;
-    let raw_bytes = serde_json::to_vec(raw).map_err(|error| {
+    super::preflight_mcp_result_tree_v1(raw).map_err(|error| {
         OxidraError::Session(format!(
-            "tool.completed at seq {} raw MCP result cannot be encoded: {error}",
+            "tool.completed at seq {} raw MCP result exceeds the v1 tree profile: {error}",
             event.seq
         ))
     })?;
-    if raw_bytes.len() > super::MAX_TOOL_RESULT_BYTES {
-        return session_error(format!(
-            "tool.completed at seq {} raw MCP result exceeds {} bytes",
-            event.seq,
-            super::MAX_TOOL_RESULT_BYTES
-        ));
-    }
+    validate_bounded_json_v3(
+        raw,
+        super::MAX_MCP_RAW_RESULT_BYTES_V1,
+        event,
+        "raw MCP result",
+    )?;
     let expected = McpModelOutputV1::from_raw_result_v1(raw).map_err(|error| {
         OxidraError::Session(format!(
             "tool.completed at seq {} has invalid MCP raw result profile: {error}",
             event.seq
         ))
     })?;
-    let actual = McpModelOutputV1::from_value_v1(
-        event
-            .data
-            .get("output")
-            .ok_or_else(|| session_message(event, "tool.completed has no model output"))?,
-    )
-    .map_err(|error| {
+    let output = event
+        .data
+        .get("output")
+        .ok_or_else(|| session_message(event, "tool.completed has no model output"))?;
+    super::preflight_mcp_result_tree_v1(output).map_err(|error| {
+        OxidraError::Session(format!(
+            "tool.completed at seq {} model output exceeds the v1 tree profile: {error}",
+            event.seq
+        ))
+    })?;
+    validate_bounded_json_v3(
+        output,
+        super::MAX_MCP_MODEL_OUTPUT_BYTES_V1,
+        event,
+        "model output",
+    )?;
+    let actual = McpModelOutputV1::from_value_v1(output).map_err(|error| {
         OxidraError::Session(format!(
             "tool.completed at seq {} has invalid MCP model output profile: {error}",
             event.seq
@@ -3038,6 +3061,105 @@ fn validate_completed_result_v3(event: &JournalEvent) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Serialize only into a bounded sink.  The journal reader must reject an
+/// oversized untrusted JSON value before any `to_vec`/clone-style operation
+/// can allocate its complete canonical representation.
+fn validate_bounded_json_v3(
+    value: &Value,
+    maximum_bytes: usize,
+    event: &JournalEvent,
+    label: &str,
+) -> Result<()> {
+    let mut sink = BoundedJsonSizeSink::new(maximum_bytes);
+    match serde_json::to_writer(&mut sink, value) {
+        Ok(()) => Ok(()),
+        Err(_error) if sink.exceeded => session_error(format!(
+            "{} at seq {} exceeds its {}-byte bound",
+            label, event.seq, maximum_bytes
+        )),
+        Err(error) => Err(OxidraError::Session(format!(
+            "{} at seq {} cannot be encoded: {error}",
+            label, event.seq
+        ))),
+    }
+}
+
+struct BoundedJsonSizeSink {
+    written: usize,
+    maximum: usize,
+    exceeded: bool,
+}
+
+impl BoundedJsonSizeSink {
+    fn new(maximum: usize) -> Self {
+        Self {
+            written: 0,
+            maximum,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonSizeSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.maximum.saturating_sub(self.written) {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "bounded JSON sink limit exceeded",
+            ));
+        }
+        self.written += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn validate_known_error_result_v3(event: &JournalEvent) -> Result<()> {
+    validate_completed_result(event)?;
+    let code = event
+        .data
+        .get("error_code")
+        .and_then(Value::as_str)
+        .ok_or_else(|| session_message(event, "raw-less MCP completion has no error code"))?;
+    if !MCP_RAWLESS_COMPLETION_CODES_V3.contains(&code) {
+        return session_error(format!(
+            "tool.completed at seq {} uses unregistered raw-less MCP error code {code}",
+            event.seq
+        ));
+    }
+    let output = event
+        .data
+        .get("output")
+        .and_then(Value::as_object)
+        .ok_or_else(|| session_message(event, "raw-less MCP error output must be an object"))?;
+    require_exact_nested_keys(output, &["error"], event, "output")?;
+    let error = output
+        .get("error")
+        .and_then(Value::as_object)
+        .ok_or_else(|| session_message(event, "raw-less MCP error must be an object"))?;
+    require_exact_nested_keys(error, &["code", "message"], event, "output.error")?;
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|message| {
+            !message.is_empty()
+                && message.len() <= MAX_MCP_RAWLESS_ERROR_MESSAGE_BYTES_V3
+                && crate::untrusted_display::sanitize_single_line(message) == *message
+        })
+        .ok_or_else(|| {
+            session_message(
+                event,
+                "raw-less MCP error message is empty, unsafe, or exceeds its v3 byte limit",
+            )
+        })?;
+    let _ = message;
+    validate_error_result(event, code)
 }
 
 fn validate_error_result(event: &JournalEvent, code: &str) -> Result<()> {
@@ -3128,6 +3250,23 @@ fn require_exact_keys(
     if actual != expected {
         return session_error(format!(
             "{} at seq {} does not match the required exact key profile",
+            event.kind, event.seq
+        ));
+    }
+    Ok(())
+}
+
+fn require_exact_nested_keys(
+    data: &Map<String, Value>,
+    expected: &[&str],
+    event: &JournalEvent,
+    path: &str,
+) -> Result<()> {
+    let actual = data.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
+    if actual != expected {
+        return session_error(format!(
+            "{} at seq {} {path} does not match the required exact key profile",
             event.kind, event.seq
         ));
     }
@@ -3710,6 +3849,102 @@ mod tests {
             data["output"]["unexpected"] = Value::Bool(true);
         };
         assert_rejected("unknown model output field", &mut unknown_output);
+    }
+
+    #[test]
+    fn v3_completed_result_checks_tree_and_bytes_before_owned_projection() {
+        let mut oversized_raw = mcp_events_v3();
+        oversized_raw[6].data["mcp_raw_result"]["_meta"] = json!({
+            "padding":"x".repeat(crate::mcp::MAX_MCP_RAW_RESULT_BYTES_V1)
+        });
+        let error = validate_mcp_call_chain_v3(&oversized_raw)
+            .expect_err("oversized raw result must fail before projection")
+            .to_string();
+        assert!(
+            error.contains("raw MCP result"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains("byte bound"), "unexpected error: {error}");
+
+        let mut oversized_model = mcp_events_v3();
+        oversized_model[6].data["output"]["content"] =
+            json!(["x".repeat(crate::mcp::MAX_MCP_MODEL_OUTPUT_BYTES_V1)]);
+        let error = validate_mcp_call_chain_v3(&oversized_model)
+            .expect_err("oversized model output must fail before typed clone")
+            .to_string();
+        assert!(error.contains("model output"), "unexpected error: {error}");
+        assert!(error.contains("byte bound"), "unexpected error: {error}");
+
+        let mut too_wide = mcp_events_v3();
+        too_wide[6].data["mcp_raw_result"]["_meta"] =
+            Value::Array((0..16_384).map(|_| Value::Array(Vec::new())).collect());
+        let error = validate_mcp_call_chain_v3(&too_wide)
+            .expect_err("raw result must share the frozen v1 tree profile")
+            .to_string();
+        assert!(error.contains("node budget"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn v3_post_start_rawless_completion_is_only_a_known_error() {
+        let mut known_error = mcp_events_v3();
+        let data = known_error[6]
+            .data
+            .as_object_mut()
+            .expect("terminal object");
+        data.remove("mcp_raw_result");
+        data["output"] = json!({
+            "error":{"code":"transport_closed","message":"server stream is closed"}
+        });
+        data["is_error"] = Value::Bool(true);
+        data["error_code"] = Value::String("transport_closed".to_owned());
+        validate_mcp_call_chain_v3(&known_error)
+            .expect("bounded post-dispatch coordination errors remain readable");
+
+        let mut rawless_success = mcp_events_v3();
+        let data = rawless_success[6]
+            .data
+            .as_object_mut()
+            .expect("terminal object");
+        data.remove("mcp_raw_result");
+        validate_mcp_call_chain_v3(&rawless_success)
+            .expect_err("raw-less success cannot claim a validated MCP result");
+
+        for forbidden_code in [
+            "in_doubt",
+            "mcp_tool_error",
+            "cancelled",
+            "approval_required",
+            "future_error",
+        ] {
+            let mut forged = mcp_events_v3();
+            let data = forged[6].data.as_object_mut().expect("terminal object");
+            data.remove("mcp_raw_result");
+            data["output"] = json!({
+                "error":{"code":forbidden_code,"message":"bounded"}
+            });
+            data["is_error"] = Value::Bool(true);
+            data["error_code"] = Value::String(forbidden_code.to_owned());
+            validate_mcp_call_chain_v3(&forged)
+                .expect_err("raw-less terminal code must be closed-world validated");
+        }
+
+        for unsafe_message in [
+            "unsafe\u{202e}bidi",
+            "unsafe\u{200b}zero-width",
+            "unsafe\u{2028}line-separator",
+            "unsafe\nnewline",
+        ] {
+            let mut forged = mcp_events_v3();
+            let data = forged[6].data.as_object_mut().expect("terminal object");
+            data.remove("mcp_raw_result");
+            data["output"] = json!({
+                "error":{"code":"transport_closed","message":unsafe_message}
+            });
+            data["is_error"] = Value::Bool(true);
+            data["error_code"] = Value::String("transport_closed".to_owned());
+            validate_mcp_call_chain_v3(&forged)
+                .expect_err("raw-less terminal message must use the safe single-line profile");
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@ use super::journal::{
 use super::registry::{
     ApprovedMcpRegistry, ApprovedMcpResumeRegistry, McpRegistry, PreparedMcpRegistryCall,
 };
-use super::{McpCallError, McpToolCallResult, PreflightedJsonValue};
+use super::{McpCallError, PreflightedJsonValue};
 use crate::compaction::validate_compaction_boundary_chain;
 use crate::context::{McpSurfaceClaimV1, ToolSurfaceSnapshotV1, snapshot_tool_surface_v1};
 use crate::error::{OxidraError, Result};
@@ -582,14 +582,16 @@ impl McpExecutionCoordinator {
         let ApprovedMcpCall { request, prepared } = approved_call;
         let dispatched = self.registry.dispatch(permit, prepared, cancellation).await;
         match dispatched {
-            Ok(McpToolCallResult {
-                raw_result,
-                model_output,
-            }) => {
-                let is_error = model_output.is_error();
+            Ok(raw_result) => {
+                // Coordinator/call-chain v2 has a frozen raw-result output
+                // contract.  The v3 model projection is an offline profile
+                // for the next typed writer epoch and is not applied to this
+                // current dispatch path.
+                let raw_value = raw_result.as_value();
+                let is_error = raw_value.get("isError").and_then(Value::as_bool) == Some(true);
                 let result = ToolResult {
                     call_id: call.call_id.to_owned(),
-                    output: model_output.as_value(),
+                    output: raw_value.clone(),
                     is_error,
                     error_code: is_error.then(|| "mcp_tool_error".to_owned()),
                 };
@@ -597,7 +599,7 @@ impl McpExecutionCoordinator {
                     journal.commit_mcp_tool_terminal_v1(
                         admission,
                         "tool.completed",
-                        terminal_data_with_raw(&request, started_seq, &result, false, &raw_result),
+                        terminal_data(&request, started_seq, &result, false),
                     )?;
                     Ok(())
                 })?;
@@ -1213,18 +1215,6 @@ fn terminal_data(
         "before_dispatch": before_dispatch,
         "mcp": provenance_data(approval),
     })
-}
-
-fn terminal_data_with_raw(
-    approval: &McpCallApprovalRequest,
-    started_seq: u64,
-    result: &ToolResult,
-    before_dispatch: bool,
-    raw_result: &Value,
-) -> Value {
-    let mut data = terminal_data(approval, started_seq, result, before_dispatch);
-    data["mcp_raw_result"] = raw_result.clone();
-    data
 }
 
 fn provenance_data(approval: &McpCallApprovalRequest) -> Value {

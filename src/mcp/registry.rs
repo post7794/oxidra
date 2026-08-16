@@ -7,9 +7,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::coordinator::{DispatchPermit, McpResumeEligibility, McpResumePermit};
 use super::{
-    ApprovedMcpProjectConfig, MCP_EXECUTION_PLAN_VERSION, MCP_LEGACY_PROTOCOL_VERSION,
-    MCP_MODERN_PROTOCOL_VERSION, MCP_SCHEMA_PROFILE_VERSION, MCP_STDIO_KERNEL_VERSION,
-    McpCallError, McpProtocolEra, McpStdioSession, McpToolCallResult, ValidatedMcpArguments,
+    ApprovedMcpProjectConfig, BoundedMcpJsonValue, MCP_EXECUTION_PLAN_VERSION,
+    MCP_LEGACY_PROTOCOL_VERSION, MCP_MODERN_PROTOCOL_VERSION, MCP_SCHEMA_PROFILE_VERSION,
+    MCP_STDIO_KERNEL_VERSION, McpCallError, McpProtocolEra, McpStdioSession, ValidatedMcpArguments,
 };
 use crate::context::McpSurfaceBindingV1;
 use crate::error::{OxidraError, Result};
@@ -427,7 +427,7 @@ impl McpRegistry {
         permit: DispatchPermit,
         prepared: PreparedMcpRegistryCall,
         cancellation: &CancellationToken,
-    ) -> std::result::Result<McpToolCallResult, McpCallError> {
+    ) -> std::result::Result<BoundedMcpJsonValue, McpCallError> {
         let Some(authority) = &self.dispatch_authority else {
             return Err(McpCallError {
                 code: "dispatch_permit_invalid",

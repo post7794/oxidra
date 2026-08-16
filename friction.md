@@ -192,9 +192,9 @@ writer 也会在 MCP-sensitive event fsync 前运行冻结 reducer。显式 acti
 offline reader 已能严格证明 activation、global `context.tools`、request context 与
 `response.started.mcp_surface` 的 exact relation，并阻止删除 claim 后把 activated alias 降级成
 generic response；绑定的 input schema 和 lifecycle outer/nested provenance 也会按冻结 profile
-重验。展示用 output-schema digest 仍不能证明 runtime structured validation；MCP kernel 现已冻结
-model-facing result envelope v1：raw MCP result 只作有界审计值，model-facing projection 只允许
-严格 text-only 且由 offline reader 从 raw 重派生。current writer 仍冻结在 v2，CLI
+重验。展示用 output-schema digest 仍不能证明 runtime structured validation；MCP kernel 已登记、但尚未
+接入当前 writer 的 v3 model-facing result envelope v1：raw MCP result 只作有界 parsed-JSON
+审计值，model-facing projection 只允许严格 text-only 且由 offline reader 从 raw 重派生。current writer 仍冻结在 v2，CLI
 参数、Agent approval 和实际 request binding 也未接通，因此用户现在仍然只能使用固定内置工具，
 不能把上述 MCP server 暴露给模型。
 

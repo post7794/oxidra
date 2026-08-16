@@ -93,8 +93,10 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - 已经 cancelled 的 connect 在第一次 spawn 前返回；modern fallback 到 legacy 前会
   再检查 cancellation，不会为已取消的连接执行 server 初始化代码。
 - 单条 JSONL 上限 1 MiB；工具表上限 512 KiB、512 个工具、64 页；单次工具
-  result 上限 50 KiB。收到超过该上限的完整 wire result 仍是 post-dispatch
-  `in_doubt`，不能伪装成 pre-dispatch/output-limit 已知失败，必须经过现有人工 resolution。
+  result 的**解析后 canonical JSON 表示**上限为 50 KiB。该上限不是原始 wire-byte
+  审计（重复 key、空白和数字词法在 `serde_json::Value` 阶段已不可恢复）；收到超过
+  canonical 上限的完整 result 仍是 post-dispatch `in_doubt`，不能伪装成 pre-dispatch/
+  output-limit 已知失败，必须经过现有人工 resolution。
 - `inputSchema` 与可选 `outputSchema` 必须通过固定 JSON Schema profile v1，根类型
   为 object。profile 支持登记的 type/object/array/string/number/composition 关键词，
   拒绝 `$ref` 和所有未知关键词。为避免 serde_json 默认 f64 在 wire 解析时先舍入，
@@ -251,12 +253,14 @@ projection、history 与 compaction 全部新增同一 v3 compatibility epoch �
 
 该 v3 reader 还不把 `output_schema_digest` 误当 runtime validation-schema identity：surface 中的
 digest 仍来自展示 schema，structured output 验证必须继续由 stdio kernel 的冻结 schema profile
-完成。post-dispatch `tool.completed` 现有独立的 model-result profile v1：`mcp_raw_result` 只作
-有界审计值，`output` 必须是严格 text-only、带 `trust = untrusted_mcp_tool_output` 的模型 envelope；
-offline reader 会从 raw 重新派生并 exact compare，禁止 `_meta`、annotations、structuredContent、
-image/resource/audio 或未知 content item 进入模型。projection/profile/大小失败统一写
-`tool.in_doubt` 并关闭旧 transport。该 profile 仍只冻结 MCP kernel/coordinator 的结果边界；
-Agent/source projection 尚未切换到 v3 protocol epoch，不能把当前 v2 activation 误报为 Agent 已接入。
+完成。已登记一个**仅供未来 v3 typed writer 使用**的 model-result profile v1：在该 profile
+中，`mcp_raw_result` 只作有界的 parsed-JSON 审计值，`output` 必须是严格 text-only、带
+`trust = untrusted_mcp_tool_output` 的模型 envelope；offline reader 会从 raw 重新派生并 exact
+compare，禁止 `_meta`、annotations、structuredContent、image/resource/audio 或未知 content
+item 进入模型。当前 v2 coordinator writer 仍返回并持久化 bounded raw result，不能把这项 v3
+reader 约束倒灌成 v2 的接受集合。v3 typed writer 的 projection/profile/大小失败才统一写
+`tool.in_doubt` 并关闭旧 transport；Agent/source projection 尚未切换到 v3 protocol epoch，不能
+把当前 v2 activation 误报为 Agent 已接入。
 
 ### 3.4 MCP call-chain validator v1/v2 与已登记的 v3 reader
 

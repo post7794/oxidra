@@ -323,14 +323,14 @@ async fn oversized_complete_tool_result_is_in_doubt_and_closes_transport() {
 }
 
 #[tokio::test]
-async fn non_text_model_projection_is_in_doubt_and_closes_transport() {
+async fn non_text_raw_result_remains_v2_compatible_and_transport_stays_open() {
     let Some(python) = find_python() else {
-        eprintln!("skipping MCP projection test: Python is unavailable");
+        eprintln!("skipping MCP raw-result compatibility test: Python is unavailable");
         return;
     };
-    let directory = tempfile::tempdir().expect("create MCP projection fixture");
+    let directory = tempfile::tempdir().expect("create MCP raw-result fixture");
     let script = directory.path().join("mcp_fixture.py");
-    let log = directory.path().join("projection.log");
+    let log = directory.path().join("raw-result.log");
     fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
 
     let mut session = McpStdioSession::connect_trusted(
@@ -338,27 +338,27 @@ async fn non_text_model_projection_is_in_doubt_and_closes_transport() {
         CancellationToken::new(),
     )
     .await
-    .expect("connect MCP projection fixture");
-    let error = session
+    .expect("connect MCP raw-result fixture");
+    let result = session
         .call_tool(
             "echo",
             json!({"text":"__image__"}),
             &CancellationToken::new(),
         )
         .await
-        .expect_err("image content must not enter the text-only model profile");
-    assert_eq!(error.code, "output_projection_error");
-    assert!(error.in_doubt);
-    let closed = session
+        .expect("v2 must preserve a bounded raw MCP result even when it is non-text");
+    assert_eq!(result["content"][0]["type"], "image");
+    assert_eq!(result["content"][0]["data"], "opaque");
+    let next = session
         .call_tool(
             "echo",
             json!({"text":"after-projection-error"}),
             &CancellationToken::new(),
         )
         .await
-        .expect_err("projection failure must terminate the old transport");
-    assert_eq!(closed.code, "transport_closed");
-    assert!(!closed.in_doubt);
+        .expect("non-text raw output must not poison the v2 transport");
+    assert_eq!(next["content"][0]["text"], "after-projection-error");
+    session.shutdown().await;
 }
 
 #[tokio::test]
