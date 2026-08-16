@@ -1132,6 +1132,40 @@ impl SessionJournal {
             turn_id: turn_id.map(str::to_owned),
             data,
         };
+        // Generic callers are still supported for historical/builtin journal
+        // events, but an MCP-claimed lifecycle edge must never be the first
+        // durable byte that the reader later rejects. Typed Provider/MCP
+        // writers already run this check as part of their admission; mirror
+        // the same prospective-prefix check here for the legacy public writer
+        // before it reaches the page cache. Tool lifecycle events use an exact
+        // `(turn_id, call_id)` lookup so stripping the marker cannot downgrade
+        // an MCP call; this O(journal) compatibility cost is confined to the
+        // legacy generic writer rather than the typed dispatch path.
+        let explicit_mcp_claim = generic_event_has_explicit_mcp_claim_v1(&event);
+        let mut mcp_prefix = if explicit_mcp_claim {
+            Some(self.read_events()?)
+        } else if is_response_terminal(&event.kind) {
+            let prefix = self.read_events()?;
+            response_terminal_may_belong_to_claimed_mcp_attempt_v1(&prefix, &event)
+                .then_some(prefix)
+        } else if is_tool_lifecycle(&event.kind) && event.turn_id.is_some() {
+            let prefix = self.read_events()?;
+            let exact_call_is_mcp = generic_tool_lifecycle_identity_v1(&event)
+                .map(|(turn_id, call_id)| {
+                    crate::mcp::validated_durable_mcp_call_if_present(&prefix, turn_id, call_id)
+                })
+                .transpose()?
+                .is_some_and(|call| call.is_some());
+            (exact_call_is_mcp
+                || claimed_mcp_response_for_turn_v1(&prefix, event.turn_id.as_deref().unwrap()))
+            .then_some(prefix)
+        } else {
+            None
+        };
+        if let Some(prospective) = mcp_prefix.as_mut() {
+            prospective.push(event.clone());
+            crate::mcp::validate_mcp_call_chain(prospective)?;
+        }
         let encoded = serde_json::to_vec(&event)?;
         let metadata_result = self.file.metadata();
         let current_size = self.finish_io(metadata_result)?.len();
@@ -3301,6 +3335,63 @@ fn validate_events(events: &[JournalEvent], session_id: &str) -> Result<()> {
         previous_seq = Some(event.seq);
     }
     Ok(())
+}
+
+/// Explicit markers that make a generic event part of the MCP protocol rather
+/// than an open-ended builtin/legacy event with a similar kind string.
+fn generic_event_has_explicit_mcp_claim_v1(event: &JournalEvent) -> bool {
+    event.kind == "mcp.registry.activated"
+        || (event.kind == "response.started"
+            && (event.data.get("mcp_registry_epoch_id").is_some()
+                || event.data.get("mcp_registry_digest").is_some()))
+        || (is_tool_lifecycle(&event.kind)
+            && (event.data.get("mcp").is_some()
+                || event
+                    .data
+                    .get("mcp_execution_coordinator_version")
+                    .is_some()))
+        || (event.kind == RECOVERY_KIND
+            && (event.data.get("tool_skip_authorization_version").is_some()
+                || event.data.get("unstarted_tool_calls").is_some()
+                || event
+                    .data
+                    .get("in_doubt_resolution_authorization_version")
+                    .is_some()))
+}
+
+fn generic_tool_lifecycle_identity_v1(event: &JournalEvent) -> Option<(&str, &str)> {
+    if !is_tool_lifecycle(&event.kind) {
+        return None;
+    }
+    let turn_id = event.turn_id.as_deref()?;
+    let call_id = event
+        .data
+        .get("call_id")
+        .or_else(|| event.data.get("id"))
+        .and_then(Value::as_str)?;
+    Some((turn_id, call_id))
+}
+
+/// MCP-owned response terminals do not repeat the registry claim from their
+/// exact `response.started`; bind them to that prior start before deciding
+/// whether the generic writer must run the frozen validator.
+fn response_terminal_may_belong_to_claimed_mcp_attempt_v1(
+    events: &[JournalEvent],
+    terminal: &JournalEvent,
+) -> bool {
+    let Some(turn_id) = terminal.turn_id.as_deref() else {
+        return false;
+    };
+    claimed_mcp_response_for_turn_v1(events, turn_id)
+}
+
+fn claimed_mcp_response_for_turn_v1(events: &[JournalEvent], turn_id: &str) -> bool {
+    events.iter().any(|event| {
+        event.kind == "response.started"
+            && event.turn_id.as_deref() == Some(turn_id)
+            && (event.data.get("mcp_registry_epoch_id").is_some()
+                || event.data.get("mcp_registry_digest").is_some())
+    })
 }
 
 fn pending_tools(events: &[JournalEvent]) -> Vec<InDoubtTool> {
@@ -8415,7 +8506,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_mcp_response_chain_is_rejected_before_recovery_writes() {
+    fn generic_writer_rejects_invalid_mcp_response_before_fsync() {
         let temp = TempDir::new().unwrap();
         let store = SessionStore::new(temp.path()).unwrap();
         let mut journal = store
@@ -8460,39 +8551,160 @@ mod tests {
                 }),
             )
             .unwrap();
-        for call_id in ["call-1", "call-2"] {
-            journal
-                .append_and_sync(
-                    "response.completed",
-                    Some("turn-mcp"),
-                    json!({
-                        "response_attempt_id":"attempt-1",
-                        "output_items":[{
-                            "type":"function_call",
-                            "call_id":call_id,
-                            "name":"mcp_fixture_echo_deadbeef",
-                            "arguments":"{}"
-                        }]
-                    }),
-                )
-                .unwrap();
-        }
-        let original_count = journal.read_events().unwrap().len();
-        drop(journal);
+        journal
+            .append_and_sync(
+                "response.completed",
+                Some("turn-mcp"),
+                json!({
+                    "response_attempt_id":"attempt-1",
+                    "output_items":[{
+                        "type":"function_call",
+                        "call_id":"call-1",
+                        "name":"mcp_fixture_echo_deadbeef",
+                        "arguments":"{}"
+                    }]
+                }),
+            )
+            .unwrap();
+        let original_events = journal.read_events().unwrap();
+        let original_size = journal.file.metadata().unwrap().len();
+        let original_seq = journal.next_seq();
 
-        let error = store
-            .open("invalid-mcp-response")
-            .err()
-            .expect("invalid MCP chain must fail before recovery")
+        let error = journal
+            .append_and_sync(
+                "response.completed",
+                Some("turn-mcp"),
+                json!({
+                    "response_attempt_id":"attempt-1",
+                    "output_items":[{
+                        "type":"function_call",
+                        "call_id":"call-2",
+                        "name":"mcp_fixture_echo_deadbeef",
+                        "arguments":"{}"
+                    }]
+                }),
+            )
+            .expect_err("generic writer must reject a second MCP response terminal")
             .to_string();
         assert!(
             error.contains("has 2 terminals"),
             "unexpected error: {error}"
         );
-        assert_eq!(
-            store.inspect("invalid-mcp-response").unwrap().len(),
-            original_count
+        assert_eq!(journal.read_events().unwrap(), original_events);
+        assert_eq!(journal.file.metadata().unwrap().len(), original_size);
+        assert_eq!(journal.next_seq(), original_seq);
+    }
+
+    #[test]
+    fn generic_writer_rejects_mcp_terminal_that_strips_authority_before_fsync() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("generic-mcp-terminal-boundary", header(temp.path()))
+            .unwrap();
+        let (epoch, digest, provider_name) = append_test_mcp_activation_v2(&mut journal);
+        journal
+            .append_and_sync(
+                "user.message",
+                Some("turn-mcp-terminal-boundary"),
+                json!({"turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION}),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "response.started",
+                Some("turn-mcp-terminal-boundary"),
+                json!({
+                    "response_attempt_id":"attempt-mcp-terminal-boundary",
+                    "mcp_registry_epoch_id":epoch,
+                    "mcp_registry_digest":digest,
+                }),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "response.completed",
+                Some("turn-mcp-terminal-boundary"),
+                json!({
+                    "response_attempt_id":"attempt-mcp-terminal-boundary",
+                    "output_items":[{
+                        "type":"function_call",
+                        "call_id":"call-mcp-terminal-boundary",
+                        "name":provider_name,
+                        "arguments":"{}"
+                    }]
+                }),
+            )
+            .unwrap();
+        let before_events = journal.read_events().unwrap();
+        let before_size = journal.file.metadata().unwrap().len();
+        let before_seq = journal.next_seq();
+
+        // A generic caller can still name the MCP call, but it must not be
+        // able to settle it while omitting the exact coordinator authority.
+        let error = journal
+            .append_and_sync(
+                "tool.completed",
+                Some("turn-mcp-terminal-boundary"),
+                json!({
+                    "call_id":"call-mcp-terminal-boundary",
+                    "tool":provider_name,
+                    "output":{"ok":true},
+                }),
+            )
+            .expect_err("MCP terminal provenance must be checked before fsync")
+            .to_string();
+        assert!(error.contains("MCP authority"), "unexpected error: {error}");
+        assert_eq!(journal.read_events().unwrap(), before_events);
+        assert_eq!(journal.file.metadata().unwrap().len(), before_size);
+        assert_eq!(journal.next_seq(), before_seq);
+    }
+
+    #[test]
+    fn generic_writer_rejects_mcp_terminal_with_missing_response_identity() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("generic-mcp-missing-response-id", header(temp.path()))
+            .unwrap();
+        let (epoch, digest, _) = append_test_mcp_activation_v2(&mut journal);
+        journal
+            .append_and_sync(
+                "user.message",
+                Some("turn-mcp-missing-response-id"),
+                json!({"turn_boundary_version":crate::turn::TURN_BOUNDARY_VERSION}),
+            )
+            .unwrap();
+        journal
+            .append_and_sync(
+                "response.started",
+                Some("turn-mcp-missing-response-id"),
+                json!({
+                    "response_attempt_id":"attempt-missing-response-id",
+                    "mcp_registry_epoch_id":epoch,
+                    "mcp_registry_digest":digest,
+                }),
+            )
+            .unwrap();
+        let before_events = journal.read_events().unwrap();
+        let before_size = journal.file.metadata().unwrap().len();
+        let before_seq = journal.next_seq();
+
+        let error = journal
+            .append_and_sync(
+                "response.failed",
+                Some("turn-mcp-missing-response-id"),
+                json!({"error":"missing attempt identity"}),
+            )
+            .expect_err("claimed MCP response terminal must bind an exact attempt")
+            .to_string();
+        assert!(
+            error.contains("response_attempt_id"),
+            "unexpected error: {error}"
         );
+        assert_eq!(journal.read_events().unwrap(), before_events);
+        assert_eq!(journal.file.metadata().unwrap().len(), before_size);
+        assert_eq!(journal.next_seq(), before_seq);
     }
 
     #[test]

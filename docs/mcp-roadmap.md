@@ -3,7 +3,8 @@
 状态：MCP stdio transport/session kernel v1、显式 project-config reader v1、
 execution-plan digest v1、JSON Schema profile v1、session-scoped tool registry v1、
 durable execution coordinator core v2 和 MCP call-chain validator v2 已实现；v1 reader
-保持冻结兼容，尚未接入 Agent 或 CLI 参数。
+保持冻结兼容；MCP-capable tool-surface snapshot 的 writer-side v1 原语已建立，但尚未
+升级为可离线证明的 activation/reader v3，也尚未接入 Agent 或 CLI 参数。
 当前代码只能由 Rust 调用方显式加载绝对 config path、批准 execution plan 与 registry
 surface，并把 coordinator 绑定到 session journal；它不是已经对用户开放的插件入口。
 
@@ -231,6 +232,13 @@ registry epoch/digest；配置不一致会在执行任何 MCP 代码前失败，
 写入这些字段，证明 Provider request 所使用的 `context.tools`、返回 call、approval、started
 和 permit 属于同一个 epoch；完成这条绑定前不能把 MCP definitions 放进 Agent 请求。
 
+当前 `ToolSurfaceSnapshotV1` / `McpProviderSurfaceV1` 已把 live registry 的 alias、
+definition digest、output-schema digest、registry epoch/digest 与 Provider-visible 工具顺序
+合并为不可由调用方直接构造的 writer-side snapshot，并在写入前拒绝 builtin/history/MCP
+名称碰撞。旧 `ToolSnapshot` v1 保持字节兼容。该 snapshot 仍只是 activation v3 的前置材料：
+coordinator v2 activation 没有 definition/output-schema digest，离线 reader 目前不能仅凭 v2
+journal 证明 snapshot 来自该 registry，因此 Agent 仍不得把它当成 durable dispatch authority。
+
 ### 3.4 MCP call-chain validator v1/v2
 
 MCP terminal 的语义权限现由单一、冻结的 call-chain validator 授予，不再要求 turn、slot、
@@ -311,6 +319,11 @@ projection 和 history 各自“碰巧做出相同判断”：
 - coordinator 不再独立扫描 `response.completed`；它只消费 call-chain validator 按 activation
   版本产出的 canonical durable-call snapshot，其中 Provider alias、参数及 digest、registry
   epoch/digest 和 exact response start/completion seq 已由同一 response envelope 证明。
+- legacy public journal writer 在写 MCP-claimed response、recovery marker 或 exact MCP-owned
+  tool lifecycle 前，会先验证完整 prospective prefix；移除 provenance 也不能把 MCP terminal
+  降级为 generic event 并先 fsync 一个 reader 必然拒绝的 journal。这个兼容检查只闭合
+  writer/reader 接受集合，不授予 dispatch 权限；未来 Agent 正常路径仍必须由 coordinator
+  capability 独占，不能把“格式合法”解释成“已获批准”。
 
 call-chain validator 解决的是 durable 事实解释，不会自动恢复 live server。下一阶段仍需在 session
 reopen 后按已批准 execution plan 重建或替换 live registry epoch，并把实际 request 的

@@ -1,8 +1,11 @@
 //! Deterministic context measurement and auditable Provider usage anchors.
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::config::{ContextLimits, ProviderConfig};
 use crate::error::{OxidraError, Result};
@@ -14,6 +17,14 @@ pub const CONTEXT_MEASUREMENT_VERSION: u32 = 2;
 pub const CONTEXT_ESTIMATOR_VERSION: u32 = 1;
 pub const REQUEST_SHAPE_VERSION: u32 = 1;
 pub const TOOL_SNAPSHOT_VERSION: u32 = 1;
+/// Version of the Provider-visible tool surface envelope used by the first
+/// MCP-capable request path.  This is deliberately separate from
+/// [`TOOL_SNAPSHOT_VERSION`]: the latter is already persisted by existing
+/// sessions and must remain byte-for-byte compatible.
+pub const TOOL_SURFACE_SNAPSHOT_VERSION_V1: u32 = 1;
+pub const MCP_SURFACE_CLAIM_VERSION_V1: u32 = 1;
+pub const TOOL_SURFACE_MAX_TOOLS_V1: usize = 512;
+pub const TOOL_SURFACE_MAX_BYTES_V1: usize = 512 * 1024;
 pub const PROVIDER_PROTOCOL_OPENAI_RESPONSES: &str = "openai_responses";
 pub const AUTOMATIC_COMPACTION_PLANNING_VERSION_V1: u32 = 1;
 pub const AUTOMATIC_COMPACTION_PLANNING_VERSION: u32 = AUTOMATIC_COMPACTION_PLANNING_VERSION_V1;
@@ -95,6 +106,283 @@ pub struct ToolSnapshot {
     pub version: u32,
     pub digest: String,
     pub tools: Vec<ToolDefinition>,
+}
+
+/// Exact identity of one MCP alias in a Provider-visible tool surface.
+///
+/// The registry digest is not invertible: by itself it cannot prove which
+/// server/raw tool a Provider alias denotes.  A surface snapshot therefore
+/// carries this bounded binding table as well as the registry epoch/digest.
+/// `definition_digest` binds the alias to the exact definition sent to the
+/// Provider; `output_schema_digest` is retained for the model-facing result
+/// profile even though output schemas are not part of a Responses request.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpSurfaceBindingV1 {
+    provider_name: String,
+    server_name: String,
+    raw_tool_name: String,
+    protocol_version: String,
+    definition_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_schema_digest: Option<String>,
+}
+
+impl McpSurfaceBindingV1 {
+    /// Build a binding identity from the discovered registry entry without
+    /// copying the untrusted output schema into the Provider-facing event.
+    pub(crate) fn from_parts(
+        provider_name: impl Into<String>,
+        server_name: impl Into<String>,
+        raw_tool_name: impl Into<String>,
+        protocol_version: impl Into<String>,
+        definition: &ToolDefinition,
+        output_schema: Option<&Value>,
+    ) -> Result<Self> {
+        let provider_name = provider_name.into();
+        let server_name = server_name.into();
+        let raw_tool_name = raw_tool_name.into();
+        let protocol_version = protocol_version.into();
+        for (label, value) in [
+            ("provider_name", provider_name.as_str()),
+            ("server_name", server_name.as_str()),
+            ("raw_tool_name", raw_tool_name.as_str()),
+            ("protocol_version", protocol_version.as_str()),
+        ] {
+            validate_surface_identity(label, value)?;
+        }
+        let definition_digest = digest_json_value(
+            b"oxidra.mcp-surface-definition.v1\0",
+            &serde_json::to_value(definition)?,
+        )?;
+        let output_schema_digest = output_schema
+            .map(|schema| digest_json_value(b"oxidra.mcp-output-schema.v1\0", schema))
+            .transpose()?;
+        Ok(Self {
+            provider_name,
+            server_name,
+            raw_tool_name,
+            protocol_version,
+            definition_digest,
+            output_schema_digest,
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (label, value) in [
+            ("provider_name", self.provider_name.as_str()),
+            ("server_name", self.server_name.as_str()),
+            ("raw_tool_name", self.raw_tool_name.as_str()),
+            ("protocol_version", self.protocol_version.as_str()),
+        ] {
+            validate_surface_identity(label, value)?;
+        }
+        validate_surface_digest("definition_digest", &self.definition_digest)?;
+        if let Some(digest) = &self.output_schema_digest {
+            validate_surface_digest("output_schema_digest", digest)?;
+        }
+        Ok(())
+    }
+
+    pub fn provider_name(&self) -> &str {
+        &self.provider_name
+    }
+
+    pub fn server_name(&self) -> &str {
+        &self.server_name
+    }
+
+    pub fn raw_tool_name(&self) -> &str {
+        &self.raw_tool_name
+    }
+
+    pub fn protocol_version(&self) -> &str {
+        &self.protocol_version
+    }
+
+    pub fn definition_digest(&self) -> &str {
+        &self.definition_digest
+    }
+
+    pub fn output_schema_digest(&self) -> Option<&str> {
+        self.output_schema_digest.as_deref()
+    }
+}
+
+/// Writer-side claim tying one Provider-visible tool surface to an activated
+/// MCP registry epoch.
+///
+/// Its shape supplies the binding material required by a future v3 activation
+/// reader. Current coordinator/call-chain v2 activation rows do not bind the
+/// definition/output-schema digests, so this value is not yet standalone
+/// offline proof of the live registry surface.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct McpSurfaceClaimV1 {
+    version: u32,
+    registry_epoch_id: String,
+    registry_digest: String,
+    bindings: Vec<McpSurfaceBindingV1>,
+}
+
+impl McpSurfaceClaimV1 {
+    pub(crate) fn new(
+        registry_epoch_id: impl Into<String>,
+        registry_digest: impl Into<String>,
+        mut bindings: Vec<McpSurfaceBindingV1>,
+    ) -> Result<Self> {
+        bindings.sort_by(|left, right| left.provider_name.cmp(&right.provider_name));
+        let claim = Self {
+            version: MCP_SURFACE_CLAIM_VERSION_V1,
+            registry_epoch_id: registry_epoch_id.into(),
+            registry_digest: registry_digest.into(),
+            bindings,
+        };
+        claim.validate()?;
+        Ok(claim)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != MCP_SURFACE_CLAIM_VERSION_V1 {
+            return Err(OxidraError::Session(format!(
+                "unsupported MCP surface claim version {}",
+                self.version
+            )));
+        }
+        validate_surface_uuid_v7("registry_epoch_id", &self.registry_epoch_id)?;
+        validate_surface_digest("registry_digest", &self.registry_digest)?;
+        if self.bindings.len() > TOOL_SURFACE_MAX_TOOLS_V1 {
+            return Err(OxidraError::Session(format!(
+                "MCP surface exposes more than {TOOL_SURFACE_MAX_TOOLS_V1} bindings"
+            )));
+        }
+        let mut previous = None;
+        for binding in &self.bindings {
+            binding.validate()?;
+            if let Some(previous) = previous {
+                if previous >= binding.provider_name.as_str() {
+                    return Err(OxidraError::Session(
+                        "MCP surface bindings must be strictly sorted and unique".to_owned(),
+                    ));
+                }
+            }
+            previous = Some(binding.provider_name.as_str());
+        }
+        Ok(())
+    }
+
+    pub fn registry_epoch_id(&self) -> &str {
+        &self.registry_epoch_id
+    }
+
+    pub fn registry_digest(&self) -> &str {
+        &self.registry_digest
+    }
+
+    pub fn bindings(&self) -> &[McpSurfaceBindingV1] {
+        &self.bindings
+    }
+}
+
+/// Versioned, exact Provider-visible tool surface.
+///
+/// Existing sessions continue to use [`ToolSnapshot`] v1.  New MCP-capable
+/// request code should use this envelope instead of bolting registry fields
+/// onto the old event: the `mcp` claim is part of the digest, and the binding
+/// table provides the material a v3 validator will need to prove
+/// alias-to-definition identity.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ToolSurfaceSnapshotV1 {
+    version: u32,
+    digest: String,
+    tools: Vec<ToolDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp: Option<McpSurfaceClaimV1>,
+}
+
+impl ToolSurfaceSnapshotV1 {
+    pub fn validate(&self) -> Result<()> {
+        if self.version != TOOL_SURFACE_SNAPSHOT_VERSION_V1 {
+            return Err(OxidraError::Session(format!(
+                "unsupported tool surface snapshot version {}",
+                self.version
+            )));
+        }
+        validate_tool_definitions(&self.tools)?;
+        if let Some(claim) = &self.mcp {
+            claim.validate()?;
+            for binding in &claim.bindings {
+                let Some(definition) = self
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name == binding.provider_name)
+                else {
+                    return Err(OxidraError::Session(format!(
+                        "MCP surface binding {} is absent from tool definitions",
+                        binding.provider_name
+                    )));
+                };
+                let actual = digest_json_value(
+                    b"oxidra.mcp-surface-definition.v1\0",
+                    &serde_json::to_value(definition)?,
+                )?;
+                if actual != binding.definition_digest {
+                    return Err(OxidraError::Session(format!(
+                        "MCP surface definition digest mismatch for {}",
+                        binding.provider_name
+                    )));
+                }
+            }
+        }
+        let expected = surface_snapshot_digest(&self.tools, self.mcp.as_ref())?;
+        if expected != self.digest {
+            return Err(OxidraError::Session(
+                "tool surface snapshot digest mismatch".to_owned(),
+            ));
+        }
+        let encoded = serde_json::to_vec(self)?;
+        if encoded.len() > TOOL_SURFACE_MAX_BYTES_V1 {
+            return Err(OxidraError::Session(format!(
+                "tool surface snapshot exceeds {TOOL_SURFACE_MAX_BYTES_V1} bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn tools(&self) -> &[ToolDefinition] {
+        &self.tools
+    }
+
+    pub fn mcp(&self) -> Option<&McpSurfaceClaimV1> {
+        self.mcp.as_ref()
+    }
+}
+
+/// Build a canonical MCP-capable tool surface.  The input order is retained
+/// because it is the order sent to the Provider; only the claim binding table
+/// is sorted for deterministic writer-side validation.
+pub(crate) fn snapshot_tool_surface_v1(
+    tools: &[ToolDefinition],
+    mcp: Option<McpSurfaceClaimV1>,
+) -> Result<ToolSurfaceSnapshotV1> {
+    validate_tool_definitions(tools)?;
+    if let Some(claim) = &mcp {
+        claim.validate()?;
+    }
+    let snapshot = ToolSurfaceSnapshotV1 {
+        version: TOOL_SURFACE_SNAPSHOT_VERSION_V1,
+        digest: surface_snapshot_digest(tools, mcp.as_ref())?,
+        tools: tools.to_vec(),
+        mcp,
+    };
+    snapshot.validate()?;
+    Ok(snapshot)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -384,6 +672,107 @@ fn digest_bytes(domain: &[u8], bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+#[derive(Serialize)]
+struct ToolSurfaceDigestPayload<'a> {
+    version: u32,
+    tools: &'a [ToolDefinition],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp: Option<&'a McpSurfaceClaimV1>,
+}
+
+fn surface_snapshot_digest(
+    tools: &[ToolDefinition],
+    mcp: Option<&McpSurfaceClaimV1>,
+) -> Result<String> {
+    let payload = ToolSurfaceDigestPayload {
+        version: TOOL_SURFACE_SNAPSHOT_VERSION_V1,
+        tools,
+        mcp,
+    };
+    Ok(digest_bytes(
+        b"oxidra.context-tool-surface.v1\0",
+        &serde_json::to_vec(&payload)?,
+    ))
+}
+
+fn digest_json_value(domain: &[u8], value: &Value) -> Result<String> {
+    Ok(digest_bytes(domain, &serde_json::to_vec(value)?))
+}
+
+fn validate_tool_definitions(tools: &[ToolDefinition]) -> Result<()> {
+    if tools.len() > TOOL_SURFACE_MAX_TOOLS_V1 {
+        return Err(OxidraError::Session(format!(
+            "tool surface exposes more than {TOOL_SURFACE_MAX_TOOLS_V1} tools"
+        )));
+    }
+    let mut names = BTreeSet::new();
+    let mut encoded_bytes = 2usize; // JSON array brackets.
+    for tool in tools {
+        if tool.name.is_empty()
+            || tool.name.len() > 64
+            || !tool
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(OxidraError::Session(format!(
+                "tool definition name is invalid or exceeds 64 bytes: {:?}",
+                tool.name
+            )));
+        }
+        if !names.insert(tool.name.as_str()) {
+            return Err(OxidraError::Session(format!(
+                "duplicate tool definition name {:?}",
+                tool.name
+            )));
+        }
+        let tool_bytes = serde_json::to_vec(tool)?.len();
+        encoded_bytes = encoded_bytes
+            .checked_add(tool_bytes)
+            .and_then(|bytes| bytes.checked_add(1)) // comma or closing bracket.
+            .ok_or_else(|| OxidraError::Session("tool surface size overflowed".to_owned()))?;
+        if encoded_bytes > TOOL_SURFACE_MAX_BYTES_V1 {
+            return Err(OxidraError::Session(format!(
+                "tool surface exceeds {TOOL_SURFACE_MAX_BYTES_V1} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_surface_identity(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 128 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(OxidraError::Session(format!(
+            "MCP surface {label} has invalid identity"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_surface_uuid_v7(label: &str, value: &str) -> Result<()> {
+    let uuid = Uuid::parse_str(value)
+        .map_err(|_| OxidraError::Session(format!("MCP surface {label} must be a UUIDv7")))?;
+    if uuid.get_version_num() != 7 {
+        return Err(OxidraError::Session(format!(
+            "MCP surface {label} must be a UUIDv7"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_surface_digest(label: &str, value: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(OxidraError::Session(format!(
+            "MCP surface {label} is not a SHA-256 digest"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -418,6 +807,139 @@ mod tests {
                 reserve_tokens_source: ContextValueSource::BuiltinDefault,
             },
         }
+    }
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_owned(),
+            description: format!("definition for {name}"),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn mcp_binding(provider_name: &str, definition: &ToolDefinition) -> McpSurfaceBindingV1 {
+        McpSurfaceBindingV1::from_parts(
+            provider_name,
+            "server",
+            provider_name,
+            "2026-07-28",
+            definition,
+            Some(&json!({"type":"object"})),
+        )
+        .unwrap()
+    }
+
+    fn registry_epoch_id() -> &'static str {
+        "0190f5e6-7b00-7abc-8000-000000000301"
+    }
+
+    #[test]
+    fn mcp_surface_snapshot_binds_aliases_and_is_canonical() {
+        let first = tool("mcp_first");
+        let second = tool("mcp_second");
+        let claim = McpSurfaceClaimV1::new(
+            registry_epoch_id(),
+            "a".repeat(64),
+            vec![
+                mcp_binding("mcp_second", &second),
+                mcp_binding("mcp_first", &first),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            claim
+                .bindings
+                .iter()
+                .map(|binding| binding.provider_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mcp_first", "mcp_second"]
+        );
+
+        let snapshot = snapshot_tool_surface_v1(
+            &[tool("builtin"), first.clone(), second.clone()],
+            Some(claim.clone()),
+        )
+        .unwrap();
+        snapshot.validate().unwrap();
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(encoded["version"], TOOL_SURFACE_SNAPSHOT_VERSION_V1);
+        assert_eq!(encoded["mcp"]["version"], MCP_SURFACE_CLAIM_VERSION_V1);
+        assert_eq!(
+            snapshot.digest(),
+            "ce17e452cb3495b1fc35d4424a36ee18acdc1c5fc3c3bf906d7726a8304cdff5"
+        );
+
+        // Reversing only the claim input cannot change the canonical digest.
+        let reversed = McpSurfaceClaimV1::new(
+            registry_epoch_id(),
+            "a".repeat(64),
+            vec![
+                mcp_binding("mcp_first", &first),
+                mcp_binding("mcp_second", &second),
+            ],
+        )
+        .unwrap();
+        let reversed_snapshot =
+            snapshot_tool_surface_v1(&[tool("builtin"), first, second], Some(reversed)).unwrap();
+        assert_eq!(snapshot.digest, reversed_snapshot.digest);
+    }
+
+    #[test]
+    fn mcp_surface_snapshot_rejects_alias_or_definition_mutation() {
+        let definition = tool("mcp_echo");
+        let claim = McpSurfaceClaimV1::new(
+            registry_epoch_id(),
+            "b".repeat(64),
+            vec![mcp_binding("mcp_echo", &definition)],
+        )
+        .unwrap();
+        let mut snapshot = snapshot_tool_surface_v1(&[definition.clone()], Some(claim)).unwrap();
+
+        snapshot.tools[0].description.push_str(" mutated");
+        assert!(snapshot.validate().is_err());
+
+        let unknown = tool("mcp_other");
+        let unknown_claim = McpSurfaceClaimV1::new(
+            registry_epoch_id(),
+            "b".repeat(64),
+            vec![mcp_binding("mcp_other", &unknown)],
+        )
+        .unwrap();
+        assert!(snapshot_tool_surface_v1(&[definition], Some(unknown_claim)).is_err());
+    }
+
+    #[test]
+    fn mcp_surface_snapshot_rejects_duplicate_tool_names_and_invalid_claim_ids() {
+        let duplicate = tool("same");
+        assert!(snapshot_tool_surface_v1(&[duplicate.clone(), duplicate], None).is_err());
+
+        let error = McpSurfaceClaimV1::new("", "c".repeat(64), Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("registry_epoch_id"));
+
+        let error = McpSurfaceClaimV1::new(
+            "0190f5e6-7b00-4abc-8000-000000000301",
+            "c".repeat(64),
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("registry_epoch_id"));
+    }
+
+    #[test]
+    fn mcp_surface_snapshot_enforces_frozen_count_and_name_limits() {
+        let too_many = (0..=TOOL_SURFACE_MAX_TOOLS_V1)
+            .map(|index| tool(&format!("tool_{index}")))
+            .collect::<Vec<_>>();
+        let error = snapshot_tool_surface_v1(&too_many, None).unwrap_err();
+        assert!(error.to_string().contains("more than"), "{error}");
+
+        let invalid = tool(&"x".repeat(65));
+        let error = snapshot_tool_surface_v1(&[invalid], None).unwrap_err();
+        assert!(error.to_string().contains("64 bytes"), "{error}");
     }
 
     #[test]

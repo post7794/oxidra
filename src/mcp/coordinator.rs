@@ -20,6 +20,9 @@ use super::registry::{
 };
 use super::{McpCallError, PreflightedJsonValue};
 use crate::compaction::validate_compaction_boundary_chain;
+use crate::context::{
+    McpSurfaceBindingV1, McpSurfaceClaimV1, ToolSurfaceSnapshotV1, snapshot_tool_surface_v1,
+};
 use crate::error::{OxidraError, Result};
 use crate::session::{JOURNAL_SCHEMA, JournalEvent, McpToolDispatchAdmissionV1, SessionJournal};
 use crate::turn::{ProviderRequestSlotState, provider_request_slot_state_for_version};
@@ -146,6 +149,33 @@ pub struct McpExecutionCoordinator {
     activation_seq: u64,
     registry: McpRegistry,
     dispatch_poisoned: Arc<AtomicBool>,
+}
+
+/// Opaque runtime proof of the exact MCP definitions and registry claim for
+/// one activated coordinator epoch.
+///
+/// The fields are private so Agent request construction cannot assemble an
+/// MCP claim from arbitrary strings.  This is only a writer-side primitive:
+/// coordinator/call-chain v2 activation rows do not yet bind definition or
+/// output-schema digests, so the future MCP-capable journal protocol must bump
+/// its activation/reader version before treating this snapshot as durable
+/// offline proof.
+pub struct McpProviderSurfaceV1 {
+    definitions: Vec<ToolDefinition>,
+    claim: McpSurfaceClaimV1,
+}
+
+impl McpProviderSurfaceV1 {
+    /// Merge the live MCP surface into builtin/history definitions and bind
+    /// the exact Provider-visible ordering in one versioned snapshot.  Name
+    /// collisions fail before any `context.tools` row can be written.
+    pub fn merge_with(
+        self,
+        mut base_definitions: Vec<ToolDefinition>,
+    ) -> Result<ToolSurfaceSnapshotV1> {
+        base_definitions.extend(self.definitions);
+        snapshot_tool_surface_v1(&base_definitions, Some(self.claim))
+    }
 }
 
 /// Opaque proof that a durable session was opened, recovered and reduced
@@ -368,6 +398,37 @@ impl McpExecutionCoordinator {
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.registry.definitions()
+    }
+
+    /// Produce the writer-side claim for the exact Provider-visible MCP
+    /// surface of this activated epoch. Agent request construction should
+    /// combine this claim with builtin/history definitions through
+    /// [`McpProviderSurfaceV1::merge_with`], not copy only the registry digest.
+    /// The current v2 activation reader does not yet persist the definition
+    /// and output-schema digests, so this is a prerequisite for (not a
+    /// substitute for) the future v3 offline proof.
+    pub fn surface_claim_v1(&self) -> Result<McpProviderSurfaceV1> {
+        let definitions = self.registry.definitions();
+        let bindings = self
+            .registry
+            .bindings()
+            .map(|binding| {
+                McpSurfaceBindingV1::from_parts(
+                    binding.provider_name.clone(),
+                    binding.server_name.clone(),
+                    binding.raw_tool_name.clone(),
+                    binding.protocol_version.clone(),
+                    &binding.definition,
+                    binding.output_schema.as_ref(),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let claim = McpSurfaceClaimV1::new(
+            self.registry_epoch_id.clone(),
+            self.registry.digest().to_owned(),
+            bindings,
+        )?;
+        Ok(McpProviderSurfaceV1 { definitions, claim })
     }
 
     /// Authorize and dispatch the unique durable Provider call identified by

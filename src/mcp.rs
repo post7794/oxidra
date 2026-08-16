@@ -17,7 +17,7 @@ pub use config::{
 pub use coordinator::{
     DenyMcpCallApproval, MCP_ARGUMENT_DIGEST_VERSION, MCP_DISPATCH_PERMIT_VERSION,
     MCP_EXECUTION_COORDINATOR_VERSION, McpCallApprovalHandler, McpCallApprovalRequest,
-    McpCallIdentity, McpExecutionCoordinator, McpResumeEligibility,
+    McpCallIdentity, McpExecutionCoordinator, McpProviderSurfaceV1, McpResumeEligibility,
 };
 pub use journal::{MAX_MCP_CALLS_PER_RESPONSE, MCP_CALL_CHAIN_VALIDATOR_VERSION};
 pub(crate) use journal::{
@@ -25,7 +25,7 @@ pub(crate) use journal::{
     MCP_CALL_CHAIN_VALIDATOR_VERSION_V2, argument_digest_v1, call_chain_validator_version,
     mcp_turn_ids, response_status_text_for_journal, validate_mcp_call_chain,
     validate_mcp_call_chain_for_version, validate_mcp_call_chain_through_version,
-    validated_durable_mcp_calls_for_turn,
+    validated_durable_mcp_call_if_present, validated_durable_mcp_calls_for_turn,
 };
 pub use registry::{
     ApprovedMcpRegistry, ApprovedMcpResumeRegistry, MCP_TOOL_REGISTRY_VERSION, McpRegistry,

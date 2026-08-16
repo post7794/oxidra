@@ -186,8 +186,11 @@ lifecycle containment，不限制文件或网络权限；未来 per-tool approva
 与审计，不是进程 sandbox。固定 JSON Schema profile v1 已在 dispatch 前验证参数、在
 complete result 后验证 structured output，并由 registry digest 绑定。durable execution
 coordinator core、registry epoch activation、call-chain validator v2 与 crash recovery 已接入
-journal，但尚未进入 CLI 参数、Agent approval 或 `context.tools`，因此用户现在仍然只能使用
-固定内置工具，不能把上述 MCP server 暴露给模型。
+journal。新的 writer-side tool-surface snapshot 已能把 live registry alias、definition/
+output-schema digest 与 builtin/history 工具表合并并在写入前拒绝名称碰撞；generic journal
+writer 也会在 MCP-sensitive event fsync 前运行冻结 reducer。不过 activation v2 尚未持久化
+足以离线验证该 definition surface 的材料，CLI 参数、Agent approval 和 `context.tools`
+绑定也仍未接通，因此用户现在仍然只能使用固定内置工具，不能把上述 MCP server 暴露给模型。
 
 下一步是 CLI execution trust 与 Agent approval：把 session-open 产生的 resume capability、
 execution-plan approval 和 discovery 后的 registry epoch/digest 接入 `context.tools`，再让
