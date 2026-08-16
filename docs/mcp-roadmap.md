@@ -249,10 +249,14 @@ response/surface/definition identity 传递到 terminal。当前 coordinator wri
 projection、history 与 compaction 全部新增同一 v3 compatibility epoch 前，不能把 v3 设为默认值，
 因此 Agent 仍不得把该 snapshot 当成当前 durable dispatch authority。
 
-该 v3 reader 当前仍只冻结 ownership/relation，不是 model-result profile：surface 中的
-`output_schema_digest` 来自展示用 schema，不证明 runtime validation schema；`tool.completed.output`
-也尚未冻结 text-only model envelope、raw/model 分离或离线重派生规则。二者必须在 v3 writer/Agent
-接入前升级为新的显式 profile，不能把 relation proof 误报为 structured output proof。
+该 v3 reader 还不把 `output_schema_digest` 误当 runtime validation-schema identity：surface 中的
+digest 仍来自展示 schema，structured output 验证必须继续由 stdio kernel 的冻结 schema profile
+完成。post-dispatch `tool.completed` 现有独立的 model-result profile v1：`mcp_raw_result` 只作
+有界审计值，`output` 必须是严格 text-only、带 `trust = untrusted_mcp_tool_output` 的模型 envelope；
+offline reader 会从 raw 重新派生并 exact compare，禁止 `_meta`、annotations、structuredContent、
+image/resource/audio 或未知 content item 进入模型。projection/profile/大小失败统一写
+`tool.in_doubt` 并关闭旧 transport。该 profile 仍只冻结 MCP kernel/coordinator 的结果边界；
+Agent/source projection 尚未切换到 v3 protocol epoch，不能把当前 v2 activation 误报为 Agent 已接入。
 
 ### 3.4 MCP call-chain validator v1/v2 与已登记的 v3 reader
 

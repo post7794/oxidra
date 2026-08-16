@@ -323,6 +323,45 @@ async fn oversized_complete_tool_result_is_in_doubt_and_closes_transport() {
 }
 
 #[tokio::test]
+async fn non_text_model_projection_is_in_doubt_and_closes_transport() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP projection test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP projection fixture");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("projection.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+
+    let mut session = McpStdioSession::connect_trusted(
+        fixture_config(&python, &script, &log, "modern"),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("connect MCP projection fixture");
+    let error = session
+        .call_tool(
+            "echo",
+            json!({"text":"__image__"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("image content must not enter the text-only model profile");
+    assert_eq!(error.code, "output_projection_error");
+    assert!(error.in_doubt);
+    let closed = session
+        .call_tool(
+            "echo",
+            json!({"text":"after-projection-error"}),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("projection failure must terminate the old transport");
+    assert_eq!(closed.code, "transport_closed");
+    assert!(!closed.in_doubt);
+}
+
+#[tokio::test]
 async fn pre_cancelled_connect_does_not_start_an_mcp_server() {
     let Some(python) = find_python() else {
         eprintln!("skipping MCP cancellation integration test: Python is unavailable");
@@ -1149,6 +1188,19 @@ for line in sys.stdin:
             continue
         else:
             text = arguments.get("text", "")
+        if text in ("__image__", "__resource__", "__unknown_content__"):
+            content_item = {
+                "type": (
+                    "image" if text == "__image__"
+                    else ("resource" if text == "__resource__" else "future-content")
+                ),
+                "data": "opaque",
+            }
+            result = {"content": [content_item], "isError": False}
+            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output"):
+                result["resultType"] = "complete"
+            write_response(message, result=result)
+            continue
         result = {"content": [{"type": "text", "text": text}], "isError": False}
         if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output"):
             result["resultType"] = "complete"

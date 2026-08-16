@@ -18,7 +18,7 @@ use super::journal::{
 use super::registry::{
     ApprovedMcpRegistry, ApprovedMcpResumeRegistry, McpRegistry, PreparedMcpRegistryCall,
 };
-use super::{McpCallError, PreflightedJsonValue};
+use super::{McpCallError, McpToolCallResult, PreflightedJsonValue};
 use crate::compaction::validate_compaction_boundary_chain;
 use crate::context::{McpSurfaceClaimV1, ToolSurfaceSnapshotV1, snapshot_tool_surface_v1};
 use crate::error::{OxidraError, Result};
@@ -582,11 +582,14 @@ impl McpExecutionCoordinator {
         let ApprovedMcpCall { request, prepared } = approved_call;
         let dispatched = self.registry.dispatch(permit, prepared, cancellation).await;
         match dispatched {
-            Ok(output) => {
-                let is_error = output.get("isError").and_then(Value::as_bool) == Some(true);
+            Ok(McpToolCallResult {
+                raw_result,
+                model_output,
+            }) => {
+                let is_error = model_output.is_error();
                 let result = ToolResult {
                     call_id: call.call_id.to_owned(),
-                    output,
+                    output: model_output.as_value(),
                     is_error,
                     error_code: is_error.then(|| "mcp_tool_error".to_owned()),
                 };
@@ -594,7 +597,7 @@ impl McpExecutionCoordinator {
                     journal.commit_mcp_tool_terminal_v1(
                         admission,
                         "tool.completed",
-                        terminal_data(&request, started_seq, &result, false),
+                        terminal_data_with_raw(&request, started_seq, &result, false, &raw_result),
                     )?;
                     Ok(())
                 })?;
@@ -1210,6 +1213,18 @@ fn terminal_data(
         "before_dispatch": before_dispatch,
         "mcp": provenance_data(approval),
     })
+}
+
+fn terminal_data_with_raw(
+    approval: &McpCallApprovalRequest,
+    started_seq: u64,
+    result: &ToolResult,
+    before_dispatch: bool,
+    raw_result: &Value,
+) -> Value {
+    let mut data = terminal_data(approval, started_seq, result, before_dispatch);
+    data["mcp_raw_result"] = raw_result.clone();
+    data
 }
 
 fn provenance_data(approval: &McpCallApprovalRequest) -> Value {

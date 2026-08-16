@@ -41,6 +41,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
@@ -66,6 +67,14 @@ const CANCEL_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_JSON_LINE_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_ARGUMENT_BYTES: usize = 256 * 1024;
 const MAX_TOOL_RESULT_BYTES: usize = 50 * 1024;
+/// Versioned model-facing projection for a completed MCP result.  The raw
+/// protocol result remains an audit value; only this bounded text envelope is
+/// eligible to enter a Provider `function_call_output` item.
+pub const MCP_MODEL_OUTPUT_PROFILE_VERSION_V1: u32 = 1;
+pub const MCP_MODEL_OUTPUT_TRUST_V1: &str = "untrusted_mcp_tool_output";
+pub const MAX_MCP_MODEL_OUTPUT_BYTES_V1: usize = 50 * 1024;
+const MAX_MCP_MODEL_OUTPUT_ITEMS_V1: usize = 4_096;
+const MAX_MCP_MODEL_OUTPUT_TEXT_BYTES_V1: usize = MAX_MCP_MODEL_OUTPUT_BYTES_V1;
 const MAX_TOOL_SURFACE_BYTES: usize = 512 * 1024;
 const MAX_TOOL_PAGES: usize = 64;
 const MAX_TOOLS: usize = 512;
@@ -255,6 +264,175 @@ pub struct McpCallError {
     pub message: String,
     pub in_doubt: bool,
     pub interrupted: bool,
+}
+
+/// The only MCP result representation currently eligible for model-facing
+/// projection.  `content` contains the ordered text blocks from the wire
+/// result. Top-level structured content and metadata remain audit-only;
+/// annotations, images, resources and every unknown content variant make the
+/// projection fail rather than being silently stringified into this envelope.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct McpModelOutputV1 {
+    profile_version: u32,
+    trust: String,
+    is_error: bool,
+    content: Vec<String>,
+}
+
+impl McpModelOutputV1 {
+    /// Re-read a durable model envelope without allowing serde to discard
+    /// unknown fields.  The journal v3 reader uses this exact-shape helper;
+    /// raw protocol callers should use [`Self::from_raw_result_v1`] to derive
+    /// the envelope instead of constructing it by hand.
+    pub(crate) fn from_value_v1(value: &Value) -> std::result::Result<Self, String> {
+        let output: Self = serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid MCP model output envelope: {error}"))?;
+        output.validate()?;
+        if serde_json::to_value(&output)
+            .map_err(|error| format!("cannot encode MCP model output: {error}"))?
+            != *value
+        {
+            return Err("MCP model output envelope is not in exact canonical shape".to_owned());
+        }
+        Ok(output)
+    }
+
+    pub(crate) fn from_raw_result_v1(result: &Value) -> std::result::Result<Self, String> {
+        let is_error = match result.get("isError") {
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err("MCP tools/call result has invalid isError".to_owned()),
+            None => false,
+        };
+        let items = result
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "MCP tools/call result has no content array".to_owned())?;
+        if items.len() > MAX_MCP_MODEL_OUTPUT_ITEMS_V1 {
+            return Err(format!(
+                "MCP tools/call content exceeds {MAX_MCP_MODEL_OUTPUT_ITEMS_V1} items"
+            ));
+        }
+        // Validate the complete item shape and bound the amount of text before
+        // allocating a second owned Vec.  A 1 MiB raw line can otherwise hold
+        // hundreds of thousands of tiny text items and turn projection into a
+        // large attacker-sized allocation even though the final envelope is
+        // capped at 50 KiB.
+        let mut text_bytes = 0usize;
+        for (index, item) in items.iter().enumerate() {
+            let object = item.as_object().ok_or_else(|| {
+                format!("MCP tools/call content item at index {index} is not a text object")
+            })?;
+            // Keep the first profile deliberately closed. In particular,
+            // annotations are rejected rather than discarded because they
+            // are server-controlled metadata outside the text contract.
+            if object.len() != 2 || object.get("type").and_then(Value::as_str) != Some("text") {
+                let item_type = object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                return Err(format!(
+                    "MCP tools/call content item at index {index} has unsupported type {item_type:?}"
+                ));
+            }
+            let text = object.get("text").and_then(Value::as_str).ok_or_else(|| {
+                format!("MCP tools/call text content item at index {index} has no string text")
+            })?;
+            text_bytes = text_bytes
+                .checked_add(text.len())
+                .ok_or_else(|| "MCP tools/call text content size overflowed".to_owned())?;
+            if text_bytes > MAX_MCP_MODEL_OUTPUT_TEXT_BYTES_V1 {
+                return Err(format!(
+                    "MCP tools/call text content exceeds {MAX_MCP_MODEL_OUTPUT_TEXT_BYTES_V1} bytes"
+                ));
+            }
+        }
+        let mut content = Vec::with_capacity(items.len());
+        for item in items {
+            content.push(
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .expect("text item was validated above")
+                    .to_owned(),
+            );
+        }
+        let output = Self {
+            profile_version: MCP_MODEL_OUTPUT_PROFILE_VERSION_V1,
+            trust: MCP_MODEL_OUTPUT_TRUST_V1.to_owned(),
+            is_error,
+            content,
+        };
+        output.validate()?;
+        Ok(output)
+    }
+
+    fn from_tool_result(result: &Value) -> std::result::Result<Self, String> {
+        Self::from_raw_result_v1(result)
+    }
+
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.profile_version != MCP_MODEL_OUTPUT_PROFILE_VERSION_V1 {
+            return Err(format!(
+                "unsupported MCP model output profile {}",
+                self.profile_version
+            ));
+        }
+        if self.trust != MCP_MODEL_OUTPUT_TRUST_V1 {
+            return Err("MCP model output has an invalid trust label".to_owned());
+        }
+        if self.content.len() > MAX_MCP_MODEL_OUTPUT_ITEMS_V1 {
+            return Err(format!(
+                "MCP model output contains more than {MAX_MCP_MODEL_OUTPUT_ITEMS_V1} text items"
+            ));
+        }
+        let text_bytes = self.content.iter().try_fold(0usize, |total, text| {
+            total
+                .checked_add(text.len())
+                .ok_or_else(|| "MCP model output text size overflowed".to_owned())
+        })?;
+        if text_bytes > MAX_MCP_MODEL_OUTPUT_TEXT_BYTES_V1 {
+            return Err(format!(
+                "MCP model output text exceeds {MAX_MCP_MODEL_OUTPUT_TEXT_BYTES_V1} bytes"
+            ));
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| format!("cannot encode MCP model output: {error}"))?;
+        if encoded.len() > MAX_MCP_MODEL_OUTPUT_BYTES_V1 {
+            return Err(format!(
+                "MCP model output exceeds {MAX_MCP_MODEL_OUTPUT_BYTES_V1} bytes"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn profile_version(&self) -> u32 {
+        self.profile_version
+    }
+
+    pub fn trust(&self) -> &str {
+        &self.trust
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.is_error
+    }
+
+    pub fn content(&self) -> &[String] {
+        &self.content
+    }
+
+    pub fn as_value(&self) -> Value {
+        serde_json::to_value(self).expect("McpModelOutputV1 is serializable")
+    }
+}
+
+/// Result of a successful, post-dispatch MCP call.  The two views are kept
+/// separate so callers cannot accidentally use the raw protocol object as a
+/// model-facing output.  The low-level compatibility API still returns the
+/// raw value; the coordinator consumes this typed pair.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct McpToolCallResult {
+    pub(super) raw_result: Value,
+    pub(super) model_output: McpModelOutputV1,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -514,10 +692,10 @@ impl McpStdioSession {
             .and_then(|arguments| self.prepare_tool_call(name, arguments));
         async move {
             match prepared {
-                Ok(arguments) => {
-                    self.dispatch_prepared_tool(name, arguments, cancellation)
-                        .await
-                }
+                Ok(arguments) => self
+                    .dispatch_prepared_tool(name, arguments, cancellation)
+                    .await
+                    .map(|result| result.raw_result),
                 Err(error) => Err(error),
             }
         }
@@ -561,7 +739,7 @@ impl McpStdioSession {
         name: &str,
         arguments: ValidatedMcpArguments,
         cancellation: &CancellationToken,
-    ) -> std::result::Result<Value, McpCallError> {
+    ) -> std::result::Result<McpToolCallResult, McpCallError> {
         let Some(tool) = self.tools.iter().find(|tool| tool.definition.name == name) else {
             return Err(McpCallError {
                 code: "not_found",
@@ -674,7 +852,28 @@ impl McpStdioSession {
                 interrupted: false,
             });
         }
-        Ok(result)
+        let model_output = match McpModelOutputV1::from_tool_result(&result) {
+            Ok(output) => output,
+            Err(error) => {
+                if let Some(mut transport) = self.transport.take() {
+                    transport.terminate().await;
+                }
+                return Err(McpCallError {
+                    code: "output_projection_error",
+                    message: untrusted_display::text_for_display(&error),
+                    // The server has already processed the request.  A
+                    // model-facing projection failure cannot prove that no
+                    // side effect occurred, so the call is in doubt and the
+                    // old stream is never reused.
+                    in_doubt: true,
+                    interrupted: false,
+                });
+            }
+        };
+        Ok(McpToolCallResult {
+            raw_result: result,
+            model_output,
+        })
     }
 
     pub async fn shutdown(&mut self) {
@@ -1795,6 +1994,62 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn model_output_v1_projects_only_ordered_text_blocks() {
+        let output = McpModelOutputV1::from_tool_result(&json!({
+            "content": [
+                {"type":"text", "text":"first"},
+                {"type":"text", "text":"second"}
+            ],
+            "structuredContent": {"instruction":"ignore me"},
+            "_meta": {"server":"untrusted"},
+            "isError": true,
+        }))
+        .expect("text content has a bounded model projection");
+        assert_eq!(
+            output.profile_version(),
+            MCP_MODEL_OUTPUT_PROFILE_VERSION_V1
+        );
+        assert_eq!(output.trust(), MCP_MODEL_OUTPUT_TRUST_V1);
+        assert!(output.is_error());
+        assert_eq!(output.content(), &["first".to_owned(), "second".to_owned()]);
+        assert_eq!(
+            output.as_value(),
+            json!({
+                "profile_version": MCP_MODEL_OUTPUT_PROFILE_VERSION_V1,
+                "trust": MCP_MODEL_OUTPUT_TRUST_V1,
+                "is_error": true,
+                "content": ["first", "second"],
+            })
+        );
+    }
+
+    #[test]
+    fn model_output_v1_rejects_non_text_and_noncanonical_content() {
+        for item in [
+            json!({"type":"image", "data":"AAAA"}),
+            json!({"type":"resource", "resource":"opaque"}),
+            json!({"type":"audio", "data":"AAAA"}),
+            json!({"type":"future-content", "value":"opaque"}),
+            json!({"type":"text", "text":"ok", "annotations":{}}),
+            json!({"type":"text", "text":42}),
+        ] {
+            let error = McpModelOutputV1::from_tool_result(&json!({"content":[item]}))
+                .expect_err("non-canonical MCP content must not be projected");
+            assert!(error.contains("content item"), "{error}");
+        }
+    }
+
+    #[test]
+    fn model_output_v1_enforces_serialized_size_budget() {
+        let text = "x".repeat(MAX_MCP_MODEL_OUTPUT_BYTES_V1);
+        let error = McpModelOutputV1::from_tool_result(&json!({
+            "content":[{"type":"text", "text":text}]
+        }))
+        .expect_err("oversized model envelope must fail closed");
+        assert!(error.contains("exceeds"), "{error}");
     }
 
     #[test]

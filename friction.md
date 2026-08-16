@@ -192,15 +192,16 @@ writer 也会在 MCP-sensitive event fsync 前运行冻结 reducer。显式 acti
 offline reader 已能严格证明 activation、global `context.tools`、request context 与
 `response.started.mcp_surface` 的 exact relation，并阻止删除 claim 后把 activated alias 降级成
 generic response；绑定的 input schema 和 lifecycle outer/nested provenance 也会按冻结 profile
-重验。这个 reader 仍是 relation-only：展示用 output-schema digest 不能证明 runtime structured
-validation，raw MCP result 也尚未与 model-facing output 分离。current writer 仍冻结在 v2，CLI
+重验。展示用 output-schema digest 仍不能证明 runtime structured validation；MCP kernel 现已冻结
+model-facing result envelope v1：raw MCP result 只作有界审计值，model-facing projection 只允许
+严格 text-only 且由 offline reader 从 raw 重派生。current writer 仍冻结在 v2，CLI
 参数、Agent approval 和实际 request binding 也未接通，因此用户现在仍然只能使用固定内置工具，
 不能把上述 MCP server 暴露给模型。
 
 下一步先完成统一 MCP protocol epoch 升级，而不是直接写 Agent glue：turn、Provider slot、
 source projection、history extractor 和 compaction boundary 必须各新增只接受 call-chain v3 的
 冻结版本；同时建立 typed `context.tools`/response writer capability，避免 public generic Value
-writer 把“格式合法”冒充成“已获授权”。随后冻结 model-facing MCP result envelope，再把
+writer 把“格式合法”冒充成“已获授权”。随后把
 session-open resume capability、CLI execution trust、Agent approval 与 coordinator 的一次性
 dispatch permit 接成唯一事实源。现有 CLI 的 durable `in_doubt` resolution transaction 必须复用，
 不能再实现一套 MCP 专用终态 writer。

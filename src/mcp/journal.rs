@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::schema;
+use super::{McpModelOutputV1, schema};
 use crate::context::{MCP_SURFACE_CLAIM_VERSION_V1, ToolSurfaceSnapshotV1};
 use crate::error::{OxidraError, Result};
 use crate::event_kind::{is_response_terminal, is_tool_lifecycle, is_tool_terminal};
@@ -2232,9 +2232,9 @@ fn validate_lifecycle_event_v3(
                 *state = CallState::Terminal;
             }
             CallState::Started { seq, provenance } => {
-                validate_post_start_terminal_outer_profile_v3(event, false)?;
+                validate_post_start_completed_outer_profile_v3(event)?;
                 validate_started_terminal_v3(event, *seq, provenance, call, activation)?;
-                validate_completed_result(event)?;
+                validate_completed_result_v3(event)?;
                 *state = CallState::Terminal;
             }
             _ => return invalid_transition(event, state),
@@ -2321,6 +2321,31 @@ fn validate_post_start_terminal_outer_profile_v3(
         return session_error(format!(
             "{} at seq {} has inconsistent before_dispatch authority",
             event.kind, event.seq
+        ));
+    }
+    Ok(())
+}
+
+fn validate_post_start_completed_outer_profile_v3(event: &JournalEvent) -> Result<()> {
+    require_exact_keys(
+        object_data(event)?,
+        &[
+            "before_dispatch",
+            "call_id",
+            "error_code",
+            "is_error",
+            "mcp",
+            "mcp_raw_result",
+            "output",
+            "started_seq",
+            "tool",
+        ],
+        event,
+    )?;
+    if event.data.get("before_dispatch").and_then(Value::as_bool) != Some(false) {
+        return session_error(format!(
+            "tool.completed at seq {} is not marked as post-dispatch",
+            event.seq
         ));
     }
     Ok(())
@@ -2947,6 +2972,74 @@ fn validate_completed_result(event: &JournalEvent) -> Result<()> {
     Ok(())
 }
 
+/// v3 post-dispatch completions carry two deliberately separate views:
+/// `mcp_raw_result` is the bounded parsed protocol audit value and `output` is
+/// the canonical text-only model projection.  Re-derive the latter from the
+/// former while reading the journal so a writer cannot smuggle metadata,
+/// structured content, a trusted label, or a different error polarity into
+/// the model-facing surface.
+fn validate_completed_result_v3(event: &JournalEvent) -> Result<()> {
+    validate_completed_result(event)?;
+    let raw = event.data.get("mcp_raw_result").ok_or_else(|| {
+        session_message(
+            event,
+            "post-dispatch v3 tool.completed has no mcp_raw_result audit value",
+        )
+    })?;
+    let raw_bytes = serde_json::to_vec(raw).map_err(|error| {
+        OxidraError::Session(format!(
+            "tool.completed at seq {} raw MCP result cannot be encoded: {error}",
+            event.seq
+        ))
+    })?;
+    if raw_bytes.len() > super::MAX_TOOL_RESULT_BYTES {
+        return session_error(format!(
+            "tool.completed at seq {} raw MCP result exceeds {} bytes",
+            event.seq,
+            super::MAX_TOOL_RESULT_BYTES
+        ));
+    }
+    let expected = McpModelOutputV1::from_raw_result_v1(raw).map_err(|error| {
+        OxidraError::Session(format!(
+            "tool.completed at seq {} has invalid MCP raw result profile: {error}",
+            event.seq
+        ))
+    })?;
+    let actual = McpModelOutputV1::from_value_v1(
+        event
+            .data
+            .get("output")
+            .ok_or_else(|| session_message(event, "tool.completed has no model output"))?,
+    )
+    .map_err(|error| {
+        OxidraError::Session(format!(
+            "tool.completed at seq {} has invalid MCP model output profile: {error}",
+            event.seq
+        ))
+    })?;
+    if actual != expected {
+        return session_error(format!(
+            "tool.completed at seq {} model output does not match mcp_raw_result",
+            event.seq
+        ));
+    }
+    if event.data.get("is_error").and_then(Value::as_bool) != Some(expected.is_error()) {
+        return session_error(format!(
+            "tool.completed at seq {} error polarity does not match mcp_raw_result",
+            event.seq
+        ));
+    }
+    let expected_error_code = expected.is_error().then_some("mcp_tool_error");
+    let actual_error_code = event.data.get("error_code").and_then(Value::as_str);
+    if actual_error_code != expected_error_code {
+        return session_error(format!(
+            "tool.completed at seq {} error_code does not match the v3 MCP result profile",
+            event.seq
+        ));
+    }
+    Ok(())
+}
+
 fn validate_error_result(event: &JournalEvent, code: &str) -> Result<()> {
     if event.data.get("is_error").and_then(Value::as_bool) != Some(true)
         || event.data.get("error_code").and_then(Value::as_str) != Some(code)
@@ -3243,7 +3336,16 @@ mod tests {
                     "started_seq":5,
                     "call_id":"call-1",
                     "tool":"mcp_fixture_echo_deadbeef",
-                    "output":{"content":[{"type":"text","text":"hello"}]},
+                    "output":{
+                        "profile_version":1,
+                        "trust":"untrusted_mcp_tool_output",
+                        "is_error":false,
+                        "content":["hello"]
+                    },
+                    "mcp_raw_result":{
+                        "content":[{"type":"text","text":"hello"}],
+                        "isError":false
+                    },
                     "is_error":false,
                     "error_code":Value::Null,
                     "before_dispatch":false,
@@ -3564,6 +3666,53 @@ mod tests {
     }
 
     #[test]
+    fn v3_completed_result_rederives_the_model_envelope_from_raw() {
+        let assert_rejected = |name: &str, mutate: &mut dyn FnMut(&mut Value)| {
+            let mut events = mcp_events_v3();
+            mutate(&mut events[6].data);
+            assert!(
+                validate_mcp_call_chain_v3(&events).is_err(),
+                "{name} must fail closed"
+            );
+        };
+
+        let mut raw_content = |data: &mut Value| {
+            data["mcp_raw_result"]["content"][0]["text"] = Value::String("drift".to_owned());
+        };
+        assert_rejected("raw content drift", &mut raw_content);
+
+        let mut model_content = |data: &mut Value| {
+            data["output"]["content"][0] = Value::String("drift".to_owned());
+        };
+        assert_rejected("model content drift", &mut model_content);
+
+        let mut trusted = |data: &mut Value| {
+            data["output"]["trust"] = Value::String("trusted".to_owned());
+        };
+        assert_rejected("trusted output label", &mut trusted);
+
+        let mut profile = |data: &mut Value| {
+            data["output"]["profile_version"] = Value::from(2);
+        };
+        assert_rejected("future output profile", &mut profile);
+
+        let mut polarity = |data: &mut Value| {
+            data["mcp_raw_result"]["isError"] = Value::Bool(true);
+        };
+        assert_rejected("raw error polarity drift", &mut polarity);
+
+        let mut code = |data: &mut Value| {
+            data["error_code"] = Value::String("other_error".to_owned());
+        };
+        assert_rejected("error code drift", &mut code);
+
+        let mut unknown_output = |data: &mut Value| {
+            data["output"]["unexpected"] = Value::Bool(true);
+        };
+        assert_rejected("unknown model output field", &mut unknown_output);
+    }
+
+    #[test]
     fn v3_pre_start_terminal_carries_surface_bound_authority() {
         let mut events = mcp_events_v3();
         let mut provenance = events[5].data["mcp"].clone();
@@ -3604,6 +3753,11 @@ mod tests {
         resolved[6].kind = "tool.in_doubt".to_owned();
         resolved[6].data["output"] =
             json!({"error":{"code":"in_doubt","message":"result was not validated"}});
+        resolved[6]
+            .data
+            .as_object_mut()
+            .expect("terminal object")
+            .remove("mcp_raw_result");
         resolved[6].data["is_error"] = Value::Bool(true);
         resolved[6].data["error_code"] = Value::String("in_doubt".to_owned());
         resolved.push(event(

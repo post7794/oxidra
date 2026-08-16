@@ -182,7 +182,15 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         )
         .await
         .expect("call namespaced MCP tool");
-    assert_eq!(result.output["structuredContent"]["text"], "registry");
+    assert_eq!(
+        result.output["profile_version"],
+        oxidra::mcp::MCP_MODEL_OUTPUT_PROFILE_VERSION_V1
+    );
+    assert_eq!(
+        result.output["trust"],
+        oxidra::mcp::MCP_MODEL_OUTPUT_TRUST_V1
+    );
+    assert_eq!(result.output["content"][0], "registry");
     let events = journal.read_events().expect("read MCP coordinator events");
     let started = events
         .iter()
@@ -204,6 +212,10 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("durable MCP tool.completed");
     assert_eq!(completed.data["started_seq"], started.seq);
     assert_eq!(completed.data["mcp"], started.data["mcp"]);
+    assert_eq!(
+        completed.data["mcp_raw_result"]["structuredContent"]["text"],
+        "registry"
+    );
 
     let replay_error = coordinator
         .execute_call(

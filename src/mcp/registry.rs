@@ -9,7 +9,7 @@ use super::coordinator::{DispatchPermit, McpResumeEligibility, McpResumePermit};
 use super::{
     ApprovedMcpProjectConfig, MCP_EXECUTION_PLAN_VERSION, MCP_LEGACY_PROTOCOL_VERSION,
     MCP_MODERN_PROTOCOL_VERSION, MCP_SCHEMA_PROFILE_VERSION, MCP_STDIO_KERNEL_VERSION,
-    McpCallError, McpProtocolEra, McpStdioSession, ValidatedMcpArguments,
+    McpCallError, McpProtocolEra, McpStdioSession, McpToolCallResult, ValidatedMcpArguments,
 };
 use crate::context::McpSurfaceBindingV1;
 use crate::error::{OxidraError, Result};
@@ -427,7 +427,7 @@ impl McpRegistry {
         permit: DispatchPermit,
         prepared: PreparedMcpRegistryCall,
         cancellation: &CancellationToken,
-    ) -> std::result::Result<Value, McpCallError> {
+    ) -> std::result::Result<McpToolCallResult, McpCallError> {
         let Some(authority) = &self.dispatch_authority else {
             return Err(McpCallError {
                 code: "dispatch_permit_invalid",
