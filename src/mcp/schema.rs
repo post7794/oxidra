@@ -89,7 +89,7 @@ const ALLOWED_KEYWORDS: &[&str] = &[
     "not",
 ];
 
-pub(super) fn validate_tool_schema(schema: &Value, label: &str) -> Result<(), String> {
+pub(crate) fn validate_tool_schema(schema: &Value, label: &str) -> Result<(), String> {
     let object = schema
         .as_object()
         .ok_or_else(|| format!("{label} must be an object schema"))?;

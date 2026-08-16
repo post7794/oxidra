@@ -8,7 +8,7 @@ mod config;
 mod coordinator;
 mod journal;
 mod registry;
-mod schema;
+pub(crate) mod schema;
 
 pub use config::{
     ApprovedMcpProjectConfig, MCP_EXECUTION_PLAN_VERSION, MCP_PROJECT_CONFIG_VERSION,
@@ -638,20 +638,39 @@ impl McpStdioSession {
                 interrupted: false,
             });
         }
-        let encoded = serde_json::to_vec(&result).map_err(|error| McpCallError {
-            code: "protocol_error",
-            message: format!("cannot serialize MCP tool result: {error}"),
-            in_doubt: false,
-            interrupted: false,
-        })?;
+        let encoded = match serde_json::to_vec(&result) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                if let Some(mut transport) = self.transport.take() {
+                    transport.terminate().await;
+                }
+                return Err(McpCallError {
+                    code: "protocol_error",
+                    message: format!("cannot serialize MCP tool result: {error}"),
+                    // The server has already processed the request.  A local
+                    // result encoding failure cannot prove that no side effect
+                    // occurred, and the old stream must not be reused.
+                    in_doubt: true,
+                    interrupted: false,
+                });
+            }
+        };
         if encoded.len() > MAX_TOOL_RESULT_BYTES {
+            if let Some(mut transport) = self.transport.take() {
+                transport.terminate().await;
+            }
             return Err(McpCallError {
                 code: "output_limit",
                 message: format!(
                     "MCP server {} tool result exceeds {MAX_TOOL_RESULT_BYTES} bytes",
                     self.config.name
                 ),
-                in_doubt: false,
+                // The complete result was received, but it cannot enter the
+                // bounded durable/model profile.  Treat the post-dispatch
+                // outcome conservatively; callers must explicitly resolve it
+                // before another MCP call is admitted.  The stream is closed
+                // so no later call can consume stale or late protocol state.
+                in_doubt: true,
                 interrupted: false,
             });
         }

@@ -3341,9 +3341,15 @@ fn validate_events(events: &[JournalEvent], session_id: &str) -> Result<()> {
 /// than an open-ended builtin/legacy event with a similar kind string.
 fn generic_event_has_explicit_mcp_claim_v1(event: &JournalEvent) -> bool {
     event.kind == "mcp.registry.activated"
+        || (event.kind == "context.tools"
+            && event
+                .data
+                .as_object()
+                .is_some_and(|data| data.contains_key("mcp")))
         || (event.kind == "response.started"
             && (event.data.get("mcp_registry_epoch_id").is_some()
-                || event.data.get("mcp_registry_digest").is_some()))
+                || event.data.get("mcp_registry_digest").is_some()
+                || event.data.get("mcp_surface").is_some()))
         || (is_tool_lifecycle(&event.kind)
             && (event.data.get("mcp").is_some()
                 || event
@@ -3390,7 +3396,8 @@ fn claimed_mcp_response_for_turn_v1(events: &[JournalEvent], turn_id: &str) -> b
         event.kind == "response.started"
             && event.turn_id.as_deref() == Some(turn_id)
             && (event.data.get("mcp_registry_epoch_id").is_some()
-                || event.data.get("mcp_registry_digest").is_some())
+                || event.data.get("mcp_registry_digest").is_some()
+                || event.data.get("mcp_surface").is_some())
     })
 }
 
@@ -8593,6 +8600,55 @@ mod tests {
         assert_eq!(journal.read_events().unwrap(), original_events);
         assert_eq!(journal.file.metadata().unwrap().len(), original_size);
         assert_eq!(journal.next_seq(), original_seq);
+    }
+
+    #[test]
+    fn generic_writer_rejects_orphan_mcp_surface_markers_before_fsync() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let mut journal = store
+            .create_with_id("orphan-mcp-surface", header(temp.path()))
+            .unwrap();
+        let original_events = journal.read_events().unwrap();
+        let original_size = journal.file.metadata().unwrap().len();
+        let original_seq = journal.next_seq();
+
+        for (kind, turn_id, data) in [
+            (
+                "context.tools",
+                None,
+                json!({
+                    "version":1,
+                    "digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "tools":[],
+                    "mcp":{},
+                }),
+            ),
+            (
+                "response.started",
+                Some("turn-orphan-surface"),
+                json!({
+                    "response_attempt_id":"attempt-orphan-surface",
+                    "mcp_surface":{
+                        "version":1,
+                        "event_seq":2,
+                        "digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    },
+                }),
+            ),
+        ] {
+            let error = journal
+                .append_and_sync(kind, turn_id, data)
+                .expect_err("orphan MCP surface authority must fail before fsync")
+                .to_string();
+            assert!(
+                error.contains("without a registry activation"),
+                "unexpected error: {error}"
+            );
+            assert_eq!(journal.read_events().unwrap(), original_events);
+            assert_eq!(journal.file.metadata().unwrap().len(), original_size);
+            assert_eq!(journal.next_seq(), original_seq);
+        }
     }
 
     #[test]

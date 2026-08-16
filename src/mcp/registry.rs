@@ -11,6 +11,7 @@ use super::{
     MCP_MODERN_PROTOCOL_VERSION, MCP_SCHEMA_PROFILE_VERSION, MCP_STDIO_KERNEL_VERSION,
     McpCallError, McpProtocolEra, McpStdioSession, ValidatedMcpArguments,
 };
+use crate::context::McpSurfaceBindingV1;
 use crate::error::{OxidraError, Result};
 use crate::types::ToolDefinition;
 use crate::untrusted_display;
@@ -328,6 +329,26 @@ impl McpRegistry {
                 server_name: binding.server_name.clone(),
                 raw_tool_name: binding.raw_tool_name.clone(),
                 protocol_version: binding.protocol_version.clone(),
+            })
+            .collect()
+    }
+
+    /// Derive the complete surface identity from the same live binding table
+    /// used for dispatch.  Surface snapshots and the future activation-v3
+    /// writer must share this function so definition/output-schema digests
+    /// cannot drift through independent reimplementation.
+    pub(super) fn surface_binding_snapshot_v1(&self) -> Result<Vec<McpSurfaceBindingV1>> {
+        self.bindings
+            .values()
+            .map(|binding| {
+                McpSurfaceBindingV1::from_parts(
+                    binding.provider_name.clone(),
+                    binding.server_name.clone(),
+                    binding.raw_tool_name.clone(),
+                    binding.protocol_version.clone(),
+                    &binding.definition,
+                    binding.output_schema.as_ref(),
+                )
             })
             .collect()
     }

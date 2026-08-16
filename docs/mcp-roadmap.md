@@ -2,9 +2,10 @@
 
 状态：MCP stdio transport/session kernel v1、显式 project-config reader v1、
 execution-plan digest v1、JSON Schema profile v1、session-scoped tool registry v1、
-durable execution coordinator core v2 和 MCP call-chain validator v2 已实现；v1 reader
-保持冻结兼容；MCP-capable tool-surface snapshot 的 writer-side v1 原语已建立，但尚未
-升级为可离线证明的 activation/reader v3，也尚未接入 Agent 或 CLI 参数。
+durable execution coordinator core v2 和当前 MCP call-chain validator v2 已实现；v1 reader
+保持冻结兼容；MCP-capable tool-surface snapshot 的 writer-side v1 原语和显式的
+activation/call-chain v3 offline reader 已建立，但 v3 尚未成为当前 writer protocol epoch，
+也尚未接入 Agent 或 CLI 参数。
 当前代码只能由 Rust 调用方显式加载绝对 config path、批准 execution plan 与 registry
 surface，并把 coordinator 绑定到 session journal；它不是已经对用户开放的插件入口。
 
@@ -92,7 +93,8 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
 - 已经 cancelled 的 connect 在第一次 spawn 前返回；modern fallback 到 legacy 前会
   再检查 cancellation，不会为已取消的连接执行 server 初始化代码。
 - 单条 JSONL 上限 1 MiB；工具表上限 512 KiB、512 个工具、64 页；单次工具
-  result 上限 50 KiB。
+  result 上限 50 KiB。收到超过该上限的完整 wire result 仍是 post-dispatch
+  `in_doubt`，不能伪装成 pre-dispatch/output-limit 已知失败，必须经过现有人工 resolution。
 - `inputSchema` 与可选 `outputSchema` 必须通过固定 JSON Schema profile v1，根类型
   为 object。profile 支持登记的 type/object/array/string/number/composition 关键词，
   拒绝 `$ref` 和所有未知关键词。为避免 serde_json 默认 f64 在 wire 解析时先舍入，
@@ -235,11 +237,24 @@ registry epoch/digest；配置不一致会在执行任何 MCP 代码前失败，
 当前 `ToolSurfaceSnapshotV1` / `McpProviderSurfaceV1` 已把 live registry 的 alias、
 definition digest、output-schema digest、registry epoch/digest 与 Provider-visible 工具顺序
 合并为不可由调用方直接构造的 writer-side snapshot，并在写入前拒绝 builtin/history/MCP
-名称碰撞。旧 `ToolSnapshot` v1 保持字节兼容。该 snapshot 仍只是 activation v3 的前置材料：
-coordinator v2 activation 没有 definition/output-schema digest，离线 reader 目前不能仅凭 v2
-journal 证明 snapshot 来自该 registry，因此 Agent 仍不得把它当成 durable dispatch authority。
+名称碰撞。旧 `ToolSnapshot` v1 保持字节兼容。显式 validator v3 已登记严格、可离线的关系：
+activation 保存 full binding digest，`response.started` 引用 activation 之后、start 之前的唯一
+global `context.tools`，并要求 `mcp_surface.event_seq == context.tools_event_seq`；snapshot、claim、
+activation 的 epoch/digest/full bindings 必须一致。删除 response claim 不能把实际使用 MCP
+surface 或返回 activated alias 的 response 降级为 generic。Serde 会忽略的 snapshot/tool/binding
+额外字段也由 parsed-JSON canonical reader 拒绝；该保证针对 journal 已解析后的语义形状，不声称
+保留重复 key、对象原始顺序或数字词法。绑定到 MCP alias 的 input schema 会重新通过冻结的
+schema profile v1；v3 lifecycle 的 outer data 与 nested provenance 都是 closed profile，并把 exact
+response/surface/definition identity 传递到 terminal。当前 coordinator writer 仍冻结在 v2；在 turn、slot、
+projection、history 与 compaction 全部新增同一 v3 compatibility epoch 前，不能把 v3 设为默认值，
+因此 Agent 仍不得把该 snapshot 当成当前 durable dispatch authority。
 
-### 3.4 MCP call-chain validator v1/v2
+该 v3 reader 当前仍只冻结 ownership/relation，不是 model-result profile：surface 中的
+`output_schema_digest` 来自展示用 schema，不证明 runtime validation schema；`tool.completed.output`
+也尚未冻结 text-only model envelope、raw/model 分离或离线重派生规则。二者必须在 v3 writer/Agent
+接入前升级为新的显式 profile，不能把 relation proof 误报为 structured output proof。
+
+### 3.4 MCP call-chain validator v1/v2 与已登记的 v3 reader
 
 MCP terminal 的语义权限现由单一、冻结的 call-chain validator 授予，不再要求 turn、slot、
 projection 和 history 各自“碰巧做出相同判断”：
@@ -249,6 +264,12 @@ projection 和 history 各自“碰巧做出相同判断”：
   `call_chain_validator_version = 2`；turn v7、Provider slot v4、source projection v6、
   history extractor v6 和 compaction boundary v7 冻结兼容集合 `{v1, v2}`，按 activation
   声明选择 exact reducer，并拒绝未来版本，而不是读取可变默认值。
+- validator v3 已作为显式 offline reader 登记，但 `MCP_CALL_CHAIN_VALIDATOR_VERSION` 和
+  coordinator current writer 仍保持 v2。`validate_mcp_call_chain_through_version(2, ...)` 对 v3
+  journal 必须继续 fail closed；只有显式 ceiling 3 才能读取 v3 fixture。下一 protocol epoch
+  必须同时新增 turn v8、Provider slot v5、source projection v7、history extractor v7 与
+  compaction boundary v8，并保持所有旧 match arm 不变；不能只推进 MCP 常量，让其他 reducer
+  在 session reopen 或 projection 时拒绝刚写出的 journal。
 - validator v2 先由 activation 之后、显式带同一 registry epoch/digest 的
   `response.started` 确定整个 response transaction 的 MCP 所有权；unfinished、failed、aborted
   以及只含内置工具的 response 仍属于该 epoch。typed response envelope 保存 exact start、

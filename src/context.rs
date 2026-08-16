@@ -1,6 +1,6 @@
 //! Deterministic context measurement and auditable Provider usage anchors.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -123,7 +123,6 @@ pub struct McpSurfaceBindingV1 {
     raw_tool_name: String,
     protocol_version: String,
     definition_digest: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     output_schema_digest: Option<String>,
 }
 
@@ -299,6 +298,34 @@ pub struct ToolSurfaceSnapshotV1 {
 }
 
 impl ToolSurfaceSnapshotV1 {
+    /// Decode the exact parsed-JSON `context.tools` representation for
+    /// surface protocol v1.
+    ///
+    /// Serde structs intentionally remain usable by ordinary callers and do
+    /// not globally opt into `deny_unknown_fields`.  The durable reader must
+    /// nevertheless reject presentation fields that Serde would otherwise
+    /// discard: Provider tool objects and MCP binding rows are part of the
+    /// authority being proved.  Round-tripping the decoded value therefore
+    /// freezes the complete semantic JSON shape without changing the
+    /// historical `ToolSnapshot` reader.  The journal parser has already
+    /// discarded object-key order and number lexemes; this method does not
+    /// claim byte-for-byte wire identity.
+    pub(crate) fn from_exact_journal_value(value: &Value) -> Result<Self> {
+        let snapshot: Self = serde_json::from_value(value.clone()).map_err(|error| {
+            OxidraError::Session(format!(
+                "context.tools does not contain a valid tool surface snapshot v1: {error}"
+            ))
+        })?;
+        snapshot.validate()?;
+        if serde_json::to_value(&snapshot)? != *value {
+            return Err(OxidraError::Session(
+                "context.tools tool surface snapshot v1 is not in its exact canonical shape"
+                    .to_owned(),
+            ));
+        }
+        Ok(snapshot)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.version != TOOL_SURFACE_SNAPSHOT_VERSION_V1 {
             return Err(OxidraError::Session(format!(
@@ -309,22 +336,37 @@ impl ToolSurfaceSnapshotV1 {
         validate_tool_definitions(&self.tools)?;
         if let Some(claim) = &self.mcp {
             claim.validate()?;
+            let definition_digests = self
+                .tools
+                .iter()
+                .map(|definition| {
+                    digest_json_value(
+                        b"oxidra.mcp-surface-definition.v1\0",
+                        &serde_json::to_value(definition)?,
+                    )
+                    .map(|digest| (definition.name.as_str(), (definition, digest)))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
             for binding in &claim.bindings {
-                let Some(definition) = self
-                    .tools
-                    .iter()
-                    .find(|tool| tool.name == binding.provider_name)
+                let Some((definition, actual)) =
+                    definition_digests.get(binding.provider_name.as_str())
                 else {
                     return Err(OxidraError::Session(format!(
                         "MCP surface binding {} is absent from tool definitions",
                         binding.provider_name
                     )));
                 };
-                let actual = digest_json_value(
-                    b"oxidra.mcp-surface-definition.v1\0",
-                    &serde_json::to_value(definition)?,
-                )?;
-                if actual != binding.definition_digest {
+                crate::mcp::schema::validate_tool_schema(
+                    &definition.input_schema,
+                    "MCP surface inputSchema",
+                )
+                .map_err(|error| {
+                    OxidraError::Session(format!(
+                        "MCP surface definition {} has an invalid input schema: {error}",
+                        binding.provider_name
+                    ))
+                })?;
+                if actual != &binding.definition_digest {
                     return Err(OxidraError::Session(format!(
                         "MCP surface definition digest mismatch for {}",
                         binding.provider_name
@@ -886,6 +928,71 @@ mod tests {
         let reversed_snapshot =
             snapshot_tool_surface_v1(&[tool("builtin"), first, second], Some(reversed)).unwrap();
         assert_eq!(snapshot.digest, reversed_snapshot.digest);
+    }
+
+    #[test]
+    fn exact_surface_reader_rejects_fields_serde_would_discard() {
+        let definition = tool("mcp_echo");
+        let claim = McpSurfaceClaimV1::new(
+            registry_epoch_id(),
+            "b".repeat(64),
+            vec![mcp_binding("mcp_echo", &definition)],
+        )
+        .unwrap();
+        let snapshot = snapshot_tool_surface_v1(&[definition], Some(claim)).unwrap();
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        ToolSurfaceSnapshotV1::from_exact_journal_value(&encoded)
+            .expect("canonical surface snapshot must decode");
+
+        let mut top_level = encoded;
+        top_level["unexpected"] = Value::Bool(true);
+        let error = ToolSurfaceSnapshotV1::from_exact_journal_value(&top_level)
+            .expect_err("unknown snapshot fields must fail closed")
+            .to_string();
+        assert!(error.contains("exact canonical shape"), "{error}");
+
+        let mut nested = serde_json::to_value(&snapshot).unwrap();
+        nested["tools"][0]["unexpected"] = Value::Bool(true);
+        assert!(ToolSurfaceSnapshotV1::from_exact_journal_value(&nested).is_err());
+
+        let mut binding = serde_json::to_value(&snapshot).unwrap();
+        binding["mcp"]["bindings"][0]["unexpected"] = Value::Bool(true);
+        assert!(ToolSurfaceSnapshotV1::from_exact_journal_value(&binding).is_err());
+    }
+
+    #[test]
+    fn exact_surface_reader_revalidates_bound_mcp_input_schema() {
+        let definition = ToolDefinition {
+            name: "mcp_invalid_schema".to_owned(),
+            description: "self-consistent but unsupported MCP schema".to_owned(),
+            input_schema: json!({
+                "type":"object",
+                "$ref":"#/$defs/forbidden",
+            }),
+        };
+        let binding = McpSurfaceBindingV1::from_parts(
+            definition.name.clone(),
+            "server",
+            "invalid_schema",
+            "2026-07-28",
+            &definition,
+            None,
+        )
+        .unwrap();
+        let claim =
+            McpSurfaceClaimV1::new(registry_epoch_id(), "c".repeat(64), vec![binding]).unwrap();
+        let tools = vec![definition];
+        let snapshot = ToolSurfaceSnapshotV1 {
+            version: TOOL_SURFACE_SNAPSHOT_VERSION_V1,
+            digest: surface_snapshot_digest(&tools, Some(&claim)).unwrap(),
+            tools,
+            mcp: Some(claim),
+        };
+        let encoded = serde_json::to_value(snapshot).unwrap();
+        let error = ToolSurfaceSnapshotV1::from_exact_journal_value(&encoded)
+            .expect_err("self-consistent unsupported MCP schemas must fail closed")
+            .to_string();
+        assert!(error.contains("invalid input schema"), "{error}");
     }
 
     #[test]

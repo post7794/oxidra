@@ -188,15 +188,22 @@ complete result 后验证 structured output，并由 registry digest 绑定。du
 coordinator core、registry epoch activation、call-chain validator v2 与 crash recovery 已接入
 journal。新的 writer-side tool-surface snapshot 已能把 live registry alias、definition/
 output-schema digest 与 builtin/history 工具表合并并在写入前拒绝名称碰撞；generic journal
-writer 也会在 MCP-sensitive event fsync 前运行冻结 reducer。不过 activation v2 尚未持久化
-足以离线验证该 definition surface 的材料，CLI 参数、Agent approval 和 `context.tools`
-绑定也仍未接通，因此用户现在仍然只能使用固定内置工具，不能把上述 MCP server 暴露给模型。
+writer 也会在 MCP-sensitive event fsync 前运行冻结 reducer。显式 activation/call-chain v3
+offline reader 已能严格证明 activation、global `context.tools`、request context 与
+`response.started.mcp_surface` 的 exact relation，并阻止删除 claim 后把 activated alias 降级成
+generic response；绑定的 input schema 和 lifecycle outer/nested provenance 也会按冻结 profile
+重验。这个 reader 仍是 relation-only：展示用 output-schema digest 不能证明 runtime structured
+validation，raw MCP result 也尚未与 model-facing output 分离。current writer 仍冻结在 v2，CLI
+参数、Agent approval 和实际 request binding 也未接通，因此用户现在仍然只能使用固定内置工具，
+不能把上述 MCP server 暴露给模型。
 
-下一步是 CLI execution trust 与 Agent approval：把 session-open 产生的 resume capability、
-execution-plan approval 和 discovery 后的 registry epoch/digest 接入 `context.tools`，再让
-Agent 只通过 coordinator 的一次性 dispatch permit 执行调用。现有 CLI 已能通过 typed、
-批量同步的 resolution transaction 处理 durable `in_doubt`；Agent MCP glue 需要复用这条
-唯一事实源，而不是再实现一套 MCP 专用终态 writer。
+下一步先完成统一 MCP protocol epoch 升级，而不是直接写 Agent glue：turn、Provider slot、
+source projection、history extractor 和 compaction boundary 必须各新增只接受 call-chain v3 的
+冻结版本；同时建立 typed `context.tools`/response writer capability，避免 public generic Value
+writer 把“格式合法”冒充成“已获授权”。随后冻结 model-facing MCP result envelope，再把
+session-open resume capability、CLI execution trust、Agent approval 与 coordinator 的一次性
+dispatch permit 接成唯一事实源。现有 CLI 的 durable `in_doubt` resolution transaction 必须复用，
+不能再实现一套 MCP 专用终态 writer。
 完整顺序与 release gate 见 `docs/mcp-roadmap.md`；不能把 kernel 的存在误报为已完成
 用户入口。
 

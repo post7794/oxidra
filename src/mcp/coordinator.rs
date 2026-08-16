@@ -20,9 +20,7 @@ use super::registry::{
 };
 use super::{McpCallError, PreflightedJsonValue};
 use crate::compaction::validate_compaction_boundary_chain;
-use crate::context::{
-    McpSurfaceBindingV1, McpSurfaceClaimV1, ToolSurfaceSnapshotV1, snapshot_tool_surface_v1,
-};
+use crate::context::{McpSurfaceClaimV1, ToolSurfaceSnapshotV1, snapshot_tool_surface_v1};
 use crate::error::{OxidraError, Result};
 use crate::session::{JOURNAL_SCHEMA, JournalEvent, McpToolDispatchAdmissionV1, SessionJournal};
 use crate::turn::{ProviderRequestSlotState, provider_request_slot_state_for_version};
@@ -409,20 +407,7 @@ impl McpExecutionCoordinator {
     /// substitute for) the future v3 offline proof.
     pub fn surface_claim_v1(&self) -> Result<McpProviderSurfaceV1> {
         let definitions = self.registry.definitions();
-        let bindings = self
-            .registry
-            .bindings()
-            .map(|binding| {
-                McpSurfaceBindingV1::from_parts(
-                    binding.provider_name.clone(),
-                    binding.server_name.clone(),
-                    binding.raw_tool_name.clone(),
-                    binding.protocol_version.clone(),
-                    &binding.definition,
-                    binding.output_schema.as_ref(),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let bindings = self.registry.surface_binding_snapshot_v1()?;
         let claim = McpSurfaceClaimV1::new(
             self.registry_epoch_id.clone(),
             self.registry.digest().to_owned(),

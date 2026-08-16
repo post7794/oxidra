@@ -5,23 +5,28 @@
 //! the activation, durable Provider call and every started/terminal edge.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::schema;
+use crate::context::{MCP_SURFACE_CLAIM_VERSION_V1, ToolSurfaceSnapshotV1};
 use crate::error::{OxidraError, Result};
 use crate::event_kind::{is_response_terminal, is_tool_lifecycle, is_tool_terminal};
 use crate::session::JournalEvent;
 
 pub(crate) const MCP_CALL_CHAIN_VALIDATOR_VERSION_V1: u32 = 1;
 pub(crate) const MCP_CALL_CHAIN_VALIDATOR_VERSION_V2: u32 = 2;
+pub(crate) const MCP_CALL_CHAIN_VALIDATOR_VERSION_V3: u32 = 3;
 pub const MCP_CALL_CHAIN_VALIDATOR_VERSION: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V2;
 const MAX_MCP_CALLS_PER_RESPONSE_V1: usize = 4_096;
 pub const MAX_MCP_CALLS_PER_RESPONSE: usize = MAX_MCP_CALLS_PER_RESPONSE_V1;
 const MCP_EXECUTION_COORDINATOR_VERSION_V1: u64 = 1;
 const MCP_EXECUTION_COORDINATOR_VERSION_V2: u64 = 2;
+const MCP_EXECUTION_COORDINATOR_VERSION_V3: u64 = 3;
+const MCP_RESPONSE_SURFACE_REFERENCE_VERSION_V1: u64 = 1;
 const MCP_DISPATCH_PERMIT_VERSION_V1: u64 = 1;
 const MCP_ARGUMENT_DIGEST_VERSION_V1: u64 = 1;
 const MCP_TOOL_REGISTRY_VERSION_V1: u64 = 1;
@@ -63,6 +68,8 @@ struct Activation {
     execution_plan_digest: String,
     provider_names: BTreeSet<String>,
     bindings: Option<BTreeMap<String, BindingIdentity>>,
+    surface_claim_version: Option<u32>,
+    surface_bindings: Option<Vec<SurfaceBindingIdentity>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +77,16 @@ struct BindingIdentity {
     server_name: String,
     raw_tool_name: String,
     protocol_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SurfaceBindingIdentity {
+    provider_name: String,
+    server_name: String,
+    raw_tool_name: String,
+    protocol_version: String,
+    definition_digest: String,
+    output_schema_digest: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +99,31 @@ struct DurableMcpCall {
     registry_digest: String,
     response_started_seq: u64,
     response_seq: u64,
+    response_attempt_id: Option<String>,
+    surface: Option<SurfaceProvenanceV3>,
+}
+
+/// The exact Provider-visible surface relation carried by a v3 MCP call.
+/// Keeping this on the validated call projection prevents lifecycle readers
+/// from re-deriving alias identity from a live registry or a second event
+/// scan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SurfaceProvenanceV3 {
+    surface_event_seq: u64,
+    surface_digest: String,
+    definition_digest: String,
+    output_schema_digest: Option<String>,
+}
+
+impl From<SurfaceProvenanceV3> for ValidatedMcpSurfaceProvenanceV3 {
+    fn from(surface: SurfaceProvenanceV3) -> Self {
+        Self {
+            surface_event_seq: surface.surface_event_seq,
+            surface_digest: surface.surface_digest,
+            definition_digest: surface.definition_digest,
+            output_schema_digest: surface.output_schema_digest,
+        }
+    }
 }
 
 /// A Provider MCP call extracted by the validator selected by the durable
@@ -96,6 +138,25 @@ pub(crate) struct ValidatedDurableMcpCall {
     pub(crate) registry_digest: String,
     pub(crate) response_started_seq: u64,
     pub(crate) response_completed_seq: u64,
+    // The v3 offline reader is intentionally registered before the v3
+    // coordinator/Agent consumers. Retain the proof now without forcing the
+    // current v2 coordinator to interpret future protocol fields.
+    #[allow(dead_code)]
+    pub(crate) response_attempt_id: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) surface: Option<ValidatedMcpSurfaceProvenanceV3>,
+}
+
+/// Exact v3 surface identity retained by the canonical durable-call reader.
+/// v1/v2 projections use `None`; consumers must not reconstruct these fields
+/// from a live registry after validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct ValidatedMcpSurfaceProvenanceV3 {
+    pub(crate) surface_event_seq: u64,
+    pub(crate) surface_digest: String,
+    pub(crate) definition_digest: String,
+    pub(crate) output_schema_digest: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -135,11 +196,30 @@ pub(crate) fn validate_mcp_call_chain_v2(events: &[JournalEvent]) -> Result<()> 
     validate_mcp_call_chain_with_activation(events, &activation)
 }
 
+/// Validate the first MCP protocol that binds an owned Provider response to
+/// one exact, durable `context.tools` surface.  This reader is registered now
+/// but is not the current writer default: turn/slot/projection/compaction
+/// protocols still freeze their compatibility ceiling at call-chain v2.
+pub(crate) fn validate_mcp_call_chain_v3(events: &[JournalEvent]) -> Result<()> {
+    let activation = activation_v3(events)?;
+    let Some(activation) = activation else {
+        reject_orphan_mcp_markers(events)?;
+        return Ok(());
+    };
+    if activation.call_chain_validator_version != MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 {
+        return session_error("unsupported MCP call-chain validator version");
+    }
+
+    validate_mcp_call_chain_with_activation(events, &activation)
+}
+
 fn validate_mcp_call_chain_with_activation(
     events: &[JournalEvent],
     activation: &Activation,
 ) -> Result<()> {
-    validate_response_registry_claims(events, activation)?;
+    if activation.call_chain_validator_version < MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 {
+        validate_response_registry_claims(events, activation)?;
+    }
     let durable_calls = durable_mcp_calls(events, activation)?;
     let mcp_call_response_seqs = durable_calls
         .values()
@@ -205,7 +285,19 @@ fn validate_mcp_call_chain_with_activation(
         };
         validate_lifecycle_identity(event, call)?;
         let state = states.get_mut(&key).expect("durable MCP call state");
-        validate_lifecycle_event_v1(event, call, activation, state, &recovery_authorities)?;
+        match activation.call_chain_validator_version {
+            MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 | MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => {
+                validate_lifecycle_event_v1(event, call, activation, state, &recovery_authorities)?;
+            }
+            MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 => {
+                validate_lifecycle_event_v3(event, call, activation, state, &recovery_authorities)?;
+            }
+            version => {
+                return session_error(format!(
+                    "unsupported MCP lifecycle validator version {version}"
+                ));
+            }
+        }
     }
 
     Ok(())
@@ -225,6 +317,256 @@ pub(crate) fn response_status_text_for_journal(input: &str) -> String {
     crate::untrusted_display::truncate_utf8(input, MAX_RESPONSE_STATUS_TEXT_BYTES_V2)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OwnedResponseSurfaceV3 {
+    surface_event_seq: u64,
+    surface_digest: String,
+    registry_epoch_id: String,
+    registry_digest: String,
+    bindings: Vec<SurfaceBindingIdentity>,
+}
+
+/// Establish v3 response ownership from the exact tool surface referenced by
+/// the Provider request.  The explicit `mcp_surface` row closes that relation;
+/// it is not the sole authority, so deleting the row cannot downgrade a
+/// response that actually used an MCP-capable `context.tools` snapshot.
+fn owned_response_start_seqs_v3(
+    events: &[JournalEvent],
+    activation: &Activation,
+) -> Result<HashMap<u64, Arc<OwnedResponseSurfaceV3>>> {
+    let mut events_by_seq = HashMap::<u64, &JournalEvent>::new();
+    for event in events {
+        if events_by_seq.insert(event.seq, event).is_some() {
+            return session_error(format!(
+                "MCP call-chain validator v3 found duplicate journal seq {}",
+                event.seq
+            ));
+        }
+    }
+
+    let mut start_context_seqs = HashMap::<u64, u64>::new();
+    let mut referenced_tools_seqs = BTreeSet::new();
+    for start in events
+        .iter()
+        .filter(|event| event.kind == "response.started")
+    {
+        let has_registry_epoch = start.data.get("mcp_registry_epoch_id").is_some();
+        let has_registry_digest = start.data.get("mcp_registry_digest").is_some();
+        let has_surface_reference = start.data.get("mcp_surface").is_some();
+        if start.seq <= activation.seq {
+            if has_registry_epoch || has_registry_digest || has_surface_reference {
+                return session_error(format!(
+                    "response.started at seq {} claims MCP surface state before activation",
+                    start.seq
+                ));
+            }
+            continue;
+        }
+        let tools_event_seq = start
+            .data
+            .get("context")
+            .and_then(Value::as_object)
+            .and_then(|context| context.get("tools_event_seq"))
+            .and_then(Value::as_u64)
+            .filter(|seq| *seq != 0)
+            .ok_or_else(|| {
+                session_message(
+                    start,
+                    "has no valid context.tools_event_seq for surface validation v3",
+                )
+            })?;
+        if tools_event_seq >= start.seq {
+            return session_error(format!(
+                "response.started at seq {} does not follow context.tools seq {tools_event_seq}",
+                start.seq
+            ));
+        }
+        start_context_seqs.insert(start.seq, tools_event_seq);
+        referenced_tools_seqs.insert(tools_event_seq);
+    }
+
+    let mut surfaces = HashMap::<u64, Arc<OwnedResponseSurfaceV3>>::new();
+    for tools_event_seq in referenced_tools_seqs {
+        let event = events_by_seq
+            .get(&tools_event_seq)
+            .copied()
+            .ok_or_else(|| {
+                OxidraError::Session(format!(
+                    "MCP surface reference points to missing context.tools seq {tools_event_seq}"
+                ))
+            })?;
+        if event.kind != "context.tools" || event.turn_id.is_some() {
+            return session_error(format!(
+                "MCP surface reference seq {tools_event_seq} does not identify one global context.tools event"
+            ));
+        }
+        let has_mcp_claim = event
+            .data
+            .as_object()
+            .is_some_and(|data| data.contains_key("mcp"));
+        if !has_mcp_claim {
+            return Err(session_message(
+                event,
+                "is referenced after activation v3 but has no MCP surface claim",
+            ));
+        }
+        let snapshot = ToolSurfaceSnapshotV1::from_exact_journal_value(&event.data)?;
+        let claim = snapshot.mcp().ok_or_else(|| {
+            session_message(event, "has an empty or non-canonical MCP surface claim")
+        })?;
+        let bindings = claim
+            .bindings()
+            .iter()
+            .map(|binding| SurfaceBindingIdentity {
+                provider_name: binding.provider_name().to_owned(),
+                server_name: binding.server_name().to_owned(),
+                raw_tool_name: binding.raw_tool_name().to_owned(),
+                protocol_version: binding.protocol_version().to_owned(),
+                definition_digest: binding.definition_digest().to_owned(),
+                output_schema_digest: binding.output_schema_digest().map(ToOwned::to_owned),
+            })
+            .collect::<Vec<_>>();
+        let surface = Arc::new(OwnedResponseSurfaceV3 {
+            surface_event_seq: tools_event_seq,
+            surface_digest: snapshot.digest().to_owned(),
+            registry_epoch_id: claim.registry_epoch_id().to_owned(),
+            registry_digest: claim.registry_digest().to_owned(),
+            bindings,
+        });
+        surfaces.insert(tools_event_seq, surface);
+    }
+
+    let expected_bindings = activation.surface_bindings.as_deref().ok_or_else(|| {
+        OxidraError::Session("MCP activation v3 has no surface binding snapshot".to_owned())
+    })?;
+    if activation.surface_claim_version != Some(MCP_SURFACE_CLAIM_VERSION_V1) {
+        return session_error("MCP activation v3 has no supported surface claim version");
+    }
+    let mut owned = HashMap::<u64, Arc<OwnedResponseSurfaceV3>>::new();
+    let mut starts_by_key = HashMap::<(String, String), Vec<u64>>::new();
+    for start in events
+        .iter()
+        .filter(|event| event.kind == "response.started" && event.seq > activation.seq)
+    {
+        let tools_event_seq = *start_context_seqs
+            .get(&start.seq)
+            .expect("post-activation start context was indexed");
+        let surface = surfaces
+            .get(&tools_event_seq)
+            .expect("referenced context.tools surface was decoded");
+        let has_registry_epoch = start.data.get("mcp_registry_epoch_id").is_some();
+        let has_registry_digest = start.data.get("mcp_registry_digest").is_some();
+        let has_surface_reference = start.data.get("mcp_surface").is_some();
+        if tools_event_seq <= activation.seq {
+            return session_error(format!(
+                "MCP context.tools seq {tools_event_seq} does not follow activation seq {}",
+                activation.seq
+            ));
+        }
+        if surface.registry_epoch_id != activation.registry_epoch_id
+            || surface.registry_digest != activation.registry_digest
+            || surface.bindings.as_slice() != expected_bindings
+        {
+            return Err(session_message(
+                start,
+                "references a tool surface that does not match activation v3",
+            ));
+        }
+        if !(has_registry_epoch && has_registry_digest && has_surface_reference) {
+            return Err(session_message(
+                start,
+                "must carry the complete MCP registry and surface reference",
+            ));
+        }
+        validate_response_registry(start, activation)?;
+        let reference = start
+            .data
+            .get("mcp_surface")
+            .and_then(Value::as_object)
+            .ok_or_else(|| session_message(start, "mcp_surface must be an object"))?;
+        require_exact_keys(reference, &["digest", "event_seq", "version"], start)?;
+        require_version(
+            reference,
+            "version",
+            MCP_RESPONSE_SURFACE_REFERENCE_VERSION_V1,
+            start,
+        )?;
+        if reference.get("event_seq").and_then(Value::as_u64) != Some(tools_event_seq) {
+            return Err(session_message(
+                start,
+                "mcp_surface.event_seq does not match context.tools_event_seq",
+            ));
+        }
+        if required_sha256(reference, "digest", start)? != surface.surface_digest {
+            return Err(session_message(
+                start,
+                "mcp_surface.digest does not match the referenced context.tools snapshot",
+            ));
+        }
+        owned.insert(start.seq, Arc::clone(surface));
+        if let (Some(turn_id), Some(attempt_id)) = (
+            start.turn_id.as_deref(),
+            start
+                .data
+                .get("response_attempt_id")
+                .and_then(Value::as_str),
+        ) {
+            starts_by_key
+                .entry((turn_id.to_owned(), attempt_id.to_owned()))
+                .or_default()
+                .push(start.seq);
+        }
+    }
+
+    // A durable activated alias cannot be smuggled through a generic response
+    // by deleting its registry/surface claim.  Canonical output owns the call;
+    // raw-response audit fields do not.
+    for completed in events
+        .iter()
+        .filter(|event| event.kind == "response.completed" && event.seq > activation.seq)
+    {
+        let uses_activated_alias = completed
+            .data
+            .get("output_items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("function_call")
+                        && item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| activation.provider_names.contains(name))
+                })
+            });
+        if !uses_activated_alias {
+            continue;
+        }
+        let key = completed
+            .turn_id
+            .as_deref()
+            .zip(
+                completed
+                    .data
+                    .get("response_attempt_id")
+                    .and_then(Value::as_str),
+            )
+            .map(|(turn_id, attempt_id)| (turn_id.to_owned(), attempt_id.to_owned()));
+        let start_seq = key
+            .as_ref()
+            .and_then(|key| starts_by_key.get(key))
+            .filter(|starts| starts.len() == 1)
+            .map(|starts| starts[0]);
+        if start_seq.is_none_or(|seq| !owned.contains_key(&seq)) {
+            return Err(session_message(
+                completed,
+                "uses an activated MCP provider alias without an owned v3 response surface",
+            ));
+        }
+    }
+
+    Ok(owned)
+}
+
 /// Validate the complete v2 response transaction before projecting any MCP
 /// calls.  The response start, not a discovered function call, owns the
 /// lifecycle.  Generic and MCP-claimed attempts share one per-turn active
@@ -233,6 +575,9 @@ fn response_attempts_v2<'a>(
     events: &'a [JournalEvent],
     activation: &Activation,
 ) -> Result<BTreeMap<(String, String), OwnedResponseAttemptV2<'a>>> {
+    let owned_v3 = (activation.call_chain_validator_version == MCP_CALL_CHAIN_VALIDATOR_VERSION_V3)
+        .then(|| owned_response_start_seqs_v3(events, activation))
+        .transpose()?;
     let mut starts = HashMap::<(String, String), Vec<u64>>::new();
     let mut active = HashMap::<String, (String, u64)>::new();
     let mut terminal_counts = HashMap::<(String, String), u8>::new();
@@ -283,10 +628,19 @@ fn response_attempts_v2<'a>(
                         ));
                     }
                     active.insert(turn_id.to_owned(), (attempt_id.to_owned(), event.seq));
-                    let claims_mcp = event.data.get("mcp_registry_epoch_id").is_some()
-                        || event.data.get("mcp_registry_digest").is_some();
+                    let claims_mcp = owned_v3.as_ref().map_or_else(
+                        || {
+                            event.data.get("mcp_registry_epoch_id").is_some()
+                                || event.data.get("mcp_registry_digest").is_some()
+                        },
+                        |owned| owned.contains_key(&event.seq),
+                    );
                     if claims_mcp {
                         validate_response_registry(event, activation)?;
+                        let surface = owned_v3
+                            .as_ref()
+                            .and_then(|owned| owned.get(&event.seq))
+                            .cloned();
                         if owned
                             .insert(
                                 key,
@@ -295,6 +649,7 @@ fn response_attempts_v2<'a>(
                                     turn_id: turn_id.to_owned(),
                                     response_attempt_id: attempt_id.to_owned(),
                                     terminal: None,
+                                    surface,
                                 },
                             )
                             .is_some()
@@ -581,6 +936,7 @@ pub(crate) fn validate_mcp_call_chain_for_version(
     match version {
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => validate_mcp_call_chain_v1(events),
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => validate_mcp_call_chain_v2(events),
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 => validate_mcp_call_chain_v3(events),
         _ => session_error(format!(
             "unsupported MCP call-chain validator version {version}"
         )),
@@ -662,6 +1018,7 @@ pub(crate) fn validated_durable_mcp_call_if_present(
     let activation = match version {
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => activation_v1(events)?,
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => activation_v2(events)?,
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 => activation_v3(events)?,
         version => {
             return session_error(format!(
                 "unsupported MCP call-chain validator version {version}"
@@ -685,6 +1042,8 @@ pub(crate) fn validated_durable_mcp_call_if_present(
         registry_digest: call.registry_digest,
         response_started_seq: call.response_started_seq,
         response_completed_seq: call.response_seq,
+        response_attempt_id: call.response_attempt_id,
+        surface: call.surface.map(Into::into),
     }))
 }
 
@@ -701,6 +1060,7 @@ pub(crate) fn validated_durable_mcp_calls_for_turn(
     let activation = match version {
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => activation_v1(events)?,
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => activation_v2(events)?,
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 => activation_v3(events)?,
         version => {
             return session_error(format!(
                 "unsupported MCP call-chain validator version {version}"
@@ -723,6 +1083,8 @@ pub(crate) fn validated_durable_mcp_calls_for_turn(
                     registry_digest: call.registry_digest,
                     response_started_seq: call.response_started_seq,
                     response_completed_seq: call.response_seq,
+                    response_attempt_id: call.response_attempt_id,
+                    surface: call.surface.map(Into::into),
                 },
             )
         })
@@ -734,6 +1096,7 @@ pub(crate) fn mcp_turn_ids(events: &[JournalEvent]) -> Result<Vec<String>> {
     let activation = match version {
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V1) => activation_v1(events)?,
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) => activation_v2(events)?,
+        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V3) => activation_v3(events)?,
         Some(version) => {
             return session_error(format!(
                 "unsupported MCP call-chain validator version {version}"
@@ -744,17 +1107,18 @@ pub(crate) fn mcp_turn_ids(events: &[JournalEvent]) -> Result<Vec<String>> {
     let Some(activation) = activation else {
         return Ok(Vec::new());
     };
-    let mut turn_ids = if version == Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) {
-        owned_response_attempts_v2(events, &activation)?
-            .values()
-            .map(|attempt| attempt.turn_id.clone())
-            .collect::<Vec<_>>()
-    } else {
-        durable_mcp_calls(events, &activation)?
-            .keys()
-            .map(|key| key.turn_id.clone())
-            .collect::<Vec<_>>()
-    };
+    let mut turn_ids =
+        if version.is_some_and(|version| version >= MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) {
+            owned_response_attempts_v2(events, &activation)?
+                .values()
+                .map(|attempt| attempt.turn_id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            durable_mcp_calls(events, &activation)?
+                .keys()
+                .map(|key| key.turn_id.clone())
+                .collect::<Vec<_>>()
+        };
     turn_ids.sort();
     turn_ids.dedup();
     Ok(turn_ids)
@@ -776,10 +1140,19 @@ pub(crate) fn ensure_no_unstarted_mcp_calls_v2(events: &[JournalEvent]) -> Resul
     ensure_no_unstarted_mcp_calls_with_activation(events, &activation)
 }
 
+pub(crate) fn ensure_no_unstarted_mcp_calls_v3(events: &[JournalEvent]) -> Result<()> {
+    validate_mcp_call_chain_v3(events)?;
+    let Some(activation) = activation_v3(events)? else {
+        return Ok(());
+    };
+    ensure_no_unstarted_mcp_calls_with_activation(events, &activation)
+}
+
 pub(crate) fn ensure_no_unstarted_mcp_calls(events: &[JournalEvent]) -> Result<()> {
     match call_chain_validator_version(events)? {
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V1) => ensure_no_unstarted_mcp_calls_v1(events),
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) => ensure_no_unstarted_mcp_calls_v2(events),
+        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V3) => ensure_no_unstarted_mcp_calls_v3(events),
         Some(version) => session_error(format!(
             "unsupported MCP call-chain validator version {version}"
         )),
@@ -932,6 +1305,8 @@ fn activation_v1(events: &[JournalEvent]) -> Result<Option<Activation>> {
         execution_plan_digest,
         provider_names,
         bindings: None,
+        surface_claim_version: None,
+        surface_bindings: None,
     }))
 }
 
@@ -1079,6 +1454,191 @@ fn activation_v2(events: &[JournalEvent]) -> Result<Option<Activation>> {
         execution_plan_digest,
         provider_names,
         bindings: Some(bindings),
+        surface_claim_version: None,
+        surface_bindings: None,
+    }))
+}
+
+fn activation_v3(events: &[JournalEvent]) -> Result<Option<Activation>> {
+    let activations = events
+        .iter()
+        .filter(|event| event.kind == MCP_REGISTRY_ACTIVATED_KIND)
+        .collect::<Vec<_>>();
+    if activations.is_empty() {
+        return Ok(None);
+    }
+    if activations.len() != 1 {
+        return session_error(
+            "MCP call-chain validator v3 requires exactly one registry activation",
+        );
+    }
+    let event = activations[0];
+    if event.turn_id.is_some() {
+        return session_error(format!(
+            "mcp.registry.activated at seq {} must be a global event",
+            event.seq
+        ));
+    }
+    let data = object_data(event)?;
+    require_exact_keys(
+        data,
+        &[
+            "bindings",
+            "config_sha256",
+            "call_chain_validator_version",
+            "coordinator_id",
+            "coordinator_version",
+            "execution_plan_digest",
+            "registry_digest",
+            "registry_epoch_id",
+            "registry_version",
+            "schema_profile_version",
+            "stdio_kernel_version",
+            "surface_claim_version",
+        ],
+        event,
+    )?;
+    require_version(
+        data,
+        "coordinator_version",
+        MCP_EXECUTION_COORDINATOR_VERSION_V3,
+        event,
+    )?;
+    require_version(
+        data,
+        "call_chain_validator_version",
+        u64::from(MCP_CALL_CHAIN_VALIDATOR_VERSION_V3),
+        event,
+    )?;
+    require_version(
+        data,
+        "registry_version",
+        MCP_TOOL_REGISTRY_VERSION_V1,
+        event,
+    )?;
+    require_version(
+        data,
+        "stdio_kernel_version",
+        MCP_STDIO_KERNEL_VERSION_V1,
+        event,
+    )?;
+    require_version(
+        data,
+        "schema_profile_version",
+        MCP_SCHEMA_PROFILE_VERSION_V1,
+        event,
+    )?;
+    require_version(
+        data,
+        "surface_claim_version",
+        u64::from(MCP_SURFACE_CLAIM_VERSION_V1),
+        event,
+    )?;
+    required_uuid_v7(data, "coordinator_id", event)?;
+    let registry_epoch_id = required_uuid_v7(data, "registry_epoch_id", event)?;
+    let registry_digest = required_sha256(data, "registry_digest", event)?;
+    let execution_plan_digest = required_sha256(data, "execution_plan_digest", event)?;
+    required_sha256(data, "config_sha256", event)?;
+
+    let snapshot = data
+        .get("bindings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| session_message(event, "bindings must be an array"))?;
+    if snapshot.len() > 512 {
+        return session_error(format!(
+            "mcp.registry.activated at seq {} exceeds the binding limit",
+            event.seq
+        ));
+    }
+    let mut provider_names = BTreeSet::new();
+    let mut bindings = BTreeMap::new();
+    let mut surface_bindings = Vec::with_capacity(snapshot.len());
+    let mut previous = None::<&str>;
+    for value in snapshot {
+        let binding = value
+            .as_object()
+            .ok_or_else(|| session_message(event, "bindings contains a non-object entry"))?;
+        require_exact_keys(
+            binding,
+            &[
+                "definition_digest",
+                "output_schema_digest",
+                "protocol_version",
+                "provider_name",
+                "raw_tool_name",
+                "server_name",
+            ],
+            event,
+        )?;
+        let provider_name = binding
+            .get("provider_name")
+            .and_then(Value::as_str)
+            .filter(|name| valid_provider_name(name))
+            .ok_or_else(|| session_message(event, "bindings contains an invalid provider_name"))?;
+        if previous.is_some_and(|candidate| candidate >= provider_name) {
+            return session_error(format!(
+                "mcp.registry.activated at seq {} bindings are not strictly sorted and unique",
+                event.seq
+            ));
+        }
+        previous = Some(provider_name);
+        let required_identity = |field: &str| -> Result<String> {
+            binding
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| valid_surface_identity_v1(value))
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| {
+                    session_message(event, format!("bindings contains an invalid {field}"))
+                })
+        };
+        let definition_digest = required_sha256(binding, "definition_digest", event)?;
+        let output_schema_digest = match binding.get("output_schema_digest") {
+            Some(Value::Null) => None,
+            Some(Value::String(_)) => {
+                Some(required_sha256(binding, "output_schema_digest", event)?)
+            }
+            _ => {
+                return Err(session_message(
+                    event,
+                    "bindings contains an invalid output_schema_digest",
+                ));
+            }
+        };
+        let server_name = required_identity("server_name")?;
+        let raw_tool_name = required_identity("raw_tool_name")?;
+        let protocol_version = required_identity("protocol_version")?;
+        provider_names.insert(provider_name.to_owned());
+        bindings.insert(
+            provider_name.to_owned(),
+            BindingIdentity {
+                server_name: server_name.clone(),
+                raw_tool_name: raw_tool_name.clone(),
+                protocol_version: protocol_version.clone(),
+            },
+        );
+        surface_bindings.push(SurfaceBindingIdentity {
+            provider_name: provider_name.to_owned(),
+            server_name,
+            raw_tool_name,
+            protocol_version,
+            definition_digest,
+            output_schema_digest,
+        });
+    }
+
+    Ok(Some(Activation {
+        seq: event.seq,
+        coordinator_version: MCP_EXECUTION_COORDINATOR_VERSION_V3 as u32,
+        call_chain_validator_version: MCP_CALL_CHAIN_VALIDATOR_VERSION_V3,
+        schema_profile_version: MCP_SCHEMA_PROFILE_VERSION_V1 as u32,
+        registry_epoch_id,
+        registry_digest,
+        execution_plan_digest,
+        provider_names,
+        bindings: Some(bindings),
+        surface_claim_version: Some(MCP_SURFACE_CLAIM_VERSION_V1),
+        surface_bindings: Some(surface_bindings),
     }))
 }
 
@@ -1089,6 +1649,7 @@ fn durable_mcp_calls(
     match activation.call_chain_validator_version {
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => durable_mcp_calls_v1(events, activation),
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => durable_mcp_calls_v2(events, activation),
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 => durable_mcp_calls_v2(events, activation),
         version => session_error(format!(
             "unsupported MCP call-chain validator version {version}"
         )),
@@ -1221,6 +1782,8 @@ fn durable_mcp_calls_v1(
                 registry_digest: activation.registry_digest.clone(),
                 response_started_seq: start.seq,
                 response_seq: event.seq,
+                response_attempt_id: None,
+                surface: None,
             };
             if let Some(previous) = call_ids.insert(call_id.to_owned(), key.clone()) {
                 return session_error(format!(
@@ -1248,6 +1811,7 @@ struct OwnedResponseAttemptV2<'a> {
     turn_id: String,
     response_attempt_id: String,
     terminal: Option<&'a JournalEvent>,
+    surface: Option<Arc<OwnedResponseSurfaceV3>>,
 }
 
 fn owned_response_attempts_v2<'a>(
@@ -1303,6 +1867,27 @@ fn durable_mcp_calls_v2(
                 .filter(|value| valid_identity(value))
                 .ok_or_else(|| session_message(event, "MCP function_call has no valid call_id"))?;
             let arguments = durable_arguments(item, event, call_id)?;
+            let surface = match attempt.surface.as_ref() {
+                Some(surface) => {
+                    let binding = surface
+                        .bindings
+                        .iter()
+                        .find(|binding| binding.provider_name == provider_name)
+                        .ok_or_else(|| {
+                            session_message(
+                                event,
+                                "MCP function_call provider alias is absent from its owned v3 surface",
+                            )
+                        })?;
+                    Some(SurfaceProvenanceV3 {
+                        surface_event_seq: surface.surface_event_seq,
+                        surface_digest: surface.surface_digest.clone(),
+                        definition_digest: binding.definition_digest.clone(),
+                        output_schema_digest: binding.output_schema_digest.clone(),
+                    })
+                }
+                None => None,
+            };
             let key = McpCallKey {
                 turn_id: attempt.turn_id.clone(),
                 call_id: call_id.to_owned(),
@@ -1316,6 +1901,8 @@ fn durable_mcp_calls_v2(
                 registry_digest: activation.registry_digest.clone(),
                 response_started_seq: attempt.start.seq,
                 response_seq: event.seq,
+                response_attempt_id: Some(attempt.response_attempt_id.clone()),
+                surface,
             };
             if let Some(previous) = call_ids.insert(call_id.to_owned(), key.clone()) {
                 return session_error(format!(
@@ -1561,6 +2148,225 @@ fn validate_lifecycle_event_v1(
     Ok(())
 }
 
+/// Validate lifecycle edges for the first protocol that binds dispatch to the
+/// exact Provider-visible surface.  v1/v2 provenance remains byte-compatible;
+/// v3 deliberately freezes a new closed provenance profile instead of
+/// silently inheriting the older alias-only checks.
+fn validate_lifecycle_event_v3(
+    event: &JournalEvent,
+    call: &DurableMcpCall,
+    activation: &Activation,
+    state: &mut CallState,
+    recovery_authorities: &HashMap<u64, RecoveryMarkerAuthority>,
+) -> Result<()> {
+    match event.kind.as_str() {
+        "tool.started" => {
+            if !matches!(state, CallState::Unstarted) {
+                return invalid_transition(event, state);
+            }
+            schema::preflight_instance_for_profile(
+                activation.schema_profile_version,
+                &call.arguments,
+            )
+            .map_err(|error| {
+                OxidraError::Session(format!(
+                    "tool.started at seq {} references unsupported MCP arguments: {error}",
+                    event.seq
+                ))
+            })?;
+            if event.data.get("arguments") != Some(&call.arguments) {
+                return session_error(format!(
+                    "tool.started at seq {} arguments differ from the durable Provider call",
+                    event.seq
+                ));
+            }
+            validate_started_outer_profile_v3(event)?;
+            let provenance = validate_full_provenance_v3(event, call, activation)?;
+            *state = CallState::Started {
+                seq: event.seq,
+                provenance: provenance.clone(),
+            };
+        }
+        "tool.in_doubt" => {
+            let CallState::Started { seq, provenance } = state else {
+                return invalid_transition(event, state);
+            };
+            validate_post_start_terminal_outer_profile_v3(event, false)?;
+            validate_started_terminal_v3(event, *seq, provenance, call, activation)?;
+            validate_error_result(event, "in_doubt")?;
+            *state = CallState::InDoubt { started_seq: *seq };
+        }
+        "tool.in_doubt_resolved" => {
+            let CallState::InDoubt { started_seq } = state else {
+                return invalid_transition(event, state);
+            };
+            require_exact_keys(
+                object_data(event)?,
+                &[
+                    "call_id",
+                    "error_code",
+                    "is_error",
+                    "output",
+                    "resolution",
+                    "started_seq",
+                    "tool",
+                ],
+                event,
+            )?;
+            require_started_seq(event, *started_seq)?;
+            validate_error_result(event, "in_doubt")?;
+            if event.data.get("resolution").and_then(Value::as_str)
+                != Some("user_treated_as_failed")
+            {
+                return session_error(format!(
+                    "tool.in_doubt_resolved at seq {} has no registered resolution",
+                    event.seq
+                ));
+            }
+            *state = CallState::Terminal;
+        }
+        "tool.completed" => match state {
+            CallState::Unstarted => {
+                validate_pre_start_terminal_outer_profile_v3(event, false)?;
+                validate_pre_start_terminal_v3(event, call, activation, false)?;
+                *state = CallState::Terminal;
+            }
+            CallState::Started { seq, provenance } => {
+                validate_post_start_terminal_outer_profile_v3(event, false)?;
+                validate_started_terminal_v3(event, *seq, provenance, call, activation)?;
+                validate_completed_result(event)?;
+                *state = CallState::Terminal;
+            }
+            _ => return invalid_transition(event, state),
+        },
+        "tool.cancelled" => match state {
+            CallState::Unstarted => {
+                validate_pre_start_terminal_outer_profile_v3(event, true)?;
+                validate_pre_start_terminal_v3(event, call, activation, true)?;
+                *state = CallState::Terminal;
+            }
+            CallState::Started { seq, provenance } => {
+                validate_post_start_terminal_outer_profile_v3(event, true)?;
+                validate_started_terminal_v3(event, *seq, provenance, call, activation)?;
+                if event.data.get("before_dispatch").and_then(Value::as_bool) != Some(true) {
+                    return session_error(format!(
+                        "tool.cancelled at seq {} is not marked before_dispatch",
+                        event.seq
+                    ));
+                }
+                validate_error_result(event, "cancelled")?;
+                *state = CallState::Terminal;
+            }
+            _ => return invalid_transition(event, state),
+        },
+        kind if kind.starts_with("tool.skipped_due_to_") => {
+            if !matches!(state, CallState::Unstarted) {
+                return invalid_transition(event, state);
+            }
+            require_exact_keys(
+                object_data(event)?,
+                &[
+                    "arguments",
+                    "call_id",
+                    "error_code",
+                    "is_error",
+                    "output",
+                    "reason",
+                    "recovery_marker_seq",
+                    "response_seq",
+                    "tool",
+                ],
+                event,
+            )?;
+            // Recovery authorization binds the exact durable response seq,
+            // call identity and arguments digest.  Since the durable v3 call
+            // already owns one exact surface, the recovery edge does not need
+            // a second caller-supplied surface claim.
+            validate_safe_skip(event, call, activation, recovery_authorities)?;
+            *state = CallState::Terminal;
+        }
+        _ if is_tool_terminal(&event.kind) => return invalid_transition(event, state),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_started_outer_profile_v3(event: &JournalEvent) -> Result<()> {
+    require_exact_keys(
+        object_data(event)?,
+        &["arguments", "call_id", "mcp", "tool"],
+        event,
+    )
+}
+
+fn validate_post_start_terminal_outer_profile_v3(
+    event: &JournalEvent,
+    before_dispatch: bool,
+) -> Result<()> {
+    require_exact_keys(
+        object_data(event)?,
+        &[
+            "before_dispatch",
+            "call_id",
+            "error_code",
+            "is_error",
+            "mcp",
+            "output",
+            "started_seq",
+            "tool",
+        ],
+        event,
+    )?;
+    if event.data.get("before_dispatch").and_then(Value::as_bool) != Some(before_dispatch) {
+        return session_error(format!(
+            "{} at seq {} has inconsistent before_dispatch authority",
+            event.kind, event.seq
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pre_start_terminal_outer_profile_v3(
+    event: &JournalEvent,
+    cancelled: bool,
+) -> Result<()> {
+    let data = object_data(event)?;
+    if cancelled {
+        require_exact_keys(
+            data,
+            &[
+                "before_start",
+                "call_id",
+                "error_code",
+                "is_error",
+                "mcp",
+                "mcp_execution_coordinator_version",
+                "output",
+                "registry_digest",
+                "registry_epoch_id",
+                "tool",
+            ],
+            event,
+        )
+    } else {
+        require_exact_keys(
+            data,
+            &[
+                "call_id",
+                "error_code",
+                "is_error",
+                "mcp",
+                "mcp_execution_coordinator_version",
+                "output",
+                "registry_digest",
+                "registry_epoch_id",
+                "tool",
+            ],
+            event,
+        )
+    }
+}
+
 fn validate_full_provenance<'a>(
     event: &'a JournalEvent,
     call: &DurableMcpCall,
@@ -1646,6 +2452,237 @@ fn validate_full_provenance<'a>(
     Ok(provenance)
 }
 
+fn validate_full_provenance_v3<'a>(
+    event: &'a JournalEvent,
+    call: &DurableMcpCall,
+    activation: &Activation,
+) -> Result<&'a Value> {
+    let provenance = event
+        .data
+        .get("mcp")
+        .ok_or_else(|| session_message(event, "MCP lifecycle event has no mcp provenance"))?;
+    let data = provenance
+        .as_object()
+        .ok_or_else(|| session_message(event, "MCP lifecycle provenance must be an object"))?;
+    require_exact_keys(
+        data,
+        &[
+            "argument_digest_version",
+            "arguments_sha256",
+            "definition_digest",
+            "dispatch_permit_version",
+            "execution_coordinator_version",
+            "execution_plan_digest",
+            "output_schema_digest",
+            "protocol_version",
+            "raw_tool_name",
+            "registry_digest",
+            "registry_epoch_id",
+            "registry_version",
+            "response_attempt_id",
+            "response_completed_seq",
+            "response_started_seq",
+            "server_attempt_id",
+            "server_name",
+            "surface_claim_version",
+            "surface_digest",
+            "surface_event_seq",
+        ],
+        event,
+    )?;
+    require_version_map(
+        data,
+        "dispatch_permit_version",
+        MCP_DISPATCH_PERMIT_VERSION_V1,
+        event,
+    )?;
+    validate_surface_bound_provenance_v3(data, event, call, activation)?;
+    required_uuid_v7(data, "server_attempt_id", event)?;
+    Ok(provenance)
+}
+
+fn validate_pre_start_provenance_v3(
+    event: &JournalEvent,
+    call: &DurableMcpCall,
+    activation: &Activation,
+) -> Result<()> {
+    let provenance = event
+        .data
+        .get("mcp")
+        .ok_or_else(|| session_message(event, "pre-start MCP lifecycle has no mcp provenance"))?;
+    let data = provenance.as_object().ok_or_else(|| {
+        session_message(
+            event,
+            "pre-start MCP lifecycle provenance must be an object",
+        )
+    })?;
+    require_exact_keys(
+        data,
+        &[
+            "argument_digest_version",
+            "arguments_sha256",
+            "definition_digest",
+            "execution_coordinator_version",
+            "execution_plan_digest",
+            "output_schema_digest",
+            "protocol_version",
+            "raw_tool_name",
+            "registry_digest",
+            "registry_epoch_id",
+            "registry_version",
+            "response_attempt_id",
+            "response_completed_seq",
+            "response_started_seq",
+            "server_name",
+            "surface_claim_version",
+            "surface_digest",
+            "surface_event_seq",
+        ],
+        event,
+    )?;
+    validate_surface_bound_provenance_v3(data, event, call, activation)
+}
+
+fn validate_surface_bound_provenance_v3(
+    data: &Map<String, Value>,
+    event: &JournalEvent,
+    call: &DurableMcpCall,
+    activation: &Activation,
+) -> Result<()> {
+    require_version_map(
+        data,
+        "execution_coordinator_version",
+        MCP_EXECUTION_COORDINATOR_VERSION_V3,
+        event,
+    )?;
+    require_version_map(
+        data,
+        "argument_digest_version",
+        MCP_ARGUMENT_DIGEST_VERSION_V1,
+        event,
+    )?;
+    require_version_map(
+        data,
+        "registry_version",
+        MCP_TOOL_REGISTRY_VERSION_V1,
+        event,
+    )?;
+    require_version_map(
+        data,
+        "surface_claim_version",
+        u64::from(MCP_SURFACE_CLAIM_VERSION_V1),
+        event,
+    )?;
+
+    let surface = call.surface.as_ref().ok_or_else(|| {
+        session_message(
+            event,
+            "MCP lifecycle call has no owned v3 surface provenance",
+        )
+    })?;
+    let response_attempt_id = call.response_attempt_id.as_deref().ok_or_else(|| {
+        session_message(event, "MCP lifecycle call has no owned response attempt")
+    })?;
+    if data.get("registry_epoch_id").and_then(Value::as_str)
+        != Some(activation.registry_epoch_id.as_str())
+        || data.get("registry_digest").and_then(Value::as_str)
+            != Some(activation.registry_digest.as_str())
+        || data.get("execution_plan_digest").and_then(Value::as_str)
+            != Some(activation.execution_plan_digest.as_str())
+        || data.get("arguments_sha256").and_then(Value::as_str)
+            != Some(call.arguments_sha256.as_str())
+        || data.get("response_attempt_id").and_then(Value::as_str) != Some(response_attempt_id)
+        || data.get("response_started_seq").and_then(Value::as_u64)
+            != Some(call.response_started_seq)
+        || data.get("response_completed_seq").and_then(Value::as_u64) != Some(call.response_seq)
+        || data.get("surface_event_seq").and_then(Value::as_u64) != Some(surface.surface_event_seq)
+        || data.get("surface_digest").and_then(Value::as_str)
+            != Some(surface.surface_digest.as_str())
+        || data.get("definition_digest").and_then(Value::as_str)
+            != Some(surface.definition_digest.as_str())
+    {
+        return session_error(format!(
+            "{} at seq {} MCP v3 provenance does not match its exact response/call/surface",
+            event.kind, event.seq
+        ));
+    }
+    match (
+        &surface.output_schema_digest,
+        data.get("output_schema_digest"),
+    ) {
+        (None, Some(Value::Null)) => {}
+        (Some(expected), Some(Value::String(actual))) if actual == expected => {}
+        _ => {
+            return session_error(format!(
+                "{} at seq {} MCP v3 provenance has a mismatched output schema digest",
+                event.kind, event.seq
+            ));
+        }
+    }
+    for field in [
+        "registry_digest",
+        "execution_plan_digest",
+        "arguments_sha256",
+        "surface_digest",
+        "definition_digest",
+    ] {
+        required_sha256(data, field, event)?;
+    }
+    if surface.output_schema_digest.is_some() {
+        required_sha256(data, "output_schema_digest", event)?;
+    }
+
+    let binding = activation
+        .surface_bindings
+        .as_deref()
+        .and_then(|bindings| {
+            bindings
+                .iter()
+                .find(|binding| binding.provider_name == call.provider_name)
+        })
+        .ok_or_else(|| {
+            session_message(
+                event,
+                "MCP lifecycle provider alias has no activated v3 surface binding",
+            )
+        })?;
+    for (field, expected) in [
+        ("server_name", binding.server_name.as_str()),
+        ("raw_tool_name", binding.raw_tool_name.as_str()),
+        ("protocol_version", binding.protocol_version.as_str()),
+    ] {
+        let actual = data
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| valid_surface_identity_v1(value));
+        if actual != Some(expected) {
+            return session_error(format!(
+                "{} at seq {} MCP v3 provenance does not match surface field {field}",
+                event.kind, event.seq
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_started_terminal_v3(
+    event: &JournalEvent,
+    started_seq: u64,
+    provenance: &Value,
+    call: &DurableMcpCall,
+    activation: &Activation,
+) -> Result<()> {
+    require_started_seq(event, started_seq)?;
+    let terminal_provenance = validate_full_provenance_v3(event, call, activation)?;
+    if terminal_provenance != provenance {
+        return session_error(format!(
+            "{} at seq {} changed MCP v3 provenance after tool.started",
+            event.kind, event.seq
+        ));
+    }
+    Ok(())
+}
+
 fn validate_started_terminal(
     event: &JournalEvent,
     started_seq: u64,
@@ -1694,6 +2731,62 @@ fn validate_pre_start_terminal(
     if event.data.get("mcp").is_some() {
         validate_full_provenance(event, call, activation)?;
     }
+    if cancelled {
+        if event.data.get("before_start").and_then(Value::as_bool) != Some(true) {
+            return session_error(format!(
+                "tool.cancelled at seq {} is not marked before_start",
+                event.seq
+            ));
+        }
+        validate_error_result(event, "cancelled")?;
+    } else {
+        let code = event
+            .data
+            .get("error_code")
+            .and_then(Value::as_str)
+            .ok_or_else(|| session_message(event, "pre-start MCP failure has no error_code"))?;
+        if !matches!(
+            code,
+            "validation_error" | "not_found" | "transport_closed" | "approval_required"
+        ) {
+            return session_error(format!(
+                "tool.completed at seq {} has unregistered pre-start error code {code}",
+                event.seq
+            ));
+        }
+        validate_error_result(event, code)?;
+    }
+    Ok(())
+}
+
+fn validate_pre_start_terminal_v3(
+    event: &JournalEvent,
+    call: &DurableMcpCall,
+    activation: &Activation,
+    cancelled: bool,
+) -> Result<()> {
+    if event.data.get("started_seq").is_some() {
+        return session_error(format!(
+            "{} at seq {} references a nonexistent MCP tool.started",
+            event.kind, event.seq
+        ));
+    }
+    if event
+        .data
+        .get("mcp_execution_coordinator_version")
+        .and_then(Value::as_u64)
+        != Some(MCP_EXECUTION_COORDINATOR_VERSION_V3)
+        || event.data.get("registry_epoch_id").and_then(Value::as_str)
+            != Some(activation.registry_epoch_id.as_str())
+        || event.data.get("registry_digest").and_then(Value::as_str)
+            != Some(activation.registry_digest.as_str())
+    {
+        return session_error(format!(
+            "{} at seq {} has no valid pre-start MCP v3 authority",
+            event.kind, event.seq
+        ));
+    }
+    validate_pre_start_provenance_v3(event, call, activation)?;
     if cancelled {
         if event.data.get("before_start").and_then(Value::as_bool) != Some(true) {
             return session_error(format!(
@@ -1908,8 +3001,14 @@ fn reject_orphan_mcp_markers(events: &[JournalEvent]) -> Result<()> {
                     .is_some());
         let orphan_response = event.kind == "response.started"
             && (event.data.get("mcp_registry_epoch_id").is_some()
-                || event.data.get("mcp_registry_digest").is_some());
-        if orphan_lifecycle || orphan_response {
+                || event.data.get("mcp_registry_digest").is_some()
+                || event.data.get("mcp_surface").is_some());
+        let orphan_context_surface = event.kind == "context.tools"
+            && event
+                .data
+                .as_object()
+                .is_some_and(|data| data.contains_key("mcp"));
+        if orphan_lifecycle || orphan_response || orphan_context_surface {
             return session_error(format!(
                 "{} at seq {} claims MCP semantics without a registry activation",
                 event.kind, event.seq
@@ -2009,6 +3108,10 @@ fn valid_identity(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
 
+fn valid_surface_identity_v1(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
 fn invalid_transition(event: &JournalEvent, state: &CallState) -> Result<()> {
     session_error(format!(
         "{} at seq {} cannot transition MCP call from state {state:?}",
@@ -2033,6 +3136,9 @@ fn session_error<T>(message: impl Into<String>) -> Result<T> {
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
+
+    use crate::context::{McpSurfaceBindingV1, McpSurfaceClaimV1, snapshot_tool_surface_v1};
+    use crate::types::ToolDefinition;
 
     fn event(seq: u64, turn_id: Option<&str>, kind: &str, data: Value) -> JournalEvent {
         JournalEvent {
@@ -2170,6 +3276,94 @@ mod tests {
         events
     }
 
+    fn mcp_events_v3() -> Vec<JournalEvent> {
+        let mut events = mcp_events_v2();
+        let epoch = events[0].data["registry_epoch_id"]
+            .as_str()
+            .expect("activation epoch")
+            .to_owned();
+        let registry_digest = events[0].data["registry_digest"]
+            .as_str()
+            .expect("activation digest")
+            .to_owned();
+        let definition = ToolDefinition {
+            name: "mcp_fixture_echo_deadbeef".to_owned(),
+            description: "MCP tool fixture/echo: echo text".to_owned(),
+            input_schema: json!({
+                "type":"object",
+                "properties":{"text":{"type":"string"}},
+                "required":["text"],
+                "additionalProperties":false,
+            }),
+        };
+        let binding = McpSurfaceBindingV1::from_parts(
+            definition.name.clone(),
+            "fixture",
+            "echo",
+            "2026-07-28",
+            &definition,
+            None,
+        )
+        .expect("surface binding");
+        let claim = McpSurfaceClaimV1::new(
+            epoch.clone(),
+            registry_digest.clone(),
+            vec![binding.clone()],
+        )
+        .expect("surface claim");
+        let surface =
+            snapshot_tool_surface_v1(&[definition], Some(claim)).expect("tool surface snapshot");
+        let surface_digest = surface.digest().to_owned();
+        let definition_digest = binding.definition_digest().to_owned();
+
+        let activation = events[0].data.as_object_mut().expect("activation data");
+        activation.insert("coordinator_version".to_owned(), Value::from(3));
+        activation.insert("call_chain_validator_version".to_owned(), Value::from(3));
+        activation.insert("surface_claim_version".to_owned(), Value::from(1));
+        activation.insert(
+            "bindings".to_owned(),
+            json!([{
+                "provider_name":binding.provider_name(),
+                "server_name":binding.server_name(),
+                "raw_tool_name":binding.raw_tool_name(),
+                "protocol_version":binding.protocol_version(),
+                "definition_digest":binding.definition_digest(),
+                "output_schema_digest":Value::Null,
+            }]),
+        );
+        for event in &mut events[1..] {
+            event.seq += 1;
+            if let Some(provenance) = event.data.get_mut("mcp") {
+                provenance["execution_coordinator_version"] = Value::from(3);
+                provenance["surface_claim_version"] = Value::from(1);
+                provenance["response_attempt_id"] = Value::String("attempt-1".to_owned());
+                provenance["response_started_seq"] = Value::from(4);
+                provenance["response_completed_seq"] = Value::from(5);
+                provenance["surface_event_seq"] = Value::from(2);
+                provenance["surface_digest"] = Value::String(surface_digest.clone());
+                provenance["definition_digest"] = Value::String(definition_digest.clone());
+                provenance["output_schema_digest"] = Value::Null;
+            }
+        }
+        events[5].data["started_seq"] = Value::from(6);
+        events[2].data["context"] = json!({"tools_event_seq":2});
+        events[2].data["mcp_surface"] = json!({
+            "version":MCP_RESPONSE_SURFACE_REFERENCE_VERSION_V1,
+            "event_seq":2,
+            "digest":surface_digest,
+        });
+        events.insert(
+            1,
+            event(
+                2,
+                None,
+                "context.tools",
+                serde_json::to_value(&surface).expect("encode surface"),
+            ),
+        );
+        events
+    }
+
     #[test]
     fn valid_mcp_call_chain_v1_is_accepted() {
         validate_mcp_call_chain_v1(&mcp_events()).expect("valid MCP chain");
@@ -2178,6 +3372,389 @@ mod tests {
     #[test]
     fn valid_mcp_call_chain_v2_binds_offline_provider_identity() {
         validate_mcp_call_chain_v2(&mcp_events_v2()).expect("valid MCP v2 chain");
+    }
+
+    #[test]
+    fn valid_mcp_call_chain_v3_binds_exact_provider_surface() {
+        let events = mcp_events_v3();
+        validate_mcp_call_chain_v3(&events).expect("valid MCP v3 chain");
+        let call = validated_durable_mcp_call(&events, "turn-1", "call-1")
+            .expect("validated v3 durable call");
+        assert_eq!(call.response_attempt_id.as_deref(), Some("attempt-1"));
+        let surface = call.surface.expect("validated v3 surface provenance");
+        assert_eq!(surface.surface_event_seq, 2);
+        assert_eq!(
+            surface.surface_digest,
+            events[1].data["digest"].as_str().expect("surface digest")
+        );
+        assert_eq!(
+            surface.definition_digest,
+            events[0].data["bindings"][0]["definition_digest"]
+                .as_str()
+                .expect("definition digest")
+        );
+        assert_eq!(surface.output_schema_digest, None);
+        validate_mcp_call_chain_through_version(3, &events)
+            .expect("v3 ceiling accepts exact surface reader");
+        let error = validate_mcp_call_chain_through_version(2, &events)
+            .expect_err("v2 compatibility ceiling must reject v3")
+            .to_string();
+        assert!(error.contains("exceeds compatibility ceiling 2"), "{error}");
+    }
+
+    #[test]
+    fn v3_surface_relation_mutations_fail_closed() {
+        let assert_rejected = |name: &str, events: Vec<JournalEvent>| {
+            assert!(
+                validate_mcp_call_chain_v3(&events).is_err(),
+                "{name} must fail closed"
+            );
+        };
+
+        let mut missing_reference = mcp_events_v3();
+        missing_reference[3]
+            .data
+            .as_object_mut()
+            .unwrap()
+            .remove("mcp_surface");
+        assert_rejected("missing surface reference", missing_reference);
+
+        let mut partial_registry = mcp_events_v3();
+        partial_registry[3]
+            .data
+            .as_object_mut()
+            .unwrap()
+            .remove("mcp_registry_digest");
+        assert_rejected("partial registry claim", partial_registry);
+
+        let mut wrong_digest = mcp_events_v3();
+        wrong_digest[3].data["mcp_surface"]["digest"] = Value::String("d".repeat(64));
+        assert_rejected("wrong surface digest", wrong_digest);
+
+        let mut wrong_kind = mcp_events_v3();
+        wrong_kind[1].kind = "context.instructions".to_owned();
+        assert_rejected("wrong referenced event kind", wrong_kind);
+
+        let mut turn_scoped = mcp_events_v3();
+        turn_scoped[1].turn_id = Some("turn-1".to_owned());
+        assert_rejected("turn-scoped surface event", turn_scoped);
+
+        let mut unknown_surface_field = mcp_events_v3();
+        unknown_surface_field[1].data["unexpected"] = Value::Bool(true);
+        assert_rejected("unknown surface field", unknown_surface_field);
+
+        let mut definition_drift = mcp_events_v3();
+        definition_drift[0].data["bindings"][0]["definition_digest"] =
+            Value::String("d".repeat(64));
+        assert_rejected("definition digest drift", definition_drift);
+
+        let mut output_schema_drift = mcp_events_v3();
+        output_schema_drift[0].data["bindings"][0]["output_schema_digest"] =
+            Value::String("d".repeat(64));
+        assert_rejected("output schema digest drift", output_schema_drift);
+
+        let mut duplicate_seq = mcp_events_v3();
+        duplicate_seq.insert(2, duplicate_seq[1].clone());
+        assert_rejected("duplicate referenced seq", duplicate_seq);
+
+        let mut split_reference = mcp_events_v3();
+        for event in &mut split_reference[2..] {
+            event.seq += 1;
+        }
+        split_reference[6].data["started_seq"] = Value::from(7);
+        let mut second_surface = split_reference[1].clone();
+        second_surface.seq = 3;
+        split_reference.insert(2, second_surface);
+        split_reference[4].data["context"]["tools_event_seq"] = Value::from(3);
+        assert_rejected(
+            "surface reference split from request context",
+            split_reference,
+        );
+    }
+
+    #[test]
+    fn v3_lifecycle_provenance_binds_exact_response_and_surface() {
+        let assert_mutation_rejected = |name: &str, field: &str, value: Value| {
+            let mut events = mcp_events_v3();
+            for event in events
+                .iter_mut()
+                .filter(|event| matches!(event.kind.as_str(), "tool.started" | "tool.completed"))
+            {
+                event.data["mcp"][field] = value.clone();
+            }
+            assert!(
+                validate_mcp_call_chain_v3(&events).is_err(),
+                "{name} must fail closed"
+            );
+        };
+
+        for (name, field, value) in [
+            (
+                "response attempt drift",
+                "response_attempt_id",
+                Value::String("attempt-other".to_owned()),
+            ),
+            (
+                "response start drift",
+                "response_started_seq",
+                Value::from(3),
+            ),
+            (
+                "response completion drift",
+                "response_completed_seq",
+                Value::from(4),
+            ),
+            ("surface event drift", "surface_event_seq", Value::from(3)),
+            (
+                "surface digest drift",
+                "surface_digest",
+                Value::String("d".repeat(64)),
+            ),
+            (
+                "definition digest drift",
+                "definition_digest",
+                Value::String("d".repeat(64)),
+            ),
+            (
+                "output schema digest drift",
+                "output_schema_digest",
+                Value::String("d".repeat(64)),
+            ),
+            (
+                "surface claim version drift",
+                "surface_claim_version",
+                Value::from(2),
+            ),
+        ] {
+            assert_mutation_rejected(name, field, value);
+        }
+
+        let mut missing_field = mcp_events_v3();
+        for event in missing_field
+            .iter_mut()
+            .filter(|event| matches!(event.kind.as_str(), "tool.started" | "tool.completed"))
+        {
+            event.data["mcp"]
+                .as_object_mut()
+                .expect("provenance object")
+                .remove("definition_digest");
+        }
+        validate_mcp_call_chain_v3(&missing_field)
+            .expect_err("v3 lifecycle provenance has an exact required key profile");
+
+        let mut unknown_field = mcp_events_v3();
+        for event in unknown_field
+            .iter_mut()
+            .filter(|event| matches!(event.kind.as_str(), "tool.started" | "tool.completed"))
+        {
+            event.data["mcp"]["unexpected"] = Value::Bool(true);
+        }
+        validate_mcp_call_chain_v3(&unknown_field)
+            .expect_err("v3 lifecycle provenance rejects unknown fields");
+
+        let mut outer_authority = mcp_events_v3();
+        outer_authority[5].data["surface_digest"] = Value::String("d".repeat(64));
+        validate_mcp_call_chain_v3(&outer_authority)
+            .expect_err("tool.started rejects a second outer surface authority");
+
+        let mut contradictory_terminal = mcp_events_v3();
+        contradictory_terminal[6].data["before_dispatch"] = Value::Bool(true);
+        validate_mcp_call_chain_v3(&contradictory_terminal)
+            .expect_err("completed result cannot claim it was before dispatch");
+    }
+
+    #[test]
+    fn v3_pre_start_terminal_carries_surface_bound_authority() {
+        let mut events = mcp_events_v3();
+        let mut provenance = events[5].data["mcp"].clone();
+        let provenance = provenance.as_object_mut().expect("provenance object");
+        provenance.remove("dispatch_permit_version");
+        provenance.remove("server_attempt_id");
+        let provenance = Value::Object(provenance.clone());
+        let registry_epoch_id = events[0].data["registry_epoch_id"].clone();
+        let registry_digest = events[0].data["registry_digest"].clone();
+        events.truncate(5);
+        events.push(event(
+            6,
+            Some("turn-1"),
+            "tool.completed",
+            json!({
+                "call_id":"call-1",
+                "tool":"mcp_fixture_echo_deadbeef",
+                "output":{"error":{"code":"approval_required","message":"not approved"}},
+                "is_error":true,
+                "error_code":"approval_required",
+                "mcp_execution_coordinator_version":3,
+                "registry_epoch_id":registry_epoch_id,
+                "registry_digest":registry_digest,
+                "mcp":provenance,
+            }),
+        ));
+        validate_mcp_call_chain_v3(&events)
+            .expect("pre-start v3 authority binds the exact durable call and surface");
+
+        events[5].data["mcp"]["surface_digest"] = Value::String("d".repeat(64));
+        validate_mcp_call_chain_v3(&events)
+            .expect_err("pre-start lifecycle cannot drift from its owned surface");
+    }
+
+    #[test]
+    fn v3_resolution_and_recovery_edges_reject_injected_surface_authority() {
+        let mut resolved = mcp_events_v3();
+        resolved[6].kind = "tool.in_doubt".to_owned();
+        resolved[6].data["output"] =
+            json!({"error":{"code":"in_doubt","message":"result was not validated"}});
+        resolved[6].data["is_error"] = Value::Bool(true);
+        resolved[6].data["error_code"] = Value::String("in_doubt".to_owned());
+        resolved.push(event(
+            8,
+            Some("turn-1"),
+            "tool.in_doubt_resolved",
+            json!({
+                "started_seq":6,
+                "call_id":"call-1",
+                "tool":"mcp_fixture_echo_deadbeef",
+                "output":{"error":{"code":"in_doubt","message":"user treated as failed"}},
+                "is_error":true,
+                "error_code":"in_doubt",
+                "resolution":"user_treated_as_failed",
+            }),
+        ));
+        validate_mcp_call_chain_v3(&resolved).expect("canonical v3 resolution edge");
+        resolved[7].data["mcp"] = resolved[5].data["mcp"].clone();
+        validate_mcp_call_chain_v3(&resolved)
+            .expect_err("resolution cannot introduce a second surface authority");
+
+        let mut recovered = mcp_events_v3();
+        recovered.truncate(5);
+        let arguments = json!({"text":"hello"});
+        recovered.push(event(
+            6,
+            None,
+            crate::session::RECOVERY_KIND,
+            json!({
+                "skipped_before_start":1,
+                "tool_skip_authorization_version":1,
+                "unstarted_tool_calls":[{
+                    "response_seq":5,
+                    "turn_id":"turn-1",
+                    "call_id":"call-1",
+                    "tool":"mcp_fixture_echo_deadbeef",
+                    "arguments_sha256":argument_digest_v1(&arguments).expect("argument digest"),
+                }],
+            }),
+        ));
+        recovered.push(event(
+            7,
+            Some("turn-1"),
+            "tool.skipped_due_to_recovery",
+            json!({
+                "response_seq":5,
+                "call_id":"call-1",
+                "tool":"mcp_fixture_echo_deadbeef",
+                "arguments":arguments,
+                "reason":"process stopped before tool.started was committed",
+                "output":{"error":{"code":"interrupted_before_start","message":"not dispatched"}},
+                "is_error":true,
+                "error_code":"interrupted_before_start",
+                "recovery_marker_seq":6,
+            }),
+        ));
+        validate_mcp_call_chain_v3(&recovered).expect("canonical v3 recovery skip");
+        recovered[6].data["mcp"] = mcp_events_v3()[5].data["mcp"].clone();
+        validate_mcp_call_chain_v3(&recovered)
+            .expect_err("recovery skip cannot introduce a second surface authority");
+    }
+
+    #[test]
+    fn v3_surface_ownership_cannot_be_downgraded_by_deleting_claims() {
+        let mut claimed_surface = mcp_events_v3();
+        for field in [
+            "mcp_registry_epoch_id",
+            "mcp_registry_digest",
+            "mcp_surface",
+        ] {
+            claimed_surface[3]
+                .data
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+        }
+        validate_mcp_call_chain_v3(&claimed_surface)
+            .expect_err("an MCP context.tools snapshot owns the response even without flat claims");
+
+        let mut alias_only = mcp_events_v3();
+        let generic_definition = ToolDefinition {
+            name: "read".to_owned(),
+            description: "builtin read".to_owned(),
+            input_schema: json!({"type":"object"}),
+        };
+        alias_only[1].data = serde_json::to_value(
+            crate::context::snapshot_tools(&[generic_definition]).expect("generic snapshot"),
+        )
+        .expect("encode generic snapshot");
+        for field in [
+            "mcp_registry_epoch_id",
+            "mcp_registry_digest",
+            "mcp_surface",
+        ] {
+            alias_only[3].data.as_object_mut().unwrap().remove(field);
+        }
+        let error = validate_mcp_call_chain_v3(&alias_only)
+            .expect_err("an activated alias cannot be projected from a generic surface")
+            .to_string();
+        assert!(error.contains("has no MCP surface claim"), "{error}");
+
+        let mut failed = mcp_events_v3();
+        failed.truncate(4);
+        failed[1].data = alias_only[1].data.clone();
+        for field in [
+            "mcp_registry_epoch_id",
+            "mcp_registry_digest",
+            "mcp_surface",
+        ] {
+            failed[3].data.as_object_mut().unwrap().remove(field);
+        }
+        failed.push(event(
+            5,
+            Some("turn-1"),
+            "response.failed",
+            json!({"response_attempt_id":"attempt-1","error":"provider failed"}),
+        ));
+        validate_mcp_call_chain_v3(&failed)
+            .expect_err("failed responses cannot downgrade by deleting all surface evidence");
+    }
+
+    #[test]
+    fn v3_multiple_attempts_can_share_one_validated_surface_event() {
+        let mut events = mcp_events_v3();
+        let mut second_start = events[3].clone();
+        second_start.seq = 8;
+        second_start.turn_id = Some("turn-2".to_owned());
+        second_start.data["response_attempt_id"] = Value::String("attempt-2".to_owned());
+        events.push(second_start);
+        events.push(event(
+            9,
+            Some("turn-2"),
+            "response.failed",
+            json!({"response_attempt_id":"attempt-2","error":"provider failed"}),
+        ));
+
+        validate_mcp_call_chain_v3(&events).expect("shared surface reference remains valid");
+        assert_eq!(
+            mcp_turn_ids(&events).expect("owned v3 turns"),
+            vec!["turn-1", "turn-2"]
+        );
+    }
+
+    #[test]
+    fn v3_orphan_surface_markers_are_rejected_without_activation() {
+        let mut events = mcp_events_v3();
+        events.remove(0);
+        validate_mcp_call_chain_v3(&events)
+            .expect_err("surface claims without activation must fail closed");
+        validate_mcp_call_chain_through_version(3, &events)
+            .expect_err("ceiling-based v3 readers must reject orphan surface claims too");
     }
 
     #[test]

@@ -326,16 +326,97 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
             &mut AllowMcpApproval,
         )
         .await
-        .expect("a known post-dispatch failure is durably terminal");
-    assert_eq!(output_limit.error_code.as_deref(), Some("output_limit"));
+        .expect("an oversized post-dispatch result is durably in doubt");
+    assert_eq!(output_limit.error_code.as_deref(), Some("in_doubt"));
+    let output_limit_pending = journal
+        .in_doubt()
+        .expect("read oversized-result in-doubt snapshot");
+    assert_eq!(output_limit_pending.len(), 1);
+    journal
+        .resolve_all_in_doubt_as_failed(&output_limit_pending)
+        .expect("explicitly resolve the oversized-result uncertainty");
+
+    let closed_turn_id = "mcp-closed-after-output-limit-turn";
+    journal
+        .append_and_sync(
+            "user.message",
+            Some(closed_turn_id),
+            json!({
+                "text":"verify oversized result closed transport",
+                "turn_boundary_version":TURN_BOUNDARY_VERSION,
+            }),
+        )
+        .expect("append transport-closed probe user message");
+    append_provider_call(
+        &mut journal,
+        closed_turn_id,
+        "closed-after-output-limit-response",
+        "closed-after-output-limit-call",
+        &provider_name,
+        &json!({"text":"must-not-dispatch"}),
+    );
+    let closed_after_output_limit = coordinator
+        .execute_call(
+            &mut journal,
+            McpCallIdentity::new(
+                closed_turn_id,
+                "closed-after-output-limit-call",
+                &provider_name,
+            ),
+            &CancellationToken::new(),
+            &mut AllowMcpApproval,
+        )
+        .await
+        .expect("the terminated transport is a known no-dispatch failure");
+    assert_eq!(
+        closed_after_output_limit.error_code.as_deref(),
+        Some("transport_closed")
+    );
+
+    // Post-dispatch result rejection closes the old stdio stream.  Explicitly
+    // reopen the durable session and reconnect the approved registry before
+    // exercising the independent JSON-RPC in-doubt path below.
+    let session_id = journal.session_id().to_owned();
+    coordinator.shutdown().await;
+    drop(coordinator);
+    drop(journal);
+    let mut journal = store
+        .open(&session_id)
+        .expect("reopen after oversized-result transport termination");
+    let eligibility = journal
+        .mcp_resume_eligibility()
+        .expect("resolved oversized result permits a fresh MCP startup");
+    let resumed_registry = McpRegistry::connect_for_resume(
+        &approved,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        eligibility,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("reconnect registry after oversized-result transport termination");
+    let approved_resumed_registry = resumed_registry
+        .approve_surface(&expected_registry_digest)
+        .expect("approve unchanged registry after transport termination");
+    let mut coordinator = McpExecutionCoordinator::resume(approved_resumed_registry, &journal)
+        .expect("resume coordinator after transport termination");
 
     // Standalone coordinator dispatch admits one-call responses only; a
     // multi-call batch must be owned by an active Agent turn admission.  The
     // in-doubt outcome itself is enough to block a later call, so keep this
     // low-level fixture single-call and exercise the same fail-closed gate.
+    let rpc_turn_id = "mcp-rpc-turn";
+    journal
+        .append_and_sync(
+            "user.message",
+            Some(rpc_turn_id),
+            json!({"text":"exercise RPC failure", "turn_boundary_version":TURN_BOUNDARY_VERSION}),
+        )
+        .expect("append RPC failure user message");
     append_provider_call(
         &mut journal,
-        turn_id,
+        rpc_turn_id,
         "in-doubt-response",
         "in-doubt-call",
         &provider_name,
@@ -344,7 +425,7 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     let in_doubt = coordinator
         .execute_call(
             &mut journal,
-            McpCallIdentity::new(turn_id, "in-doubt-call", &provider_name),
+            McpCallIdentity::new(rpc_turn_id, "in-doubt-call", &provider_name),
             &CancellationToken::new(),
             &mut AllowMcpApproval,
         )
@@ -354,7 +435,7 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     let blocked = coordinator
         .execute_call(
             &mut journal,
-            McpCallIdentity::new(turn_id, "blocked-call", &provider_name),
+            McpCallIdentity::new(rpc_turn_id, "blocked-call", &provider_name),
             &CancellationToken::new(),
             &mut PanicMcpApproval,
         )
@@ -380,9 +461,9 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
             && event.data["started_seq"].is_u64()
     }));
     assert!(events.iter().any(|event| {
-        event.kind == "tool.completed"
+        event.kind == "tool.in_doubt"
             && event.data["call_id"] == "output-limit-call"
-            && event.data["error_code"] == "output_limit"
+            && event.data["error_code"] == "in_doubt"
             && event.data["started_seq"].is_u64()
             && event.data["mcp"]["server_attempt_id"].is_string()
     }));
