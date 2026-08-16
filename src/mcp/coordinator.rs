@@ -711,6 +711,10 @@ struct McpStartedCallGuard<'journal> {
 
 impl<'journal> McpStartedCallGuard<'journal> {
     fn new(journal: &'journal mut SessionJournal, dispatch_poisoned: Arc<AtomicBool>) -> Self {
+        // `tool.started` is already durable when this guard is created.  Arm
+        // the coordinator poison before returning so leaking/forgetting the
+        // future cannot make the old transport reusable without a terminal.
+        dispatch_poisoned.store(true, Ordering::Release);
         Self {
             journal,
             dispatch_poisoned,
@@ -724,6 +728,7 @@ impl<'journal> McpStartedCallGuard<'journal> {
     ) -> Result<T> {
         let result = commit(self.journal)?;
         self.terminalized = true;
+        self.dispatch_poisoned.store(false, Ordering::Release);
         Ok(result)
     }
 }
@@ -732,7 +737,6 @@ impl Drop for McpStartedCallGuard<'_> {
     fn drop(&mut self) {
         if !self.terminalized {
             self.journal.mark_reopen_required();
-            self.dispatch_poisoned.store(true, Ordering::Release);
         }
     }
 }

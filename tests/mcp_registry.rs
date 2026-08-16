@@ -592,7 +592,7 @@ async fn resume_rechecks_in_doubt_after_registry_start() {
 }
 
 #[tokio::test]
-async fn dropping_started_execute_call_requires_reopen_but_unpolled_and_terminal_calls_do_not() {
+async fn started_call_forget_keeps_poison_after_reopen() {
     let Some(python) = find_python() else {
         eprintln!("skipping MCP drop-guard integration test: Python is unavailable");
         return;
@@ -715,15 +715,15 @@ async fn dropping_started_execute_call_requires_reopen_but_unpolled_and_terminal
         }
         () = wait_for_tool_call_count(&log, calls_before + 1) => {}
     }
-    drop(started_future);
-    let poisoned = journal
+    // `mem::forget` intentionally bypasses Drop.  The journal handle remains
+    // readable until it is closed, but the pre-armed coordinator poison must
+    // still survive the leak and prevent this live transport from being
+    // reused after recovery.
+    std::mem::forget(started_future);
+    let prefix = journal
         .read_events()
-        .expect_err("dropping a started MCP call must require reopen");
-    assert!(
-        poisoned
-            .to_string()
-            .contains("dropped before terminalization")
-    );
+        .expect("forgetting the future must not invent a terminal event");
+    assert!(prefix.iter().any(|event| event.kind == "tool.started"));
 
     let session_id = journal.session_id().to_owned();
     drop(journal);
