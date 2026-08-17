@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use oxidra::Result;
 use oxidra::mcp::{
     MCP_EXECUTION_PLAN_VERSION, MCP_TOOL_REGISTRY_VERSION, McpCallApprovalHandler,
-    McpCallApprovalRequest, McpCallIdentity, McpExecutionCoordinator, McpProjectConfig,
-    McpRegistry,
+    McpCallApprovalRequest, McpCallIdentity, McpExecutionCoordinator, McpJournalWriteCapabilityV1,
+    McpProjectConfig, McpRegistry,
 };
 use oxidra::session::{SessionHeader, SessionStore};
 use oxidra::turn::TURN_BOUNDARY_VERSION;
@@ -78,6 +78,9 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("approve MCP registry surface");
     let mut coordinator = McpExecutionCoordinator::activate(approved_registry, &mut journal)
         .expect("activate MCP execution coordinator");
+    let journal_write_capability = coordinator
+        .journal_write_capability_v1(&journal)
+        .expect("mint MCP journal write capability");
     let fresh_resume_error = journal
         .mcp_resume_eligibility()
         .err()
@@ -141,7 +144,8 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         )
         .expect("append MCP user message");
     journal
-        .append_and_sync(
+        .append_mcp_event_with_capability_v1(
+            &journal_write_capability,
             "response.started",
             Some(turn_id),
             json!({
@@ -158,7 +162,8 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         "arguments":serde_json::to_string(&arguments).expect("encode MCP arguments"),
     });
     journal
-        .append_and_sync(
+        .append_mcp_event_with_capability_v1(
+            &journal_write_capability,
             "response.completed",
             Some(turn_id),
             json!({
@@ -221,6 +226,7 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
 
     append_provider_call(
         &mut journal,
+        &journal_write_capability,
         turn_id,
         "identity-response",
         "identity-call",
@@ -253,6 +259,7 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
 
     append_provider_call(
         &mut journal,
+        &journal_write_capability,
         turn_id,
         "invalid-arguments-response",
         "invalid-arguments-call",
@@ -275,6 +282,7 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
 
     append_provider_call(
         &mut journal,
+        &journal_write_capability,
         turn_id,
         "denied-response",
         "denied-call",
@@ -294,6 +302,7 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
 
     append_provider_call(
         &mut journal,
+        &journal_write_capability,
         turn_id,
         "cancelled-response",
         "cancelled-call",
@@ -315,6 +324,7 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
 
     append_provider_call(
         &mut journal,
+        &journal_write_capability,
         turn_id,
         "output-limit-response",
         "output-limit-call",
@@ -352,6 +362,7 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("append transport-closed probe user message");
     append_provider_call(
         &mut journal,
+        &journal_write_capability,
         closed_turn_id,
         "closed-after-output-limit-response",
         "closed-after-output-limit-call",
@@ -404,6 +415,9 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("approve unchanged registry after transport termination");
     let mut coordinator = McpExecutionCoordinator::resume(approved_resumed_registry, &journal)
         .expect("resume coordinator after transport termination");
+    let journal_write_capability = coordinator
+        .journal_write_capability_v1(&journal)
+        .expect("mint resumed MCP journal write capability");
 
     // Standalone coordinator dispatch admits one-call responses only; a
     // multi-call batch must be owned by an active Agent turn admission.  The
@@ -419,6 +433,7 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("append RPC failure user message");
     append_provider_call(
         &mut journal,
+        &journal_write_capability,
         rpc_turn_id,
         "in-doubt-response",
         "in-doubt-call",
@@ -678,7 +693,7 @@ async fn resume_rechecks_in_doubt_after_registry_start() {
 }
 
 #[tokio::test]
-async fn started_call_forget_keeps_poison_after_reopen() {
+async fn started_call_forget_keeps_poison_and_old_authority_out_of_reopened_handle() {
     let Some(python) = find_python() else {
         eprintln!("skipping MCP drop-guard integration test: Python is unavailable");
         return;
@@ -730,6 +745,9 @@ async fn started_call_forget_keeps_poison_after_reopen() {
         &mut journal,
     )
     .expect("activate MCP drop-guard coordinator");
+    let journal_write_capability = coordinator
+        .journal_write_capability_v1(&journal)
+        .expect("mint MCP drop-guard journal write capability");
     let turn_id = "drop-guard-turn";
     journal
         .append_and_sync(
@@ -740,6 +758,7 @@ async fn started_call_forget_keeps_poison_after_reopen() {
         .expect("append MCP drop-guard user message");
     append_provider_call(
         &mut journal,
+        &journal_write_capability,
         turn_id,
         "unpolled-response",
         "unpolled-call",
@@ -779,6 +798,7 @@ async fn started_call_forget_keeps_poison_after_reopen() {
 
     append_provider_call(
         &mut journal,
+        &journal_write_capability,
         turn_id,
         "dropped-response",
         "dropped-call",
@@ -835,13 +855,31 @@ async fn started_call_forget_keeps_poison_after_reopen() {
             json!({"text":"retry after dropped MCP transport", "turn_boundary_version":TURN_BOUNDARY_VERSION}),
         )
         .expect("append retry user message");
-    append_provider_call(
-        &mut reopened,
-        retry_turn,
-        "retry-response",
-        "retry-call",
-        &provider_name,
-        &json!({"text":"after-drop"}),
+    let before_events = reopened
+        .read_events()
+        .expect("read reopened journal before stale writer probe");
+    let stale_writer_error = reopened
+        .append_mcp_event_with_capability_v1(
+            &journal_write_capability,
+            "response.started",
+            Some(retry_turn),
+            json!({
+                "response_attempt_id":"retry-response",
+                "mcp_registry_epoch_id":coordinator.registry_epoch_id(),
+                "mcp_registry_digest":coordinator.registry_digest(),
+            }),
+        )
+        .expect_err("old journal capability must not cross a reopen boundary");
+    assert!(
+        stale_writer_error
+            .to_string()
+            .contains("different session journal handle")
+    );
+    assert_eq!(
+        reopened
+            .read_events()
+            .expect("stale writer remains zero-write"),
+        before_events
     );
     let calls_before_poisoned_retry = tool_call_count(&log);
     let retry_error = coordinator
@@ -852,11 +890,11 @@ async fn started_call_forget_keeps_poison_after_reopen() {
             &mut AllowMcpApproval,
         )
         .await
-        .expect_err("the abandoned coordinator transport must never be reused");
+        .expect_err("the abandoned coordinator must never cross into a reopened journal handle");
     assert!(
         retry_error
             .to_string()
-            .contains("shut it down and reconnect")
+            .contains("different session journal handle")
     );
     assert_eq!(
         tool_call_count(&log),
@@ -865,6 +903,117 @@ async fn started_call_forget_keeps_poison_after_reopen() {
     );
 
     coordinator.shutdown().await;
+}
+
+#[test]
+fn dropping_started_call_aborts_transport_while_current_thread_runtime_is_idle() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP started-call drop test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP started-call drop fixture");
+    let root = directory.path().join("project");
+    fs::create_dir_all(&root).expect("create MCP started-call drop project");
+    let script = root.join("server.py");
+    let log = root.join("server.log");
+    let survived = root.join("server-survived-drop.txt");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP started-call drop fixture");
+    let config_path = root.join("mcp.toml");
+    fs::write(&config_path, project_config(&python, &script, &log, false))
+        .expect("write MCP started-call drop config");
+    let config = McpProjectConfig::load(
+        &root,
+        &config_path
+            .canonicalize()
+            .expect("canonicalize MCP started-call drop config"),
+    )
+    .expect("load MCP started-call drop config");
+    let approved = config
+        .approve_execution(config.execution_plan_digest())
+        .expect("approve MCP started-call drop execution plan");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build MCP started-call drop runtime");
+    let registry = runtime
+        .block_on(McpRegistry::connect(
+            &approved,
+            ["read", "edit", "write", "shell", "remember"]
+                .into_iter()
+                .map(str::to_owned),
+            &CancellationToken::new(),
+        ))
+        .expect("connect MCP started-call drop registry");
+    let provider_name = registry
+        .bindings()
+        .next()
+        .expect("MCP started-call drop binding")
+        .provider_name
+        .clone();
+    let registry_digest = registry.digest().to_owned();
+    let store = SessionStore::new(directory.path().join("data"))
+        .expect("create MCP started-call drop session store");
+    let mut journal = store
+        .create(SessionHeader::new(&root, "mcp-started-call-drop"))
+        .expect("create MCP started-call drop journal");
+    let mut coordinator = McpExecutionCoordinator::activate(
+        registry
+            .approve_surface(&registry_digest)
+            .expect("approve MCP started-call drop surface"),
+        &mut journal,
+    )
+    .expect("activate MCP started-call drop coordinator");
+    let journal_write_capability = coordinator
+        .journal_write_capability_v1(&journal)
+        .expect("mint MCP started-call drop journal capability");
+    let turn_id = "started-call-drop-turn";
+    journal
+        .append_and_sync(
+            "user.message",
+            Some(turn_id),
+            json!({"text":"drop an in-flight MCP call", "turn_boundary_version":TURN_BOUNDARY_VERSION}),
+        )
+        .expect("append MCP started-call drop user message");
+    append_provider_call(
+        &mut journal,
+        &journal_write_capability,
+        turn_id,
+        "started-call-drop-response",
+        "started-call-drop-call",
+        &provider_name,
+        &json!({"text":format!("__drop_probe__:{}", survived.display())}),
+    );
+
+    let calls_before = tool_call_count(&log);
+    let cancellation = CancellationToken::new();
+    let mut approval = AllowMcpApproval;
+    let mut started_future = Box::pin(coordinator.execute_call(
+        &mut journal,
+        McpCallIdentity::new(turn_id, "started-call-drop-call", &provider_name),
+        &cancellation,
+        &mut approval,
+    ));
+    runtime.block_on(async {
+        tokio::select! {
+            result = &mut started_future => {
+                result.expect_err("drop-probe MCP call unexpectedly returned successfully");
+                panic!("drop-probe MCP call completed before it could be dropped");
+            }
+            () = wait_for_tool_call_count(&log, calls_before + 1) => {}
+        }
+    });
+
+    // Do not drive the runtime after dropping the future. The started-call
+    // guard must synchronously terminate the exact native containment rather
+    // than relying on the transport owner task to observe cancellation.
+    drop(started_future);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert!(
+        !survived.exists(),
+        "MCP server continued executing after the started-call future was dropped"
+    );
+
+    runtime.block_on(coordinator.shutdown());
 }
 
 struct AllowMcpApproval;
@@ -895,6 +1044,7 @@ impl McpCallApprovalHandler for PanicMcpApproval {
 
 fn append_provider_call(
     journal: &mut oxidra::session::SessionJournal,
+    capability: &McpJournalWriteCapabilityV1,
     turn_id: &str,
     response_attempt_id: &str,
     call_id: &str,
@@ -903,6 +1053,7 @@ fn append_provider_call(
 ) {
     append_provider_calls(
         journal,
+        capability,
         turn_id,
         response_attempt_id,
         provider_name,
@@ -912,6 +1063,7 @@ fn append_provider_call(
 
 fn append_provider_calls(
     journal: &mut oxidra::session::SessionJournal,
+    capability: &McpJournalWriteCapabilityV1,
     turn_id: &str,
     response_attempt_id: &str,
     provider_name: &str,
@@ -920,7 +1072,8 @@ fn append_provider_calls(
     let registry_epoch_id = active_registry_epoch(journal);
     let registry_digest = active_registry_digest(journal);
     journal
-        .append_and_sync(
+        .append_mcp_event_with_capability_v1(
+            capability,
             "response.started",
             Some(turn_id),
             json!({
@@ -942,7 +1095,8 @@ fn append_provider_calls(
         })
         .collect::<Vec<_>>();
     journal
-        .append_and_sync(
+        .append_mcp_event_with_capability_v1(
+            capability,
             "response.completed",
             Some(turn_id),
             json!({
@@ -1142,6 +1296,18 @@ for line in sys.stdin:
         })
     elif method == "tools/call":
         text = message.get("params", {}).get("arguments", {}).get("text", "")
+        if text.startswith("__drop_probe__:"):
+            from pathlib import Path
+            time.sleep(0.5)
+            Path(text.split(":", 1)[1]).write_text("server survived dropped call", encoding="utf-8")
+            time.sleep(30)
+            reply(message, {
+                "resultType": "complete",
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": {"text": text},
+                "isError": False,
+            })
+            continue
         if text == "__hang__":
             time.sleep(30)
             reply(message, {

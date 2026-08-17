@@ -3932,6 +3932,7 @@ mod tests {
             "unsafe\u{202e}bidi",
             "unsafe\u{200b}zero-width",
             "unsafe\u{2028}line-separator",
+            "unsafe\u{2029}paragraph-separator",
             "unsafe\nnewline",
         ] {
             let mut forged = mcp_events_v3();

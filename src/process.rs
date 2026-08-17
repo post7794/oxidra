@@ -17,6 +17,19 @@ pub(crate) struct ProcessTree {
     job: WindowsJob,
 }
 
+/// A clone-independent, exact-process termination capability retained by
+/// cancellation guards that cannot await the asynchronous process owner.
+///
+/// MCP uses this handle after the child has been attached to its platform
+/// containment primitive.  Signalling it is synchronous and therefore does
+/// not depend on the Tokio runtime polling the task that owns `Child`.
+pub(crate) struct ProcessTreeAbortHandle {
+    #[cfg(target_os = "linux")]
+    linux_pidfd: std::os::fd::OwnedFd,
+    #[cfg(windows)]
+    windows_job: std::os::windows::io::OwnedHandle,
+}
+
 impl ProcessTree {
     pub(crate) fn configure(command: &mut Command) {
         #[cfg(unix)]
@@ -106,6 +119,45 @@ impl ProcessTree {
         Ok(())
     }
 
+    /// Duplicate the native containment identity for synchronous cancellation.
+    ///
+    /// Unsupported Unix platforms already fail closed in
+    /// `configure_suspended`; keep this method fail-closed as well so adding a
+    /// new launch path cannot silently fall back to a numeric PID.
+    pub(crate) fn abort_handle(&self) -> io::Result<ProcessTreeAbortHandle> {
+        #[cfg(target_os = "linux")]
+        {
+            if !self.linux_contained {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "exact synchronous abort requires Linux MCP containment",
+                ));
+            }
+            let pidfd = self.linux_pidfd.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "contained Linux process has no pidfd",
+                )
+            })?;
+            return Ok(ProcessTreeAbortHandle {
+                linux_pidfd: pidfd.try_clone()?,
+            });
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "exact synchronous abort is not implemented for this Unix platform",
+            ))
+        }
+        #[cfg(windows)]
+        {
+            Ok(ProcessTreeAbortHandle {
+                windows_job: self.job.handle.try_clone()?,
+            })
+        }
+    }
+
     /// Kill the complete group/job even when its leader has already exited.
     pub(crate) fn terminate_descendants(&mut self) {
         let process_id = self.process_id.take();
@@ -140,6 +192,22 @@ impl ProcessTree {
             let _ = child.start_kill();
         }
         let _ = tokio::time::timeout(PROCESS_EXIT_GRACE, child.wait()).await;
+    }
+}
+
+impl ProcessTreeAbortHandle {
+    /// Best-effort synchronous termination of the exact contained process.
+    /// Async ownership remains responsible for the eventual wait/reap.
+    pub(crate) fn abort(&self) {
+        #[cfg(target_os = "linux")]
+        linux_containment::signal_pidfd(&self.linux_pidfd, nix::libc::SIGKILL);
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+            let _ = unsafe { TerminateJobObject(self.windows_job.as_raw_handle().cast(), 1) };
+        }
     }
 }
 

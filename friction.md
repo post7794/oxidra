@@ -188,7 +188,10 @@ complete result 后验证 structured output，并由 registry digest 绑定。du
 coordinator core、registry epoch activation、call-chain validator v2 与 crash recovery 已接入
 journal。新的 writer-side tool-surface snapshot 已能把 live registry alias、definition/
 output-schema digest 与 builtin/history 工具表合并并在写入前拒绝名称碰撞；generic journal
-writer 也会在 MCP-sensitive event fsync 前运行冻结 reducer。显式 activation/call-chain v3
+writer 也会在 MCP-sensitive event fsync 前运行冻结 reducer。live coordinator 和其公开
+Provider/context capability 还绑定当前 runtime journal handle，reopen 后旧对象即使 session/
+registry digest 未变也不能继续写入或 dispatch；generic Provider admission 在专用 typed writer
+完成前会拒绝 MCP-owned start 与 activated-alias completion。显式 activation/call-chain v3
 offline reader 已能严格证明 activation、global `context.tools`、request context 与
 `response.started.mcp_surface` 的 exact relation，并阻止删除 claim 后把 activated alias 降级成
 generic response；绑定的 input schema 和 lifecycle outer/nested provenance 也会按冻结 profile

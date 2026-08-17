@@ -9,7 +9,8 @@ use super::coordinator::{DispatchPermit, McpResumeEligibility, McpResumePermit};
 use super::{
     ApprovedMcpProjectConfig, BoundedMcpJsonValue, MCP_EXECUTION_PLAN_VERSION,
     MCP_LEGACY_PROTOCOL_VERSION, MCP_MODERN_PROTOCOL_VERSION, MCP_SCHEMA_PROFILE_VERSION,
-    MCP_STDIO_KERNEL_VERSION, McpCallError, McpProtocolEra, McpStdioSession, ValidatedMcpArguments,
+    MCP_STDIO_KERNEL_VERSION, McpCallError, McpProtocolEra, McpStdioSession, TransportAbortHandle,
+    ValidatedMcpArguments,
 };
 use crate::context::McpSurfaceBindingV1;
 use crate::error::{OxidraError, Result};
@@ -83,6 +84,7 @@ pub(super) struct PreparedMcpRegistryCall {
     binding: McpToolBinding,
     server_attempt_id: String,
     arguments: ValidatedMcpArguments,
+    transport_abort: TransportAbortHandle,
 }
 
 impl ApprovedMcpRegistry {
@@ -150,6 +152,10 @@ impl PreparedMcpRegistryCall {
 
     pub(super) fn arguments(&self) -> &Value {
         self.arguments.as_value()
+    }
+
+    pub(super) fn transport_abort_handle(&self) -> TransportAbortHandle {
+        self.transport_abort.clone()
     }
 }
 
@@ -394,11 +400,20 @@ impl McpRegistry {
                 interrupted: false,
             });
         };
+        let Some(transport_abort) = session.transport_abort_handle() else {
+            return Err(McpCallError {
+                code: "transport_closed",
+                message: format!("MCP server {} session is closed", binding.server_name),
+                in_doubt: false,
+                interrupted: false,
+            });
+        };
         let prepared = session.prepare_tool_call(&binding.raw_tool_name, arguments)?;
         Ok(PreparedMcpRegistryCall {
             binding: binding.clone(),
             server_attempt_id: session.attempt_id().to_owned(),
             arguments: prepared,
+            transport_abort,
         })
     }
 
@@ -467,6 +482,14 @@ impl McpRegistry {
 
     pub async fn shutdown(&mut self) {
         shutdown_sessions(&mut self.sessions).await;
+    }
+
+    pub(super) fn abort_transports(&self) {
+        for session in self.sessions.values() {
+            if let Some(handle) = session.transport_abort_handle() {
+                handle.abort();
+            }
+        }
     }
 }
 

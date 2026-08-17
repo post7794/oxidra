@@ -828,6 +828,96 @@ async fn windows_mcp_child_is_owned_before_server_resume() {
     );
 }
 
+#[test]
+fn dropping_session_terminates_mcp_while_current_thread_runtime_is_idle() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP synchronous drop test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP drop fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("drop.log");
+    let worker_ready = directory.path().join("drop.worker-ready");
+    let arm = directory.path().join("drop.arm");
+    let survived = directory.path().join("drop.survived");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP fixture");
+
+    let mut config = fixture_config(&python, &script, &log, "drop_survival_probe");
+    config
+        .args
+        .push(worker_ready.to_string_lossy().into_owned());
+    config.args.push(arm.to_string_lossy().into_owned());
+    config.args.push(survived.to_string_lossy().into_owned());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime");
+    let session = runtime
+        .block_on(McpStdioSession::connect_trusted(
+            config,
+            CancellationToken::new(),
+        ))
+        .expect("connect MCP drop fixture");
+
+    // Arm a non-daemon fixture thread only after connect has returned. Once
+    // the session is dropped, deliberately do not poll or shut down the
+    // runtime: native containment cancellation must stop server code itself.
+    wait_for_path(&worker_ready, Duration::from_secs(5));
+    fs::write(&arm, b"armed").expect("arm MCP survival probe");
+    drop(session);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !survived.exists(),
+        "MCP server continued executing because drop depended on polling its owner task"
+    );
+    drop(runtime);
+}
+
+#[test]
+fn dropping_runtime_terminates_mcp_before_session_drop() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP runtime-drop test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP runtime-drop fixture directory");
+    let script = directory.path().join("mcp_fixture.py");
+    let log = directory.path().join("runtime-drop.log");
+    let worker_ready = directory.path().join("runtime-drop.worker-ready");
+    let arm = directory.path().join("runtime-drop.arm");
+    let survived = directory.path().join("runtime-drop.survived");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP runtime-drop fixture");
+
+    let mut config = fixture_config(&python, &script, &log, "drop_survival_probe");
+    config
+        .args
+        .push(worker_ready.to_string_lossy().into_owned());
+    config.args.push(arm.to_string_lossy().into_owned());
+    config.args.push(survived.to_string_lossy().into_owned());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build runtime-drop current-thread runtime");
+    let session = runtime
+        .block_on(McpStdioSession::connect_trusted(
+            config,
+            CancellationToken::new(),
+        ))
+        .expect("connect MCP runtime-drop fixture");
+
+    wait_for_path(&worker_ready, Duration::from_secs(5));
+    fs::write(&arm, b"armed").expect("arm MCP runtime-drop survival probe");
+    // Destroy the runtime while the Session/TransportProcess handle is still
+    // live. Tokio drops the detached owner task here, so the owner's own Drop
+    // guard—not TransportProcess::drop—must synchronously kill containment.
+    drop(runtime);
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !survived.exists(),
+        "MCP server continued executing after its Tokio runtime was destroyed"
+    );
+    drop(session);
+}
+
 fn fixture_config(python: &Path, script: &Path, log: &Path, mode: &str) -> McpStdioConfig {
     let mut config = McpStdioConfig::new("fixture", python);
     config.args = vec![
@@ -882,7 +972,6 @@ fn methods(log: &[String]) -> Vec<&str> {
         .collect()
 }
 
-#[cfg(target_os = "linux")]
 fn wait_for_path(path: &Path, timeout: Duration) {
     let deadline = std::time::Instant::now() + timeout;
     while !path.exists() {
@@ -1125,11 +1214,11 @@ for line in sys.stdin:
                 "serverInfo": {"name": "fixture-legacy", "version": "1"},
             })
     elif method == "tools/list":
-        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id", "decimal_output") and not require_modern_meta(message):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "drop_survival_probe", "bad_schema", "bad_output", "bad_response_id", "decimal_output") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
         else:
             result = {"tools": tools}
-            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id", "decimal_output"):
+            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "drop_survival_probe", "bad_schema", "bad_output", "bad_response_id", "decimal_output"):
                 result["resultType"] = "complete"
                 result["ttlMs"] = 1000
                 result["cacheScope"] = "private"
@@ -1145,8 +1234,22 @@ for line in sys.stdin:
                 worker = threading.Thread(target=survive_leader_exit, daemon=False)
                 worker.start()
                 ctypes.CDLL(None).pthread_exit(None)
+            elif mode == "drop_survival_probe":
+                from pathlib import Path
+                worker_ready_path = Path(sys.argv[3])
+                arm_path = Path(sys.argv[4])
+                survived_path = Path(sys.argv[5])
+                def report_survival_after_drop():
+                    worker_ready_path.write_text("ready", encoding="utf-8")
+                    while not arm_path.exists():
+                        time.sleep(0.01)
+                    time.sleep(0.5)
+                    survived_path.write_text("server still ran", encoding="utf-8")
+                    time.sleep(60.0)
+                worker = threading.Thread(target=report_survival_after_drop, daemon=False)
+                worker.start()
     elif method == "tools/call":
-        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "bad_response_id", "decimal_output") and not require_modern_meta(message):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "drop_survival_probe", "bad_schema", "bad_output", "bad_response_id", "decimal_output") and not require_modern_meta(message):
             write_response(message, error={"code": -32602, "message": "missing modern metadata"})
             continue
         params = message.get("params", {})
@@ -1182,7 +1285,7 @@ for line in sys.stdin:
                 },
                 "isError": False,
             }
-            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output", "decimal_output"):
+            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "drop_survival_probe", "bad_schema", "bad_output", "decimal_output"):
                 result["resultType"] = "complete"
             write_response(message, result=result)
             continue
@@ -1197,12 +1300,12 @@ for line in sys.stdin:
                 "data": "opaque",
             }
             result = {"content": [content_item], "isError": False}
-            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output"):
+            if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "drop_survival_probe", "bad_schema", "bad_output"):
                 result["resultType"] = "complete"
             write_response(message, result=result)
             continue
         result = {"content": [{"type": "text", "text": text}], "isError": False}
-        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "bad_schema", "bad_output"):
+        if mode in ("modern", "stderr", "verify_linux_containment", "leader_exits_with_worker", "drop_survival_probe", "bad_schema", "bad_output"):
             result["resultType"] = "complete"
         write_response(message, result=result)
     else:

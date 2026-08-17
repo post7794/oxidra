@@ -8239,7 +8239,7 @@ mod tests {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let config_sha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         journal
-            .append_and_sync(
+            .append_mcp_event_for_test_v1(
                 "mcp.registry.activated",
                 None,
                 json!({
@@ -8275,10 +8275,10 @@ mod tests {
             .unwrap();
         let arguments = json!({"text": "hello"});
         let second_arguments = json!({"text": "world"});
-        let mut response_admission = journal
-            .append_provider_response_started_v1(
-                &turn_admission,
-                turn_id,
+        journal
+            .append_mcp_event_for_test_v1(
+                "response.started",
+                Some(turn_id),
                 json!({
                     "response_attempt_id": "attempt-agent-mcp-skip",
                     "response_index": 1,
@@ -8289,8 +8289,9 @@ mod tests {
             )
             .unwrap();
         journal
-            .append_provider_response_completed_v1(
-                &mut response_admission,
+            .append_mcp_event_for_test_v1(
+                "response.completed",
+                Some(turn_id),
                 json!({
                     "response_attempt_id": "attempt-agent-mcp-skip",
                     "raw_response": {"output": [

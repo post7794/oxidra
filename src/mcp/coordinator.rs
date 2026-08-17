@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::sync::{
-    Arc,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, Ordering},
 };
 use tokio_util::sync::CancellationToken;
@@ -18,7 +18,7 @@ use super::journal::{
 use super::registry::{
     ApprovedMcpRegistry, ApprovedMcpResumeRegistry, McpRegistry, PreparedMcpRegistryCall,
 };
-use super::{McpCallError, PreflightedJsonValue};
+use super::{McpCallError, PreflightedJsonValue, TransportAbortHandle};
 use crate::compaction::validate_compaction_boundary_chain;
 use crate::context::{McpSurfaceClaimV1, ToolSurfaceSnapshotV1, snapshot_tool_surface_v1};
 use crate::error::{OxidraError, Result};
@@ -134,19 +134,270 @@ impl McpCallApprovalHandler for DenyMcpCallApproval {
     }
 }
 
+/// Opaque authority to append the bounded Provider response/context portion
+/// of the MCP journal for one exact live coordinator/registry epoch and one
+/// exact runtime journal handle.
+///
+/// Construction stays private to this module.  Copying the durable activation
+/// strings, or being another module in this crate, is therefore insufficient
+/// to manufacture writer authority. The handle identity is deliberately not
+/// durable: reopening the same session produces a new identity, so a surviving
+/// coordinator or capability from the old handle cannot cross the recovery
+/// boundary. The Session layer can only validate and consume a capability that
+/// a live coordinator actually minted for its current handle. Tool lifecycle
+/// and recovery events use narrower coordinator/session admissions and are
+/// deliberately outside this capability's public vocabulary.
+pub struct McpJournalWriteCapabilityV1 {
+    session_id: String,
+    journal_handle_id: String,
+    activation_seq: u64,
+    coordinator_id: String,
+    registry_epoch_id: String,
+    registry_digest: String,
+    authority: Arc<McpJournalAuthorityState>,
+}
+
+/// Proof that one fixed synchronous journal append acquired the live
+/// coordinator authority before revocation.
+///
+/// The proof is intentionally not constructible outside this module.  In
+/// particular, callers cannot run an arbitrary closure while the authority
+/// mutex is held and then re-enter coordinator shutdown from that closure.
+pub(crate) struct LiveMcpJournalWriteProofV1<'a> {
+    capability: &'a McpJournalWriteCapabilityV1,
+    _guard: MutexGuard<'a, ()>,
+}
+
+impl LiveMcpJournalWriteProofV1<'_> {
+    pub(crate) fn capability(&self) -> &McpJournalWriteCapabilityV1 {
+        self.capability
+    }
+}
+
+struct McpJournalAuthorityState {
+    active: Arc<AtomicBool>,
+    gate: Mutex<()>,
+}
+
+impl McpJournalAuthorityState {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicBool::new(true)),
+            gate: Mutex::new(()),
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    fn begin_revoke(&self) {
+        // Publish revocation before waiting for an in-flight append. Writers
+        // that have not already acquired the gate must fail even if they win
+        // the mutex race against the draining thread.
+        self.active.store(false, Ordering::Release);
+    }
+
+    fn wait_for_writers(&self) {
+        match self.gate.lock() {
+            Ok(_guard) => {}
+            Err(_poisoned) => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn revoke(&self) {
+        self.begin_revoke();
+        self.wait_for_writers();
+    }
+}
+
+impl McpJournalWriteCapabilityV1 {
+    fn new(
+        session_id: String,
+        journal_handle_id: String,
+        activation_seq: u64,
+        coordinator_id: String,
+        registry_epoch_id: String,
+        registry_digest: String,
+        authority: Arc<McpJournalAuthorityState>,
+    ) -> Self {
+        Self {
+            session_id,
+            journal_handle_id,
+            activation_seq,
+            coordinator_id,
+            registry_epoch_id,
+            registry_digest,
+            authority,
+        }
+    }
+
+    fn acquire_live_proof(&self) -> Result<LiveMcpJournalWriteProofV1<'_>> {
+        let guard = self.authority.gate.lock().map_err(|_| {
+            OxidraError::Session("MCP journal authority lock is poisoned".to_owned())
+        })?;
+        if !self.authority.is_active() {
+            return Err(OxidraError::Session(
+                "MCP journal write capability has been revoked with its coordinator".to_owned(),
+            ));
+        }
+        Ok(LiveMcpJournalWriteProofV1 {
+            capability: self,
+            _guard: guard,
+        })
+    }
+
+    pub(crate) fn append_event_to_journal(
+        &self,
+        journal: &mut SessionJournal,
+        kind: String,
+        turn_id: Option<&str>,
+        data: Value,
+    ) -> Result<JournalEvent> {
+        if !matches!(
+            kind.as_str(),
+            "context.tools"
+                | "response.started"
+                | "response.completed"
+                | "response.failed"
+                | "response.aborted"
+        ) {
+            return Err(OxidraError::Session(format!(
+                "MCP journal capability v1 cannot author {kind}; use the typed dispatch or recovery writer"
+            )));
+        }
+        let proof = self.acquire_live_proof()?;
+        journal.append_mcp_event_with_live_proof_v1(&proof, kind, turn_id, data)
+    }
+
+    pub(crate) fn append_tool_cancelled_before_start_to_journal(
+        &self,
+        journal: &mut SessionJournal,
+        turn_id: &str,
+        data: Value,
+    ) -> Result<JournalEvent> {
+        let proof = self.acquire_live_proof()?;
+        journal.append_mcp_tool_cancelled_before_start_with_live_proof_v1(&proof, turn_id, data)
+    }
+
+    pub(crate) fn append_tool_completed_before_start_to_journal(
+        &self,
+        journal: &mut SessionJournal,
+        turn_id: &str,
+        data: Value,
+    ) -> Result<JournalEvent> {
+        let proof = self.acquire_live_proof()?;
+        journal.append_mcp_tool_completed_before_start_with_live_proof_v1(&proof, turn_id, data)
+    }
+
+    pub(crate) fn validate_for_journal_unlocked(
+        &self,
+        session_id: &str,
+        journal_handle_id: &str,
+        events: &[JournalEvent],
+    ) -> Result<()> {
+        if self.session_id != session_id || self.journal_handle_id != journal_handle_id {
+            return Err(OxidraError::Session(
+                "MCP journal write capability belongs to a different session journal handle"
+                    .to_owned(),
+            ));
+        }
+        validate_mcp_call_chain(events)?;
+        let mut matching = events.iter().filter(|event| {
+            event.kind == MCP_REGISTRY_ACTIVATED_KIND
+                && event.seq == self.activation_seq
+                && event.turn_id.is_none()
+                && event.data.get("coordinator_id").and_then(Value::as_str)
+                    == Some(self.coordinator_id.as_str())
+                && event.data.get("registry_epoch_id").and_then(Value::as_str)
+                    == Some(self.registry_epoch_id.as_str())
+                && event.data.get("registry_digest").and_then(Value::as_str)
+                    == Some(self.registry_digest.as_str())
+        });
+        if matching.next().is_none() || matching.next().is_some() {
+            return Err(OxidraError::Session(
+                "MCP journal write capability no longer matches one exact registry activation"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        session_id: String,
+        journal_handle_id: String,
+        activation_seq: u64,
+        coordinator_id: String,
+        registry_epoch_id: String,
+        registry_digest: String,
+        authority_active: Arc<AtomicBool>,
+    ) -> Self {
+        Self::new(
+            session_id,
+            journal_handle_id,
+            activation_seq,
+            coordinator_id,
+            registry_epoch_id,
+            registry_digest,
+            Arc::new(McpJournalAuthorityState {
+                active: authority_active,
+                gate: Mutex::new(()),
+            }),
+        )
+    }
+}
+
+/// One-shot bootstrap authority for the first durable MCP activation.
+///
+/// The activation itself necessarily precedes the ordinary epoch capability,
+/// so it uses a separate token that owns the exact prevalidated payload and
+/// expected journal position.  No generic/raw append primitive is exposed to
+/// the rest of the crate.
+pub(crate) struct McpRegistryActivationAdmissionV1 {
+    session_id: String,
+    expected_seq: u64,
+    data: Value,
+}
+
+impl McpRegistryActivationAdmissionV1 {
+    fn new(session_id: String, expected_seq: u64, data: Value) -> Self {
+        Self {
+            session_id,
+            expected_seq,
+            data,
+        }
+    }
+
+    pub(crate) fn into_data_for_journal(self, session_id: &str, next_seq: u64) -> Result<Value> {
+        if self.session_id != session_id || self.expected_seq != next_seq {
+            return Err(OxidraError::Session(
+                "MCP activation admission no longer matches the target journal prefix".to_owned(),
+            ));
+        }
+        Ok(self.data)
+    }
+}
+
 /// Sole owner of a surface-approved registry and its dispatch authority.
 ///
-/// The coordinator binds one runtime registry epoch to one durable session.
-/// Callers can request approval and execution, but cannot construct the
-/// private `DispatchPermit` consumed by the registry.
+/// The coordinator binds one runtime registry epoch to one durable session
+/// and to the exact journal handle that activated or resumed it. Reopening the
+/// same durable session invalidates this coordinator even when the activation
+/// and registry digests are unchanged. Callers can request approval and
+/// execution, but cannot construct the private `DispatchPermit` consumed by
+/// the registry.
 pub struct McpExecutionCoordinator {
     policy: McpCoordinatorPolicy,
     coordinator_id: String,
     registry_epoch_id: String,
     session_id: String,
+    journal_handle_id: String,
     activation_seq: u64,
     registry: McpRegistry,
     dispatch_poisoned: Arc<AtomicBool>,
+    journal_authority_active: Arc<McpJournalAuthorityState>,
 }
 
 /// Opaque runtime proof of the exact MCP definitions and registry claim for
@@ -319,16 +570,23 @@ impl McpExecutionCoordinator {
         validate_mcp_call_chain(&events)?;
         validate_compaction_boundary_chain(&events)?;
 
+        let activation_admission = McpRegistryActivationAdmissionV1::new(
+            journal.session_id().to_owned(),
+            journal.next_seq(),
+            activation_data,
+        );
         registry.bind_dispatch_authority(&coordinator_id, &registry_epoch_id)?;
-        let event = journal.append_and_sync(MCP_REGISTRY_ACTIVATED_KIND, None, activation_data)?;
+        let event = journal.append_mcp_registry_activation_v1(activation_admission)?;
         Ok(Self {
             policy,
             coordinator_id,
             registry_epoch_id,
             session_id: journal.session_id().to_owned(),
+            journal_handle_id: journal.handle_id().to_owned(),
             activation_seq: event.seq,
             registry,
             dispatch_poisoned: Arc::new(AtomicBool::new(false)),
+            journal_authority_active: Arc::new(McpJournalAuthorityState::new()),
         })
     }
 
@@ -378,9 +636,11 @@ impl McpExecutionCoordinator {
             coordinator_id: resume_permit.coordinator_id,
             registry_epoch_id: resume_permit.registry_epoch_id,
             session_id: journal.session_id().to_owned(),
+            journal_handle_id: journal.handle_id().to_owned(),
             activation_seq: activation.seq,
             registry,
             dispatch_poisoned: Arc::new(AtomicBool::new(false)),
+            journal_authority_active: Arc::new(McpJournalAuthorityState::new()),
         };
         validate_activation(&events, &coordinator)?;
         Ok(coordinator)
@@ -392,6 +652,35 @@ impl McpExecutionCoordinator {
 
     pub fn registry_digest(&self) -> &str {
         self.registry.digest()
+    }
+
+    /// Mint the opaque journal capability used by Provider/context writers.
+    /// Tool lifecycle and recovery events remain on narrower typed paths. The
+    /// exact activation and runtime journal handle are revalidated before the
+    /// capability is issued, so copying public digest strings is not
+    /// sufficient to obtain this authority and a capability cannot be reused
+    /// after the session is reopened.
+    pub fn journal_write_capability_v1(
+        &self,
+        journal: &SessionJournal,
+    ) -> Result<McpJournalWriteCapabilityV1> {
+        if !self.journal_authority_active.is_active() {
+            return Err(OxidraError::Session(
+                "MCP coordinator journal authority has been revoked".to_owned(),
+            ));
+        }
+        self.require_bound_journal(journal)?;
+        let events = journal.read_events()?;
+        let activation_seq = validate_activation(&events, self)?;
+        Ok(McpJournalWriteCapabilityV1::new(
+            journal.session_id().to_owned(),
+            journal.handle_id().to_owned(),
+            activation_seq,
+            self.coordinator_id.clone(),
+            self.registry_epoch_id.clone(),
+            self.registry.digest().to_owned(),
+            Arc::clone(&self.journal_authority_active),
+        ))
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -441,8 +730,12 @@ impl McpExecutionCoordinator {
         cancellation: &CancellationToken,
         approval: &mut dyn McpCallApprovalHandler,
     ) -> Result<ToolResult> {
-        self.ensure_dispatch_healthy()?;
+        // Bind the exact live journal handle before consulting coordinator
+        // health.  A coordinator from a pre-reopen prefix must fail closed
+        // on the ownership boundary, even if its old transport was also
+        // poisoned by an abandoned dispatch.
         self.require_bound_journal(journal)?;
+        self.ensure_dispatch_healthy()?;
         validate_call_identity(call.turn_id, call.call_id, call.provider_name)?;
 
         let (arguments_sha256, prepared) = match prepared? {
@@ -544,8 +837,12 @@ impl McpExecutionCoordinator {
             )
             .map_err(|error| error.into_error())?;
         let started_seq = admission.started_seq();
-        let mut started_guard =
-            McpStartedCallGuard::new(journal, admission, Arc::clone(&self.dispatch_poisoned));
+        let mut started_guard = McpStartedCallGuard::new(
+            journal,
+            admission,
+            Arc::clone(&self.dispatch_poisoned),
+            approved_call.prepared.transport_abort_handle(),
+        );
         let permit = DispatchPermit {
             permit_version: self.policy.dispatch_permit_version,
             coordinator_id: self.coordinator_id.clone(),
@@ -630,15 +927,22 @@ impl McpExecutionCoordinator {
     }
 
     fn require_bound_journal(&self, journal: &SessionJournal) -> Result<()> {
-        if journal.session_id() != self.session_id {
+        if journal.session_id() != self.session_id || journal.handle_id() != self.journal_handle_id
+        {
             return Err(OxidraError::Session(
-                "MCP coordinator cannot dispatch into a different session journal".to_owned(),
+                "MCP coordinator cannot dispatch into a different session journal handle"
+                    .to_owned(),
             ));
         }
         Ok(())
     }
 
     fn ensure_dispatch_healthy(&self) -> Result<()> {
+        if !self.journal_authority_active.is_active() {
+            return Err(OxidraError::Session(
+                "MCP coordinator is shut down and cannot dispatch another call".to_owned(),
+            ));
+        }
         if self.dispatch_poisoned.load(Ordering::Acquire) {
             return Err(OxidraError::Session(
                 "MCP coordinator dispatch was abandoned after tool.started; shut it down and reconnect before dispatching another call"
@@ -653,8 +957,8 @@ impl McpExecutionCoordinator {
         journal: &SessionJournal,
         call: McpCallIdentity<'_>,
     ) -> Result<PreparedCoordinatorCall> {
-        self.ensure_dispatch_healthy()?;
         self.require_bound_journal(journal)?;
+        self.ensure_dispatch_healthy()?;
         validate_call_identity(call.turn_id, call.call_id, call.provider_name)?;
         if !journal.in_doubt()?.is_empty() {
             return Err(OxidraError::Session(
@@ -700,9 +1004,10 @@ impl McpExecutionCoordinator {
     ) -> Result<ToolResult> {
         let result = ToolResult::error(call.call_id, "cancelled", message);
         let policy = self.policy;
-        journal.append_and_sync(
-            "tool.cancelled",
-            Some(call.turn_id),
+        let capability = self.journal_write_capability_v1(journal)?;
+        capability.append_tool_cancelled_before_start_to_journal(
+            journal,
+            call.turn_id,
             json!({
                 "call_id": call.call_id,
                 "tool": call.provider_name,
@@ -745,12 +1050,31 @@ impl McpExecutionCoordinator {
         if let Some(started_seq) = started_seq {
             data["started_seq"] = Value::from(started_seq);
         }
-        journal.append_and_sync("tool.completed", Some(call.turn_id), data)?;
+        let capability = self.journal_write_capability_v1(journal)?;
+        capability.append_tool_completed_before_start_to_journal(journal, call.turn_id, data)?;
         Ok(result)
     }
 
     pub async fn shutdown(&mut self) {
+        self.journal_authority_active.begin_revoke();
+        // Native transport abort must happen before waiting for a possibly
+        // blocking journal fsync. Otherwise coordinator shutdown/drop could
+        // strand a live MCP server behind the authority drain.
+        self.registry.abort_transports();
+        self.journal_authority_active.wait_for_writers();
         self.registry.shutdown().await;
+    }
+}
+
+impl Drop for McpExecutionCoordinator {
+    fn drop(&mut self) {
+        // A journal capability is live authority, not a detached copy of the
+        // activation strings. Revoking it before the registry is dropped
+        // prevents late callers from authoring MCP lifecycle events after the
+        // coordinator that owns the dispatch epoch has gone away.
+        self.journal_authority_active.begin_revoke();
+        self.registry.abort_transports();
+        self.journal_authority_active.wait_for_writers();
     }
 }
 
@@ -758,6 +1082,7 @@ struct McpStartedCallGuard<'journal> {
     journal: &'journal mut SessionJournal,
     admission: McpToolDispatchAdmissionV1,
     dispatch_poisoned: Arc<AtomicBool>,
+    transport_abort: TransportAbortHandle,
     terminalized: bool,
 }
 
@@ -766,6 +1091,7 @@ impl<'journal> McpStartedCallGuard<'journal> {
         journal: &'journal mut SessionJournal,
         admission: McpToolDispatchAdmissionV1,
         dispatch_poisoned: Arc<AtomicBool>,
+        transport_abort: TransportAbortHandle,
     ) -> Self {
         // `tool.started` is already durable when this guard is created.  Arm
         // the coordinator poison before returning so leaking/forgetting the
@@ -775,6 +1101,7 @@ impl<'journal> McpStartedCallGuard<'journal> {
             journal,
             admission,
             dispatch_poisoned,
+            transport_abort,
             terminalized: false,
         }
     }
@@ -793,6 +1120,11 @@ impl<'journal> McpStartedCallGuard<'journal> {
 impl Drop for McpStartedCallGuard<'_> {
     fn drop(&mut self) {
         if !self.terminalized {
+            // A dropped future cannot await `Transport::terminate`.  Publish
+            // a synchronous abort request before poisoning the journal; the
+            // transport owner task can then terminate the exact process tree
+            // independently of this borrowed guard.
+            self.transport_abort.abort();
             self.journal.mark_reopen_required();
         }
     }
@@ -1237,6 +1569,12 @@ fn provenance_data(approval: &McpCallApprovalRequest) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{SessionHeader, SessionStore};
+    use std::path::Path;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::TempDir;
 
     fn event(seq: u64, turn_id: Option<&str>, kind: &str, data: Value) -> JournalEvent {
         JournalEvent {
@@ -1279,6 +1617,102 @@ mod tests {
             }))
             .expect("compute frozen MCP argument digest"),
             "490f03fe740f99e35c2ed88df2cdc00017e89d463b891dd2e0c16ff866fe1b31"
+        );
+    }
+
+    #[test]
+    fn journal_authority_revoke_waits_for_inflight_writer() {
+        let authority = Arc::new(McpJournalAuthorityState::new());
+        let capability = McpJournalWriteCapabilityV1::new(
+            "session".to_owned(),
+            "journal-handle".to_owned(),
+            1,
+            "coordinator".to_owned(),
+            "epoch".to_owned(),
+            "digest".to_owned(),
+            Arc::clone(&authority),
+        );
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let proof = capability
+                .acquire_live_proof()
+                .expect("in-flight writer acquires live authority");
+            entered_tx.send(()).expect("announce live authority");
+            release_rx.recv().expect("release live authority");
+            drop(proof);
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer acquired authority gate");
+
+        let (revoked_tx, revoked_rx) = mpsc::channel();
+        let revoking_authority = Arc::clone(&authority);
+        let revoker = thread::spawn(move || {
+            revoking_authority.revoke();
+            revoked_tx.send(()).expect("announce authority revocation");
+        });
+        assert!(
+            revoked_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "revocation must not overtake a writer that already holds the authority gate"
+        );
+        release_tx.send(()).expect("release in-flight writer");
+        writer.join().expect("join authority writer");
+        revoked_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("revocation completes after the writer exits");
+        revoker.join().expect("join authority revoker");
+        assert!(!authority.is_active());
+    }
+
+    #[test]
+    fn journal_kind_conversion_runs_before_authority_gate_is_acquired() {
+        struct GateCheckingKind {
+            authority: Arc<McpJournalAuthorityState>,
+        }
+
+        impl From<GateCheckingKind> for String {
+            fn from(value: GateCheckingKind) -> Self {
+                let _guard = value
+                    .authority
+                    .gate
+                    .try_lock()
+                    .expect("kind conversion must run before the authority gate is acquired");
+                "response.started".to_owned()
+            }
+        }
+
+        let directory = TempDir::new().expect("create authority fixture directory");
+        let store = SessionStore::new(directory.path()).expect("create authority fixture store");
+        let mut journal = store
+            .create_with_id(
+                "authority-kind-conversion",
+                SessionHeader::new(Path::new("."), "authority-test"),
+            )
+            .expect("create authority fixture journal");
+        let authority = Arc::new(McpJournalAuthorityState::new());
+        let capability = McpJournalWriteCapabilityV1::new(
+            journal.session_id().to_owned(),
+            journal.handle_id().to_owned(),
+            1,
+            "coordinator".to_owned(),
+            "epoch".to_owned(),
+            "digest".to_owned(),
+            Arc::clone(&authority),
+        );
+
+        let error = journal
+            .append_mcp_event_with_capability_v1(
+                &capability,
+                GateCheckingKind { authority },
+                Some("turn"),
+                json!({"response_attempt_id":"attempt"}),
+            )
+            .expect_err("fixture capability has no matching activation")
+            .to_string();
+        assert!(
+            error.contains("exact registry activation"),
+            "unexpected error: {error}"
         );
     }
 

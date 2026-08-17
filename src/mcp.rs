@@ -17,8 +17,10 @@ pub use config::{
 pub use coordinator::{
     DenyMcpCallApproval, MCP_ARGUMENT_DIGEST_VERSION, MCP_DISPATCH_PERMIT_VERSION,
     MCP_EXECUTION_COORDINATOR_VERSION, McpCallApprovalHandler, McpCallApprovalRequest,
-    McpCallIdentity, McpExecutionCoordinator, McpProviderSurfaceV1, McpResumeEligibility,
+    McpCallIdentity, McpExecutionCoordinator, McpJournalWriteCapabilityV1, McpProviderSurfaceV1,
+    McpResumeEligibility,
 };
+pub(crate) use coordinator::{LiveMcpJournalWriteProofV1, McpRegistryActivationAdmissionV1};
 pub use journal::{MAX_MCP_CALLS_PER_RESPONSE, MCP_CALL_CHAIN_VALIDATOR_VERSION};
 pub(crate) use journal::{
     MAX_RESPONSE_STATUS_TEXT_BYTES_V2, MCP_CALL_CHAIN_VALIDATOR_VERSION_V1,
@@ -38,20 +40,24 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{OxidraError, Result};
-use crate::process::ProcessTree;
+use crate::process::{ProcessTree, ProcessTreeAbortHandle};
 use crate::types::ToolDefinition;
 use crate::untrusted_display;
 
@@ -442,6 +448,35 @@ pub struct McpStdioSession {
     tools: Vec<McpTool>,
 }
 
+/// A synchronous, cloneable abort capability for a live MCP transport.
+///
+/// The coordinator's started-call guard is dropped from cancellation paths,
+/// where awaiting is impossible. Calling `abort` synchronously signals the
+/// exact native containment identity and then publishes cancellation; it
+/// therefore does not depend on the Tokio runtime polling the transport owner
+/// task. The owner still performs the eventual asynchronous wait/reap and pipe
+/// drain. Keeping this capability separate from `Transport` lets the guard
+/// retain cleanup authority without borrowing the registry/session across an
+/// await.
+#[derive(Clone)]
+pub(super) struct TransportAbortHandle {
+    state: Arc<TransportProcessState>,
+}
+
+impl TransportAbortHandle {
+    pub(super) fn abort(&self) {
+        self.state.native_abort.abort();
+        self.state.abort.cancel();
+    }
+}
+
+struct TransportProcessState {
+    abort: CancellationToken,
+    native_abort: ProcessTreeAbortHandle,
+    exited: AtomicBool,
+    finished: Notify,
+}
+
 /// Owns an untrusted JSON value across async cancellation boundaries without
 /// allowing the compiler-generated future to recursively drop a deep tree.
 /// The preflight result is computed before the future is constructed, while
@@ -774,6 +809,10 @@ impl McpStdioSession {
 
     pub(super) fn attempt_id(&self) -> &str {
         &self.attempt_id
+    }
+
+    pub(super) fn transport_abort_handle(&self) -> Option<TransportAbortHandle> {
+        self.transport.as_ref().map(Transport::abort_handle)
     }
 
     /// Return bounded, source-prefixed stderr diagnostics with terminal and
@@ -1304,12 +1343,97 @@ fn valid_environment_name(name: &str) -> bool {
 }
 
 struct Transport {
-    child: Child,
-    process_tree: ProcessTree,
+    process: TransportProcess,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     stderr_task: Option<JoinHandle<()>>,
     next_id: u64,
+}
+
+struct TransportProcess {
+    state: Arc<TransportProcessState>,
+    owner_task: Option<JoinHandle<()>>,
+}
+
+impl TransportProcess {
+    fn abort_handle(&self) -> TransportAbortHandle {
+        TransportAbortHandle {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    fn exited(&self) -> bool {
+        self.state.exited.load(Ordering::Acquire)
+    }
+
+    fn abort(&self) {
+        self.state.native_abort.abort();
+        self.state.abort.cancel();
+    }
+
+    async fn wait_finished(&self, duration: Duration) -> bool {
+        if self.exited() {
+            return true;
+        }
+        let notified = self.state.finished.notified();
+        if self.exited() {
+            return true;
+        }
+        timeout(duration, notified).await.is_ok() || self.exited()
+    }
+
+    async fn join(&mut self) {
+        if let Some(task) = self.owner_task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for TransportProcess {
+    fn drop(&mut self) {
+        // Terminate through the duplicated native containment identity before
+        // publishing cancellation. This remains effective when a current-
+        // thread runtime is alive but no longer being driven.
+        self.abort();
+        // Dropping the JoinHandle intentionally detaches the owner task.  It
+        // owns the process and will finish termination independently.
+        self.owner_task.take();
+    }
+}
+
+struct TransportOwnerCompletion {
+    state: Arc<TransportProcessState>,
+}
+
+impl Drop for TransportOwnerCompletion {
+    fn drop(&mut self) {
+        // This guard is an async-function argument, so it is owned by the
+        // generated future before its first poll. Runtime shutdown, task
+        // abortion and panic therefore synchronously terminate the native
+        // containment before releasing waiters, rather than leaving either
+        // cleanup or `wait_finished` dependent on the ordinary task tail.
+        self.state.native_abort.abort();
+        self.state.exited.store(true, Ordering::Release);
+        self.state.finished.notify_waiters();
+    }
+}
+
+async fn own_transport_process(
+    mut child: Child,
+    mut process_tree: ProcessTree,
+    completion: TransportOwnerCompletion,
+) {
+    let state = &completion.state;
+    tokio::select! {
+        _ = state.abort.cancelled() => {
+            process_tree.terminate(&mut child).await;
+        }
+        _ = child.wait() => {
+            // A server can exit before its parent is reaped.  Keep the
+            // process-tree cleanup symmetric with the explicit abort path.
+            process_tree.terminate_descendants();
+        }
+    }
 }
 
 impl Transport {
@@ -1385,6 +1509,18 @@ impl Transport {
             }
         };
         let stderr_task = tokio::spawn(drain_stderr(stderr, Arc::clone(&stderr_capture)));
+        let native_abort = match process_tree.abort_handle() {
+            Ok(handle) => handle,
+            Err(error) => {
+                process_tree.terminate(&mut child).await;
+                stderr_task.abort();
+                let _ = stderr_task.await;
+                return Err(OxidraError::Mcp(format!(
+                    "failed to duplicate MCP server {} containment identity: {error}",
+                    config.name
+                )));
+            }
+        };
         if let Err(error) = process_tree.resume_suspended() {
             process_tree.terminate(&mut child).await;
             stderr_task.abort();
@@ -1394,9 +1530,24 @@ impl Transport {
                 config.name
             )));
         }
-        Ok(Self {
+        let process_state = Arc::new(TransportProcessState {
+            abort: CancellationToken::new(),
+            native_abort,
+            exited: AtomicBool::new(false),
+            finished: Notify::new(),
+        });
+        let owner_task = tokio::spawn(own_transport_process(
             child,
             process_tree,
+            TransportOwnerCompletion {
+                state: Arc::clone(&process_state),
+            },
+        ));
+        Ok(Self {
+            process: TransportProcess {
+                state: process_state,
+                owner_task: Some(owner_task),
+            },
             stdin,
             stdout: BufReader::new(stdout),
             stderr_task: Some(stderr_task),
@@ -1411,15 +1562,7 @@ impl Transport {
         duration: Duration,
         cancellation: &CancellationToken,
     ) -> std::result::Result<Value, ClientError> {
-        if self
-            .child
-            .try_wait()
-            .map_err(|error| ClientError::Io {
-                error,
-                after_send: false,
-            })?
-            .is_some()
-        {
+        if self.process.exited() {
             return Err(ClientError::Exited { after_send: false });
         }
         if cancellation.is_cancelled() {
@@ -1547,17 +1690,23 @@ impl Transport {
 
     async fn shutdown(&mut self) {
         let _ = timeout(SHUTDOWN_GRACE, self.stdin.shutdown()).await;
-        if timeout(SHUTDOWN_GRACE, self.child.wait()).await.is_err() {
-            self.process_tree.terminate(&mut self.child).await;
-        } else {
-            self.process_tree.terminate_descendants();
+        if !self.process.wait_finished(SHUTDOWN_GRACE).await {
+            self.process.abort();
+            let _ = self.process.wait_finished(SHUTDOWN_GRACE).await;
         }
+        self.process.join().await;
         self.finish_stderr().await;
     }
 
     async fn terminate(&mut self) {
-        self.process_tree.terminate(&mut self.child).await;
+        self.process.abort();
+        let _ = self.process.wait_finished(SHUTDOWN_GRACE).await;
+        self.process.join().await;
         self.finish_stderr().await;
+    }
+
+    fn abort_handle(&self) -> TransportAbortHandle {
+        self.process.abort_handle()
     }
 
     async fn finish_stderr(&mut self) {
