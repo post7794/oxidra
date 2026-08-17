@@ -188,10 +188,14 @@ complete result 后验证 structured output，并由 registry digest 绑定。du
 coordinator core、registry epoch activation、call-chain validator v2 与 crash recovery 已接入
 journal。新的 writer-side tool-surface snapshot 已能把 live registry alias、definition/
 output-schema digest 与 builtin/history 工具表合并并在写入前拒绝名称碰撞；generic journal
-writer 也会在 MCP-sensitive event fsync 前运行冻结 reducer。live coordinator 和其公开
-Provider/context capability 还绑定当前 runtime journal handle，reopen 后旧对象即使 session/
-registry digest 未变也不能继续写入或 dispatch；generic Provider admission 在专用 typed writer
-完成前会拒绝 MCP-owned start 与 activated-alias completion。显式 activation/call-chain v3
+writer 也会在 MCP-sensitive event fsync 前运行冻结 reducer。live coordinator 和公开的 typed
+Provider/context writer 绑定当前 runtime journal handle；首次 activation 还会在 spawn 前消费该
+generation 的 one-shot startup slot。coordinator 与独立 native transport reaper 共同持有 session
+lock execution lease；kill 只是请求，只有 direct child 已 reap 且 Windows Job 的 active process
+归零才释放最后一份 lease，所以 journal/coordinator 或 Tokio runtime 单独 drop 后不能在旧 MCP
+transport 完成退出前 reopen。旧 authority
+即使 session/registry digest 未变也不能继续写入或 dispatch；generic Provider admission 会拒绝
+MCP-owned start 与 activated-alias completion。显式 activation/call-chain v3
 offline reader 已能严格证明 activation、global `context.tools`、request context 与
 `response.started.mcp_surface` 的 exact relation，并阻止删除 claim 后把 activated alias 降级成
 generic response；绑定的 input schema 和 lifecycle outer/nested provenance 也会按冻结 profile
@@ -203,8 +207,8 @@ generic response；绑定的 input schema 和 lifecycle outer/nested provenance 
 
 下一步先完成统一 MCP protocol epoch 升级，而不是直接写 Agent glue：turn、Provider slot、
 source projection、history extractor 和 compaction boundary 必须各新增只接受 call-chain v3 的
-冻结版本；同时建立 typed `context.tools`/response writer capability，避免 public generic Value
-writer 把“格式合法”冒充成“已获授权”。随后把
+冻结版本；现有 v2 typed `context.tools`/response writer 必须由 Agent 直接消费，并在 v3 epoch
+升级时同步收窄其 surface/result profile，不能退回 public generic Value writer。随后把
 session-open resume capability、CLI execution trust、Agent approval 与 coordinator 的一次性
 dispatch permit 接成唯一事实源。现有 CLI 的 durable `in_doubt` resolution transaction 必须复用，
 不能再实现一套 MCP 专用终态 writer。

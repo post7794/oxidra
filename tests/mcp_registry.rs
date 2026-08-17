@@ -3,17 +3,21 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use oxidra::Result;
+use oxidra::context::ToolSurfaceSnapshotV1;
 use oxidra::mcp::{
     MCP_EXECUTION_PLAN_VERSION, MCP_TOOL_REGISTRY_VERSION, McpCallApprovalHandler,
-    McpCallApprovalRequest, McpCallIdentity, McpExecutionCoordinator, McpJournalWriteCapabilityV1,
-    McpProjectConfig, McpRegistry,
+    McpCallApprovalRequest, McpCallIdentity, McpExecutionCoordinator, McpProjectConfig,
+    McpProviderResponseAdmissionErrorV1, McpProviderResponseCommitErrorV1, McpRegistry,
 };
-use oxidra::session::{SessionHeader, SessionStore};
+use oxidra::session::{SessionHeader, SessionStore, TurnTransactionAdmissionV1};
 use oxidra::turn::TURN_BOUNDARY_VERSION;
-use serde_json::{Value, json};
+use oxidra::types::ToolDefinition;
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -38,13 +42,60 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     let approved = config
         .approve_execution(config.execution_plan_digest())
         .expect("approve MCP execution plan fixture");
+    let data_dir = directory.path().join("data");
+    let store = SessionStore::new(&data_dir).expect("create MCP coordinator session store");
+    let mut journal = store
+        .create(SessionHeader::new(&root, "mcp-test"))
+        .expect("create MCP coordinator journal");
 
     let cancellation = CancellationToken::new();
-    let registry = McpRegistry::connect(
+    let mut probe_registry = McpRegistry::connect_for_activation(
         &approved,
         ["read", "edit", "write", "shell", "remember"]
             .into_iter()
             .map(str::to_owned),
+        &mut journal,
+        &cancellation,
+    )
+    .await
+    .expect("connect lease-bound MCP registry");
+    let log_before_duplicate_start = fs::read(&log).expect("read log before duplicate startup");
+    let duplicate_start = McpRegistry::connect_for_activation(
+        &approved,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        &mut journal,
+        &cancellation,
+    )
+    .await
+    .err()
+    .expect("one journal generation must not start a second MCP registry");
+    assert!(duplicate_start.to_string().contains("already claimed"));
+    assert_eq!(
+        fs::read(&log).expect("read log after duplicate startup"),
+        log_before_duplicate_start,
+        "duplicate activation startup must fail before executing MCP code"
+    );
+    let probe_session_id = journal.session_id().to_owned();
+    drop(journal);
+    let lock_error = store
+        .open(&probe_session_id)
+        .err()
+        .expect("pre-coordinator activation registry must retain the session lock lease");
+    assert!(lock_error.to_string().contains("already open"));
+    probe_registry.shutdown().await;
+    drop(probe_registry);
+    let mut journal = store
+        .open(&probe_session_id)
+        .expect("open after releasing pre-coordinator activation lease");
+
+    let registry = McpRegistry::connect_for_activation(
+        &approved,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        &mut journal,
         &cancellation,
     )
     .await
@@ -67,29 +118,12 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     let provider_name = binding.provider_name.clone();
     let protocol_version = binding.protocol_version.clone();
 
-    let data_dir = directory.path().join("data");
-    let store = SessionStore::new(&data_dir).expect("create MCP coordinator session store");
-    let mut journal = store
-        .create(SessionHeader::new(&root, "mcp-test"))
-        .expect("create MCP coordinator journal");
     let expected_registry_digest = registry.digest().to_owned();
     let approved_registry = registry
         .approve_surface(&expected_registry_digest)
         .expect("approve MCP registry surface");
     let mut coordinator = McpExecutionCoordinator::activate(approved_registry, &mut journal)
         .expect("activate MCP execution coordinator");
-    let journal_write_capability = coordinator
-        .journal_write_capability_v1(&journal)
-        .expect("mint MCP journal write capability");
-    let fresh_resume_error = journal
-        .mcp_resume_eligibility()
-        .err()
-        .expect("a newly created journal cannot authorize resume startup");
-    assert!(
-        fresh_resume_error
-            .to_string()
-            .contains("SessionStore::open")
-    );
     assert_eq!(coordinator.registry_digest(), expected_registry_digest);
     let activation_events = journal.read_events().expect("read MCP activation");
     let activation = activation_events
@@ -108,6 +142,135 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         activation.data["execution_plan_digest"],
         approved.execution_plan_digest()
     );
+
+    // The public typed writer is synchronous, but callers can still hand it a
+    // deeply nested in-memory Value.  Preflight must take ownership before any
+    // recursive serializer or error-path drop can run.
+    let mut deep = Value::Null;
+    for _ in 0..50_000 {
+        deep = Value::Array(vec![deep]);
+    }
+    let mut deep_turn = begin_test_turn(&mut journal, "deep-provider-event-turn", "deep event");
+    let before_deep_event = journal
+        .read_events()
+        .expect("read journal before deep Provider event");
+    let deep_error = coordinator
+        .admit_provider_response_v1(
+            &mut journal,
+            &deep_turn,
+            "deep-provider-event-turn",
+            Value::Object(Map::from_iter([
+                (
+                    "response_attempt_id".to_owned(),
+                    Value::String("deep-attempt".to_owned()),
+                ),
+                ("context".to_owned(), deep),
+            ])),
+        )
+        .err()
+        .expect("deep Provider event must fail closed before journaling");
+    assert!(matches!(
+        deep_error,
+        McpProviderResponseAdmissionErrorV1::RejectedBeforeStart(_)
+    ));
+    assert_eq!(
+        journal
+            .read_events()
+            .expect("read journal after deep Provider event"),
+        before_deep_event,
+        "deep Provider event rejection must be zero-write"
+    );
+    journal
+        .finish_turn_transaction_v1(&mut deep_turn, Some("deep event rejected"))
+        .expect("finish deep event probe turn");
+
+    let mut wide_turn = begin_test_turn(
+        &mut journal,
+        "wide-provider-event-turn",
+        "oversized shallow event",
+    );
+    let before_wide_event = journal
+        .read_events()
+        .expect("read journal before oversized Provider event");
+    let wide_error = coordinator
+        .admit_provider_response_v1(
+            &mut journal,
+            &wide_turn,
+            "wide-provider-event-turn",
+            json!({
+                "response_attempt_id":"wide-attempt",
+                "context":{"blob":"x".repeat(300 * 1024)},
+            }),
+        )
+        .err()
+        .expect("oversized shallow Provider event must fail before cloning or journaling");
+    assert!(matches!(
+        wide_error,
+        McpProviderResponseAdmissionErrorV1::RejectedBeforeStart(_)
+    ));
+    assert_eq!(
+        journal
+            .read_events()
+            .expect("read journal after oversized Provider event"),
+        before_wide_event,
+        "oversized Provider event rejection must be zero-write"
+    );
+    journal
+        .finish_turn_transaction_v1(&mut wide_turn, Some("wide event rejected"))
+        .expect("finish wide event probe turn");
+
+    let mut deep_completed_turn = begin_test_turn(
+        &mut journal,
+        "deep-completed-event-turn",
+        "deep completed event",
+    );
+    let mut deep_completed_admission = coordinator
+        .admit_provider_response_v1(
+            &mut journal,
+            &deep_completed_turn,
+            "deep-completed-event-turn",
+            json!({
+                "response_attempt_id":"deep-completed-attempt",
+                "context":{},
+            }),
+        )
+        .expect("admit deep completed Provider response");
+    let before_deep_completed = journal
+        .read_events()
+        .expect("read journal before deep completion candidate");
+    let mut deep_completed = Value::Null;
+    for _ in 0..50_000 {
+        deep_completed = Value::Array(vec![deep_completed]);
+    }
+    let deep_completed_error = deep_completed_admission
+        .commit_completed_v1(
+            &mut journal,
+            Value::Object(Map::from_iter([(
+                "raw_response".to_owned(),
+                deep_completed,
+            )])),
+        )
+        .expect_err("deep completion must be rejected before any terminal write");
+    assert!(matches!(
+        deep_completed_error,
+        McpProviderResponseCommitErrorV1::FallbackPermittedBeforeWrite(_)
+    ));
+    assert_eq!(
+        journal
+            .read_events()
+            .expect("read journal after deep completion candidate"),
+        before_deep_completed,
+        "fallback-safe completion rejection must be zero-write"
+    );
+    deep_completed_admission
+        .commit_failed_v1(&mut journal, "deep completion rejected by bounded profile")
+        .expect("the same one-shot guard must retain its bounded failure fallback");
+    journal
+        .finish_turn_transaction_v1(
+            &mut deep_completed_turn,
+            Some("deep completed event rejected"),
+        )
+        .expect("finish deep completed event probe turn");
     assert_eq!(
         activation.data["bindings"],
         json!([{
@@ -118,6 +281,58 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         }])
     );
     assert!(activation.data.get("provider_names").is_none());
+
+    // A serde-deserialized snapshot can be internally self-consistent while
+    // pointing an MCP alias at a different server/raw binding.  The
+    // coordinator must reject it before any context.tools bytes are written;
+    // matching only the public epoch/digest claim is insufficient.
+    let valid_surface = coordinator
+        .surface_claim_v1()
+        .expect("derive live MCP surface claim")
+        .merge_with(Vec::new())
+        .expect("build canonical MCP surface snapshot");
+    let valid_value =
+        serde_json::to_value(&valid_surface).expect("serialize canonical MCP surface snapshot");
+    let mut forged_value = valid_value.clone();
+    forged_value["mcp"]["bindings"][0]["server_name"] = Value::String("forged".to_owned());
+    let forged_tools: Vec<ToolDefinition> = serde_json::from_value(forged_value["tools"].clone())
+        .expect("decode forged tool definitions");
+    let forged_claim: oxidra::context::McpSurfaceClaimV1 =
+        serde_json::from_value(forged_value["mcp"].clone()).expect("decode forged MCP claim");
+    #[derive(serde::Serialize)]
+    struct SurfaceDigestPayload<'a> {
+        version: u32,
+        tools: &'a [ToolDefinition],
+        mcp: Option<&'a oxidra::context::McpSurfaceClaimV1>,
+    }
+    let digest_payload = SurfaceDigestPayload {
+        version: forged_value["version"].as_u64().unwrap() as u32,
+        tools: &forged_tools,
+        mcp: Some(&forged_claim),
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"oxidra.context-tool-surface.v1\0");
+    hasher.update(serde_json::to_vec(&digest_payload).expect("serialize forged digest payload"));
+    forged_value["digest"] = Value::String(hex::encode(hasher.finalize()));
+    let forged_surface: ToolSurfaceSnapshotV1 = serde_json::from_value(forged_value)
+        .expect("forged snapshot remains self-consistent under its public schema");
+    forged_surface
+        .validate()
+        .expect("forged snapshot should pass self-contained validation");
+    let before_forged_append = journal
+        .read_events()
+        .expect("read journal before forged context.tools append");
+    let forged_error = coordinator
+        .append_context_tools_v1(&mut journal, &forged_surface)
+        .expect_err("forged live binding must be rejected");
+    assert!(forged_error.to_string().contains("bindings"));
+    assert_eq!(
+        journal
+            .read_events()
+            .expect("read journal after forged context.tools append"),
+        before_forged_append,
+        "forged surface rejection must be zero-write"
+    );
 
     let mut other_journal = store
         .create(SessionHeader::new(&root, "mcp-other"))
@@ -136,45 +351,17 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     let turn_id = "mcp-turn";
     let call_id = "mcp-call";
     let arguments = json!({"text":"registry"});
-    journal
-        .append_and_sync(
-            "user.message",
-            Some(turn_id),
-            json!({"text":"use MCP", "turn_boundary_version":TURN_BOUNDARY_VERSION}),
-        )
-        .expect("append MCP user message");
-    journal
-        .append_mcp_event_with_capability_v1(
-            &journal_write_capability,
-            "response.started",
-            Some(turn_id),
-            json!({
-                "response_attempt_id":"mcp-response",
-                "mcp_registry_epoch_id":coordinator.registry_epoch_id(),
-                "mcp_registry_digest":coordinator.registry_digest(),
-            }),
-        )
-        .expect("append MCP response start");
-    let call_item = json!({
-        "type":"function_call",
-        "call_id":call_id,
-        "name":provider_name,
-        "arguments":serde_json::to_string(&arguments).expect("encode MCP arguments"),
-    });
-    journal
-        .append_mcp_event_with_capability_v1(
-            &journal_write_capability,
-            "response.completed",
-            Some(turn_id),
-            json!({
-                "response_attempt_id":"mcp-response",
-                "raw_response":{"output":[call_item.clone()]},
-                "output_items":[call_item],
-                "text":"",
-                "usage":{},
-            }),
-        )
-        .expect("append MCP provider call");
+    let mut turn_admission = begin_test_turn(&mut journal, turn_id, "use MCP");
+    append_provider_call(
+        &mut journal,
+        &coordinator,
+        &turn_admission,
+        turn_id,
+        "mcp-response",
+        call_id,
+        &provider_name,
+        &arguments,
+    );
 
     let call_cancellation = CancellationToken::new();
     let mut call_approval = AllowMcpApproval;
@@ -226,7 +413,8 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
 
     append_provider_call(
         &mut journal,
-        &journal_write_capability,
+        &coordinator,
+        &turn_admission,
         turn_id,
         "identity-response",
         "identity-call",
@@ -259,7 +447,8 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
 
     append_provider_call(
         &mut journal,
-        &journal_write_capability,
+        &coordinator,
+        &turn_admission,
         turn_id,
         "invalid-arguments-response",
         "invalid-arguments-call",
@@ -282,7 +471,8 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
 
     append_provider_call(
         &mut journal,
-        &journal_write_capability,
+        &coordinator,
+        &turn_admission,
         turn_id,
         "denied-response",
         "denied-call",
@@ -302,7 +492,8 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
 
     append_provider_call(
         &mut journal,
-        &journal_write_capability,
+        &coordinator,
+        &turn_admission,
         turn_id,
         "cancelled-response",
         "cancelled-call",
@@ -324,7 +515,8 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
 
     append_provider_call(
         &mut journal,
-        &journal_write_capability,
+        &coordinator,
+        &turn_admission,
         turn_id,
         "output-limit-response",
         "output-limit-call",
@@ -346,23 +538,22 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("read oversized-result in-doubt snapshot");
     assert_eq!(output_limit_pending.len(), 1);
     journal
+        .finish_turn_transaction_v1(&mut turn_admission, Some("fixture turn complete"))
+        .expect("finish the first admitted MCP turn");
+    journal
         .resolve_all_in_doubt_as_failed(&output_limit_pending)
         .expect("explicitly resolve the oversized-result uncertainty");
 
     let closed_turn_id = "mcp-closed-after-output-limit-turn";
-    journal
-        .append_and_sync(
-            "user.message",
-            Some(closed_turn_id),
-            json!({
-                "text":"verify oversized result closed transport",
-                "turn_boundary_version":TURN_BOUNDARY_VERSION,
-            }),
-        )
-        .expect("append transport-closed probe user message");
+    let mut turn_admission = begin_test_turn(
+        &mut journal,
+        closed_turn_id,
+        "verify oversized result closed transport",
+    );
     append_provider_call(
         &mut journal,
-        &journal_write_capability,
+        &coordinator,
+        &turn_admission,
         closed_turn_id,
         "closed-after-output-limit-response",
         "closed-after-output-limit-call",
@@ -386,6 +577,9 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         closed_after_output_limit.error_code.as_deref(),
         Some("transport_closed")
     );
+    journal
+        .finish_turn_transaction_v1(&mut turn_admission, Some("transport closed"))
+        .expect("finish the transport-closed probe turn");
 
     // Post-dispatch result rejection closes the old stdio stream.  Explicitly
     // reopen the durable session and reconnect the approved registry before
@@ -415,25 +609,16 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .expect("approve unchanged registry after transport termination");
     let mut coordinator = McpExecutionCoordinator::resume(approved_resumed_registry, &journal)
         .expect("resume coordinator after transport termination");
-    let journal_write_capability = coordinator
-        .journal_write_capability_v1(&journal)
-        .expect("mint resumed MCP journal write capability");
-
     // Standalone coordinator dispatch admits one-call responses only; a
     // multi-call batch must be owned by an active Agent turn admission.  The
     // in-doubt outcome itself is enough to block a later call, so keep this
     // low-level fixture single-call and exercise the same fail-closed gate.
     let rpc_turn_id = "mcp-rpc-turn";
-    journal
-        .append_and_sync(
-            "user.message",
-            Some(rpc_turn_id),
-            json!({"text":"exercise RPC failure", "turn_boundary_version":TURN_BOUNDARY_VERSION}),
-        )
-        .expect("append RPC failure user message");
+    let turn_admission = begin_test_turn(&mut journal, rpc_turn_id, "exercise RPC failure");
     append_provider_call(
         &mut journal,
-        &journal_write_capability,
+        &coordinator,
+        &turn_admission,
         rpc_turn_id,
         "in-doubt-response",
         "in-doubt-call",
@@ -503,6 +688,27 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
         .open(&durable_session_id)
         .expect("reopen and recover MCP coordinator journal");
     let log_before_blocked_resume = fs::read(&log).expect("read log before blocked resume");
+    let replacement_start = McpRegistry::connect_for_activation(
+        &approved,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        &mut reopened,
+        &CancellationToken::new(),
+    )
+    .await
+    .err()
+    .expect("an existing activation must reject replacement before MCP startup");
+    assert!(
+        replacement_start
+            .to_string()
+            .contains("existing registry activation")
+    );
+    assert_eq!(
+        fs::read(&log).expect("read log after blocked replacement activation"),
+        log_before_blocked_resume,
+        "existing activation rejection must not execute MCP discovery code"
+    );
     let resume_error = reopened
         .mcp_resume_eligibility()
         .err()
@@ -515,8 +721,16 @@ async fn explicit_project_config_builds_a_stable_namespaced_registry() {
     );
     drop(reopened);
 
-    let collision =
-        McpRegistry::connect(&approved, [provider_name], &CancellationToken::new()).await;
+    let mut collision_journal = store
+        .create(SessionHeader::new(&root, "mcp-collision"))
+        .expect("create collision probe journal");
+    let collision = McpRegistry::connect_for_activation(
+        &approved,
+        [provider_name],
+        &mut collision_journal,
+        &CancellationToken::new(),
+    )
+    .await;
     assert!(matches!(collision, Err(error) if error.to_string().contains("tool name collision")));
 }
 
@@ -545,21 +759,22 @@ async fn resume_rechecks_in_doubt_after_registry_start() {
     let approved = config
         .approve_execution(config.execution_plan_digest())
         .expect("approve MCP resume execution plan");
-    let registry = McpRegistry::connect(
-        &approved,
-        ["read", "edit", "write", "shell", "remember"]
-            .into_iter()
-            .map(str::to_owned),
-        &CancellationToken::new(),
-    )
-    .await
-    .expect("connect MCP resume registry");
-    let registry_digest = registry.digest().to_owned();
     let store =
         SessionStore::new(directory.path().join("data")).expect("create MCP resume session store");
     let mut journal = store
         .create(SessionHeader::new(&root, "mcp-resume"))
         .expect("create MCP resume journal");
+    let registry = McpRegistry::connect_for_activation(
+        &approved,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        &mut journal,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("connect MCP resume registry");
+    let registry_digest = registry.digest().to_owned();
     let mut coordinator = McpExecutionCoordinator::activate(
         registry
             .approve_surface(&registry_digest)
@@ -620,6 +835,31 @@ async fn resume_rechecks_in_doubt_after_registry_start() {
     let eligibility = reopened
         .mcp_resume_eligibility()
         .expect("mint clean MCP resume eligibility");
+    let mut resumed_registry = McpRegistry::connect_for_resume(
+        &approved,
+        ["read", "edit", "write", "shell", "remember"]
+            .into_iter()
+            .map(str::to_owned),
+        eligibility,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("connect lease-bound MCP resume registry");
+    drop(reopened);
+    let lock_error = store
+        .open(&session_id)
+        .err()
+        .expect("pre-coordinator resume registry must retain the session lock lease");
+    assert!(lock_error.to_string().contains("already open"));
+    resumed_registry.shutdown().await;
+    let mut reopened = store
+        .open(&session_id)
+        .expect("resume-registry shutdown releases the pre-coordinator execution lease");
+    drop(resumed_registry);
+
+    let eligibility = reopened
+        .mcp_resume_eligibility()
+        .expect("mint eligibility after releasing the resume-registry probe");
     let resumed_registry = McpRegistry::connect_for_resume(
         &approved,
         ["read", "edit", "write", "shell", "remember"]
@@ -633,17 +873,19 @@ async fn resume_rechecks_in_doubt_after_registry_start() {
     let approved_resumed_registry = resumed_registry
         .approve_surface(&registry_digest)
         .expect("approve clean MCP resume surface");
-    let mut resumed = McpExecutionCoordinator::resume(approved_resumed_registry, &reopened)
+    let resumed = McpExecutionCoordinator::resume(approved_resumed_registry, &reopened)
         .expect("resume clean MCP registry epoch");
     assert_eq!(resumed.registry_epoch_id(), durable_epoch);
     assert_eq!(resumed.registry_digest(), registry_digest);
-    resumed.shutdown().await;
-    drop(resumed);
     drop(reopened);
-
-    let mut reopened = store
+    let locked_error = store
         .open(&session_id)
-        .expect("reopen before final MCP resume validation");
+        .err()
+        .expect("resumed coordinator must retain the exact session lock lease");
+    assert!(locked_error.to_string().contains("already open"));
+    drop(resumed);
+
+    let mut reopened = open_after_execution_exit(&store, &session_id).await;
     let eligibility = reopened
         .mcp_resume_eligibility()
         .expect("mint MCP eligibility before final validation drift");
@@ -717,11 +959,17 @@ async fn started_call_forget_keeps_poison_and_old_authority_out_of_reopened_hand
     let approved = config
         .approve_execution(config.execution_plan_digest())
         .expect("approve MCP drop-guard execution plan");
-    let registry = McpRegistry::connect(
+    let store = SessionStore::new(directory.path().join("data"))
+        .expect("create MCP drop-guard session store");
+    let mut journal = store
+        .create(SessionHeader::new(&root, "mcp-drop-guard"))
+        .expect("create MCP drop-guard journal");
+    let registry = McpRegistry::connect_for_activation(
         &approved,
         ["read", "edit", "write", "shell", "remember"]
             .into_iter()
             .map(str::to_owned),
+        &mut journal,
         &CancellationToken::new(),
     )
     .await
@@ -733,11 +981,6 @@ async fn started_call_forget_keeps_poison_and_old_authority_out_of_reopened_hand
         .provider_name
         .clone();
     let registry_digest = registry.digest().to_owned();
-    let store = SessionStore::new(directory.path().join("data"))
-        .expect("create MCP drop-guard session store");
-    let mut journal = store
-        .create(SessionHeader::new(&root, "mcp-drop-guard"))
-        .expect("create MCP drop-guard journal");
     let mut coordinator = McpExecutionCoordinator::activate(
         registry
             .approve_surface(&registry_digest)
@@ -745,20 +988,12 @@ async fn started_call_forget_keeps_poison_and_old_authority_out_of_reopened_hand
         &mut journal,
     )
     .expect("activate MCP drop-guard coordinator");
-    let journal_write_capability = coordinator
-        .journal_write_capability_v1(&journal)
-        .expect("mint MCP drop-guard journal write capability");
     let turn_id = "drop-guard-turn";
-    journal
-        .append_and_sync(
-            "user.message",
-            Some(turn_id),
-            json!({"text":"exercise MCP drop guard", "turn_boundary_version":TURN_BOUNDARY_VERSION}),
-        )
-        .expect("append MCP drop-guard user message");
+    let turn_admission = begin_test_turn(&mut journal, turn_id, "exercise MCP drop guard");
     append_provider_call(
         &mut journal,
-        &journal_write_capability,
+        &coordinator,
+        &turn_admission,
         turn_id,
         "unpolled-response",
         "unpolled-call",
@@ -798,7 +1033,8 @@ async fn started_call_forget_keeps_poison_and_old_authority_out_of_reopened_hand
 
     append_provider_call(
         &mut journal,
-        &journal_write_capability,
+        &coordinator,
+        &turn_admission,
         turn_id,
         "dropped-response",
         "dropped-call",
@@ -833,9 +1069,20 @@ async fn started_call_forget_keeps_poison_and_old_authority_out_of_reopened_hand
 
     let session_id = journal.session_id().to_owned();
     drop(journal);
+    let locked_error = store
+        .open(&session_id)
+        .err()
+        .expect("live MCP coordinator must retain the session writer lock");
+    assert!(locked_error.to_string().contains("already open"));
+
+    // Explicit shutdown first aborts the transport and revokes live journal
+    // authority, then releases the execution lease so crash recovery can own
+    // the next open generation. The coordinator object itself may remain in
+    // scope without retaining the lock after shutdown completes.
+    coordinator.shutdown().await;
     let mut reopened = store
         .open(&session_id)
-        .expect("reopen and recover dropped MCP call");
+        .expect("reopen after coordinator shutdown and recover dropped MCP call");
     let pending = reopened.in_doubt().expect("read recovered in-doubt set");
     assert_eq!(pending.len(), 1);
     let resume_error = reopened
@@ -848,61 +1095,108 @@ async fn started_call_forget_keeps_poison_and_old_authority_out_of_reopened_hand
         .resolve_all_in_doubt_as_failed(&pending)
         .expect("resolve the recovered in-doubt call");
     let retry_turn = "drop-guard-retry-turn";
-    reopened
-        .append_and_sync(
-            "user.message",
-            Some(retry_turn),
-            json!({"text":"retry after dropped MCP transport", "turn_boundary_version":TURN_BOUNDARY_VERSION}),
-        )
-        .expect("append retry user message");
+    let retry_admission = begin_test_turn(
+        &mut reopened,
+        retry_turn,
+        "retry after dropped MCP transport",
+    );
     let before_events = reopened
         .read_events()
         .expect("read reopened journal before stale writer probe");
-    let stale_writer_error = reopened
-        .append_mcp_event_with_capability_v1(
-            &journal_write_capability,
-            "response.started",
-            Some(retry_turn),
+    let stale_writer_error = coordinator
+        .admit_provider_response_v1(
+            &mut reopened,
+            &retry_admission,
+            retry_turn,
             json!({
                 "response_attempt_id":"retry-response",
-                "mcp_registry_epoch_id":coordinator.registry_epoch_id(),
-                "mcp_registry_digest":coordinator.registry_digest(),
+                "context":{},
             }),
         )
-        .expect_err("old journal capability must not cross a reopen boundary");
-    assert!(
-        stale_writer_error
-            .to_string()
-            .contains("different session journal handle")
-    );
+        .err()
+        .expect("revoked coordinator must not cross a shutdown/reopen boundary");
+    assert!(matches!(
+        &stale_writer_error,
+        McpProviderResponseAdmissionErrorV1::RejectedBeforeStart(_)
+    ));
+    assert!(stale_writer_error.to_string().contains("revoked"));
     assert_eq!(
         reopened
             .read_events()
             .expect("stale writer remains zero-write"),
         before_events
     );
-    let calls_before_poisoned_retry = tool_call_count(&log);
-    let retry_error = coordinator
-        .execute_call(
-            &mut reopened,
-            McpCallIdentity::new(retry_turn, "retry-call", &provider_name),
-            &CancellationToken::new(),
-            &mut AllowMcpApproval,
-        )
-        .await
-        .expect_err("the abandoned coordinator must never cross into a reopened journal handle");
-    assert!(
-        retry_error
-            .to_string()
-            .contains("different session journal handle")
-    );
-    assert_eq!(
-        tool_call_count(&log),
-        calls_before_poisoned_retry,
-        "a poisoned coordinator must reject before another MCP request is sent"
-    );
+}
 
-    coordinator.shutdown().await;
+#[test]
+fn dropping_coordinator_reaps_transport_without_runtime_progress() {
+    let Some(python) = find_python() else {
+        eprintln!("skipping MCP independent reaper test: Python is unavailable");
+        return;
+    };
+    let directory = tempfile::tempdir().expect("create MCP independent reaper fixture");
+    let root = directory.path().join("project");
+    fs::create_dir_all(&root).expect("create MCP independent reaper project");
+    let script = root.join("server.py");
+    let log = root.join("server.log");
+    fs::write(&script, PYTHON_FIXTURE).expect("write MCP independent reaper fixture");
+    let config_path = root.join("mcp.toml");
+    fs::write(&config_path, project_config(&python, &script, &log, false))
+        .expect("write MCP independent reaper config");
+    let config = McpProjectConfig::load(
+        &root,
+        &config_path
+            .canonicalize()
+            .expect("canonicalize MCP independent reaper config"),
+    )
+    .expect("load MCP independent reaper config");
+    let approved = config
+        .approve_execution(config.execution_plan_digest())
+        .expect("approve MCP independent reaper execution plan");
+    let store = SessionStore::new(directory.path().join("data"))
+        .expect("create MCP independent reaper session store");
+    let mut journal = store
+        .create(SessionHeader::new(&root, "mcp-independent-reaper"))
+        .expect("create MCP independent reaper journal");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build MCP independent reaper runtime");
+    let registry = runtime
+        .block_on(McpRegistry::connect_for_activation(
+            &approved,
+            ["read", "edit", "write", "shell", "remember"]
+                .into_iter()
+                .map(str::to_owned),
+            &mut journal,
+            &CancellationToken::new(),
+        ))
+        .expect("connect MCP independent reaper registry");
+    let registry_digest = registry.digest().to_owned();
+    let coordinator = McpExecutionCoordinator::activate(
+        registry
+            .approve_surface(&registry_digest)
+            .expect("approve MCP independent reaper surface"),
+        &mut journal,
+    )
+    .expect("activate MCP independent reaper coordinator");
+    let session_id = journal.session_id().to_owned();
+
+    drop(journal);
+    let locked_error = store
+        .open(&session_id)
+        .err()
+        .expect("live coordinator must retain the session lock");
+    assert!(locked_error.to_string().contains("already open"));
+
+    // Destroy the current-thread runtime first. The runtime sentinel may only
+    // request termination; the independent std reaper must retain the final
+    // lease until Child::try_wait has reaped the leader and the native
+    // containment is empty. No Tokio runtime is polled below.
+    drop(runtime);
+    drop(coordinator);
+    let reopened = open_after_execution_exit_blocking(&store, &session_id);
+    drop(reopened);
 }
 
 #[test]
@@ -931,16 +1225,22 @@ fn dropping_started_call_aborts_transport_while_current_thread_runtime_is_idle()
     let approved = config
         .approve_execution(config.execution_plan_digest())
         .expect("approve MCP started-call drop execution plan");
+    let store = SessionStore::new(directory.path().join("data"))
+        .expect("create MCP started-call drop session store");
+    let mut journal = store
+        .create(SessionHeader::new(&root, "mcp-started-call-drop"))
+        .expect("create MCP started-call drop journal");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("build MCP started-call drop runtime");
     let registry = runtime
-        .block_on(McpRegistry::connect(
+        .block_on(McpRegistry::connect_for_activation(
             &approved,
             ["read", "edit", "write", "shell", "remember"]
                 .into_iter()
                 .map(str::to_owned),
+            &mut journal,
             &CancellationToken::new(),
         ))
         .expect("connect MCP started-call drop registry");
@@ -951,11 +1251,6 @@ fn dropping_started_call_aborts_transport_while_current_thread_runtime_is_idle()
         .provider_name
         .clone();
     let registry_digest = registry.digest().to_owned();
-    let store = SessionStore::new(directory.path().join("data"))
-        .expect("create MCP started-call drop session store");
-    let mut journal = store
-        .create(SessionHeader::new(&root, "mcp-started-call-drop"))
-        .expect("create MCP started-call drop journal");
     let mut coordinator = McpExecutionCoordinator::activate(
         registry
             .approve_surface(&registry_digest)
@@ -963,20 +1258,12 @@ fn dropping_started_call_aborts_transport_while_current_thread_runtime_is_idle()
         &mut journal,
     )
     .expect("activate MCP started-call drop coordinator");
-    let journal_write_capability = coordinator
-        .journal_write_capability_v1(&journal)
-        .expect("mint MCP started-call drop journal capability");
     let turn_id = "started-call-drop-turn";
-    journal
-        .append_and_sync(
-            "user.message",
-            Some(turn_id),
-            json!({"text":"drop an in-flight MCP call", "turn_boundary_version":TURN_BOUNDARY_VERSION}),
-        )
-        .expect("append MCP started-call drop user message");
+    let turn_admission = begin_test_turn(&mut journal, turn_id, "drop an in-flight MCP call");
     append_provider_call(
         &mut journal,
-        &journal_write_capability,
+        &coordinator,
+        &turn_admission,
         turn_id,
         "started-call-drop-response",
         "started-call-drop-call",
@@ -1042,9 +1329,11 @@ impl McpCallApprovalHandler for PanicMcpApproval {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_provider_call(
     journal: &mut oxidra::session::SessionJournal,
-    capability: &McpJournalWriteCapabilityV1,
+    coordinator: &McpExecutionCoordinator,
+    turn_admission: &TurnTransactionAdmissionV1,
     turn_id: &str,
     response_attempt_id: &str,
     call_id: &str,
@@ -1053,7 +1342,8 @@ fn append_provider_call(
 ) {
     append_provider_calls(
         journal,
-        capability,
+        coordinator,
+        turn_admission,
         turn_id,
         response_attempt_id,
         provider_name,
@@ -1063,26 +1353,24 @@ fn append_provider_call(
 
 fn append_provider_calls(
     journal: &mut oxidra::session::SessionJournal,
-    capability: &McpJournalWriteCapabilityV1,
+    coordinator: &McpExecutionCoordinator,
+    turn_admission: &TurnTransactionAdmissionV1,
     turn_id: &str,
     response_attempt_id: &str,
     provider_name: &str,
     calls: &[(&str, Value)],
 ) {
-    let registry_epoch_id = active_registry_epoch(journal);
-    let registry_digest = active_registry_digest(journal);
-    journal
-        .append_mcp_event_with_capability_v1(
-            capability,
-            "response.started",
-            Some(turn_id),
+    let mut admission = coordinator
+        .admit_provider_response_v1(
+            journal,
+            turn_admission,
+            turn_id,
             json!({
                 "response_attempt_id":response_attempt_id,
-                "mcp_registry_epoch_id":registry_epoch_id,
-                "mcp_registry_digest":registry_digest,
+                "context":{},
             }),
         )
-        .expect("append MCP response start");
+        .expect("admit MCP Provider response");
     let call_items = calls
         .iter()
         .map(|(call_id, arguments)| {
@@ -1094,13 +1382,10 @@ fn append_provider_calls(
             })
         })
         .collect::<Vec<_>>();
-    journal
-        .append_mcp_event_with_capability_v1(
-            capability,
-            "response.completed",
-            Some(turn_id),
+    admission
+        .commit_completed_v1(
+            journal,
             json!({
-                "response_attempt_id":response_attempt_id,
                 "raw_response":{"output":call_items},
                 "output_items":call_items,
                 "text":"",
@@ -1110,36 +1395,57 @@ fn append_provider_calls(
         .expect("append MCP provider call");
 }
 
-fn active_registry_epoch(journal: &oxidra::session::SessionJournal) -> String {
+fn begin_test_turn(
+    journal: &mut oxidra::session::SessionJournal,
+    turn_id: &str,
+    text: &str,
+) -> TurnTransactionAdmissionV1 {
     journal
-        .read_events()
-        .expect("read MCP activation for fixture response")
-        .into_iter()
-        .find(|event| event.kind == "mcp.registry.activated")
-        .and_then(|event| {
-            event
-                .data
-                .get("registry_epoch_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .expect("MCP registry activation epoch")
+        .begin_turn_transaction_v1(
+            turn_id,
+            json!({"text":text, "turn_boundary_version":TURN_BOUNDARY_VERSION}),
+        )
+        .expect("admit MCP test turn")
 }
 
-fn active_registry_digest(journal: &oxidra::session::SessionJournal) -> String {
-    journal
-        .read_events()
-        .expect("read MCP activation for fixture response")
-        .into_iter()
-        .find(|event| event.kind == "mcp.registry.activated")
-        .and_then(|event| {
-            event
-                .data
-                .get("registry_digest")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .expect("MCP registry activation digest")
+async fn open_after_execution_exit(
+    store: &SessionStore,
+    session_id: &str,
+) -> oxidra::session::SessionJournal {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match store.open(session_id) {
+            Ok(journal) => return journal,
+            Err(error)
+                if error.to_string().contains("already open") && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!(
+                "execution owner did not release the session lock after transport exit: {error}"
+            ),
+        }
+    }
+}
+
+fn open_after_execution_exit_blocking(
+    store: &SessionStore,
+    session_id: &str,
+) -> oxidra::session::SessionJournal {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match store.open(session_id) {
+            Ok(journal) => return journal,
+            Err(error)
+                if error.to_string().contains("already open") && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!(
+                "independent native reaper did not release the session lock after exit: {error}"
+            ),
+        }
+    }
 }
 
 fn tool_call_count(log: &Path) -> usize {

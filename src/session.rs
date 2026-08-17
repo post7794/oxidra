@@ -356,14 +356,15 @@ impl SessionStore {
                 }
             })?;
         fs::create_dir_all(self.layout.artifact_dir(&session_id)?)?;
+        let handle_id = Uuid::now_v7().to_string();
 
         let mut journal = SessionJournal {
             session_id: session_id.clone(),
-            handle_id: Uuid::now_v7().to_string(),
+            handle_id: handle_id.clone(),
             journal_path,
             artifact_dir: self.layout.artifact_dir(&session_id)?,
             file,
-            _lock_file: lock_file,
+            execution_lease: SessionExecutionLeaseV1::new(lock_file, &session_id, &handle_id),
             next_seq: 1,
             recovery: RecoveryInfo::default(),
             poisoned: false,
@@ -375,6 +376,8 @@ impl SessionStore {
             active_mcp_tool: None,
             recovery_headroom_bytes: 0,
             mcp_resume_open_id: None,
+            mcp_activation_present_at_open: false,
+            mcp_activation_startup_issued: false,
             mcp_resume_eligibility_issued: false,
         };
         journal.append_and_sync(SESSION_STARTED_KIND, None, serde_json::to_value(header)?)?;
@@ -410,6 +413,15 @@ impl SessionStore {
             normalized_missing_newline,
         } = scan;
         validate_events(&prospective_events, session_id)?;
+        // Resume startup is only authorized from a journal generation that
+        // was opened with an already-durable MCP activation.  A newly-created
+        // journal may activate MCP during this handle, but that first
+        // activation must be closed and reopened before it can mint the
+        // pre-start recovery gate.  This keeps the gate causally tied to the
+        // prefix that SessionStore::open actually reduced.
+        let mcp_activation_present_at_open = prospective_events
+            .iter()
+            .any(|event| event.kind == crate::mcp::MCP_REGISTRY_ACTIVATED_KIND);
         let provider_context_limit_actions =
             provider_context_limit_recovery_actions_v1(&prospective_events)?;
         let provider_context_limit_recovery_turns = provider_context_limit_actions
@@ -496,13 +508,14 @@ impl SessionStore {
             cancelled_turns: previously_cancelled_turns,
         };
 
+        let handle_id = Uuid::now_v7().to_string();
         let mut journal = SessionJournal {
             session_id: session_id.to_owned(),
-            handle_id: Uuid::now_v7().to_string(),
+            handle_id: handle_id.clone(),
             journal_path,
             artifact_dir: self.layout.artifact_dir(session_id)?,
             file,
-            _lock_file: lock_file,
+            execution_lease: SessionExecutionLeaseV1::new(lock_file, session_id, &handle_id),
             next_seq,
             recovery: RecoveryInfo::default(),
             poisoned: false,
@@ -518,6 +531,8 @@ impl SessionStore {
             // mint that capability, and reopening after dropping this handle
             // produces a different nonce.
             mcp_resume_open_id: Some(Uuid::now_v7().to_string()),
+            mcp_activation_present_at_open,
+            mcp_activation_startup_issued: false,
             mcp_resume_eligibility_issued: false,
         };
         fs::create_dir_all(&journal.artifact_dir)?;
@@ -825,6 +840,45 @@ pub(crate) struct McpRecoverySkipV1 {
     pub(crate) arguments: Value,
 }
 
+/// Runtime ownership of the exact OS file handle carrying a session's
+/// exclusive writer lock.
+///
+/// This lease is intentionally crate-private and can only be minted by the
+/// already-locked [`SessionJournal`]. It shares the original `File` through an
+/// `Arc` instead of duplicating the descriptor/handle, avoiding platform
+/// differences in `flock`/`LockFileEx` duplicate-handle semantics. As long as
+/// either the journal or an MCP coordinator retains a lease, the original
+/// locked handle remains open and `SessionStore::open` must fail closed. MCP
+/// transport native reapers retain their own clone until native exit/reap, so a
+/// coordinator Drop cannot release the generation while old code still runs.
+pub(crate) struct SessionExecutionLeaseV1 {
+    _lock_file: Arc<File>,
+    session_id: String,
+    journal_handle_id: String,
+}
+
+impl SessionExecutionLeaseV1 {
+    fn new(lock_file: File, session_id: &str, journal_handle_id: &str) -> Self {
+        Self {
+            _lock_file: Arc::new(lock_file),
+            session_id: session_id.to_owned(),
+            journal_handle_id: journal_handle_id.to_owned(),
+        }
+    }
+
+    pub(crate) fn clone_v1(&self) -> Self {
+        Self {
+            _lock_file: Arc::clone(&self._lock_file),
+            session_id: self.session_id.clone(),
+            journal_handle_id: self.journal_handle_id.clone(),
+        }
+    }
+
+    pub(crate) fn matches_journal(&self, journal: &SessionJournal) -> bool {
+        self.session_id == journal.session_id && self.journal_handle_id == journal.handle_id
+    }
+}
+
 pub struct SessionJournal {
     session_id: String,
     /// Runtime-only identity of this exact locked journal handle. Reopening
@@ -834,7 +888,7 @@ pub struct SessionJournal {
     journal_path: PathBuf,
     artifact_dir: PathBuf,
     file: File,
-    _lock_file: File,
+    execution_lease: SessionExecutionLeaseV1,
     next_seq: u64,
     recovery: RecoveryInfo,
     poisoned: bool,
@@ -847,6 +901,15 @@ pub struct SessionJournal {
     /// Capacity retained after reopen for explicit in-doubt resolutions.
     recovery_headroom_bytes: u64,
     mcp_resume_open_id: Option<String>,
+    /// Whether this open generation reduced a prefix that already contained
+    /// a durable MCP activation.  A first activation appended to a newly
+    /// opened handle must be closed and reopened before it can authorize MCP
+    /// startup.
+    mcp_activation_present_at_open: bool,
+    /// A fresh activation may start untrusted MCP code only once per locked
+    /// journal generation.  Reopening creates a new runtime generation; an
+    /// existing durable activation is still rejected independently.
+    mcp_activation_startup_issued: bool,
     mcp_resume_eligibility_issued: bool,
 }
 
@@ -902,7 +965,7 @@ pub(crate) struct ProviderResponseDispatchAdmissionV1 {
 /// crash. The token is deliberately owned by the `run_turn` future: abnormal
 /// future destruction marks the journal handle reopen-required.
 #[derive(Debug)]
-pub(crate) struct TurnTransactionAdmissionV1 {
+pub struct TurnTransactionAdmissionV1 {
     reservation_id: String,
     consumed: bool,
     reopen_required: Arc<AtomicBool>,
@@ -936,15 +999,38 @@ pub(crate) enum DispatchAdmissionErrorV1 {
 
 #[derive(Debug)]
 pub(crate) enum DurableOutcomeCommitErrorV1 {
-    CapacityDenied(OxidraError),
+    FallbackPermittedBeforeWrite(OxidraError),
     Fatal(OxidraError),
 }
 
 impl DurableOutcomeCommitErrorV1 {
     pub(crate) fn into_error(self) -> OxidraError {
         match self {
-            Self::CapacityDenied(error) | Self::Fatal(error) => error,
+            Self::FallbackPermittedBeforeWrite(error) | Self::Fatal(error) => error,
         }
+    }
+}
+
+impl std::fmt::Display for DurableOutcomeCommitErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FallbackPermittedBeforeWrite(error) | Self::Fatal(error) => {
+                std::fmt::Display::fmt(error, formatter)
+            }
+        }
+    }
+}
+
+impl std::error::Error for DurableOutcomeCommitErrorV1 {}
+
+fn provider_response_candidate_error_v1(
+    error: OxidraError,
+    fallback_permitted_before_write: bool,
+) -> DurableOutcomeCommitErrorV1 {
+    if fallback_permitted_before_write {
+        DurableOutcomeCommitErrorV1::FallbackPermittedBeforeWrite(error)
+    } else {
+        DurableOutcomeCommitErrorV1::Fatal(error)
     }
 }
 
@@ -971,6 +1057,12 @@ impl Drop for ProviderResponseDispatchAdmissionV1 {
         if !self.consumed {
             self.reopen_required.store(true, Ordering::Release);
         }
+    }
+}
+
+impl ProviderResponseDispatchAdmissionV1 {
+    pub(crate) fn mark_reopen_required_v1(&self) {
+        self.reopen_required.store(true, Ordering::Release);
     }
 }
 
@@ -1013,6 +1105,42 @@ impl SessionJournal {
         &self.handle_id
     }
 
+    pub(crate) fn retain_execution_lease_v1(&self) -> SessionExecutionLeaseV1 {
+        self.execution_lease.clone_v1()
+    }
+
+    /// Consume the one startup slot for a first MCP activation on this exact
+    /// locked journal generation.  The prefix is checked before any server is
+    /// spawned, so an existing activation or pending compaction boundary
+    /// cannot execute discovery code and fail only later in the coordinator.
+    pub(crate) fn claim_mcp_activation_startup_v1(&mut self) -> Result<SessionExecutionLeaseV1> {
+        self.ensure_healthy()?;
+        if self.mcp_activation_startup_issued {
+            return Err(OxidraError::Session(
+                "MCP activation startup was already claimed for this session journal handle"
+                    .to_owned(),
+            ));
+        }
+        let events = self.read_events()?;
+        crate::mcp::validate_mcp_call_chain(&events)?;
+        if events
+            .iter()
+            .any(|event| event.kind == crate::mcp::MCP_REGISTRY_ACTIVATED_KIND)
+        {
+            return Err(OxidraError::Session(
+                "MCP activation startup cannot replace an existing registry activation".to_owned(),
+            ));
+        }
+        if let Some(pending) = validate_compaction_boundary_chain(&events)?.latest_pending() {
+            return Err(OxidraError::Session(format!(
+                "MCP activation startup cannot cross pending compaction boundary {}",
+                pending.boundary.boundary_id
+            )));
+        }
+        self.mcp_activation_startup_issued = true;
+        Ok(self.retain_execution_lease_v1())
+    }
+
     pub fn journal_path(&self) -> &Path {
         &self.journal_path
     }
@@ -1049,6 +1177,12 @@ impl SessionJournal {
     }
 
     pub(crate) fn claim_mcp_resume_open_id(&mut self) -> Result<String> {
+        if !self.mcp_activation_present_at_open {
+            return Err(OxidraError::Session(
+                "MCP resume eligibility requires an activation present when SessionStore::open reduced the journal"
+                    .to_owned(),
+            ));
+        }
         let open_id = self.mcp_resume_open_id.clone().ok_or_else(|| {
             OxidraError::Session(
                 "MCP resume eligibility requires a journal returned by SessionStore::open"
@@ -1108,27 +1242,29 @@ impl SessionJournal {
         self.append_mcp_event_and_sync_v1("mcp.registry.activated", None, data)
     }
 
-    /// Append an MCP Provider response/context event only when the live
-    /// coordinator has minted an opaque capability for this exact durable
-    /// activation and this exact runtime journal handle. Reopening the same
-    /// session invalidates the old capability. Tool lifecycle and recovery
-    /// events use narrower typed admissions and are rejected by this public
-    /// compatibility entry point.
-    pub fn append_mcp_event_with_capability_v1(
+    #[cfg(test)]
+    pub(crate) fn append_mcp_event_with_capability_v1(
         &mut self,
         capability: &McpJournalWriteCapabilityV1,
         kind: impl Into<String>,
         turn_id: Option<&str>,
         data: Value,
     ) -> Result<JournalEvent> {
-        // Conversion is caller-controlled through `Into<String>`.  Complete it
-        // before taking the non-reentrant authority mutex so conversion cannot
-        // drop/shutdown the coordinator while the same mutex is held.
         let kind = kind.into();
-        capability.append_event_to_journal(self, kind, turn_id, data)
+        capability.append_event_to_journal_for_test(self, kind, turn_id, data)
     }
 
-    pub(crate) fn append_mcp_event_with_live_proof_v1(
+    pub(crate) fn append_mcp_context_tools_with_live_proof_v1(
+        &mut self,
+        proof: &LiveMcpJournalWriteProofV1<'_>,
+        data: Value,
+    ) -> Result<JournalEvent> {
+        self.validate_mcp_journal_write_capability_v1(proof.capability())?;
+        self.append_mcp_event_and_sync_v1("context.tools", None, data)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_mcp_event_with_live_proof_for_test_v1(
         &mut self,
         proof: &LiveMcpJournalWriteProofV1<'_>,
         kind: String,
@@ -2059,6 +2195,18 @@ impl SessionJournal {
         })
     }
 
+    /// Start one durable turn while reserving the recovery capacity that every
+    /// subsequent external dispatch must preserve.  The returned opaque token
+    /// is the only public way to prove ownership of that active turn.
+    pub fn begin_turn_transaction_v1(
+        &mut self,
+        turn_id: &str,
+        data: Value,
+    ) -> Result<TurnTransactionAdmissionV1> {
+        self.append_user_message_with_turn_admission_v1(turn_id, data)
+            .map_err(DispatchAdmissionErrorV1::into_error)
+    }
+
     /// Re-acquire the turn-level outcome reserve for a continuation that
     /// reuses an already durable `user.message`.  Recovery intents are allowed
     /// to be appended while this capability is active; the caller must obtain
@@ -2156,7 +2304,7 @@ impl SessionJournal {
     /// owned by a terminal or explicit retry/abandon protocol. If the caller
     /// returns an error before such an owner exists, consume the protected
     /// reserve with one bounded `turn.cancelled` event.
-    pub(crate) fn finish_turn_transaction_v1(
+    pub fn finish_turn_transaction_v1(
         &mut self,
         admission: &mut TurnTransactionAdmissionV1,
         cancellation_reason: Option<&str>,
@@ -2434,6 +2582,28 @@ impl SessionJournal {
         turn_id: &str,
         data: Value,
     ) -> std::result::Result<ProviderResponseDispatchAdmissionV1, DispatchAdmissionErrorV1> {
+        self.append_provider_response_started_inner_v1(turn_admission, turn_id, data, false)
+    }
+
+    pub(crate) fn append_mcp_provider_response_started_with_live_proof_v1(
+        &mut self,
+        proof: &LiveMcpJournalWriteProofV1<'_>,
+        turn_admission: &TurnTransactionAdmissionV1,
+        turn_id: &str,
+        data: Value,
+    ) -> std::result::Result<ProviderResponseDispatchAdmissionV1, DispatchAdmissionErrorV1> {
+        self.validate_mcp_journal_write_capability_v1(proof.capability())
+            .map_err(DispatchAdmissionErrorV1::Fatal)?;
+        self.append_provider_response_started_inner_v1(turn_admission, turn_id, data, true)
+    }
+
+    fn append_provider_response_started_inner_v1(
+        &mut self,
+        turn_admission: &TurnTransactionAdmissionV1,
+        turn_id: &str,
+        data: Value,
+        mcp_authorized: bool,
+    ) -> std::result::Result<ProviderResponseDispatchAdmissionV1, DispatchAdmissionErrorV1> {
         self.ensure_healthy()
             .map_err(DispatchAdmissionErrorV1::Fatal)?;
         if self.recovery_headroom_bytes > 0 {
@@ -2521,9 +2691,16 @@ impl SessionJournal {
             data,
         )
         .map_err(DispatchAdmissionErrorV1::Fatal)?;
-        if response_started_references_mcp_surface_v1(&durable_prefix, &started) {
+        let mcp_owned = response_started_references_mcp_surface_v1(&durable_prefix, &started);
+        if mcp_owned && !mcp_authorized {
             return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
                 "generic Provider response admission cannot author an MCP-owned response.started; use the typed MCP Provider writer"
+                    .to_owned(),
+            )));
+        }
+        if !mcp_owned && mcp_authorized {
+            return Err(DispatchAdmissionErrorV1::Fatal(OxidraError::Session(
+                "typed MCP Provider response admission requires an explicit MCP-owned response.started"
                     .to_owned(),
             )));
         }
@@ -2614,21 +2791,48 @@ impl SessionJournal {
         admission: &mut ProviderResponseDispatchAdmissionV1,
         error: &str,
     ) -> Result<JournalEvent> {
-        let active = self.active_provider_response_v1(admission)?.clone();
-        let error = provider_response_status_for_outcome_v1(error)?;
-        let mut planned_seq = self.next_seq();
-        let event = planned_recovery_event(
-            self.session_id(),
-            &mut planned_seq,
-            "response.failed",
-            Some(&active.turn_id),
-            json!({
-                "response_attempt_id": active.response_attempt_id,
-                "error": error,
-            }),
-        )?;
-        self.commit_provider_response_events_v1(admission, &[event.clone()], true)?;
-        Ok(event)
+        (|| {
+            let active = self.active_provider_response_v1(admission)?.clone();
+            let error = provider_response_status_for_outcome_v1(error)?;
+            let mut planned_seq = self.next_seq();
+            let event = planned_recovery_event(
+                self.session_id(),
+                &mut planned_seq,
+                "response.failed",
+                Some(&active.turn_id),
+                json!({
+                    "response_attempt_id": active.response_attempt_id,
+                    "error": error,
+                }),
+            )?;
+            match self.commit_provider_response_events_v1(admission, &[event.clone()], true, false)
+            {
+                Ok(()) => {}
+                Err(DurableOutcomeCommitErrorV1::Fatal(error)) => {
+                    admission.mark_reopen_required_v1();
+                    return Err(error);
+                }
+                Err(DurableOutcomeCommitErrorV1::FallbackPermittedBeforeWrite(error)) => {
+                    return Err(error);
+                }
+            }
+            Ok(event)
+        })()
+    }
+
+    pub(crate) fn append_mcp_provider_response_failed_with_live_proof_v1(
+        &mut self,
+        proof: &LiveMcpJournalWriteProofV1<'_>,
+        admission: &mut ProviderResponseDispatchAdmissionV1,
+        error: &str,
+    ) -> Result<JournalEvent> {
+        if let Err(error) =
+            self.validate_mcp_provider_response_admission_with_live_proof_v1(proof, admission)
+        {
+            admission.mark_reopen_required_v1();
+            return Err(error);
+        }
+        self.append_provider_response_failed_v1(admission, error)
     }
 
     pub(crate) fn append_provider_response_aborted_v1(
@@ -2636,34 +2840,98 @@ impl SessionJournal {
         admission: &mut ProviderResponseDispatchAdmissionV1,
         reason: &str,
     ) -> Result<JournalEvent> {
-        let active = self.active_provider_response_v1(admission)?.clone();
-        let reason = provider_response_status_for_outcome_v1(reason)?;
-        let mut planned_seq = self.next_seq();
-        let event = planned_recovery_event(
-            self.session_id(),
-            &mut planned_seq,
-            "response.aborted",
-            Some(&active.turn_id),
-            json!({
-                "response_attempt_id": active.response_attempt_id,
-                "reason": reason,
-            }),
-        )?;
-        self.commit_provider_response_events_v1(admission, &[event.clone()], true)?;
-        Ok(event)
+        (|| {
+            let active = self.active_provider_response_v1(admission)?.clone();
+            let reason = provider_response_status_for_outcome_v1(reason)?;
+            let mut planned_seq = self.next_seq();
+            let event = planned_recovery_event(
+                self.session_id(),
+                &mut planned_seq,
+                "response.aborted",
+                Some(&active.turn_id),
+                json!({
+                    "response_attempt_id": active.response_attempt_id,
+                    "reason": reason,
+                }),
+            )?;
+            match self.commit_provider_response_events_v1(admission, &[event.clone()], true, false)
+            {
+                Ok(()) => {}
+                Err(DurableOutcomeCommitErrorV1::Fatal(error)) => {
+                    admission.mark_reopen_required_v1();
+                    return Err(error);
+                }
+                Err(DurableOutcomeCommitErrorV1::FallbackPermittedBeforeWrite(error)) => {
+                    return Err(error);
+                }
+            }
+            Ok(event)
+        })()
+    }
+
+    pub(crate) fn append_mcp_provider_response_aborted_with_live_proof_v1(
+        &mut self,
+        proof: &LiveMcpJournalWriteProofV1<'_>,
+        admission: &mut ProviderResponseDispatchAdmissionV1,
+        reason: &str,
+    ) -> Result<JournalEvent> {
+        if let Err(error) =
+            self.validate_mcp_provider_response_admission_with_live_proof_v1(proof, admission)
+        {
+            admission.mark_reopen_required_v1();
+            return Err(error);
+        }
+        self.append_provider_response_aborted_v1(admission, reason)
     }
 
     pub(crate) fn append_provider_response_completed_v1(
         &mut self,
         admission: &mut ProviderResponseDispatchAdmissionV1,
         data: Value,
-    ) -> Result<JournalEvent> {
-        let active = self.active_provider_response_v1(admission)?.clone();
+    ) -> std::result::Result<JournalEvent, DurableOutcomeCommitErrorV1> {
+        let result = self.append_provider_response_completed_inner_v1(admission, data, false);
+        if matches!(result, Err(DurableOutcomeCommitErrorV1::Fatal(_))) {
+            admission.mark_reopen_required_v1();
+        }
+        result
+    }
+
+    pub(crate) fn append_mcp_provider_response_completed_with_live_proof_v1(
+        &mut self,
+        proof: &LiveMcpJournalWriteProofV1<'_>,
+        admission: &mut ProviderResponseDispatchAdmissionV1,
+        data: Value,
+    ) -> std::result::Result<JournalEvent, DurableOutcomeCommitErrorV1> {
+        if let Err(error) =
+            self.validate_mcp_provider_response_admission_with_live_proof_v1(proof, admission)
+        {
+            admission.mark_reopen_required_v1();
+            return Err(DurableOutcomeCommitErrorV1::Fatal(error));
+        }
+        let result = self.append_provider_response_completed_inner_v1(admission, data, true);
+        if matches!(result, Err(DurableOutcomeCommitErrorV1::Fatal(_))) {
+            admission.mark_reopen_required_v1();
+        }
+        result
+    }
+
+    fn append_provider_response_completed_inner_v1(
+        &mut self,
+        admission: &mut ProviderResponseDispatchAdmissionV1,
+        data: Value,
+        mcp_authorized: bool,
+    ) -> std::result::Result<JournalEvent, DurableOutcomeCommitErrorV1> {
+        let active = self
+            .active_provider_response_v1(admission)
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?
+            .clone();
         if data.get("response_attempt_id").and_then(Value::as_str)
             != Some(active.response_attempt_id.as_str())
         {
-            return Err(OxidraError::Session(
-                "response.completed does not bind its admitted response attempt".to_owned(),
+            return Err(DurableOutcomeCommitErrorV1::FallbackPermittedBeforeWrite(
+                OxidraError::Session(
+                    "response.completed does not bind its admitted response attempt".to_owned(),
+                ),
             ));
         }
         let mut planned_seq = self.next_seq();
@@ -2673,17 +2941,37 @@ impl SessionJournal {
             "response.completed",
             Some(&active.turn_id),
             data,
-        )?;
-        let durable_prefix = self.read_events()?;
-        if generic_event_has_explicit_mcp_claim_v1(&event)
-            || response_completed_uses_activated_alias_v1(&durable_prefix, &event)
-        {
-            return Err(OxidraError::Session(
-                "generic Provider response admission cannot author an MCP-owned response.completed; use the typed MCP Provider writer"
-                    .to_owned(),
+        )
+        .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        let durable_prefix = self
+            .read_events()
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        crate::mcp::validate_mcp_call_chain(&durable_prefix)
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        let baseline_slot = provider_request_slot_state_for_version(
+            PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+            &durable_prefix,
+            &active.turn_id,
+        )
+        .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        if baseline_slot != ProviderRequestSlotState::ResponseInFlight {
+            return Err(DurableOutcomeCommitErrorV1::Fatal(OxidraError::Session(
+                format!(
+                    "Provider response completion requires an in-flight response slot, found {baseline_slot:?}"
+                ),
+            )));
+        }
+        let mcp_owned = generic_event_has_explicit_mcp_claim_v1(&event)
+            || response_completed_uses_activated_alias_v1(&durable_prefix, &event);
+        if mcp_owned && !mcp_authorized {
+            return Err(DurableOutcomeCommitErrorV1::FallbackPermittedBeforeWrite(
+                OxidraError::Session(
+                    "generic Provider response admission cannot author an MCP-owned response.completed; use the typed MCP Provider writer"
+                        .to_owned(),
+                ),
             ));
         }
-        self.commit_provider_response_events_v1(admission, &[event.clone()], false)?;
+        self.commit_provider_response_events_v1(admission, &[event.clone()], false, true)?;
         Ok(event)
     }
 
@@ -2700,50 +2988,84 @@ impl SessionJournal {
         admission: &mut ProviderResponseDispatchAdmissionV1,
         reason: &str,
     ) -> Result<(JournalEvent, JournalEvent)> {
-        let active = self.active_provider_response_v1(admission)?.clone();
-        validate_provider_context_limit_writer_input_v1(
-            &active.turn_id,
-            &active.response_attempt_id,
-            active.response_started_seq,
-            &active.context,
-        )?;
-        let error = provider_context_limit_error_for_journal_v1(reason);
-        let mut planned_seq = self.next_seq();
-        let failed = planned_recovery_event(
-            self.session_id(),
-            &mut planned_seq,
-            "response.failed",
-            Some(&active.turn_id),
-            provider_context_limit_failed_data_v1(
+        (|| {
+            let active = self.active_provider_response_v1(admission)?.clone();
+            validate_provider_context_limit_writer_input_v1(
+                &active.turn_id,
                 &active.response_attempt_id,
                 active.response_started_seq,
-                &error,
-                active.context.clone(),
-            ),
-        )?;
-        let limit = planned_recovery_event(
-            self.session_id(),
-            &mut planned_seq,
-            "context.limit_reached",
-            Some(&active.turn_id),
-            provider_context_limit_event_data_v1(
-                &active.response_attempt_id,
-                failed.seq,
-                &error,
-                active.context,
-            ),
-        )?;
-        let mut prospective = self.read_events()?;
-        prospective.extend([failed.clone(), limit.clone()]);
-        if !provider_context_limit_recovery_actions_v1(&prospective)?.is_empty() {
-            return Err(OxidraError::Session(
-                "provider context-limit writer did not construct a complete v1 transaction"
-                    .to_owned(),
-            ));
+                &active.context,
+            )?;
+            let error = provider_context_limit_error_for_journal_v1(reason);
+            let mut planned_seq = self.next_seq();
+            let failed = planned_recovery_event(
+                self.session_id(),
+                &mut planned_seq,
+                "response.failed",
+                Some(&active.turn_id),
+                provider_context_limit_failed_data_v1(
+                    &active.response_attempt_id,
+                    active.response_started_seq,
+                    &error,
+                    active.context.clone(),
+                ),
+            )?;
+            let limit = planned_recovery_event(
+                self.session_id(),
+                &mut planned_seq,
+                "context.limit_reached",
+                Some(&active.turn_id),
+                provider_context_limit_event_data_v1(
+                    &active.response_attempt_id,
+                    failed.seq,
+                    &error,
+                    active.context,
+                ),
+            )?;
+            let mut prospective = self.read_events()?;
+            prospective.extend([failed.clone(), limit.clone()]);
+            if !provider_context_limit_recovery_actions_v1(&prospective)?.is_empty() {
+                return Err(OxidraError::Session(
+                    "provider context-limit writer did not construct a complete v1 transaction"
+                        .to_owned(),
+                ));
+            }
+            validate_provider_context_limit_turns_v1(
+                &prospective,
+                &HashSet::from([active.turn_id]),
+            )?;
+            match self.commit_provider_response_events_v1(
+                admission,
+                &[failed.clone(), limit.clone()],
+                true,
+                false,
+            ) {
+                Ok(()) => {}
+                Err(DurableOutcomeCommitErrorV1::Fatal(error)) => {
+                    admission.mark_reopen_required_v1();
+                    return Err(error);
+                }
+                Err(DurableOutcomeCommitErrorV1::FallbackPermittedBeforeWrite(error)) => {
+                    return Err(error);
+                }
+            }
+            Ok((failed, limit))
+        })()
+    }
+
+    pub(crate) fn append_mcp_provider_context_limit_with_live_proof_v1(
+        &mut self,
+        proof: &LiveMcpJournalWriteProofV1<'_>,
+        admission: &mut ProviderResponseDispatchAdmissionV1,
+        reason: &str,
+    ) -> Result<(JournalEvent, JournalEvent)> {
+        if let Err(error) =
+            self.validate_mcp_provider_response_admission_with_live_proof_v1(proof, admission)
+        {
+            admission.mark_reopen_required_v1();
+            return Err(error);
         }
-        validate_provider_context_limit_turns_v1(&prospective, &HashSet::from([active.turn_id]))?;
-        self.commit_provider_response_events_v1(admission, &[failed.clone(), limit.clone()], true)?;
-        Ok((failed, limit))
+        self.append_provider_context_limit_v1(admission, reason)
     }
 
     fn active_provider_response_v1(
@@ -2766,46 +3088,106 @@ impl SessionJournal {
             })
     }
 
+    fn validate_mcp_provider_response_admission_with_live_proof_v1(
+        &self,
+        proof: &LiveMcpJournalWriteProofV1<'_>,
+        admission: &ProviderResponseDispatchAdmissionV1,
+    ) -> Result<()> {
+        self.validate_mcp_journal_write_capability_v1(proof.capability())?;
+        let active = self.active_provider_response_v1(admission)?;
+        let events = self.read_events()?;
+        let exact_owned_start = events.iter().any(|event| {
+            event.kind == "response.started"
+                && event.seq == active.response_started_seq
+                && event.turn_id.as_deref() == Some(active.turn_id.as_str())
+                && event
+                    .data
+                    .get("response_attempt_id")
+                    .and_then(Value::as_str)
+                    == Some(active.response_attempt_id.as_str())
+                && response_started_references_mcp_surface_v1(&events, event)
+        });
+        if !exact_owned_start {
+            return Err(OxidraError::Session(
+                "typed MCP Provider response admission is not bound to its exact durable MCP response.started"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn commit_provider_response_events_v1(
         &mut self,
         admission: &mut ProviderResponseDispatchAdmissionV1,
         events: &[JournalEvent],
         must_fit_headroom: bool,
-    ) -> Result<()> {
-        let active = self.active_provider_response_v1(admission)?.clone();
-        let active_turn = self.active_turn.as_ref().ok_or_else(|| {
-            OxidraError::Session(
-                "Provider response terminal cannot be committed without an active turn transaction"
-                    .to_owned(),
-            )
-        })?;
+        fallback_permitted_before_write: bool,
+    ) -> std::result::Result<(), DurableOutcomeCommitErrorV1> {
+        let active = self
+            .active_provider_response_v1(admission)
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?
+            .clone();
+        let active_turn = self
+            .active_turn
+            .as_ref()
+            .ok_or_else(|| {
+                DurableOutcomeCommitErrorV1::Fatal(OxidraError::Session(
+                    "Provider response terminal cannot be committed without an active turn transaction"
+                        .to_owned(),
+                ))
+            })?
+            .clone();
         if active_turn.turn_id != active.turn_id {
-            return Err(OxidraError::Session(
+            return Err(DurableOutcomeCommitErrorV1::Fatal(OxidraError::Session(
                 "Provider response terminal does not match the active turn transaction".to_owned(),
-            ));
+            )));
         }
-        let mut prospective = self.read_events()?;
+        let durable_prefix = self
+            .read_events()
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        crate::mcp::validate_mcp_call_chain(&durable_prefix)
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        let baseline_slot = provider_request_slot_state_for_version(
+            PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
+            &durable_prefix,
+            &active.turn_id,
+        )
+        .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
+        if baseline_slot != ProviderRequestSlotState::ResponseInFlight {
+            return Err(DurableOutcomeCommitErrorV1::Fatal(OxidraError::Session(
+                format!(
+                    "Provider response terminal requires an in-flight response slot, found {baseline_slot:?}"
+                ),
+            )));
+        }
+        let mut prospective = durable_prefix;
         prospective.extend(events.iter().cloned());
         // Keep the production writer's acceptance set inside the frozen MCP
         // reader's acceptance set.  This is deliberately before any append;
         // callers may still use the same admission to write the bounded
         // response.failed fallback when a completed response is malformed.
-        crate::mcp::validate_mcp_call_chain(&prospective)?;
-        let encoded_bytes = encoded_journal_events_bytes(events)?;
+        crate::mcp::validate_mcp_call_chain(&prospective).map_err(|error| {
+            provider_response_candidate_error_v1(error, fallback_permitted_before_write)
+        })?;
+        let encoded_bytes = encoded_journal_events_bytes(events).map_err(|error| {
+            provider_response_candidate_error_v1(error, fallback_permitted_before_write)
+        })?;
         if must_fit_headroom && encoded_bytes > active.headroom_bytes {
-            return Err(OxidraError::Session(format!(
-                "Provider response terminal requires {encoded_bytes} bytes, exceeding its reserved {}-byte durable outcome headroom",
-                active.headroom_bytes
+            return Err(DurableOutcomeCommitErrorV1::Fatal(OxidraError::Session(
+                format!(
+                    "Provider response terminal requires {encoded_bytes} bytes, exceeding its reserved {}-byte durable outcome headroom",
+                    active.headroom_bytes
+                ),
             )));
         }
         let mut next_turn_headroom = None;
         let byte_limit = if must_fit_headroom {
             self.limit_preserving_headroom_v1(active_turn.headroom_bytes)
                 .map_err(|_| {
-                    OxidraError::Session(format!(
+                    DurableOutcomeCommitErrorV1::Fatal(OxidraError::Session(format!(
                         "Provider terminal cannot preserve the {}-byte turn recovery debt",
                         active_turn.headroom_bytes
-                    ))
+                    )))
                 })?
         } else {
             let turn = active_turn.clone();
@@ -2813,25 +3195,46 @@ impl SessionJournal {
                 PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
                 &prospective,
                 &turn.turn_id,
-            )?;
+            )
+            .map_err(|error| {
+                provider_response_candidate_error_v1(error, fallback_permitted_before_write)
+            })?;
             let required_headroom = active_turn_recovery_headroom_v1(
                 &self.session_id,
                 &prospective,
                 &turn.turn_id,
                 turn.user_message_seq,
-            )?;
+            )
+            .map_err(|error| {
+                provider_response_candidate_error_v1(error, fallback_permitted_before_write)
+            })?;
             let protected_headroom = TURN_OUTCOME_HEADROOM_BYTES_V1.max(required_headroom);
             let limit = self
                 .limit_preserving_headroom_v1(protected_headroom)
                 .map_err(|_| {
-                    OxidraError::Session(format!(
-                        "response completion cannot reserve the {protected_headroom}-byte tool-batch recovery debt"
-                    ))
+                    provider_response_candidate_error_v1(
+                        OxidraError::Session(format!(
+                            "response completion cannot reserve the {protected_headroom}-byte tool-batch recovery debt"
+                        )),
+                        fallback_permitted_before_write,
+                    )
                 })?;
             next_turn_headroom = Some(protected_headroom);
             limit
         };
-        self.append_prebuilt_batch_with_limit(events, byte_limit)?;
+        if !self
+            .preflight_prebuilt_batch_capacity(events, byte_limit)
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?
+        {
+            return Err(provider_response_candidate_error_v1(
+                OxidraError::Session(format!(
+                    "journal transaction would exceed the {byte_limit}-byte safety limit while committing the Provider response terminal"
+                )),
+                fallback_permitted_before_write,
+            ));
+        }
+        self.append_prebuilt_batch_with_limit(events, byte_limit)
+            .map_err(DurableOutcomeCommitErrorV1::Fatal)?;
         if let (Some(headroom), Some(turn)) = (next_turn_headroom, self.active_turn.as_mut()) {
             turn.headroom_bytes = headroom;
         }
@@ -3125,7 +3528,7 @@ impl SessionJournal {
             .preflight_prebuilt_batch_capacity(&events, commit_limit)
             .map_err(DurableOutcomeCommitErrorV1::Fatal)?
         {
-            return Err(DurableOutcomeCommitErrorV1::CapacityDenied(
+            return Err(DurableOutcomeCommitErrorV1::FallbackPermittedBeforeWrite(
                 OxidraError::Session(format!(
                     "compaction outcome transaction would exceed the {}-byte safety limit",
                     commit_limit
@@ -6403,13 +6806,14 @@ mod tests {
             .truncate(false)
             .open(lock_path)
             .unwrap();
+        let handle_id = Uuid::now_v7().to_string();
         let mut journal = SessionJournal {
             session_id: "poisoned".to_owned(),
-            handle_id: Uuid::now_v7().to_string(),
+            handle_id: handle_id.clone(),
             journal_path,
             artifact_dir: temp.path().join("artifacts"),
             file,
-            _lock_file: lock_file,
+            execution_lease: SessionExecutionLeaseV1::new(lock_file, "poisoned", &handle_id),
             next_seq: 1,
             recovery: RecoveryInfo::default(),
             poisoned: false,
@@ -6421,6 +6825,8 @@ mod tests {
             active_mcp_tool: None,
             recovery_headroom_bytes: 0,
             mcp_resume_open_id: None,
+            mcp_activation_present_at_open: false,
+            mcp_activation_startup_issued: false,
             mcp_resume_eligibility_issued: false,
         };
 
@@ -6452,6 +6858,23 @@ mod tests {
         assert!(error.to_string().contains("already open"));
         drop(journal);
         store.open("locked").unwrap();
+    }
+
+    #[test]
+    fn retained_execution_lease_keeps_the_original_writer_lock_alive() {
+        let temp = TempDir::new().unwrap();
+        let store = SessionStore::new(temp.path()).unwrap();
+        let journal = store
+            .create_with_id("execution-lease", header(temp.path()))
+            .unwrap();
+        let execution_lease = journal.retain_execution_lease_v1();
+
+        drop(journal);
+        let error = store.open("execution-lease").err().unwrap();
+        assert!(error.to_string().contains("already open"));
+
+        drop(execution_lease);
+        store.open("execution-lease").unwrap();
     }
 
     #[test]

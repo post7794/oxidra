@@ -18,11 +18,19 @@ use super::journal::{
 use super::registry::{
     ApprovedMcpRegistry, ApprovedMcpResumeRegistry, McpRegistry, PreparedMcpRegistryCall,
 };
-use super::{McpCallError, PreflightedJsonValue, TransportAbortHandle};
+use super::{
+    MAX_MCP_PROVIDER_COMPLETED_EVENT_BYTES_V1, MAX_MCP_PROVIDER_START_EVENT_BYTES_V1, McpCallError,
+    PreflightedJsonValue, TransportAbortHandle, drop_json_value_iteratively,
+    preflight_mcp_provider_event_tree_v1,
+};
 use crate::compaction::validate_compaction_boundary_chain;
 use crate::context::{McpSurfaceClaimV1, ToolSurfaceSnapshotV1, snapshot_tool_surface_v1};
 use crate::error::{OxidraError, Result};
-use crate::session::{JOURNAL_SCHEMA, JournalEvent, McpToolDispatchAdmissionV1, SessionJournal};
+use crate::session::{
+    DispatchAdmissionErrorV1, DurableOutcomeCommitErrorV1, JOURNAL_SCHEMA, JournalEvent,
+    McpToolDispatchAdmissionV1, ProviderResponseDispatchAdmissionV1, SessionExecutionLeaseV1,
+    SessionJournal, TurnTransactionAdmissionV1,
+};
 use crate::turn::{ProviderRequestSlotState, provider_request_slot_state_for_version};
 use crate::types::{ToolDefinition, ToolResult};
 use crate::untrusted_display;
@@ -147,7 +155,7 @@ impl McpCallApprovalHandler for DenyMcpCallApproval {
 /// a live coordinator actually minted for its current handle. Tool lifecycle
 /// and recovery events use narrower coordinator/session admissions and are
 /// deliberately outside this capability's public vocabulary.
-pub struct McpJournalWriteCapabilityV1 {
+pub(crate) struct McpJournalWriteCapabilityV1 {
     session_id: String,
     journal_handle_id: String,
     activation_seq: u64,
@@ -155,6 +163,267 @@ pub struct McpJournalWriteCapabilityV1 {
     registry_epoch_id: String,
     registry_digest: String,
     authority: Arc<McpJournalAuthorityState>,
+}
+
+/// Typed failure from the pre-dispatch MCP Provider response gate.
+///
+/// `RejectedBeforeStart` is a caller-controlled event/profile rejection that
+/// is proven zero-write and leaves the journal reusable. Only
+/// `CapacityDeniedBeforeStart` permits the bounded capacity cancellation
+/// fallback. `Fatal` covers journal/protocol/I/O failures or authority lost
+/// after acquisition; the journal is marked reopen-required before that
+/// variant is returned. A stale or already-revoked coordinator rejected
+/// before capability acquisition is also zero-write `RejectedBeforeStart`.
+#[derive(Debug)]
+pub enum McpProviderResponseAdmissionErrorV1 {
+    RejectedBeforeStart(OxidraError),
+    CapacityDeniedBeforeStart(OxidraError),
+    Fatal(OxidraError),
+}
+
+/// Typed failure from an admitted MCP Provider response terminal.
+///
+/// `FallbackPermittedBeforeWrite` proves that the completed candidate was
+/// rejected before any terminal byte was written and the same one-shot guard
+/// may still be consumed by a bounded `response.failed`. `Fatal` means the
+/// durable prefix, authority, serialization, I/O or fsync outcome is no
+/// longer safely classifiable; callers must close/reopen instead of trying a
+/// second write.
+#[derive(Debug)]
+pub enum McpProviderResponseCommitErrorV1 {
+    FallbackPermittedBeforeWrite(OxidraError),
+    Fatal(OxidraError),
+}
+
+impl McpProviderResponseCommitErrorV1 {
+    pub fn into_error(self) -> OxidraError {
+        match self {
+            Self::FallbackPermittedBeforeWrite(error) | Self::Fatal(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for McpProviderResponseCommitErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FallbackPermittedBeforeWrite(error) | Self::Fatal(error) => {
+                std::fmt::Display::fmt(error, formatter)
+            }
+        }
+    }
+}
+
+impl std::error::Error for McpProviderResponseCommitErrorV1 {}
+
+impl From<DurableOutcomeCommitErrorV1> for McpProviderResponseCommitErrorV1 {
+    fn from(error: DurableOutcomeCommitErrorV1) -> Self {
+        match error {
+            DurableOutcomeCommitErrorV1::FallbackPermittedBeforeWrite(error) => {
+                Self::FallbackPermittedBeforeWrite(error)
+            }
+            DurableOutcomeCommitErrorV1::Fatal(error) => Self::Fatal(error),
+        }
+    }
+}
+
+impl McpProviderResponseAdmissionErrorV1 {
+    pub fn into_error(self) -> OxidraError {
+        match self {
+            Self::RejectedBeforeStart(error)
+            | Self::CapacityDeniedBeforeStart(error)
+            | Self::Fatal(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for McpProviderResponseAdmissionErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RejectedBeforeStart(error)
+            | Self::CapacityDeniedBeforeStart(error)
+            | Self::Fatal(error) => std::fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for McpProviderResponseAdmissionErrorV1 {}
+
+struct OwnedMcpProviderEventV1 {
+    value: Option<Value>,
+}
+
+impl OwnedMcpProviderEventV1 {
+    fn new(value: Value, maximum_bytes: usize) -> std::result::Result<Self, OxidraError> {
+        let owned = Self { value: Some(value) };
+        owned.validate(maximum_bytes)?;
+        Ok(owned)
+    }
+
+    fn validate(&self, maximum_bytes: usize) -> std::result::Result<(), OxidraError> {
+        preflight_mcp_provider_event_tree_v1(self.as_value(), maximum_bytes).map_err(|error| {
+            OxidraError::Session(format!(
+                "MCP Provider event exceeds the bounded v1 JSON profile: {error}"
+            ))
+        })
+    }
+
+    fn as_value(&self) -> &Value {
+        self.value.as_ref().expect("owned MCP Provider event")
+    }
+
+    fn as_value_mut(&mut self) -> &mut Value {
+        self.value.as_mut().expect("owned MCP Provider event")
+    }
+
+    fn into_value(mut self) -> Value {
+        self.value.take().expect("owned MCP Provider event")
+    }
+}
+
+impl Drop for OwnedMcpProviderEventV1 {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            drop_json_value_iteratively(value);
+        }
+    }
+}
+
+/// One-shot durable ownership of an MCP-owned Provider response attempt.
+///
+/// Construction atomically validates and binds the active turn's capacity
+/// boundary, acquires live coordinator authority, syncs the exact
+/// `response.started`, and creates its bounded one-shot outcome/recovery
+/// reservation. The parent turn admission remains live across sequential
+/// Provider attempts. The guard can commit only one terminal and poisons the
+/// journal handle if it is abandoned.
+pub struct McpProviderResponseDispatchAdmissionV1 {
+    capability: McpJournalWriteCapabilityV1,
+    inner: ProviderResponseDispatchAdmissionV1,
+    turn_id: String,
+    response_attempt_id: String,
+}
+
+impl McpProviderResponseDispatchAdmissionV1 {
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    pub fn response_attempt_id(&self) -> &str {
+        &self.response_attempt_id
+    }
+
+    /// Commit the unique successful terminal for this admitted response.
+    /// The exact response identity is inserted by the guard and cannot be
+    /// redirected by caller-provided JSON.
+    pub fn commit_completed_v1(
+        &mut self,
+        journal: &mut SessionJournal,
+        data: Value,
+    ) -> std::result::Result<JournalEvent, McpProviderResponseCommitErrorV1> {
+        let mut data =
+            OwnedMcpProviderEventV1::new(data, MAX_MCP_PROVIDER_COMPLETED_EVENT_BYTES_V1)
+                .map_err(McpProviderResponseCommitErrorV1::FallbackPermittedBeforeWrite)?;
+        bind_exact_response_attempt_v1(data.as_value_mut(), &self.response_attempt_id)
+            .map_err(McpProviderResponseCommitErrorV1::FallbackPermittedBeforeWrite)?;
+        data.validate(MAX_MCP_PROVIDER_COMPLETED_EVENT_BYTES_V1)
+            .map_err(McpProviderResponseCommitErrorV1::FallbackPermittedBeforeWrite)?;
+        let proof = self.capability.acquire_live_proof().map_err(|error| {
+            self.inner.mark_reopen_required_v1();
+            McpProviderResponseCommitErrorV1::Fatal(error)
+        })?;
+        journal
+            .append_mcp_provider_response_completed_with_live_proof_v1(
+                &proof,
+                &mut self.inner,
+                data.into_value(),
+            )
+            .map_err(|error| {
+                if matches!(error, DurableOutcomeCommitErrorV1::Fatal(_)) {
+                    self.inner.mark_reopen_required_v1();
+                }
+                McpProviderResponseCommitErrorV1::from(error)
+            })
+    }
+
+    /// Commit the unique bounded failure terminal for this admitted response.
+    pub fn commit_failed_v1(
+        &mut self,
+        journal: &mut SessionJournal,
+        error: &str,
+    ) -> std::result::Result<JournalEvent, McpProviderResponseCommitErrorV1> {
+        let proof = self.capability.acquire_live_proof().map_err(|error| {
+            self.inner.mark_reopen_required_v1();
+            McpProviderResponseCommitErrorV1::Fatal(error)
+        })?;
+        journal
+            .append_mcp_provider_response_failed_with_live_proof_v1(&proof, &mut self.inner, error)
+            .map_err(|error| {
+                self.inner.mark_reopen_required_v1();
+                McpProviderResponseCommitErrorV1::Fatal(error)
+            })
+    }
+
+    /// Commit the unique bounded cancellation terminal for this response.
+    pub fn commit_aborted_v1(
+        &mut self,
+        journal: &mut SessionJournal,
+        reason: &str,
+    ) -> std::result::Result<JournalEvent, McpProviderResponseCommitErrorV1> {
+        let proof = self.capability.acquire_live_proof().map_err(|error| {
+            self.inner.mark_reopen_required_v1();
+            McpProviderResponseCommitErrorV1::Fatal(error)
+        })?;
+        journal
+            .append_mcp_provider_response_aborted_with_live_proof_v1(
+                &proof,
+                &mut self.inner,
+                reason,
+            )
+            .map_err(|error| {
+                self.inner.mark_reopen_required_v1();
+                McpProviderResponseCommitErrorV1::Fatal(error)
+            })
+    }
+
+    /// Commit the crash-recoverable Provider context-limit intent/audit pair
+    /// while retaining the same live MCP and outcome authority.
+    pub fn commit_context_limit_v1(
+        &mut self,
+        journal: &mut SessionJournal,
+        reason: &str,
+    ) -> std::result::Result<(JournalEvent, JournalEvent), McpProviderResponseCommitErrorV1> {
+        let proof = self.capability.acquire_live_proof().map_err(|error| {
+            self.inner.mark_reopen_required_v1();
+            McpProviderResponseCommitErrorV1::Fatal(error)
+        })?;
+        journal
+            .append_mcp_provider_context_limit_with_live_proof_v1(&proof, &mut self.inner, reason)
+            .map_err(|error| {
+                self.inner.mark_reopen_required_v1();
+                McpProviderResponseCommitErrorV1::Fatal(error)
+            })
+    }
+}
+
+fn bind_exact_response_attempt_v1(data: &mut Value, response_attempt_id: &str) -> Result<()> {
+    let object = data.as_object_mut().ok_or_else(|| {
+        OxidraError::Session("MCP Provider response.completed data must be an object".to_owned())
+    })?;
+    if object
+        .get("response_attempt_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value != response_attempt_id)
+    {
+        return Err(OxidraError::Session(
+            "MCP Provider response.completed attempts to change its admitted response identity"
+                .to_owned(),
+        ));
+    }
+    object.insert(
+        "response_attempt_id".to_owned(),
+        Value::String(response_attempt_id.to_owned()),
+    );
+    Ok(())
 }
 
 /// Proof that one fixed synchronous journal append acquired the live
@@ -248,7 +517,8 @@ impl McpJournalWriteCapabilityV1 {
         })
     }
 
-    pub(crate) fn append_event_to_journal(
+    #[cfg(test)]
+    pub(crate) fn append_event_to_journal_for_test(
         &self,
         journal: &mut SessionJournal,
         kind: String,
@@ -268,10 +538,10 @@ impl McpJournalWriteCapabilityV1 {
             )));
         }
         let proof = self.acquire_live_proof()?;
-        journal.append_mcp_event_with_live_proof_v1(&proof, kind, turn_id, data)
+        journal.append_mcp_event_with_live_proof_for_test_v1(&proof, kind, turn_id, data)
     }
 
-    pub(crate) fn append_tool_cancelled_before_start_to_journal(
+    fn append_tool_cancelled_before_start_to_journal(
         &self,
         journal: &mut SessionJournal,
         turn_id: &str,
@@ -281,7 +551,7 @@ impl McpJournalWriteCapabilityV1 {
         journal.append_mcp_tool_cancelled_before_start_with_live_proof_v1(&proof, turn_id, data)
     }
 
-    pub(crate) fn append_tool_completed_before_start_to_journal(
+    fn append_tool_completed_before_start_to_journal(
         &self,
         journal: &mut SessionJournal,
         turn_id: &str,
@@ -383,17 +653,21 @@ impl McpRegistryActivationAdmissionV1 {
 /// Sole owner of a surface-approved registry and its dispatch authority.
 ///
 /// The coordinator binds one runtime registry epoch to one durable session
-/// and to the exact journal handle that activated or resumed it. Reopening the
-/// same durable session invalidates this coordinator even when the activation
-/// and registry digests are unchanged. Callers can request approval and
-/// execution, but cannot construct the private `DispatchPermit` consumed by
-/// the registry.
+/// and to the exact journal handle that activated or resumed it. It retains
+/// that handle's exclusive writer-lock lease until `shutdown` completes or the
+/// coordinator is dropped, so a second open generation cannot coexist with
+/// live MCP transports. Callers can request approval and execution, but cannot
+/// construct the private `DispatchPermit` consumed by the registry.
 pub struct McpExecutionCoordinator {
     policy: McpCoordinatorPolicy,
     coordinator_id: String,
     registry_epoch_id: String,
     session_id: String,
     journal_handle_id: String,
+    /// Keeps the exact session writer lock alive for the full execution
+    /// authority lifetime. Dropping the journal alone must not allow another
+    /// open generation to start MCP processes alongside this coordinator.
+    journal_execution_lease: Option<SessionExecutionLeaseV1>,
     activation_seq: u64,
     registry: McpRegistry,
     dispatch_poisoned: Arc<AtomicBool>,
@@ -443,6 +717,7 @@ pub struct McpResumeEligibility<'journal> {
     config_sha256: String,
     execution_plan_digest: String,
     registry_digest: String,
+    execution_lease: Option<SessionExecutionLeaseV1>,
     _journal: PhantomData<&'journal mut SessionJournal>,
 }
 
@@ -486,6 +761,7 @@ impl<'journal> McpResumeEligibility<'journal> {
             config_sha256,
             execution_plan_digest,
             registry_digest,
+            execution_lease: Some(journal.retain_execution_lease_v1()),
             _journal: PhantomData,
         })
     }
@@ -518,6 +794,17 @@ impl<'journal> McpResumeEligibility<'journal> {
             registry_digest: self.registry_digest,
         }
     }
+
+    pub(super) fn execution_lease(&self) -> SessionExecutionLeaseV1 {
+        // The eligibility is only minted from the exact locked journal handle;
+        // cloning the Arc-backed lease here transfers that ownership into the
+        // registry before startup. The eligibility itself remains consumed by
+        // `connect_for_resume` and cannot be reused.
+        self.execution_lease
+            .as_ref()
+            .expect("MCP resume eligibility execution lease missing")
+            .clone_v1()
+    }
 }
 
 impl McpResumePermit {
@@ -540,7 +827,18 @@ impl McpExecutionCoordinator {
     ) -> Result<Self> {
         let mut events = journal.read_events()?;
         validate_new_activation(&events)?;
-        let mut registry = approved_registry.into_registry();
+        let (mut registry, journal_execution_lease) = approved_registry.into_parts();
+        let journal_execution_lease = journal_execution_lease.ok_or_else(|| {
+            OxidraError::Session(
+                "MCP activation registry was not bound to the locked session journal before startup"
+                    .to_owned(),
+            )
+        })?;
+        if !journal_execution_lease.matches_journal(journal) {
+            return Err(OxidraError::Session(
+                "MCP activation registry belongs to a different session journal handle".to_owned(),
+            ));
+        }
         let policy = MCP_COORDINATOR_POLICY_V2;
         let bindings = registry.binding_identity_snapshot();
         let coordinator_id = Uuid::now_v7().to_string();
@@ -583,6 +881,7 @@ impl McpExecutionCoordinator {
             registry_epoch_id,
             session_id: journal.session_id().to_owned(),
             journal_handle_id: journal.handle_id().to_owned(),
+            journal_execution_lease: Some(journal_execution_lease),
             activation_seq: event.seq,
             registry,
             dispatch_poisoned: Arc::new(AtomicBool::new(false)),
@@ -602,7 +901,17 @@ impl McpExecutionCoordinator {
         approved_registry: ApprovedMcpResumeRegistry,
         journal: &SessionJournal,
     ) -> Result<Self> {
-        let (mut registry, resume_permit) = approved_registry.into_parts();
+        let (mut registry, resume_permit, journal_execution_lease) = approved_registry.into_parts();
+        let journal_execution_lease = journal_execution_lease.ok_or_else(|| {
+            OxidraError::Session(
+                "MCP resume registry lost its locked session execution lease".to_owned(),
+            )
+        })?;
+        if !journal_execution_lease.matches_journal(journal) {
+            return Err(OxidraError::Session(
+                "MCP resume registry belongs to a different session journal handle".to_owned(),
+            ));
+        }
         resume_permit.validate_journal(journal)?;
         let events = journal.read_events()?;
         validate_mcp_call_chain(&events)?;
@@ -637,6 +946,7 @@ impl McpExecutionCoordinator {
             registry_epoch_id: resume_permit.registry_epoch_id,
             session_id: journal.session_id().to_owned(),
             journal_handle_id: journal.handle_id().to_owned(),
+            journal_execution_lease: Some(journal_execution_lease),
             activation_seq: activation.seq,
             registry,
             dispatch_poisoned: Arc::new(AtomicBool::new(false)),
@@ -660,7 +970,7 @@ impl McpExecutionCoordinator {
     /// capability is issued, so copying public digest strings is not
     /// sufficient to obtain this authority and a capability cannot be reused
     /// after the session is reopened.
-    pub fn journal_write_capability_v1(
+    fn journal_write_capability_v1(
         &self,
         journal: &SessionJournal,
     ) -> Result<McpJournalWriteCapabilityV1> {
@@ -681,6 +991,133 @@ impl McpExecutionCoordinator {
             self.registry.digest().to_owned(),
             Arc::clone(&self.journal_authority_active),
         ))
+    }
+
+    /// Admit one MCP-owned Provider response against the exact active turn.
+    /// This is the sole production path for MCP `response.started`: it holds
+    /// live coordinator authority across the synchronous append and returns a
+    /// one-shot guard backed by the ordinary Provider outcome reservation.
+    pub fn admit_provider_response_v1(
+        &self,
+        journal: &mut SessionJournal,
+        turn_admission: &TurnTransactionAdmissionV1,
+        turn_id: &str,
+        data: Value,
+    ) -> std::result::Result<
+        McpProviderResponseDispatchAdmissionV1,
+        McpProviderResponseAdmissionErrorV1,
+    > {
+        // Take iterative-drop ownership before any fallible journal/authority
+        // check. A stale coordinator must not turn rejection of a deep caller-
+        // constructed Value into recursive stack overflow.
+        let mut data = OwnedMcpProviderEventV1::new(data, MAX_MCP_PROVIDER_START_EVENT_BYTES_V1)
+            .map_err(McpProviderResponseAdmissionErrorV1::RejectedBeforeStart)?;
+        if !self.journal_authority_active.is_active() {
+            return Err(McpProviderResponseAdmissionErrorV1::RejectedBeforeStart(
+                OxidraError::Session(
+                    "MCP coordinator journal authority has been revoked".to_owned(),
+                ),
+            ));
+        }
+        if let Err(error) = self.require_bound_journal(journal) {
+            return Err(McpProviderResponseAdmissionErrorV1::RejectedBeforeStart(
+                error,
+            ));
+        }
+        let capability = match self.journal_write_capability_v1(journal) {
+            Ok(capability) => capability,
+            Err(error) => {
+                journal.mark_reopen_required();
+                return Err(McpProviderResponseAdmissionErrorV1::Fatal(error));
+            }
+        };
+        let object = data.as_value_mut().as_object_mut().ok_or_else(|| {
+            McpProviderResponseAdmissionErrorV1::RejectedBeforeStart(OxidraError::Session(
+                "MCP response.started data must be an object".to_owned(),
+            ))
+        })?;
+        let response_attempt_id = object
+            .get("response_attempt_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                McpProviderResponseAdmissionErrorV1::RejectedBeforeStart(OxidraError::Session(
+                    "MCP response.started has no response_attempt_id for dispatch admission"
+                        .to_owned(),
+                ))
+            })?
+            .to_owned();
+        object.insert(
+            "mcp_registry_epoch_id".to_owned(),
+            Value::String(self.registry_epoch_id.clone()),
+        );
+        object.insert(
+            "mcp_registry_digest".to_owned(),
+            Value::String(self.registry.digest().to_owned()),
+        );
+        data.validate(MAX_MCP_PROVIDER_START_EVENT_BYTES_V1)
+            .map_err(McpProviderResponseAdmissionErrorV1::RejectedBeforeStart)?;
+        let proof = match capability.acquire_live_proof() {
+            Ok(proof) => proof,
+            Err(error) => {
+                journal.mark_reopen_required();
+                return Err(McpProviderResponseAdmissionErrorV1::Fatal(error));
+            }
+        };
+        let inner = match journal.append_mcp_provider_response_started_with_live_proof_v1(
+            &proof,
+            turn_admission,
+            turn_id,
+            data.into_value(),
+        ) {
+            Ok(inner) => inner,
+            Err(DispatchAdmissionErrorV1::CapacityDeniedBeforeStart(error)) => {
+                return Err(McpProviderResponseAdmissionErrorV1::CapacityDeniedBeforeStart(error));
+            }
+            Err(DispatchAdmissionErrorV1::Fatal(error)) => {
+                journal.mark_reopen_required();
+                return Err(McpProviderResponseAdmissionErrorV1::Fatal(error));
+            }
+        };
+        drop(proof);
+        Ok(McpProviderResponseDispatchAdmissionV1 {
+            capability,
+            inner,
+            turn_id: turn_id.to_owned(),
+            response_attempt_id,
+        })
+    }
+
+    /// Persist one canonical Provider-visible MCP tool surface.  Callers pass
+    /// the typed snapshot rather than a raw journal event, and the coordinator
+    /// proves that its embedded registry claim belongs to this live epoch.
+    pub fn append_context_tools_v1(
+        &self,
+        journal: &mut SessionJournal,
+        snapshot: &ToolSurfaceSnapshotV1,
+    ) -> Result<JournalEvent> {
+        snapshot.validate()?;
+        let claim = snapshot.mcp().ok_or_else(|| {
+            OxidraError::Session(
+                "MCP context.tools snapshot has no live registry surface claim".to_owned(),
+            )
+        })?;
+        if claim.registry_epoch_id() != self.registry_epoch_id
+            || claim.registry_digest() != self.registry.digest()
+        {
+            return Err(OxidraError::Session(
+                "MCP context.tools snapshot belongs to a different live registry epoch".to_owned(),
+            ));
+        }
+        let live_bindings = self.registry.surface_binding_snapshot_v1()?;
+        if claim.bindings() != live_bindings.as_slice() {
+            return Err(OxidraError::Session(
+                "MCP context.tools snapshot bindings do not match the live registry surface"
+                    .to_owned(),
+            ));
+        }
+        let capability = self.journal_write_capability_v1(journal)?;
+        let proof = capability.acquire_live_proof()?;
+        journal.append_mcp_context_tools_with_live_proof_v1(&proof, serde_json::to_value(snapshot)?)
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -1063,6 +1500,7 @@ impl McpExecutionCoordinator {
         self.registry.abort_transports();
         self.journal_authority_active.wait_for_writers();
         self.registry.shutdown().await;
+        self.journal_execution_lease.take();
     }
 }
 
@@ -1075,6 +1513,7 @@ impl Drop for McpExecutionCoordinator {
         self.journal_authority_active.begin_revoke();
         self.registry.abort_transports();
         self.journal_authority_active.wait_for_writers();
+        self.journal_execution_lease.take();
     }
 }
 
@@ -1122,8 +1561,8 @@ impl Drop for McpStartedCallGuard<'_> {
         if !self.terminalized {
             // A dropped future cannot await `Transport::terminate`.  Publish
             // a synchronous abort request before poisoning the journal; the
-            // transport owner task can then terminate the exact process tree
-            // independently of this borrowed guard.
+            // independent native reaper can then terminate and reap the exact
+            // process tree without depending on this borrowed guard or Tokio.
             self.transport_abort.abort();
             self.journal.mark_reopen_required();
         }

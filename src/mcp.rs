@@ -17,11 +17,15 @@ pub use config::{
 pub use coordinator::{
     DenyMcpCallApproval, MCP_ARGUMENT_DIGEST_VERSION, MCP_DISPATCH_PERMIT_VERSION,
     MCP_EXECUTION_COORDINATOR_VERSION, McpCallApprovalHandler, McpCallApprovalRequest,
-    McpCallIdentity, McpExecutionCoordinator, McpJournalWriteCapabilityV1, McpProviderSurfaceV1,
+    McpCallIdentity, McpExecutionCoordinator, McpProviderResponseAdmissionErrorV1,
+    McpProviderResponseCommitErrorV1, McpProviderResponseDispatchAdmissionV1, McpProviderSurfaceV1,
     McpResumeEligibility,
 };
-pub(crate) use coordinator::{LiveMcpJournalWriteProofV1, McpRegistryActivationAdmissionV1};
+pub(crate) use coordinator::{
+    LiveMcpJournalWriteProofV1, McpJournalWriteCapabilityV1, McpRegistryActivationAdmissionV1,
+};
 pub use journal::{MAX_MCP_CALLS_PER_RESPONSE, MCP_CALL_CHAIN_VALIDATOR_VERSION};
+pub(crate) const MCP_REGISTRY_ACTIVATED_KIND: &str = "mcp.registry.activated";
 pub(crate) use journal::{
     MAX_RESPONSE_STATUS_TEXT_BYTES_V2, MCP_CALL_CHAIN_VALIDATOR_VERSION_V1,
     MCP_CALL_CHAIN_VALIDATOR_VERSION_V2, argument_digest_v1, call_chain_validator_version,
@@ -55,6 +59,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+use crate::session::SessionExecutionLeaseV1;
 
 use crate::error::{OxidraError, Result};
 use crate::process::{ProcessTree, ProcessTreeAbortHandle};
@@ -453,8 +459,9 @@ pub struct McpStdioSession {
 /// The coordinator's started-call guard is dropped from cancellation paths,
 /// where awaiting is impossible. Calling `abort` synchronously signals the
 /// exact native containment identity and then publishes cancellation; it
-/// therefore does not depend on the Tokio runtime polling the transport owner
-/// task. The owner still performs the eventual asynchronous wait/reap and pipe
+/// therefore does not depend on the Tokio runtime polling a transport owner
+/// task. An independent native reaper retains the execution lease through the
+/// eventual synchronous wait/reap; Tokio remains responsible only for pipe
 /// drain. Keeping this capability separate from `Transport` lets the guard
 /// retain cleanup authority without borrowing the registry/session across an
 /// await.
@@ -465,16 +472,25 @@ pub(super) struct TransportAbortHandle {
 
 impl TransportAbortHandle {
     pub(super) fn abort(&self) {
-        self.state.native_abort.abort();
-        self.state.abort.cancel();
+        self.state.request_abort();
     }
 }
 
 struct TransportProcessState {
-    abort: CancellationToken,
     native_abort: ProcessTreeAbortHandle,
+    abort_requested: AtomicBool,
     exited: AtomicBool,
     finished: Notify,
+}
+
+impl TransportProcessState {
+    fn request_abort(&self) {
+        // Signal the exact kernel containment first. The independent native
+        // reaper observes the flag and retains the session execution lease
+        // until it has synchronously confirmed exit/reap.
+        self.native_abort.abort();
+        self.abort_requested.store(true, Ordering::Release);
+    }
 }
 
 /// Owns an untrusted JSON value across async cancellation boundaries without
@@ -498,6 +514,10 @@ pub(super) struct BoundedMcpJsonValue {
 const MAX_MCP_RESULT_DEPTH_RUNTIME: usize = 256;
 const MAX_MCP_RESULT_DEPTH_V1: usize = 128;
 const MAX_MCP_RESULT_NODES_V1: usize = 16_384;
+const MAX_MCP_PROVIDER_EVENT_DEPTH_V1: usize = 128;
+const MAX_MCP_PROVIDER_EVENT_NODES_V1: usize = 262_144;
+pub(super) const MAX_MCP_PROVIDER_START_EVENT_BYTES_V1: usize = 256 * 1024;
+pub(super) const MAX_MCP_PROVIDER_COMPLETED_EVENT_BYTES_V1: usize = 128 * 1024 * 1024;
 
 pub(super) struct ValidatedMcpArguments {
     value: Option<Value>,
@@ -594,12 +614,34 @@ pub(super) fn preflight_mcp_result_tree_v1(value: &Value) -> std::result::Result
     preflight_mcp_result_tree(value, MAX_MCP_RESULT_DEPTH_V1, MAX_MCP_RESULT_NODES_V1)
 }
 
+pub(super) fn preflight_mcp_provider_event_tree_v1(
+    value: &Value,
+    maximum_bytes: usize,
+) -> std::result::Result<(), String> {
+    preflight_mcp_json_tree(
+        value,
+        MAX_MCP_PROVIDER_EVENT_DEPTH_V1,
+        MAX_MCP_PROVIDER_EVENT_NODES_V1,
+        maximum_bytes,
+    )
+}
+
 fn preflight_mcp_result_tree(
     value: &Value,
     max_depth: usize,
     max_nodes: usize,
 ) -> std::result::Result<(), String> {
+    preflight_mcp_json_tree(value, max_depth, max_nodes, usize::MAX)
+}
+
+fn preflight_mcp_json_tree(
+    value: &Value,
+    max_depth: usize,
+    max_nodes: usize,
+    maximum_bytes: usize,
+) -> std::result::Result<(), String> {
     let mut nodes = 0usize;
+    let mut encoded_bytes = 0usize;
     let mut pending = vec![McpResultFrame::Value(value, 0)];
     while let Some(frame) = pending.pop() {
         match frame {
@@ -615,12 +657,55 @@ fn preflight_mcp_result_tree(
                 }
                 match value {
                     Value::Array(values) => {
+                        add_json_encoded_bytes(&mut encoded_bytes, 2, maximum_bytes)?;
+                        add_json_encoded_bytes(
+                            &mut encoded_bytes,
+                            values.len().saturating_sub(1),
+                            maximum_bytes,
+                        )?;
                         pending.push(McpResultFrame::Array(values.iter(), depth + 1));
                     }
                     Value::Object(values) => {
+                        add_json_encoded_bytes(&mut encoded_bytes, 2, maximum_bytes)?;
+                        add_json_encoded_bytes(
+                            &mut encoded_bytes,
+                            values.len().saturating_sub(1),
+                            maximum_bytes,
+                        )?;
+                        for key in values.keys() {
+                            add_json_encoded_bytes(
+                                &mut encoded_bytes,
+                                json_string_encoded_len(key)?,
+                                maximum_bytes,
+                            )?;
+                            add_json_encoded_bytes(&mut encoded_bytes, 1, maximum_bytes)?;
+                        }
                         pending.push(McpResultFrame::Object(values.iter(), depth + 1));
                     }
-                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+                    Value::Null => {
+                        add_json_encoded_bytes(&mut encoded_bytes, 4, maximum_bytes)?;
+                    }
+                    Value::Bool(value) => {
+                        add_json_encoded_bytes(
+                            &mut encoded_bytes,
+                            if *value { 4 } else { 5 },
+                            maximum_bytes,
+                        )?;
+                    }
+                    Value::Number(value) => {
+                        add_json_encoded_bytes(
+                            &mut encoded_bytes,
+                            value.to_string().len(),
+                            maximum_bytes,
+                        )?;
+                    }
+                    Value::String(value) => {
+                        add_json_encoded_bytes(
+                            &mut encoded_bytes,
+                            json_string_encoded_len(value)?,
+                            maximum_bytes,
+                        )?;
+                    }
                 }
             }
             McpResultFrame::Array(mut values, depth) => {
@@ -638,6 +723,33 @@ fn preflight_mcp_result_tree(
         }
     }
     Ok(())
+}
+
+fn add_json_encoded_bytes(
+    total: &mut usize,
+    additional: usize,
+    maximum: usize,
+) -> std::result::Result<(), String> {
+    *total = total
+        .checked_add(additional)
+        .ok_or_else(|| "JSON encoded size overflowed".to_owned())?;
+    if *total > maximum {
+        return Err(format!("JSON value exceeds {maximum} bytes when encoded"));
+    }
+    Ok(())
+}
+
+fn json_string_encoded_len(value: &str) -> std::result::Result<usize, String> {
+    value.chars().try_fold(2usize, |total, character| {
+        let encoded = match character {
+            '\"' | '\\' | '\u{0008}' | '\t' | '\n' | '\u{000c}' | '\r' => 2,
+            '\u{0000}'..='\u{001f}' => 6,
+            _ => character.len_utf8(),
+        };
+        total
+            .checked_add(encoded)
+            .ok_or_else(|| "JSON string encoded size overflowed".to_owned())
+    })
 }
 
 enum McpResultFrame<'a> {
@@ -677,18 +789,20 @@ impl McpStdioSession {
     /// authority of the current OS user.
     ///
     /// This low-level API does not perform project execution-plan approval.
-    /// Applications should normally use [`McpProjectConfig::approve_execution`]
-    /// followed by [`McpRegistry::connect`].
+    /// Applications that need durable MCP execution should use
+    /// [`McpProjectConfig::approve_execution`] followed by
+    /// [`McpRegistry::connect_for_activation`] with an open session journal.
     pub async fn connect_trusted(
         config: McpStdioConfig,
         cancellation: CancellationToken,
     ) -> Result<Self> {
-        Self::connect_prepared(config.prepare()?, cancellation).await
+        Self::connect_prepared(config.prepare()?, cancellation, None).await
     }
 
     pub(super) async fn connect_prepared(
         config: PreparedMcpStdioConfig,
         cancellation: CancellationToken,
+        execution_lease: Option<SessionExecutionLeaseV1>,
     ) -> Result<Self> {
         if cancellation.is_cancelled() {
             return Err(OxidraError::Interrupted);
@@ -699,7 +813,13 @@ impl McpStdioSession {
         }
         let mut transport = timeout(
             START_TIMEOUT,
-            Transport::spawn(&config, Arc::clone(&stderr_capture)),
+            Transport::spawn(
+                &config,
+                Arc::clone(&stderr_capture),
+                execution_lease
+                    .as_ref()
+                    .map(SessionExecutionLeaseV1::clone_v1),
+            ),
         )
         .await
         .map_err(|_| OxidraError::Mcp(format!("MCP server {} start timed out", config.name)))??;
@@ -738,7 +858,13 @@ impl McpStdioSession {
                 }
                 let mut legacy = timeout(
                     START_TIMEOUT,
-                    Transport::spawn(&config, Arc::clone(&stderr_capture)),
+                    Transport::spawn(
+                        &config,
+                        Arc::clone(&stderr_capture),
+                        execution_lease
+                            .as_ref()
+                            .map(SessionExecutionLeaseV1::clone_v1),
+                    ),
                 )
                 .await
                 .map_err(|_| {
@@ -1352,7 +1478,8 @@ struct Transport {
 
 struct TransportProcess {
     state: Arc<TransportProcessState>,
-    owner_task: Option<JoinHandle<()>>,
+    runtime_sentinel: Option<JoinHandle<()>>,
+    owner_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TransportProcess {
@@ -1367,8 +1494,7 @@ impl TransportProcess {
     }
 
     fn abort(&self) {
-        self.state.native_abort.abort();
-        self.state.abort.cancel();
+        self.state.request_abort();
     }
 
     async fn wait_finished(&self, duration: Duration) -> bool {
@@ -1383,8 +1509,23 @@ impl TransportProcess {
     }
 
     async fn join(&mut self) {
-        if let Some(task) = self.owner_task.take() {
+        while !self.exited() {
+            let notified = self.state.finished.notified();
+            if self.exited() {
+                break;
+            }
+            notified.await;
+        }
+        if let Some(task) = self.runtime_sentinel.take() {
             let _ = task.await;
+        }
+        if let Some(thread) = self.owner_thread.take() {
+            // `exited` is published only after the independent owner has
+            // reaped the direct child, emptied the native containment and
+            // released its execution lease. The thread is therefore already
+            // at its return boundary and this join cannot wait on untrusted
+            // code or on Tokio runtime progress.
+            let _ = thread.join();
         }
     }
 }
@@ -1392,46 +1533,160 @@ impl TransportProcess {
 impl Drop for TransportProcess {
     fn drop(&mut self) {
         // Terminate through the duplicated native containment identity before
-        // publishing cancellation. This remains effective when a current-
-        // thread runtime is alive but no longer being driven.
+        // publishing the abort request. The detached OS reaper remains alive
+        // even if the Tokio runtime is idle or has already been dropped.
         self.abort();
-        // Dropping the JoinHandle intentionally detaches the owner task.  It
-        // owns the process and will finish termination independently.
-        self.owner_task.take();
+        // Dropping a Tokio JoinHandle detaches the sentinel. If the runtime
+        // itself is later destroyed, the task guard synchronously aborts the
+        // native containment; it never owns or releases the execution lease.
+        self.runtime_sentinel.take();
+        // Dropping a std JoinHandle detaches only the handle, not the thread.
+        // The thread owns Child, ProcessTree and the final transport lease.
+        self.owner_thread.take();
     }
+}
+
+struct AbortTransportOnRuntimeDrop {
+    state: Arc<TransportProcessState>,
+}
+
+impl Drop for AbortTransportOnRuntimeDrop {
+    fn drop(&mut self) {
+        if !self.state.exited.load(Ordering::Acquire) {
+            self.state.request_abort();
+        }
+    }
+}
+
+fn watch_transport_runtime(
+    state: Arc<TransportProcessState>,
+) -> impl std::future::Future<Output = ()> {
+    // Construct the guard before returning the future. Tokio may destroy a
+    // freshly spawned task without ever polling it during runtime shutdown;
+    // an async-fn local would not exist in that case and could not request the
+    // native abort. Moving this synchronously-created guard into the future
+    // makes unpolled task destruction cancellation-safe.
+    let abort_on_drop = AbortTransportOnRuntimeDrop {
+        state: Arc::clone(&state),
+    };
+    retain_guard_until_future_drop(abort_on_drop, async move {
+        while !state.exited.load(Ordering::Acquire) {
+            let notified = state.finished.notified();
+            if state.exited.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    })
+}
+
+async fn retain_guard_until_future_drop<Guard, Future>(
+    guard: Guard,
+    future: Future,
+) -> Future::Output
+where
+    Future: std::future::Future,
+{
+    let _guard = guard;
+    future.await
 }
 
 struct TransportOwnerCompletion {
     state: Arc<TransportProcessState>,
+    /// The final runtime-only session-lock reference lives in the independent
+    /// native owner, not in a Tokio task or the coordinator Drop path.
+    execution_lease: Option<SessionExecutionLeaseV1>,
 }
 
 impl Drop for TransportOwnerCompletion {
     fn drop(&mut self) {
-        // This guard is an async-function argument, so it is owned by the
-        // generated future before its first poll. Runtime shutdown, task
-        // abortion and panic therefore synchronously terminate the native
-        // containment before releasing waiters, rather than leaving either
-        // cleanup or `wait_finished` dependent on the ordinary task tail.
-        self.state.native_abort.abort();
+        // The enclosing owner proves direct-child reap and containment
+        // emptiness before this field may drop. Release the lock lease before
+        // waking async waiters so a completed shutdown can immediately open a
+        // new session generation without racing the final Arc<File> drop.
+        self.execution_lease.take();
         self.state.exited.store(true, Ordering::Release);
         self.state.finished.notify_waiters();
     }
 }
 
-async fn own_transport_process(
-    mut child: Child,
-    mut process_tree: ProcessTree,
+struct TransportProcessOwner {
+    child: Child,
+    process_tree: ProcessTree,
     completion: TransportOwnerCompletion,
-) {
-    let state = &completion.state;
-    tokio::select! {
-        _ = state.abort.cancelled() => {
-            process_tree.terminate(&mut child).await;
+    reaped: bool,
+}
+
+impl TransportProcessOwner {
+    fn run(mut self) {
+        loop {
+            if self
+                .completion
+                .state
+                .abort_requested
+                .load(Ordering::Acquire)
+            {
+                self.abort_and_reap();
+                return;
+            }
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.finish_after_direct_exit();
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(_) => {
+                    // Losing the ability to observe the direct child is not a
+                    // reason to release execution authority. Force exact
+                    // native termination and retain the lease until a later
+                    // try_wait proves that the child has been reaped.
+                    self.abort_and_reap();
+                    return;
+                }
+            }
         }
-        _ = child.wait() => {
-            // A server can exit before its parent is reaped.  Keep the
-            // process-tree cleanup symmetric with the explicit abort path.
-            process_tree.terminate_descendants();
+    }
+
+    fn finish_after_direct_exit(&mut self) {
+        // On Windows the leader may exit while descendants remain in the Job.
+        // Terminate the complete containment and wait for its kernel-owned
+        // active-process count to reach zero before releasing the lease.
+        self.process_tree.terminate_descendants();
+        self.process_tree.wait_containment_empty_blocking();
+        self.reaped = true;
+    }
+
+    fn abort_and_reap(&mut self) {
+        self.completion.state.request_abort();
+        // If the OS can never prove exit/reap, this call deliberately retains
+        // the session lock forever rather than authorizing a second live
+        // execution generation.
+        self.process_tree
+            .terminate_and_reap_blocking(&mut self.child);
+        self.reaped = true;
+    }
+}
+
+impl Drop for TransportProcessOwner {
+    fn drop(&mut self) {
+        if !self.reaped {
+            // This also covers a panic inside the owner thread. Field drop --
+            // including TransportOwnerCompletion and its execution lease --
+            // cannot begin until this synchronous reap has completed.
+            self.abort_and_reap();
+        }
+    }
+}
+
+fn terminate_direct_child_and_reap_blocking(child: &mut Child) {
+    let _ = child.start_kill();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) | Err(_) => {
+                let _ = child.start_kill();
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 }
@@ -1440,6 +1695,7 @@ impl Transport {
     async fn spawn(
         config: &PreparedMcpStdioConfig,
         stderr_capture: Arc<Mutex<StderrCapture>>,
+        execution_lease: Option<SessionExecutionLeaseV1>,
     ) -> Result<Self> {
         let mut command = Command::new(&config.command);
         command
@@ -1470,8 +1726,9 @@ impl Transport {
         let mut process_tree = match ProcessTree::attach_contained(&child) {
             Ok(tree) => tree,
             Err(error) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                // No untrusted code may outlive the startup lease even when
+                // this async constructor is cancelled on an error path.
+                terminate_direct_child_and_reap_blocking(&mut child);
                 return Err(OxidraError::Mcp(format!(
                     "failed to own MCP server {} process tree: {error}",
                     config.name
@@ -1481,7 +1738,7 @@ impl Transport {
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
             None => {
-                process_tree.terminate(&mut child).await;
+                process_tree.terminate_and_reap_blocking(&mut child);
                 return Err(OxidraError::Mcp(format!(
                     "MCP server {} has no stdin",
                     config.name
@@ -1491,7 +1748,7 @@ impl Transport {
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
-                process_tree.terminate(&mut child).await;
+                process_tree.terminate_and_reap_blocking(&mut child);
                 return Err(OxidraError::Mcp(format!(
                     "MCP server {} has no stdout",
                     config.name
@@ -1501,7 +1758,7 @@ impl Transport {
         let stderr = match child.stderr.take() {
             Some(stderr) => stderr,
             None => {
-                process_tree.terminate(&mut child).await;
+                process_tree.terminate_and_reap_blocking(&mut child);
                 return Err(OxidraError::Mcp(format!(
                     "MCP server {} has no stderr",
                     config.name
@@ -1512,7 +1769,7 @@ impl Transport {
         let native_abort = match process_tree.abort_handle() {
             Ok(handle) => handle,
             Err(error) => {
-                process_tree.terminate(&mut child).await;
+                process_tree.terminate_and_reap_blocking(&mut child);
                 stderr_task.abort();
                 let _ = stderr_task.await;
                 return Err(OxidraError::Mcp(format!(
@@ -1522,7 +1779,7 @@ impl Transport {
             }
         };
         if let Err(error) = process_tree.resume_suspended() {
-            process_tree.terminate(&mut child).await;
+            process_tree.terminate_and_reap_blocking(&mut child);
             stderr_task.abort();
             let _ = stderr_task.await;
             return Err(OxidraError::Mcp(format!(
@@ -1531,22 +1788,44 @@ impl Transport {
             )));
         }
         let process_state = Arc::new(TransportProcessState {
-            abort: CancellationToken::new(),
             native_abort,
+            abort_requested: AtomicBool::new(false),
             exited: AtomicBool::new(false),
             finished: Notify::new(),
         });
-        let owner_task = tokio::spawn(own_transport_process(
+        let owner = TransportProcessOwner {
             child,
             process_tree,
-            TransportOwnerCompletion {
+            completion: TransportOwnerCompletion {
                 state: Arc::clone(&process_state),
+                execution_lease,
             },
-        ));
+            reaped: false,
+        };
+        let owner_thread = match std::thread::Builder::new()
+            .name("oxidra-mcp-reaper".to_owned())
+            .spawn(move || owner.run())
+        {
+            Ok(thread) => thread,
+            Err(error) => {
+                // The failed Builder drops the owner closure here. Its Drop
+                // synchronously aborts/reaps the already-resumed child while
+                // retaining the execution lease, so this error cannot leave
+                // either live code or a prematurely reusable journal lock.
+                stderr_task.abort();
+                let _ = stderr_task.await;
+                return Err(OxidraError::Mcp(format!(
+                    "failed to start MCP server {} native reaper: {error}",
+                    config.name
+                )));
+            }
+        };
+        let runtime_sentinel = tokio::spawn(watch_transport_runtime(Arc::clone(&process_state)));
         Ok(Self {
             process: TransportProcess {
                 state: process_state,
-                owner_task: Some(owner_task),
+                runtime_sentinel: Some(runtime_sentinel),
+                owner_thread: Some(owner_thread),
             },
             stdin,
             stdout: BufReader::new(stdout),
@@ -1925,43 +2204,7 @@ fn ensure_json_within_limit(
     value: &Value,
     maximum_bytes: usize,
 ) -> std::result::Result<(), String> {
-    let mut writer = BoundedJsonWriter::new(maximum_bytes);
-    match serde_json::to_writer(&mut writer, value) {
-        Ok(()) => Ok(()),
-        Err(_) if writer.exceeded => Err(format!("JSON value exceeds {maximum_bytes} bytes")),
-        Err(error) => Err(format!("cannot serialize JSON value: {error}")),
-    }
-}
-
-struct BoundedJsonWriter {
-    written: usize,
-    maximum: usize,
-    exceeded: bool,
-}
-
-impl BoundedJsonWriter {
-    fn new(maximum: usize) -> Self {
-        Self {
-            written: 0,
-            maximum,
-            exceeded: false,
-        }
-    }
-}
-
-impl std::io::Write for BoundedJsonWriter {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        if self.written.saturating_add(buffer.len()) > self.maximum {
-            self.exceeded = true;
-            return Err(std::io::Error::other("bounded JSON writer limit exceeded"));
-        }
-        self.written += buffer.len();
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    preflight_mcp_json_tree(value, usize::MAX, usize::MAX, maximum_bytes)
 }
 
 #[derive(Debug)]
@@ -2255,6 +2498,54 @@ mod tests {
         }))
         .expect_err("oversized model envelope must fail closed");
         assert!(error.contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn iterative_json_size_matches_serde_encoding() {
+        let fixtures = [
+            Value::Null,
+            json!(true),
+            json!(false),
+            json!(12345),
+            json!("quote\" slash\\ controls\u{0000}\u{0008}\t\n\u{000c}\r 界"),
+            json!([]),
+            json!({}),
+            json!([null, true, "x", {"key\n界":"value\\\""}]),
+        ];
+        for value in fixtures {
+            let encoded = serde_json::to_vec(&value).expect("encode JSON size fixture");
+            preflight_mcp_provider_event_tree_v1(&value, encoded.len())
+                .expect("exact encoded-byte boundary must be accepted");
+            if !encoded.is_empty() {
+                let error =
+                    preflight_mcp_provider_event_tree_v1(&value, encoded.len().saturating_sub(1))
+                        .expect_err("one byte below the exact encoding must be rejected");
+                assert!(error.contains("when encoded"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_abort_guard_exists_before_the_sentinel_is_polled() {
+        struct DropProbe(Arc<AtomicBool>);
+
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let future = retain_guard_until_future_drop(
+            DropProbe(Arc::clone(&dropped)),
+            std::future::pending::<()>(),
+        );
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(future);
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "dropping an unpolled sentinel future must synchronously drop its abort guard"
+        );
     }
 
     #[test]

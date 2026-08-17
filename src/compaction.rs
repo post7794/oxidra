@@ -3846,7 +3846,7 @@ where
     ) {
         Ok(events) => events,
         Err(DurableOutcomeCommitErrorV1::Fatal(error)) => return Err(error),
-        Err(DurableOutcomeCommitErrorV1::CapacityDenied(error)) => {
+        Err(DurableOutcomeCommitErrorV1::FallbackPermittedBeforeWrite(error)) => {
             let fallback_message = format!(
                 "validated compaction response could not be committed as a checkpoint: {error}"
             );
@@ -4265,7 +4265,7 @@ fn commit_compaction_terminal_v1(
     ) {
         Ok(_) => Ok(()),
         Err(DurableOutcomeCommitErrorV1::Fatal(error)) => Err(error),
-        Err(DurableOutcomeCommitErrorV1::CapacityDenied(primary_error)) => {
+        Err(DurableOutcomeCommitErrorV1::FallbackPermittedBeforeWrite(primary_error)) => {
             let fallback = compaction_failure_data_v1(
                 attempt_id,
                 started_seq,

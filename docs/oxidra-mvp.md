@@ -1,8 +1,8 @@
 # Oxidra 个人 CLI Agent 设计
 
-状态：M1-M3 已实现；M5 checkpoint 协议、低权限版本化 summary envelope、真实 Provider `compact_once`、checkpoint-aware Agent projection、受控历史回查、model-aware context 测量/审计、Provider context 超限后的显式 retry/abandon 恢复，以及 `--experimental-auto-compact` preflight 已经实现。当前改动已通过本地 Windows 验证；推送后仍需由 Linux、macOS 和 Windows 远程 CI 重新确认。主线还包含 MCP stdio kernel/config/schema/registry 的 Rust 基础，但尚未接入 CLI、Agent、approval 或 journal，因此不是用户可用的扩展入口。2026-08-07 的 `Kimi-K2.7-Code` prompt-v3 live baseline 在 3/5/10 轮均保留 17/17 事实且未执行注入文本；该证据只绑定记录的 Provider usage domain，其他当前/默认模型未测，因此自动 compaction 继续显式 opt-in。
+状态：M1-M3 已实现；M5 checkpoint 协议、低权限版本化 summary envelope、真实 Provider `compact_once`、checkpoint-aware Agent projection、受控历史回查、model-aware context 测量/审计、Provider context 超限后的显式 retry/abandon 恢复，以及 `--experimental-auto-compact` preflight 已经实现。当前改动已通过本地 Windows 验证；推送后仍需由 Linux、macOS 和 Windows 远程 CI 重新确认。主线还包含 MCP stdio kernel/config/schema/registry 与 durable coordinator/journal policy core，但尚未接入 CLI、Agent tool surface 或用户 approval，因此不是用户可用的扩展入口。2026-08-07 的 `Kimi-K2.7-Code` prompt-v3 live baseline 在 3/5/10 轮均保留 17/17 事实且未执行注入文本；该证据只绑定记录的 Provider usage domain，其他当前/默认模型未测，因此自动 compaction 继续显式 opt-in。
 
-MCP 首次发布前的内部迭代已压平成单一 v1 policy；尚未进入持久 journal 的本地提交不伪装成历史兼容协议。完整接入顺序见 `docs/mcp-roadmap.md`。
+MCP 首次发布前，尚未进入 durable journal 的 kernel/config/schema/registry identity 已压平成各自单一的 v1 policy；已经写入 journal 的 coordinator/call-chain 等协议按其真实版本保留，不伪装成不存在的历史兼容层。完整接入顺序见 `docs/mcp-roadmap.md`。
 
 ## 1. 产品边界
 
@@ -34,7 +34,7 @@ MCP 首次发布前的内部迭代已压平成单一 v1 policy；尚未进入持
 暂不实现：
 
 - 通用扩展/插件安装器，以及 MCP 的 CLI、Agent、approval、journal 用户闭环。底层
-  stdio config/schema/registry 已实现，但不能据此宣称 MCP 已可用。
+  stdio config/schema/registry 与 durable coordinator/journal policy 已实现，但不能据此宣称 MCP 已可用。
 - Goal mode、默认启用的自动 compaction、sub-agent。M5 的 checkpoint/reducer、真实 Provider 摘要调用、受控历史回查和显式实验入口已进入主线，但默认开关仍关闭。
 - TUI、steering/follow-up 队列。
 - delete/move 等更多文件工具。

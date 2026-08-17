@@ -14,6 +14,7 @@ use super::{
 };
 use crate::context::McpSurfaceBindingV1;
 use crate::error::{OxidraError, Result};
+use crate::session::{SessionExecutionLeaseV1, SessionJournal};
 use crate::types::ToolDefinition;
 use crate::untrusted_display;
 
@@ -55,6 +56,10 @@ pub struct McpRegistry {
     sessions: BTreeMap<String, McpStdioSession>,
     bindings: BTreeMap<String, McpToolBinding>,
     dispatch_authority: Option<RegistryDispatchAuthority>,
+    /// Present when registry startup was bound to a locked session journal
+    /// before any MCP process was spawned. Test-only empty registries may omit
+    /// it, but coordinator activation/resume then fail closed.
+    execution_lease: Option<SessionExecutionLeaseV1>,
 }
 
 struct RegistryDispatchAuthority {
@@ -88,14 +93,24 @@ pub(super) struct PreparedMcpRegistryCall {
 }
 
 impl ApprovedMcpRegistry {
-    pub(super) fn into_registry(self) -> McpRegistry {
-        self.registry
+    pub(super) fn into_parts(self) -> (McpRegistry, Option<SessionExecutionLeaseV1>) {
+        let mut registry = self.registry;
+        let execution_lease = registry.execution_lease.take();
+        (registry, execution_lease)
     }
 }
 
 impl ApprovedMcpResumeRegistry {
-    pub(super) fn into_parts(self) -> (McpRegistry, McpResumePermit) {
-        (self.registry, self.permit)
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        McpRegistry,
+        McpResumePermit,
+        Option<SessionExecutionLeaseV1>,
+    ) {
+        let mut registry = self.registry;
+        let execution_lease = registry.execution_lease.take();
+        (registry, self.permit, execution_lease)
     }
 }
 
@@ -160,12 +175,26 @@ impl PreparedMcpRegistryCall {
 }
 
 impl McpRegistry {
-    pub async fn connect(
+    /// Connect a registry whose process startup is bound to an already-open
+    /// session journal.  The journal consumes its one-shot activation-start
+    /// slot and validates the durable prefix before the first child spawn.
+    /// The resulting lease travels with the registry through surface approval
+    /// and coordinator activation; dropping the journal alone therefore
+    /// cannot open a second generation while these transports remain alive.
+    pub async fn connect_for_activation(
         config: &ApprovedMcpProjectConfig,
         reserved_provider_names: impl IntoIterator<Item = String>,
+        journal: &mut SessionJournal,
         cancellation: &CancellationToken,
     ) -> Result<Self> {
-        Self::connect_inner(config, reserved_provider_names, cancellation).await
+        let execution_lease = journal.claim_mcp_activation_startup_v1()?;
+        Self::connect_inner(
+            config,
+            reserved_provider_names,
+            cancellation,
+            Some(execution_lease),
+        )
+        .await
     }
 
     /// Connect a live registry for an existing durable MCP epoch.
@@ -181,8 +210,15 @@ impl McpRegistry {
         cancellation: &CancellationToken,
     ) -> Result<McpResumeRegistry> {
         eligibility.validate_config(config.source_sha256(), config.execution_plan_digest())?;
+        let execution_lease = eligibility.execution_lease();
         let permit = eligibility.into_permit();
-        let registry = Self::connect_inner(config, reserved_provider_names, cancellation).await?;
+        let registry = Self::connect_inner(
+            config,
+            reserved_provider_names,
+            cancellation,
+            Some(execution_lease),
+        )
+        .await?;
         Ok(McpResumeRegistry { registry, permit })
     }
 
@@ -190,6 +226,7 @@ impl McpRegistry {
         config: &ApprovedMcpProjectConfig,
         reserved_provider_names: impl IntoIterator<Item = String>,
         cancellation: &CancellationToken,
+        execution_lease: Option<SessionExecutionLeaseV1>,
     ) -> Result<Self> {
         let mut sessions = BTreeMap::new();
         let mut bindings = BTreeMap::new();
@@ -201,6 +238,9 @@ impl McpRegistry {
             let session = match McpStdioSession::connect_prepared(
                 server_config.clone(),
                 cancellation.clone(),
+                execution_lease
+                    .as_ref()
+                    .map(SessionExecutionLeaseV1::clone_v1),
             )
             .await
             {
@@ -297,6 +337,7 @@ impl McpRegistry {
             sessions,
             bindings,
             dispatch_authority: None,
+            execution_lease,
         })
     }
 
@@ -482,6 +523,10 @@ impl McpRegistry {
 
     pub async fn shutdown(&mut self) {
         shutdown_sessions(&mut self.sessions).await;
+        // Explicit shutdown is the hand-off point at which no transport can
+        // execute anymore. Release a pre-start session lease even when the
+        // registry wrapper remains owned by its caller.
+        self.execution_lease.take();
     }
 
     pub(super) fn abort_transports(&self) {
@@ -584,6 +629,7 @@ mod tests {
             sessions: BTreeMap::new(),
             bindings: BTreeMap::new(),
             dispatch_authority: None,
+            execution_lease: None,
         };
         let error = registry
             .approve_surface(&"0".repeat(64))

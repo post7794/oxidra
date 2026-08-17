@@ -193,6 +193,42 @@ impl ProcessTree {
         }
         let _ = tokio::time::timeout(PROCESS_EXIT_GRACE, child.wait()).await;
     }
+
+    /// Terminate and synchronously reap a contained child without depending
+    /// on an async runtime. This operation intentionally has no timeout: the
+    /// caller must retain its execution lease until the OS proves that both
+    /// the direct process and the complete native containment are gone.
+    pub(crate) fn terminate_and_reap_blocking(&mut self, child: &mut Child) {
+        self.terminate_descendants();
+        let _ = child.start_kill();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) | Err(_) => {
+                    self.terminate_descendants();
+                    let _ = child.start_kill();
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        self.terminate_descendants();
+        self.wait_containment_empty_blocking();
+    }
+
+    /// Block until the platform containment contains no live process.
+    ///
+    /// The MCP transport reaper calls this only after it has requested
+    /// termination and synchronously reaped the direct child. Linux MCP
+    /// servers cannot create descendant processes under the frozen seccomp
+    /// profile, so the direct-child wait is sufficient there. A Windows Job
+    /// Object may still contain descendants after the leader exits, and its
+    /// signalled state is the kernel proof that the complete job is empty.
+    pub(crate) fn wait_containment_empty_blocking(&self) {
+        #[cfg(windows)]
+        self.job.wait_empty_blocking();
+        #[cfg(not(windows))]
+        let _ = self;
+    }
 }
 
 impl ProcessTreeAbortHandle {
@@ -552,5 +588,39 @@ impl WindowsJob {
         use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 
         let _ = unsafe { TerminateJobObject(self.handle.as_raw_handle().cast(), 1) };
+    }
+
+    fn wait_empty_blocking(&self) {
+        use std::mem::{size_of, zeroed};
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr;
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject,
+        };
+
+        // A Job Object is not generally documented to become signalled merely
+        // because TerminateJobObject made it empty. Query the kernel-owned
+        // active-process count instead. Do not turn an unexpected query
+        // failure into permission to
+        // release the session execution lease. Retrying forever is the
+        // deliberate fail-closed outcome: a new journal generation must not
+        // start while the old Job cannot be proven empty.
+        loop {
+            let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.handle.as_raw_handle().cast(),
+                    JobObjectBasicAccountingInformation,
+                    (&raw mut accounting).cast(),
+                    size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                    ptr::null_mut(),
+                )
+            };
+            if queried != 0 && accounting.ActiveProcesses == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }

@@ -56,8 +56,8 @@ use crate::projection::{
 };
 use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
 use crate::session::{
-    DispatchAdmissionErrorV1, JournalEvent, McpRecoverySkipV1, ProviderResponseDispatchAdmissionV1,
-    SessionJournal, TurnTransactionAdmissionV1,
+    DispatchAdmissionErrorV1, DurableOutcomeCommitErrorV1, JournalEvent, McpRecoverySkipV1,
+    ProviderResponseDispatchAdmissionV1, SessionJournal, TurnTransactionAdmissionV1,
 };
 use crate::tools::{BuiltinTools, ToolContext};
 use crate::turn::{
@@ -695,7 +695,7 @@ impl Agent {
                 .append_provider_response_completed_v1(&mut response_admission, response_data)
             {
                 Ok(event) => event,
-                Err(commit_error) => {
+                Err(DurableOutcomeCommitErrorV1::FallbackPermittedBeforeWrite(commit_error)) => {
                     let fallback = self.journal.append_provider_response_failed_v1(
                         &mut response_admission,
                         &format!("response completed but could not be committed: {commit_error}"),
@@ -705,6 +705,9 @@ impl Agent {
                             "response commit failed ({commit_error}); reserved fallback terminal also failed ({fallback_error})"
                         )));
                     }
+                    return Err(commit_error);
+                }
+                Err(DurableOutcomeCommitErrorV1::Fatal(commit_error)) => {
                     return Err(commit_error);
                 }
             };

@@ -77,11 +77,11 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
   seccomp/pidfd 时，以及其他 Unix（包括当前 macOS）缺少等价边界时，都会 fail closed。
   受支持平台上的连接失败、取消、协议错误、in-doubt、shutdown 或宿主强杀不会留下
   MCP 后代进程。
-- stdio owner task 负责正常的异步 wait/reap，但 session 或已 started 调用的 future 在
-  `Drop` 中不能依赖 Tokio 再次 poll。transport 因此另外持有复制的 Linux pidfd / Windows
-  Job handle，先同步终止 exact containment identity，再通知 owner task 收尾；current-thread
-  runtime 即使暂时不再驱动，也不能让 server 继续执行。若 runtime 已被整体销毁，这项保证
-  不扩张为“立即完成 Unix zombie reap”；完整 wait 仍由可运行的异步 owner 完成。
+- stdio transport 把 `Child`、`ProcessTree` 和最后一份 execution lease 交给独立的原生 reaper
+  thread；kill 只是请求，只有 direct child 的同步 `try_wait` 已完成 reap，且 Windows Job 的
+  `ActiveProcesses` 已降为零，才会释放 lease 并发布完成。session、runtime 或已 started 调用的
+  future 在 `Drop` 中通过复制的 Linux pidfd / Windows Job handle 同步请求终止；即使
+  current-thread runtime 不再驱动或已整体销毁，reap 与锁释放也不依赖 Tokio 再次 poll。
 - Linux kernel v1 的 lifecycle 保证来自“禁止 server 创建独立子进程”，不是启动后补扫后代。
   因此当前不支持需要 subprocess 的 MCP server，也不支持依赖 `npx`、shell wrapper
   等二次 spawn 的启动链；应直接配置最终 interpreter/executable。若未来需要允许
@@ -162,9 +162,13 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
   kernel v1 和 JSON Schema profile v1 进入 registry-digest v1；字面量 fixture 固定
   其 SHA-256。coordinator activation 首次把该 v1 identity 写入 journal；不存在需要兼容的
   v2-v4 伪历史 digest。
-- registry 可统一 shutdown 全部长连接进程，但真实 dispatch 已不是公开方法；surface
-  digest 匹配后生成的 `ApprovedMcpRegistry` 只能交给 execution coordinator。registry
-  内部 dispatch 还要求 coordinator 私有、按值消费且不可 clone 的 `DispatchPermit`。
+- registry 可统一 shutdown 全部长连接进程，但真实 dispatch 已不是公开方法；无 session
+  lease 的普通 `McpRegistry::connect` 也不再是公开入口。首次 activation 必须由
+  `McpRegistry::connect_for_activation(session journal, ...)` 在 spawn 前消费 exact journal
+  generation 的一次性 activation-start slot、校验无既有 activation/待结 compaction boundary，
+  并捕获 lock lease；digest 匹配后生成的 `ApprovedMcpRegistry` 只能交给 execution coordinator。
+  registry 内部 dispatch
+  还要求 coordinator 私有、按值消费且不可 clone 的 `DispatchPermit`。
   `McpStdioSession::call_tool` 仍保留为显式高级调用方使用的低层 API，不属于 Agent 的
   正常执行路径，也不提供 journal/approval 语义。
 
@@ -179,7 +183,8 @@ execution-plan digest 与 registry digest 是单向的两层证据：前者在�
 和私有类型建立以下边界，而不是依赖调用约定：
 
 ```text
-McpRegistry::approve_surface(expected digest)
+McpRegistry::connect_for_activation(session journal, ...)
+→ approve_surface(expected digest)
 → ApprovedMcpRegistry
 → McpExecutionCoordinator::activate(session journal)
 → private single-use DispatchPermit
@@ -195,16 +200,24 @@ McpRegistry::approve_surface(expected digest)
 - 首次 activation 由 coordinator 私有构造、按值消费的一次性 bootstrap token 提交；之后
   MCP-reserved journal event 必须携带同一 live coordinator 为 exact session/activation/epoch
   **以及 exact runtime journal handle** 生成的 opaque writer capability。handle identity 不写入
-  journal，也不参与 durable digest；它只是当前进程内的 exact-handle binding，并不延长 journal
-  lock 的生命周期。即使 session ID、activation 和
-  registry digest 均未变化，关闭并 reopen 后也会生成新 handle，旧 coordinator/capability 必须
-  在任何验证或 dispatch 前因 handle mismatch fail closed。不存在 crate-wide raw MCP append 或
+  journal，也不参与 durable digest。coordinator 同时持有该 journal 原始 OS lock handle 的
+  runtime-only execution lease；每个 transport native reaper 也保留 lease 到 native exit/reap，单独
+  drop `SessionJournal` 或 coordinator 不会在旧 MCP transport 仍存活时释放 writer lock。只有
+  coordinator/registry shutdown 或 Drop 先 revoke writer、终止 transport，并且 native reaper
+  完成后才允许 reopen；新 handle 仍会使旧 capability 在任何验证
+  或 dispatch 前 fail closed。不存在 crate-wide raw MCP append 或
   可公开构造的 capability；shutdown/Drop 的 revoke 与已开始的同步 append 通过同一 gate 线性化，
   revoke 返回后不会再有晚到写入。为避免阻塞中的 journal fsync 把 server termination 卡在 gate
   后面，coordinator 会先发布 revoke 并通过 native containment handle 同步终止所有 transport，
-  再等待已进入 gate 的 writer 完成。公开 v1 capability 仅覆盖 Provider response/context
-  vocabulary；tool lifecycle/recovery 继续要求 coordinator/session 的 typed admission。它仍
-  尚不是未来 v3 按 response identity 收窄的 typed Provider writer。
+  再等待已进入 gate 的 writer 完成。底层 journal capability 为 crate-private；公开 v1 Provider
+  response writer 会校验并绑定 active parent turn reserve，同时创建一次性的 Provider outcome
+  reservation，并绑定 live coordinator proof 与 exact response identity；父 turn admission 可跨同一
+  turn 的顺序 Provider attempts 保持存活。未提交 terminal 的 guard Drop 会把 handle 标为
+  reopen-required。`response.completed` 的公开 commit 结果还区分“第一字节前拒绝、允许同一 guard
+  写 bounded failed fallback”和“Fatal、必须 close/reopen”；后者会立即 poison 当前 handle，不能靠
+  错误文案猜测是否可重试。start/completed 的不可信内存 JSON 在任何 clone/serialize 前同时执行
+  O(depth) 的 depth、node 与精确 encoded-byte preflight，并在 coordinator 注入 identity 后复验最终
+  canonical data。tool lifecycle/recovery 继续要求更窄的 coordinator/session typed admission。
 - 每次调用先对参数完成同步 bounded ownership/preflight，再验证 durable
   `response.completed.output_items` 中存在唯一、同 turn/call ID、同 provider name、同参数
   digest 的 Provider call；对应的 `response.started` 还必须显式记录当前
@@ -244,23 +257,28 @@ session reopen/recovery 后，用重新取得 execution trust 与 surface trust 
 resume 的启动顺序由类型而不是注释约定：只有 `SessionStore::open` 返回的同一 journal handle
 能一次性签发 `McpResumeEligibility`；`McpRegistry::connect_for_resume` 在 spawn 前消费它，并返回
 独立的 `McpResumeRegistry`；其 surface approval 生成 `ApprovedMcpResumeRegistry`，而
-`McpExecutionCoordinator::resume` 不接受普通 `connect` 产生的 `ApprovedMcpRegistry`。eligibility
+`McpExecutionCoordinator::resume` 不接受 activation 路径产生的 `ApprovedMcpRegistry`。eligibility
 同时绑定 open-handle nonce、session、activation seq/版本、config SHA、execution-plan digest、
 registry epoch/digest；配置不一致会在执行任何 MCP 代码前失败，同一 open handle 不能重复启动。
-这里的 one-shot resume nonce 与 coordinator/capability 的 runtime handle binding 是两道不同门：
+这里的 one-shot resume nonce 与 coordinator/capability 的 runtime handle binding/execution lease
+是两道不同门：
 前者证明“本次 startup 之前已经 open/reduce”，后者证明“后续 writer/dispatch 仍在使用签发它们的
-同一个 live journal handle”。任一对象都不能跨下一次 reopen 复用。
+同一个 live journal handle”，并让该 coordinator 的 transport lifetime 排他地覆盖 session lock
+generation。coordinator shutdown/Drop 发起 transport 终止，native reaper 在 exit/reap 后释放最后的 lease，
+随后才可能发生下一次 reopen；旧 capability 不能复用。
 未解决的 `tool.in_doubt` 同样会在 eligibility 签发前阻止 MCP 启动；discovery 后、coordinator
 重新绑定 registry 前还会再次检查当前 journal，避免启动期间的状态漂移绕过恢复门槛。
-但 Agent 尚未消费该 reader，也尚未把 `context.tools` snapshot writer 改为在
-`response.started` 填充上述 registry epoch 字段。Agent 必须从同一 prepared request snapshot
+但 Agent 尚未消费该 reader，也尚未调用现有的 typed `context.tools` / MCP Provider response
+writer。后者会在 `response.started` 注入当前 registry epoch/digest；Agent 仍必须从同一
+prepared request snapshot
 写入这些字段，证明 Provider request 所使用的 `context.tools`、返回 call、approval、started
 和 permit 属于同一个 epoch；完成这条绑定前不能把 MCP definitions 放进 Agent 请求。
 
 当前 `ToolSurfaceSnapshotV1` / `McpProviderSurfaceV1` 已把 live registry 的 alias、
 definition digest、output-schema digest、registry epoch/digest 与 Provider-visible 工具顺序
-合并为不可由调用方直接构造的 writer-side snapshot，并在写入前拒绝 builtin/history/MCP
-名称碰撞。旧 `ToolSnapshot` v1 保持字节兼容。显式 validator v3 已登记严格、可离线的关系：
+合并为 writer-side snapshot，并在写入前拒绝 builtin/history/MCP 名称碰撞。公开 serde 类型可以
+被解析或构造出内部自洽的值，因此真正的 authority 边界是 coordinator 写入时对 exact live registry
+binding snapshot 的逐项比较，而不是“类型不可构造”。旧 `ToolSnapshot` v1 保持字节兼容。显式 validator v3 已登记严格、可离线的关系：
 activation 保存 full binding digest，`response.started` 引用 activation 之后、start 之前的唯一
 global `context.tools`，并要求 `mcp_surface.event_seq == context.tools_event_seq`；snapshot、claim、
 activation 的 epoch/digest/full bindings 必须一致。删除 response claim 不能把实际使用 MCP
@@ -376,9 +394,11 @@ projection 和 history 各自“碰巧做出相同判断”：
   capability 独占，不能把“格式合法”解释成“已获批准”。
 - 当前 generic Provider response admission 只拥有容量与普通 Provider lifecycle 权限，不能与
   registry 字符串拼接出 MCP authority：完整/部分 v2 claim、v3 surface relation，以及
-  `response.completed` 中的 activated alias 都必须在首笔相关 fsync 前 fail closed。未来 Agent
-  接入需要一个专用 typed writer 同时消费 turn/outcome reserve 与 live coordinator capability；
-  不能先用 generic admission 写 start，再另行“补”MCP provenance。
+  `response.completed` 中的 activated alias 都必须在首笔相关 fsync 前 fail closed。专用 typed
+  MCP response writer 已校验并绑定 parent turn reserve、创建一次性 outcome reservation，并绑定
+  live coordinator capability；同一 guard 提交 exact terminal，并用 typed commit error 证明是否仍
+  允许 bounded fallback。未来 Agent 接入必须直接消费该 writer，不能先用 generic admission 写
+  start，再另行“补”MCP provenance。
 
 call-chain validator 解决的是 durable 事实解释，不会自动恢复 live server。下一阶段仍需在 session
 reopen 后按已批准 execution plan 重建或替换 live registry epoch，并把实际 request 的
