@@ -7,6 +7,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use uuid::Uuid;
 
 use crate::error::{OxidraError, Result};
+use crate::fs_security::{enforce_private_file, ensure_private_dir, private_create_options};
 
 pub const MAX_MEMORY_FILE_BYTES: usize = 64 * 1024;
 pub const MAX_INJECTED_MEMORY_BYTES: usize = 16 * 1024;
@@ -44,7 +45,15 @@ pub struct MemoryStore {
 impl MemoryStore {
     pub fn new(directory: impl Into<PathBuf>) -> Result<Self> {
         let directory = directory.into();
-        fs::create_dir_all(&directory)?;
+        ensure_private_dir(&directory)?;
+        for item in fs::read_dir(&directory)? {
+            let item = item?;
+            let path = item.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.is_file() && !metadata.file_type().is_symlink() {
+                enforce_private_file(&path)?;
+            }
+        }
         Ok(Self { directory })
     }
 
@@ -150,13 +159,14 @@ impl MemoryStore {
                 format!("complete memory file exceeds {MAX_MEMORY_FILE_BYTES} bytes"),
             ));
         }
-        fs::create_dir_all(&self.directory)?;
+        ensure_private_dir(&self.directory)?;
         let id = Uuid::now_v7().to_string();
         let path = self.path_for(&id);
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        private_create_options(&mut options);
+        let mut file = options.open(&path)?;
+        enforce_private_file(&path)?;
         file.write_all(file_text.as_bytes())?;
         file.sync_all()?;
         let modified = file
@@ -451,5 +461,39 @@ mod tests {
         assert_eq!(injection.omitted, 1);
         assert!(injection.text.contains("small"));
         assert!(!injection.text.contains(&"x".repeat(64)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memory_directory_and_files_are_private_even_when_preexisting_modes_are_broad() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = TempDir::new().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let legacy = directory
+            .path()
+            .join("00000000-0000-0000-0000-000000000001.md");
+        fs::write(&legacy, "legacy").unwrap();
+        fs::set_permissions(&legacy, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let store = MemoryStore::new(directory.path()).unwrap();
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&legacy).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let entry = store.remember("private", Path::new("project")).unwrap();
+        assert_eq!(
+            fs::metadata(store.path_for(&entry.id))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 }

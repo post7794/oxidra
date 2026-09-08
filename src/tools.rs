@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fs::Permissions;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -14,6 +15,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::error::{OxidraError, Result};
+use crate::fs_security::{
+    enforce_private_file_handle_async, ensure_private_dir, ensure_private_dir_async,
+    open_read_only_no_follow,
+};
 use crate::memory::{MAX_MEMORY_FILE_BYTES, MemoryStore};
 use crate::process::ProcessTree;
 use crate::types::{ToolCall, ToolDefinition, ToolResult};
@@ -88,7 +93,7 @@ impl BuiltinTools {
             ));
         }
 
-        std::fs::create_dir_all(artifact_dir.as_ref()).map_err(|error| {
+        ensure_private_dir(artifact_dir.as_ref()).map_err(|error| {
             OxidraError::tool(
                 io_error_code(&error),
                 format!("failed to create artifact directory: {error}"),
@@ -115,7 +120,7 @@ impl BuiltinTools {
         Self::tool_definitions()
     }
 
-    pub async fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolResult {
+    pub(crate) async fn execute(&self, call: &ToolCall, context: &ToolContext) -> ToolResult {
         match call.name.as_str() {
             "read" => self.read(call, context).await,
             "edit" => self.edit(call, context).await,
@@ -166,33 +171,30 @@ impl BuiltinTools {
             Ok(path) => path,
             Err(error) => return error_result(&call.id, error),
         };
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(error) => return io_result(&call.id, "read file metadata", error),
-        };
-        if metadata.len() > MAX_FILE_BYTES {
-            return ToolResult::error(
-                &call.id,
-                "validation_error",
-                format!("file exceeds the {MAX_FILE_BYTES}-byte read limit"),
-            );
-        }
-        let bytes = match tokio::select! {
-            _ = context.cancellation.cancelled() => {
-                return ToolResult::error(&call.id, "cancelled", "read was cancelled");
-            }
-            result = tokio::fs::read(&path) => result,
-        } {
-            Ok(bytes) => bytes,
-            Err(error) => return io_result(&call.id, "read file", error),
-        };
-        if bytes.len() as u64 > MAX_FILE_BYTES {
-            return ToolResult::error(
-                &call.id,
-                "validation_error",
-                format!("file grew beyond the {MAX_FILE_BYTES}-byte read limit"),
-            );
-        }
+        let bytes =
+            match read_regular_file_bounded(&path, MAX_FILE_BYTES, &context.cancellation).await {
+                Ok(snapshot) => snapshot.bytes,
+                Err(BoundedFileReadError::Cancelled) => {
+                    return ToolResult::error(&call.id, "cancelled", "read was cancelled");
+                }
+                Err(BoundedFileReadError::NotRegular) => {
+                    return ToolResult::error(
+                        &call.id,
+                        "validation_error",
+                        "read target is not a regular file",
+                    );
+                }
+                Err(BoundedFileReadError::TooLarge) => {
+                    return ToolResult::error(
+                        &call.id,
+                        "validation_error",
+                        format!("file exceeds the {MAX_FILE_BYTES}-byte read limit"),
+                    );
+                }
+                Err(BoundedFileReadError::Io(error)) => {
+                    return io_result(&call.id, "read file", error);
+                }
+            };
         let full_file_sha256 = sha256_hex(&bytes);
         let text = match String::from_utf8(bytes) {
             Ok(text) => text,
@@ -309,33 +311,32 @@ impl BuiltinTools {
             Ok(path) => path,
             Err(error) => return error_result(&call.id, error),
         };
-        let metadata = match tokio::fs::metadata(&path).await {
-            Ok(metadata) => metadata,
-            Err(error) => return io_result(&call.id, "read file metadata", error),
-        };
-        if metadata.len() > MAX_FILE_BYTES {
-            return ToolResult::error(
-                &call.id,
-                "validation_error",
-                format!("file exceeds the {MAX_FILE_BYTES}-byte edit limit"),
-            );
-        }
-        let original = match tokio::select! {
-            _ = context.cancellation.cancelled() => {
-                return ToolResult::error(&call.id, "cancelled", "edit was cancelled");
-            }
-            result = tokio::fs::read(&path) => result,
-        } {
-            Ok(bytes) => bytes,
-            Err(error) => return io_result(&call.id, "read file before edit", error),
-        };
-        if original.len() as u64 > MAX_FILE_BYTES {
-            return ToolResult::error(
-                &call.id,
-                "validation_error",
-                format!("file grew beyond the {MAX_FILE_BYTES}-byte edit limit"),
-            );
-        }
+        let original =
+            match read_regular_file_bounded(&path, MAX_FILE_BYTES, &context.cancellation).await {
+                Ok(snapshot) => snapshot,
+                Err(BoundedFileReadError::Cancelled) => {
+                    return ToolResult::error(&call.id, "cancelled", "edit was cancelled");
+                }
+                Err(BoundedFileReadError::NotRegular) => {
+                    return ToolResult::error(
+                        &call.id,
+                        "validation_error",
+                        "edit target is not a regular file",
+                    );
+                }
+                Err(BoundedFileReadError::TooLarge) => {
+                    return ToolResult::error(
+                        &call.id,
+                        "validation_error",
+                        format!("file exceeds the {MAX_FILE_BYTES}-byte edit limit"),
+                    );
+                }
+                Err(BoundedFileReadError::Io(error)) => {
+                    return io_result(&call.id, "read file before edit", error);
+                }
+            };
+        let original_permissions = original.permissions;
+        let original = original.bytes;
         let original_hash = sha256_hex(&original);
         if !original_hash.eq_ignore_ascii_case(&args.expected_sha256) {
             return ToolResult::error(
@@ -376,14 +377,6 @@ impl BuiltinTools {
             );
         }
         let new_hash = sha256_hex(replacement.as_bytes());
-        if !metadata.is_file() {
-            return ToolResult::error(
-                &call.id,
-                "validation_error",
-                "edit target is not a regular file",
-            );
-        }
-
         let temp_path = temporary_sibling(&path);
         let mut temp = match tokio::fs::OpenOptions::new()
             .write(true)
@@ -394,6 +387,11 @@ impl BuiltinTools {
             Ok(file) => file,
             Err(error) => return io_result(&call.id, "create temporary edit file", error),
         };
+        if let Err(error) = enforce_private_file_handle_async(&temp).await {
+            drop(temp);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return io_result(&call.id, "secure temporary edit file", error);
+        }
         if let Err(error) = temp.write_all(replacement.as_bytes()).await {
             drop(temp);
             let _ = tokio::fs::remove_file(&temp_path).await;
@@ -404,11 +402,12 @@ impl BuiltinTools {
             let _ = tokio::fs::remove_file(&temp_path).await;
             return io_result(&call.id, "flush temporary edit file", error);
         }
-        drop(temp);
-        if let Err(error) = tokio::fs::set_permissions(&temp_path, metadata.permissions()).await {
+        if let Err(error) = temp.set_permissions(original_permissions).await {
+            drop(temp);
             let _ = tokio::fs::remove_file(&temp_path).await;
             return io_result(&call.id, "preserve file permissions", error);
         }
+        drop(temp);
 
         if context.cancellation.is_cancelled() {
             let _ = tokio::fs::remove_file(&temp_path).await;
@@ -416,27 +415,34 @@ impl BuiltinTools {
         }
 
         // Recheck immediately before replacement to narrow the optimistic-lock race.
-        let current = match tokio::select! {
-            _ = context.cancellation.cancelled() => {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return ToolResult::error(&call.id, "cancelled", "edit was cancelled");
-            }
-            result = tokio::fs::read(&path) => result,
-        } {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                return io_result(&call.id, "recheck file before edit", error);
-            }
-        };
-        if current.len() as u64 > MAX_FILE_BYTES {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-            return ToolResult::error(
-                &call.id,
-                "validation_error",
-                format!("file grew beyond the {MAX_FILE_BYTES}-byte edit limit"),
-            );
-        }
+        let current =
+            match read_regular_file_bounded(&path, MAX_FILE_BYTES, &context.cancellation).await {
+                Ok(snapshot) => snapshot.bytes,
+                Err(BoundedFileReadError::Cancelled) => {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return ToolResult::error(&call.id, "cancelled", "edit was cancelled");
+                }
+                Err(BoundedFileReadError::NotRegular) => {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return ToolResult::error(
+                        &call.id,
+                        "stale_file",
+                        "edit target stopped being a regular file while the edit was prepared",
+                    );
+                }
+                Err(BoundedFileReadError::TooLarge) => {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return ToolResult::error(
+                        &call.id,
+                        "validation_error",
+                        format!("file grew beyond the {MAX_FILE_BYTES}-byte edit limit"),
+                    );
+                }
+                Err(BoundedFileReadError::Io(error)) => {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    return io_result(&call.id, "recheck file before edit", error);
+                }
+            };
         let current_hash = sha256_hex(&current);
         if current_hash != original_hash {
             let _ = tokio::fs::remove_file(&temp_path).await;
@@ -496,6 +502,23 @@ impl BuiltinTools {
             Ok(file) => file,
             Err(error) => return io_result(&call.id, "create temporary write file", error),
         };
+        // Capture the mode/ACL inherited by a normal create before temporarily
+        // tightening the unpublished sibling. The final project file should
+        // follow the project/umask policy, not the 0600 policy used for Oxidra's
+        // private journals and artifact state.
+        let publish_permissions = match temp.metadata().await {
+            Ok(metadata) => metadata.permissions(),
+            Err(error) => {
+                drop(temp);
+                let _ = tokio::fs::remove_file(&temp_path).await;
+                return io_result(&call.id, "inspect temporary write file", error);
+            }
+        };
+        if let Err(error) = enforce_private_file_handle_async(&temp).await {
+            drop(temp);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return io_result(&call.id, "secure temporary write file", error);
+        }
         if let Err(error) = temp.write_all(args.content.as_bytes()).await {
             drop(temp);
             let _ = tokio::fs::remove_file(&temp_path).await;
@@ -505,6 +528,11 @@ impl BuiltinTools {
             drop(temp);
             let _ = tokio::fs::remove_file(&temp_path).await;
             return io_result(&call.id, "flush temporary write file", error);
+        }
+        if let Err(error) = temp.set_permissions(publish_permissions).await {
+            drop(temp);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return io_result(&call.id, "restore new file permissions", error);
         }
         drop(temp);
 
@@ -710,7 +738,7 @@ impl BuiltinTools {
         timeout_secs: u64,
         cancellation: &CancellationToken,
     ) -> Result<ShellExecution> {
-        tokio::fs::create_dir_all(&self.artifact_dir).await?;
+        ensure_private_dir_async(&self.artifact_dir).await?;
         let invocation_id = Uuid::now_v7().to_string();
         let stdout_spool = self
             .artifact_dir
@@ -851,7 +879,7 @@ impl BuiltinTools {
         stderr: &StreamCapture,
     ) -> Result<ArtifactReference> {
         let directory = self.artifact_dir.join(id);
-        tokio::fs::create_dir(&directory).await?;
+        ensure_private_dir_async(&directory).await?;
         let stdout_path = directory.join("stdout.bin");
         let stderr_path = directory.join("stderr.bin");
         tokio::fs::rename(&stdout.spool_path, &stdout_path).await?;
@@ -891,6 +919,7 @@ impl BuiltinTools {
             .create_new(true)
             .open(&metadata_path)
             .await?;
+        enforce_private_file_handle_async(&metadata_file).await?;
         metadata_file.write_all(&metadata_bytes).await?;
         metadata_file.flush().await?;
         metadata_file.sync_data().await?;
@@ -1040,6 +1069,68 @@ fn parse_arguments<T: for<'de> Deserialize<'de>>(
     })
 }
 
+#[derive(Debug)]
+struct BoundedFileSnapshot {
+    bytes: Vec<u8>,
+    permissions: Permissions,
+}
+
+#[derive(Debug)]
+enum BoundedFileReadError {
+    Cancelled,
+    NotRegular,
+    TooLarge,
+    Io(io::Error),
+}
+
+impl From<io::Error> for BoundedFileReadError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+/// Opens the final path without following a racing final-component link where
+/// the platform exposes that primitive, verifies the opened object rather than
+/// earlier pathname metadata, and reads at most `max_bytes + 1` bytes.
+///
+/// Parent-component namespace replacement is deliberately not claimed here:
+/// closing that boundary requires handle-relative traversal from the project
+/// root. The bounded handle read still prevents FIFOs/devices and a concurrently
+/// growing regular file from turning the documented file limit into an
+/// unbounded blocking read or allocation.
+async fn read_regular_file_bounded(
+    path: &Path,
+    max_bytes: u64,
+    cancellation: &CancellationToken,
+) -> std::result::Result<BoundedFileSnapshot, BoundedFileReadError> {
+    let file = tokio::select! {
+        _ = cancellation.cancelled() => return Err(BoundedFileReadError::Cancelled),
+        result = open_read_only_no_follow(path) => result?,
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(BoundedFileReadError::NotRegular);
+    }
+    if metadata.len() > max_bytes {
+        return Err(BoundedFileReadError::TooLarge);
+    }
+
+    let capacity = usize::try_from(metadata.len().min(max_bytes)).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut limited = tokio::fs::File::from_std(file).take(max_bytes.saturating_add(1));
+    tokio::select! {
+        _ = cancellation.cancelled() => return Err(BoundedFileReadError::Cancelled),
+        result = limited.read_to_end(&mut bytes) => result?,
+    };
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(BoundedFileReadError::TooLarge);
+    }
+    Ok(BoundedFileSnapshot {
+        bytes,
+        permissions: metadata.permissions(),
+    })
+}
+
 fn split_lines(text: &str) -> Vec<&str> {
     if text.is_empty() {
         Vec::new()
@@ -1178,7 +1269,12 @@ async fn capture_stream<R>(mut reader: R, spool_path: PathBuf) -> io::Result<Str
 where
     R: AsyncRead + Unpin,
 {
-    let mut spool = tokio::fs::File::create(&spool_path).await?;
+    let mut spool = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&spool_path)
+        .await?;
+    enforce_private_file_handle_async(&spool).await?;
     let mut prefix = Vec::with_capacity(MAX_TOOL_OUTPUT_BYTES);
     let mut total_bytes = 0u64;
     let mut stored_bytes = 0u64;
@@ -1463,6 +1559,51 @@ mod tests {
         assert_eq!(result.error_code.as_deref(), Some("permission_denied"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_and_edit_reject_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let (root, _artifacts, tools) = harness();
+        let fifo = root.path().join("blocking.fifo");
+        let fifo_bytes = CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+        let result = unsafe { nix::libc::mkfifo(fifo_bytes.as_ptr(), 0o600) };
+        assert_eq!(result, 0, "create FIFO: {}", io::Error::last_os_error());
+
+        let read = tokio::time::timeout(
+            Duration::from_secs(1),
+            tools.execute(
+                &call("read", json!({"path":"blocking.fifo"})),
+                &ToolContext::default(),
+            ),
+        )
+        .await
+        .expect("read must reject a FIFO without waiting for a writer");
+        assert!(read.is_error);
+        assert_eq!(read.error_code.as_deref(), Some("validation_error"));
+
+        let edit = tokio::time::timeout(
+            Duration::from_secs(1),
+            tools.execute(
+                &call(
+                    "edit",
+                    json!({
+                        "path":"blocking.fifo",
+                        "old_text":"x",
+                        "new_text":"y",
+                        "expected_sha256":"0".repeat(64),
+                    }),
+                ),
+                &ToolContext::default(),
+            ),
+        )
+        .await
+        .expect("edit must reject a FIFO without waiting for a writer");
+        assert!(edit.is_error);
+        assert_eq!(edit.error_code.as_deref(), Some("validation_error"));
+    }
+
     #[tokio::test]
     async fn edit_rejects_stale_hash_without_overwriting() {
         let (root, _artifacts, tools) = harness();
@@ -1603,6 +1744,20 @@ mod tests {
             std::fs::read_to_string(root.path().join("nested/new.txt")).unwrap(),
             content
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let probe = root.path().join("nested/mode-probe.txt");
+            std::fs::write(&probe, "probe").unwrap();
+            let expected = std::fs::metadata(probe).unwrap().permissions().mode() & 0o777;
+            let actual = std::fs::metadata(root.path().join("nested/new.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(actual, expected, "write must preserve normal create mode");
+        }
     }
 
     #[tokio::test]

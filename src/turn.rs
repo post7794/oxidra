@@ -8,22 +8,46 @@ use crate::compaction::validate_provider_budget_retries_v1;
 use crate::error::{OxidraError, Result};
 use crate::mcp::{
     MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, MCP_CALL_CHAIN_VALIDATOR_VERSION_V2,
-    validate_mcp_call_chain_for_version, validate_mcp_call_chain_through_version,
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V4, validate_mcp_call_chain_for_version,
+    validate_mcp_call_chain_through_version,
 };
 use crate::session::JournalEvent;
 
-pub const TURN_BOUNDARY_VALIDATOR_VERSION: u32 = 7;
+pub const TURN_BOUNDARY_VALIDATOR_VERSION: u32 = 8;
 pub const TURN_BOUNDARY_VERSION: u64 = TURN_BOUNDARY_VALIDATOR_VERSION as u64;
 const TURN_BOUNDARY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V1;
 const TURN_BOUNDARY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V7: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V2;
+const TURN_BOUNDARY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V4;
 const PROVIDER_REQUEST_SLOT_MCP_CALL_CHAIN_VALIDATOR_VERSION_V3: u32 =
     MCP_CALL_CHAIN_VALIDATOR_VERSION_V1;
 const PROVIDER_REQUEST_SLOT_MCP_CALL_CHAIN_VALIDATOR_VERSION_V4: u32 =
     MCP_CALL_CHAIN_VALIDATOR_VERSION_V2;
+const PROVIDER_REQUEST_SLOT_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5: u32 =
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V4;
 /// Default slot reducer for a new writer. Persisted compaction boundary
 /// policies bind their own historical version and must not read this constant.
 #[allow(dead_code)]
-pub(crate) const PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION: u32 = 4;
+pub(crate) const PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION: u32 = 5;
+
+/// Frozen turn reducers historically treated these root fields as protocol
+/// markers independently of `kind`.  Keep that literal reader behavior for
+/// legacy schema-1 journals; the public custom-event writer prevents new
+/// extension payloads from placing caller-controlled fields at this root.
+fn has_inline_turn_completion(event: &JournalEvent) -> bool {
+    event.data.get("turn_completion").is_some()
+}
+
+fn direct_turn_boundary_version_mut(event: &mut JournalEvent) -> Option<&mut Value> {
+    event.data.get_mut("turn_boundary_version")
+}
+
+fn inline_turn_boundary_version_mut(event: &mut JournalEvent) -> Option<&mut Value> {
+    event
+        .data
+        .get_mut("turn_completion")
+        .and_then(Value::as_object_mut)
+        .and_then(|completion| completion.get_mut("turn_boundary_version"))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionEvidence {
@@ -111,8 +135,166 @@ pub(crate) struct ValidatedTurnRecovery {
 ///
 /// 放弃只适用于尚未完成、确实经历过 context-limit 的 turn；引用、顺序和
 /// 重复事件任一不成立时都 fail closed。
+#[cfg(test)]
 pub(crate) fn validate_turn_recovery(events: &[JournalEvent]) -> Result<ValidatedTurnRecovery> {
     validate_turn_recovery_v3(events)
+}
+
+/// Validate a complete journal using the recovery language selected by each
+/// owning `user.message`.
+///
+/// This is the runtime/full-history entry point. Frozen reducers continue to
+/// call their literal v2 or v3 validator directly so persisted artifacts keep
+/// their published semantics.
+pub(crate) fn validate_turn_recovery_dynamic(
+    events: &[JournalEvent],
+) -> Result<ValidatedTurnRecovery> {
+    let turn_versions = resolve_user_turn_boundary_versions(events)?;
+    validate_turn_recovery_for_versions(events, &turn_versions)
+}
+
+/// Validate recovery controls in the language of the turn that owns them.
+///
+/// `segment_turns` may need a newer reducer for a later turn, but that must not
+/// make an older turn adopt the newer recovery ordering rules.  In particular,
+/// v2 allowed a durable `context.limit_reached` to precede its `user.message`,
+/// while v3 requires the opposite ordering and binds provider limits to a
+/// failed response attempt.  Running one global v3 validator over a mixed
+/// journal therefore rejects legal historical prefixes as soon as a later
+/// v8 turn appears.
+///
+/// The per-turn validators intentionally receive only events belonging to that
+/// turn; recovery state is turn-scoped.  Retry identifiers remain globally
+/// unique, matching the frozen whole-journal validators.
+fn validate_turn_recovery_for_versions(
+    events: &[JournalEvent],
+    turn_versions: &HashMap<String, u32>,
+) -> Result<ValidatedTurnRecovery> {
+    let mut recovery = ValidatedTurnRecovery::default();
+    let mut seen_retry_ids = HashSet::new();
+    let mut event_indices_by_turn = HashMap::<&str, Vec<usize>>::new();
+    for (index, event) in events.iter().enumerate() {
+        if let Some(turn_id) = event.turn_id.as_deref() {
+            event_indices_by_turn
+                .entry(turn_id)
+                .or_default()
+                .push(index);
+        }
+    }
+
+    // A partitioned validator must not silently drop protocol rows that have
+    // no owning user turn. These are exactly the event classes consumed by
+    // recovery v2/v3, plus the historical root-level inline marker.
+    for event in events.iter().filter(|event| {
+        is_turn_recovery_owned_event_kind(&event.kind) || has_inline_turn_completion(event)
+    }) {
+        let inline = has_inline_turn_completion(event);
+        let turn_id = event.turn_id.as_deref().ok_or_else(|| {
+            let label = if inline {
+                "inline turn completion"
+            } else {
+                event.kind.as_str()
+            };
+            OxidraError::Session(format!("{label} at seq {} has no turn_id", event.seq))
+        })?;
+        if !turn_versions.contains_key(turn_id) {
+            let label = if inline {
+                "inline turn completion"
+            } else {
+                event.kind.as_str()
+            };
+            return Err(OxidraError::Session(format!(
+                "{label} at seq {} references unknown turn {turn_id}",
+                event.seq
+            )));
+        }
+    }
+
+    let mut validated_turns = HashSet::new();
+    for event in events.iter().filter(|event| event.kind == "user.message") {
+        let Some(turn_id) = event.turn_id.as_deref() else {
+            continue;
+        };
+        if !validated_turns.insert(turn_id) {
+            continue;
+        }
+        let version = turn_versions.get(turn_id).copied().unwrap_or(1);
+        let scoped = event_indices_by_turn
+            .get(turn_id)
+            .into_iter()
+            .flatten()
+            .map(|index| events[*index].clone())
+            .collect::<Vec<_>>();
+        let scoped_recovery = if version >= 3 {
+            validate_turn_recovery_v3(&scoped)?
+        } else {
+            validate_turn_recovery_v2(&scoped)?
+        };
+
+        for (retry_id, abandon) in scoped_recovery.abandons {
+            if recovery
+                .abandons
+                .insert(retry_id.clone(), abandon)
+                .is_some()
+            {
+                return Err(OxidraError::Session(format!(
+                    "turn {retry_id} has duplicate recovery ownership"
+                )));
+            }
+        }
+        for retry in scoped_recovery.retries {
+            if !seen_retry_ids.insert(retry.retry_id.clone()) {
+                return Err(OxidraError::Session(format!(
+                    "duplicate turn retry id {}",
+                    retry.retry_id
+                )));
+            }
+            recovery.retries.push(retry);
+        }
+    }
+
+    Ok(recovery)
+}
+
+fn is_turn_recovery_owned_event_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "user.message"
+            | "response.completed"
+            | "response.failed"
+            | "response.aborted"
+            | "turn.completed"
+            | "turn.cancelled"
+            | "turn.abandoned"
+            | "turn.retry_started"
+            | "agent.stalled"
+            | "agent.limit_reached"
+            | "context.limit_reached"
+    )
+}
+
+fn legacy_pre_user_recovery_turns(
+    events: &[JournalEvent],
+    turn_versions: &HashMap<String, u32>,
+) -> HashSet<String> {
+    let users = events
+        .iter()
+        .filter(|event| event.kind == "user.message")
+        .filter_map(|event| {
+            let turn_id = event.turn_id.as_ref()?.clone();
+            let version = turn_versions.get(&turn_id).copied().unwrap_or(1);
+            (version <= 2).then_some((turn_id, event.seq))
+        })
+        .collect::<HashMap<_, _>>();
+    events
+        .iter()
+        .filter(|event| event.kind == "context.limit_reached")
+        .filter_map(|event| {
+            let turn_id = event.turn_id.as_ref()?;
+            let user_seq = users.get(turn_id)?;
+            (event.seq < *user_seq).then_some(turn_id.clone())
+        })
+        .collect()
 }
 
 // v2 按 40e7930 的字面实现冻结；更严格的语义只能新增版本。
@@ -178,7 +360,7 @@ pub(crate) fn validate_turn_recovery_v2(events: &[JournalEvent]) -> Result<Valid
                 .or_default()
                 .push(event.seq);
         }
-        if event.data.get("turn_completion").is_some() {
+        if has_inline_turn_completion(event) {
             let turn_id = event.turn_id.as_deref().ok_or_else(|| {
                 OxidraError::Session(format!(
                     "inline turn completion at seq {} has no turn_id",
@@ -456,7 +638,7 @@ pub(crate) fn validate_turn_recovery_v3(events: &[JournalEvent]) -> Result<Valid
                 .or_default()
                 .push(event);
         }
-        if event.data.get("turn_completion").is_some() {
+        if has_inline_turn_completion(event) {
             let turn_id = event.turn_id.as_deref().ok_or_else(|| {
                 OxidraError::Session(format!(
                     "inline turn completion at seq {} has no turn_id",
@@ -750,6 +932,65 @@ pub fn segment_turns(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
     segment_turns_for_version(TURN_BOUNDARY_VALIDATOR_VERSION, events)
 }
 
+/// Resolve the historical recovery language claimed by each user turn.
+///
+/// The owning `user.message` is the only authority for this choice. A later
+/// completion written by a newer binary cannot retroactively strengthen the
+/// recovery grammar of an already-started turn. Likewise,
+/// `compaction.*.turn_boundary_validator_version` records the frozen reducer
+/// used to build that compaction artifact; it does not upgrade the language of
+/// every historical turn covered by the checkpoint.
+fn resolve_user_turn_boundary_versions(events: &[JournalEvent]) -> Result<HashMap<String, u32>> {
+    let mut turn_versions = HashMap::new();
+    for event in events.iter().filter(|event| event.kind == "user.message") {
+        let Some(turn_id) = event.turn_id.as_deref() else {
+            continue;
+        };
+        let version = event
+            .data
+            .get("turn_boundary_version")
+            .map(|value| parse_turn_boundary_claim(event.seq, "turn boundary", value))
+            .transpose()?
+            .unwrap_or(1);
+        if turn_versions.insert(turn_id.to_owned(), version).is_some() {
+            return Err(OxidraError::Session(format!(
+                "turn {turn_id} has more than one user.message"
+            )));
+        }
+    }
+    Ok(turn_versions)
+}
+
+fn parse_turn_boundary_claim(seq: u64, label: &str, value: &Value) -> Result<u32> {
+    let version = value.as_u64().ok_or_else(|| {
+        OxidraError::Session(format!(
+            "{label} version at seq {seq} is not an unsigned integer"
+        ))
+    })?;
+    let version = u32::try_from(version).map_err(|_| {
+        OxidraError::Session(format!(
+            "unsupported {label} version {version} at seq {seq}"
+        ))
+    })?;
+    if !(1..=TURN_BOUNDARY_VALIDATOR_VERSION).contains(&version) {
+        return Err(OxidraError::Session(format!(
+            "unsupported {label} version {version} at seq {seq}"
+        )));
+    }
+    Ok(version)
+}
+
+fn last_response_event_seq_for_turn_span(events: &[JournalEvent], turn: &TurnSpan) -> Option<u64> {
+    events
+        .get(turn.start_index..turn.end_index_exclusive)
+        .into_iter()
+        .flatten()
+        .filter(|event| event.turn_id.as_deref() == Some(turn.turn_id.as_str()))
+        .filter(|event| is_response_lifecycle_v1(&event.kind))
+        .map(|event| event.seq)
+        .next_back()
+}
+
 /// Rebuild turn boundaries using an immutable historical reducer.
 /// Published match arms must not be changed; add a new version instead.
 pub(crate) fn segment_turns_for_version(
@@ -764,6 +1005,7 @@ pub(crate) fn segment_turns_for_version(
         5 => segment_turns_v5(events),
         6 => segment_turns_v6(events),
         7 => segment_turns_v7(events),
+        8 => segment_turns_v8(events),
         _ => Err(OxidraError::Session(format!(
             "unsupported turn boundary reducer version {version}"
         ))),
@@ -806,37 +1048,33 @@ fn segment_turns_v2(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
 }
 
 fn normalize_boundary_version_v2_for_v1(event: &mut JournalEvent) -> Result<()> {
-    if let Some(version) = event.data.get_mut("turn_boundary_version") {
+    let seq = event.seq;
+    if let Some(version) = direct_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1 | 2) {
             return Err(OxidraError::Session(format!(
                 "unsupported turn boundary version {value} at seq {}",
-                event.seq
+                seq
             )));
         }
         *version = Value::from(1);
     }
-    if let Some(version) = event
-        .data
-        .get_mut("turn_completion")
-        .and_then(Value::as_object_mut)
-        .and_then(|completion| completion.get_mut("turn_boundary_version"))
-    {
+    if let Some(version) = inline_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "inline turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1 | 2) {
             return Err(OxidraError::Session(format!(
                 "unsupported inline turn boundary version {value} at seq {}",
-                event.seq
+                seq
             )));
         }
         *version = Value::from(1);
@@ -884,37 +1122,33 @@ fn segment_turns_v3(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
 }
 
 fn normalize_boundary_version_v3_for_v1(event: &mut JournalEvent) -> Result<()> {
-    if let Some(version) = event.data.get_mut("turn_boundary_version") {
+    let seq = event.seq;
+    if let Some(version) = direct_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1..=3) {
             return Err(OxidraError::Session(format!(
                 "unsupported turn boundary version {value} at seq {}",
-                event.seq
+                seq
             )));
         }
         *version = Value::from(1);
     }
-    if let Some(version) = event
-        .data
-        .get_mut("turn_completion")
-        .and_then(Value::as_object_mut)
-        .and_then(|completion| completion.get_mut("turn_boundary_version"))
-    {
+    if let Some(version) = inline_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "inline turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1..=3) {
             return Err(OxidraError::Session(format!(
                 "unsupported inline turn boundary version {value} at seq {}",
-                event.seq
+                seq
             )));
         }
         *version = Value::from(1);
@@ -1101,38 +1335,117 @@ fn segment_turns_v7(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
     segment_turns_base(&normalized, LegacyCompletionSeq::NextUserEvidence)
 }
 
+fn segment_turns_v8(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
+    validate_mcp_call_chain_through_version(
+        TURN_BOUNDARY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8,
+        events,
+    )?;
+    let turn_versions = resolve_user_turn_boundary_versions(events)?;
+    // v8 is the first turn reducer that fixes recovery-language ownership.
+    // Structural rules stay current for the journal, while each user.message
+    // selects the v2/v3 recovery grammar for its own turn. Versions v1-v7
+    // remain literal and must never learn this dispatch rule.
+    let recovery = validate_turn_recovery_for_versions(events, &turn_versions)?;
+    let legacy_pre_user = legacy_pre_user_recovery_turns(events, &turn_versions);
+    let mut turns = segment_turns_v8_with_recovery(events, recovery, &legacy_pre_user)?;
+
+    // Recovery ownership must not retroactively change the historical
+    // completion evidence selected by the owning user turn: reducers v1-v3
+    // use the last response event, while v4+ use the next user event.
+    for turn in &mut turns {
+        let version = turn_versions.get(&turn.turn_id).copied().unwrap_or(1);
+        if version < 4
+            && matches!(
+                turn.state,
+                TurnState::Complete(CompletionEvidence::LegacyNextUser)
+            )
+        {
+            turn.completion_seq = last_response_event_seq_for_turn_span(events, turn);
+        }
+    }
+    Ok(turns)
+}
+
+fn segment_turns_v8_with_recovery(
+    events: &[JournalEvent],
+    recovery: ValidatedTurnRecovery,
+    legacy_pre_user_recovery_turns: &HashSet<String>,
+) -> Result<Vec<TurnSpan>> {
+    let latest_retry_by_turn =
+        recovery
+            .retries
+            .iter()
+            .fold(HashMap::<String, u64>::new(), |mut latest, retry| {
+                latest
+                    .entry(retry.turn_id.clone())
+                    .and_modify(|seq| *seq = (*seq).max(retry.retry_seq))
+                    .or_insert(retry.retry_seq);
+                latest
+            });
+    let budget_retry_limit_seqs = validate_provider_budget_retries_v1(events)?
+        .into_iter()
+        .map(|retry| retry.limit_seq)
+        .collect::<HashSet<_>>();
+    let mut normalized = events.to_vec();
+    for event in &mut normalized {
+        normalize_boundary_version_v8_for_v1(event)?;
+        let context_retry_supersedes = event
+            .turn_id
+            .as_ref()
+            .and_then(|turn_id| latest_retry_by_turn.get(turn_id))
+            .is_some_and(|retry_seq| {
+                event.seq < *retry_seq
+                    && matches!(
+                        event.kind.as_str(),
+                        "response.failed"
+                            | "response.aborted"
+                            | "turn.cancelled"
+                            | "agent.stalled"
+                            | "agent.limit_reached"
+                            | "context.limit_reached"
+                    )
+            });
+        let budget_retry_supersedes =
+            event.kind == "agent.limit_reached" && budget_retry_limit_seqs.contains(&event.seq);
+        if context_retry_supersedes || budget_retry_supersedes {
+            event.kind = "turn.retry_superseded".to_owned();
+        }
+    }
+    segment_turns_base_with_pre_user_recovery(
+        &normalized,
+        LegacyCompletionSeq::NextUserEvidence,
+        legacy_pre_user_recovery_turns,
+    )
+}
+
 fn normalize_boundary_version_v4_for_v1(event: &mut JournalEvent) -> Result<()> {
-    if let Some(version) = event.data.get_mut("turn_boundary_version") {
+    let seq = event.seq;
+    if let Some(version) = direct_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1..=4) {
             return Err(OxidraError::Session(format!(
                 "unsupported turn boundary version {value} at seq {}",
-                event.seq
+                seq
             )));
         }
         *version = Value::from(1);
     }
-    if let Some(version) = event
-        .data
-        .get_mut("turn_completion")
-        .and_then(Value::as_object_mut)
-        .and_then(|completion| completion.get_mut("turn_boundary_version"))
-    {
+    if let Some(version) = inline_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "inline turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1..=4) {
             return Err(OxidraError::Session(format!(
                 "unsupported inline turn boundary version {value} at seq {}",
-                event.seq
+                seq
             )));
         }
         *version = Value::from(1);
@@ -1141,37 +1454,33 @@ fn normalize_boundary_version_v4_for_v1(event: &mut JournalEvent) -> Result<()> 
 }
 
 fn normalize_boundary_version_v5_for_v1(event: &mut JournalEvent) -> Result<()> {
-    if let Some(version) = event.data.get_mut("turn_boundary_version") {
+    let seq = event.seq;
+    if let Some(version) = direct_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1..=5) {
             return Err(OxidraError::Session(format!(
                 "unsupported turn boundary version {value} at seq {}",
-                event.seq
+                seq
             )));
         }
         *version = Value::from(1);
     }
-    if let Some(version) = event
-        .data
-        .get_mut("turn_completion")
-        .and_then(Value::as_object_mut)
-        .and_then(|completion| completion.get_mut("turn_boundary_version"))
-    {
+    if let Some(version) = inline_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "inline turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1..=5) {
             return Err(OxidraError::Session(format!(
                 "unsupported inline turn boundary version {value} at seq {}",
-                event.seq
+                seq
             )));
         }
         *version = Value::from(1);
@@ -1180,37 +1489,33 @@ fn normalize_boundary_version_v5_for_v1(event: &mut JournalEvent) -> Result<()> 
 }
 
 fn normalize_boundary_version_v6_for_v1(event: &mut JournalEvent) -> Result<()> {
-    if let Some(version) = event.data.get_mut("turn_boundary_version") {
+    let seq = event.seq;
+    if let Some(version) = direct_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1..=6) {
             return Err(OxidraError::Session(format!(
                 "unsupported turn boundary version {value} at seq {}",
-                event.seq
+                seq
             )));
         }
         *version = Value::from(1);
     }
-    if let Some(version) = event
-        .data
-        .get_mut("turn_completion")
-        .and_then(Value::as_object_mut)
-        .and_then(|completion| completion.get_mut("turn_boundary_version"))
-    {
+    if let Some(version) = inline_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "inline turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1..=6) {
             return Err(OxidraError::Session(format!(
                 "unsupported inline turn boundary version {value} at seq {}",
-                event.seq
+                seq
             )));
         }
         *version = Value::from(1);
@@ -1219,37 +1524,68 @@ fn normalize_boundary_version_v6_for_v1(event: &mut JournalEvent) -> Result<()> 
 }
 
 fn normalize_boundary_version_v7_for_v1(event: &mut JournalEvent) -> Result<()> {
-    if let Some(version) = event.data.get_mut("turn_boundary_version") {
+    let seq = event.seq;
+    if let Some(version) = direct_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1..=7) {
             return Err(OxidraError::Session(format!(
                 "unsupported turn boundary version {value} at seq {}",
-                event.seq
+                seq
             )));
         }
         *version = Value::from(1);
     }
-    if let Some(version) = event
-        .data
-        .get_mut("turn_completion")
-        .and_then(Value::as_object_mut)
-        .and_then(|completion| completion.get_mut("turn_boundary_version"))
-    {
+    if let Some(version) = inline_turn_boundary_version_mut(event) {
         let value = version.as_u64().ok_or_else(|| {
             OxidraError::Session(format!(
                 "inline turn boundary version at seq {} is not an unsigned integer",
-                event.seq
+                seq
             ))
         })?;
         if !matches!(value, 1..=7) {
             return Err(OxidraError::Session(format!(
                 "unsupported inline turn boundary version {value} at seq {}",
-                event.seq
+                seq
+            )));
+        }
+        *version = Value::from(1);
+    }
+    Ok(())
+}
+
+fn normalize_boundary_version_v8_for_v1(event: &mut JournalEvent) -> Result<()> {
+    let seq = event.seq;
+    if let Some(version) = direct_turn_boundary_version_mut(event) {
+        let value = version.as_u64().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "turn boundary version at seq {} is not an unsigned integer",
+                seq
+            ))
+        })?;
+        if !matches!(value, 1..=8) {
+            return Err(OxidraError::Session(format!(
+                "unsupported turn boundary version {value} at seq {}",
+                seq
+            )));
+        }
+        *version = Value::from(1);
+    }
+    if let Some(version) = inline_turn_boundary_version_mut(event) {
+        let value = version.as_u64().ok_or_else(|| {
+            OxidraError::Session(format!(
+                "inline turn boundary version at seq {} is not an unsigned integer",
+                seq
+            ))
+        })?;
+        if !matches!(value, 1..=8) {
+            return Err(OxidraError::Session(format!(
+                "unsupported inline turn boundary version {value} at seq {}",
+                seq
             )));
         }
         *version = Value::from(1);
@@ -1270,6 +1606,14 @@ fn segment_turns_v1(events: &[JournalEvent]) -> Result<Vec<TurnSpan>> {
 fn segment_turns_base(
     events: &[JournalEvent],
     legacy_completion_seq: LegacyCompletionSeq,
+) -> Result<Vec<TurnSpan>> {
+    segment_turns_base_with_pre_user_recovery(events, legacy_completion_seq, &HashSet::new())
+}
+
+fn segment_turns_base_with_pre_user_recovery(
+    events: &[JournalEvent],
+    legacy_completion_seq: LegacyCompletionSeq,
+    legacy_pre_user_recovery_turns: &HashSet<String>,
 ) -> Result<Vec<TurnSpan>> {
     let mut starts = Vec::new();
     let mut seen_turn_ids = HashSet::new();
@@ -1319,6 +1663,12 @@ fn segment_turns_base(
             }
             continue;
         };
+        if index < *start
+            && legacy_pre_user_recovery_turns.contains(turn_id)
+            && event.kind == "context.limit_reached"
+        {
+            continue;
+        }
         if index < *start || index >= *end {
             return Err(OxidraError::Session(format!(
                 "event at seq {} appears outside turn {turn_id}",
@@ -1335,9 +1685,17 @@ fn segment_turns_base(
             .unwrap_or(events.len());
         let user_event = &events[*start_index];
         let tagged = boundary_version(user_event)?.is_some();
-        let turn_events = events[*start_index..end_index_exclusive]
+        let turn_events = events
             .iter()
-            .filter(|event| event.turn_id.as_deref() == Some(turn_id.as_str()))
+            .enumerate()
+            .filter(|(index, event)| {
+                event.turn_id.as_deref() == Some(turn_id.as_str())
+                    && ((*index >= *start_index && *index < end_index_exclusive)
+                        || (legacy_pre_user_recovery_turns.contains(turn_id)
+                            && *index < *start_index
+                            && event.kind == "context.limit_reached"))
+            })
+            .map(|(_, event)| event)
             .collect::<Vec<_>>();
         let markers = turn_events
             .iter()
@@ -1352,7 +1710,7 @@ fn segment_turns_base(
         let inline_completions = turn_events
             .iter()
             .copied()
-            .filter(|event| event.data.get("turn_completion").is_some())
+            .filter(|event| has_inline_turn_completion(event))
             .collect::<Vec<_>>();
         if inline_completions.len() > 1 {
             return Err(OxidraError::Session(format!(
@@ -1439,7 +1797,7 @@ fn segment_turns_base(
 
 /// Return complete cutoffs in the contiguous cut-safe prefix.
 pub fn complete_prefix_candidates(events: &[JournalEvent]) -> Result<Vec<CompletePrefix>> {
-    complete_prefix_candidates_for_version(TURN_BOUNDARY_VALIDATOR_VERSION, events)
+    complete_prefix_candidates_from_turns(segment_turns(events)?)
 }
 
 /// Rebuild complete-prefix cutoffs using an immutable historical reducer.
@@ -1447,9 +1805,13 @@ pub(crate) fn complete_prefix_candidates_for_version(
     version: u32,
     events: &[JournalEvent],
 ) -> Result<Vec<CompletePrefix>> {
+    complete_prefix_candidates_from_turns(segment_turns_for_version(version, events)?)
+}
+
+fn complete_prefix_candidates_from_turns(turns: Vec<TurnSpan>) -> Result<Vec<CompletePrefix>> {
     let mut candidates = Vec::new();
     let mut complete_turns = 0;
-    for turn in segment_turns_for_version(version, events)? {
+    for turn in turns {
         if !turn.cut_safe {
             break;
         }
@@ -1761,10 +2123,22 @@ pub(crate) fn provider_request_slot_state_for_version(
         2 => provider_request_slot_state_v2(events, turn_id),
         3 => provider_request_slot_state_v3(events, turn_id),
         4 => provider_request_slot_state_v4(events, turn_id),
+        5 => provider_request_slot_state_v5(events, turn_id),
         _ => Err(OxidraError::Session(format!(
             "unsupported Provider request-slot reducer version {version}"
         ))),
     }
+}
+
+fn provider_request_slot_state_v5(
+    events: &[JournalEvent],
+    turn_id: &str,
+) -> Result<ProviderRequestSlotState> {
+    validate_mcp_call_chain_through_version(
+        PROVIDER_REQUEST_SLOT_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5,
+        events,
+    )?;
+    provider_request_slot_state_v2(events, turn_id)
 }
 
 fn provider_request_slot_state_v4(
@@ -1835,7 +2209,6 @@ pub(crate) fn validate_provider_request_slots_v2(
             event.kind = "turn.budget_retry_superseded".to_owned();
         }
     }
-    let recovery = validate_turn_recovery_v3(&normalized)?;
     validate_provider_slot_event_turn_ids(&normalized)?;
     let mut scoped = HashMap::<&str, Vec<JournalEvent>>::new();
     for event in &normalized {
@@ -1846,6 +2219,11 @@ pub(crate) fn validate_provider_request_slots_v2(
             scoped.entry(turn_id).or_default().push(event.clone());
         }
     }
+    let scoped_recovery_events = ordered_turn_ids
+        .iter()
+        .flat_map(|turn_id| scoped.get(turn_id).into_iter().flatten().cloned())
+        .collect::<Vec<_>>();
+    let recovery = validate_turn_recovery_v3(&scoped_recovery_events)?;
     for turn_id in ordered_turn_ids {
         provider_request_slot_state_v1_with_recovery(
             scoped.get(turn_id).map(Vec::as_slice).unwrap_or_default(),
@@ -1868,8 +2246,17 @@ fn provider_request_slot_state_v1(
     events: &[JournalEvent],
     turn_id: &str,
 ) -> Result<ProviderRequestSlotState> {
-    let recovery = validate_turn_recovery_v3(events)?;
     validate_provider_slot_event_turn_ids(events)?;
+    // Slot v1 deliberately keeps recovery-v3 semantics for the target turn,
+    // but it is a turn-scoped reducer. Running recovery v3 over the complete
+    // journal retroactively reinterprets unrelated, legal v2 recovery rows
+    // whenever a later turn asks for a Provider slot.
+    let scoped_recovery_events = events
+        .iter()
+        .filter(|event| event.turn_id.as_deref() == Some(turn_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let recovery = validate_turn_recovery_v3(&scoped_recovery_events)?;
     provider_request_slot_state_v1_with_recovery(events, turn_id, &recovery)
 }
 
@@ -2513,6 +2900,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn current_reducer_clones_deep_public_fixture_iteratively() {
+        let mut data = Value::Null;
+        for _ in 0..20_000 {
+            data = Value::Array(vec![data]);
+        }
+        let event = global_event(1, "custom.deep_fixture", data);
+
+        assert!(
+            segment_turns(std::slice::from_ref(&event))
+                .expect("projection-neutral public fixtures must not overflow recursive Clone")
+                .is_empty()
+        );
+    }
+
+    fn mcp_v4_activation(seq: u64) -> JournalEvent {
+        global_event(
+            seq,
+            "mcp.registry.activated",
+            json!({
+                "bindings":[],
+                "config_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "call_chain_validator_version":4,
+                "coordinator_id":"0190f5e6-7b00-7abc-8000-000000000001",
+                "coordinator_version":4,
+                "execution_plan_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "registry_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "registry_epoch_id":"0190f5e6-7b00-7abc-8000-000000000002",
+                "registry_version":1,
+                "schema_profile_version":1,
+                "stdio_kernel_version":1,
+                "surface_claim_version":1,
+            }),
+        )
+    }
+
     fn user(seq: u64, turn_id: &str, tagged: bool) -> JournalEvent {
         let mut data = json!({
             "item": {"role": "user", "content": turn_id},
@@ -2521,6 +2944,18 @@ mod tests {
             data["turn_boundary_version"] = json!(TURN_BOUNDARY_VERSION);
         }
         event(seq, turn_id, "user.message", data)
+    }
+
+    fn user_with_boundary_version(seq: u64, turn_id: &str, version: u64) -> JournalEvent {
+        event(
+            seq,
+            turn_id,
+            "user.message",
+            json!({
+                "item": {"role": "user", "content": turn_id},
+                "turn_boundary_version": version,
+            }),
+        )
     }
 
     fn response(seq: u64, turn_id: &str) -> JournalEvent {
@@ -2607,6 +3042,13 @@ mod tests {
                 .contains("unsupported turn boundary version 3"),
             "unexpected v2 tag error: {unsupported}"
         );
+
+        let dynamic = segment_turns(&events)
+            .expect("the public reader uses v8 structure with the owning v2 recovery language");
+        assert_eq!(
+            dynamic[0].state,
+            TurnState::Complete(CompletionEvidence::InlineResponse)
+        );
     }
 
     #[test]
@@ -2631,15 +3073,70 @@ mod tests {
         events.push(user(2, "turn-current", true));
         events.push(inline_response(3, "turn-current", 2));
 
-        let turns = segment_turns_v7(&events)
+        let turns = segment_turns_v8(&events)
             .expect("current turn validator must dispatch the durable v1 MCP reducer");
         assert_eq!(turns.len(), 1);
         assert!(matches!(turns[0].state, TurnState::Complete(_)));
     }
 
     #[test]
-    fn frozen_recovery_v2_keeps_the_pre_v3_ordering_contract() {
+    fn public_turn_reader_does_not_bypass_the_current_mcp_chain_validator() {
         let events = vec![
+            global_event(1, "mcp.registry.activated", json!({})),
+            user_with_boundary_version(2, "turn-current", 8),
+        ];
+
+        let error = segment_turns(&events)
+            .expect_err("public segmentation must reject a malformed MCP activation")
+            .to_string();
+        assert!(error.contains("mcp.registry.activated"), "{error}");
+    }
+
+    #[test]
+    fn turn_v8_and_provider_slot_v5_are_the_first_v4_compatible_reducers() {
+        assert_eq!(TURN_BOUNDARY_VALIDATOR_VERSION, 8);
+        assert_eq!(PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION, 5);
+        let events = vec![mcp_v4_activation(1), user(2, "turn-v4", false)];
+
+        let turn_error = segment_turns_for_version(7, &events)
+            .expect_err("turn v7 must retain its call-chain v2 ceiling")
+            .to_string();
+        assert!(
+            turn_error.contains("compatibility ceiling 2"),
+            "{turn_error}"
+        );
+        segment_turns_for_version(8, &events).expect("turn v8 accepts call-chain v4");
+
+        let slot_error = provider_request_slot_state_for_version(4, &events, "turn-v4")
+            .expect_err("slot v4 must retain its call-chain v2 ceiling")
+            .to_string();
+        assert!(
+            slot_error.contains("compatibility ceiling 2"),
+            "{slot_error}"
+        );
+        assert_eq!(
+            provider_request_slot_state_for_version(5, &events, "turn-v4")
+                .expect("slot v5 accepts call-chain v4"),
+            ProviderRequestSlotState::Ready
+        );
+    }
+
+    #[test]
+    fn turn_v7_does_not_learn_the_v8_boundary_tag() {
+        let events = vec![user(1, "turn-v8", true), inline_response(2, "turn-v8", 1)];
+        segment_turns_for_version(8, &events).expect("turn v8 accepts its current tag");
+        let error = segment_turns_for_version(7, &events)
+            .expect_err("frozen turn v7 must reject a v8 boundary tag")
+            .to_string();
+        assert!(
+            error.contains("unsupported turn boundary version 8"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn frozen_recovery_v2_keeps_the_pre_v3_ordering_contract() {
+        let mut events = vec![
             event(1, "limited", "context.limit_reached", json!({})),
             user(2, "limited", true),
             event(
@@ -2657,6 +3154,112 @@ mod tests {
         assert!(
             validate_turn_recovery_v3(&events).is_err(),
             "v3 must enforce user.message < context.limit_reached < control event"
+        );
+
+        // The recovery validator and the published turn reducer are separate
+        // frozen languages. v2 recovery accepted this ordering, but the v2
+        // structural reducer still rejected the pre-user row as outside the
+        // turn. The dynamic reader may provide compatibility without changing
+        // the literal `segment_turns_for_version(2)` contract used by durable
+        // compaction artifacts.
+        events[1].data["turn_boundary_version"] = json!(2);
+        let error = segment_turns_for_version(2, &events)
+            .expect_err("frozen turn reducer v2 must remain literal")
+            .to_string();
+        assert!(error.contains("appears outside turn limited"), "{error}");
+    }
+
+    #[test]
+    fn partitioned_recovery_rejects_orphan_and_unowned_controls() {
+        let user = user_with_boundary_version(1, "known", 8);
+        for (turn_id, kind, data) in [
+            (
+                Some("ghost"),
+                "turn.abandoned",
+                json!({"user_message_seq": 99, "reason": "forged"}),
+            ),
+            (
+                Some("ghost"),
+                "turn.retry_started",
+                json!({
+                    "retry_version": 1,
+                    "retry_id": "orphan-retry",
+                    "user_message_seq": 99,
+                    "context_limit_seq": 98,
+                }),
+            ),
+            (
+                None,
+                "turn.abandoned",
+                json!({"user_message_seq": 1, "reason": "unowned"}),
+            ),
+        ] {
+            let mut control = event(2, turn_id.unwrap_or("placeholder"), kind, data);
+            control.turn_id = turn_id.map(str::to_owned);
+            let error = segment_turns(&[user.clone(), control])
+                .expect_err("recovery control must have one durable owning user turn")
+                .to_string();
+            assert!(
+                error.contains("references unknown turn") || error.contains("has no turn_id"),
+                "{kind}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_recovery_preserves_mixed_languages_and_requires_exact_owners() {
+        let mixed = vec![
+            user_with_boundary_version(1, "legacy-v2", 2),
+            event(
+                2,
+                "legacy-v2",
+                "context.limit_reached",
+                json!({"source":"provider"}),
+            ),
+            event(
+                3,
+                "legacy-v2",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"legacy-retry",
+                    "user_message_seq":1,
+                    "context_limit_seq":2,
+                }),
+            ),
+            user_with_boundary_version(4, "current-v8", 8),
+        ];
+        let recovery = validate_turn_recovery_dynamic(&mixed)
+            .expect("each turn selects its owning user.message recovery language");
+        assert_eq!(recovery.retries.len(), 1);
+        assert_eq!(recovery.retries[0].retry_id, "legacy-retry");
+
+        for (kind, data) in [
+            ("context.limit_reached", json!({})),
+            (
+                "response.failed",
+                json!({"response_attempt_id":"orphan-attempt"}),
+            ),
+            ("turn.completed", json!({})),
+        ] {
+            let orphan = event(1, "ghost", kind, data);
+            let error = validate_turn_recovery_dynamic(&[orphan])
+                .expect_err("a full-history recovery consumer must not drop orphan protocol rows")
+                .to_string();
+            assert!(
+                error.contains("references unknown turn ghost"),
+                "{kind}: {error}"
+            );
+        }
+
+        let mut unowned_user = user_with_boundary_version(1, "missing", 8);
+        unowned_user.turn_id = None;
+        let error = validate_turn_recovery_dynamic(&[unowned_user])
+            .expect_err("user.message must select one owned recovery language")
+            .to_string();
+        assert!(
+            error.contains("user.message at seq 1 has no turn_id"),
+            "{error}"
         );
     }
 
@@ -2846,11 +3449,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_completion_seq_is_the_next_user_evidence() {
+    fn untagged_journal_defaults_to_legacy_completion_evidence() {
         let events = vec![
             user(1, "legacy", false),
             response(3, "legacy"),
-            user(4, "next", true),
+            user(4, "next", false),
         ];
 
         let turns = segment_turns(&events).expect("valid legacy boundary");
@@ -2858,7 +3461,131 @@ mod tests {
             turns[0].state,
             TurnState::Complete(CompletionEvidence::LegacyNextUser)
         );
-        assert_eq!(turns[0].completion_seq, Some(4));
+        assert_eq!(turns[0].completion_seq, Some(3));
+    }
+
+    #[test]
+    fn compaction_reducer_claim_does_not_upgrade_the_underlying_turn_language() {
+        let events = vec![
+            user(1, "v4", false),
+            response(2, "v4"),
+            global_event(
+                3,
+                "compaction.started",
+                json!({
+                    "covers_through_seq": 2,
+                    "turn_boundary_validator_version": 4,
+                }),
+            ),
+            user(4, "next", false),
+        ];
+
+        let turns = segment_turns(&events).expect("compaction metadata is projection-neutral");
+        assert_eq!(
+            turns[0].state,
+            TurnState::Complete(CompletionEvidence::LegacyNextUser)
+        );
+        assert_eq!(turns[0].completion_seq, Some(2));
+    }
+
+    #[test]
+    fn mixed_legacy_and_tagged_turns_keep_each_completion_language() {
+        let events = vec![
+            user(1, "legacy", false),
+            response(2, "legacy"),
+            user_with_boundary_version(3, "v4", 4),
+            response(4, "v4"),
+            user_with_boundary_version(5, "tail", 4),
+        ];
+
+        let turns = segment_turns(&events).expect("mixed historical boundary versions");
+        assert_eq!(turns[0].completion_seq, Some(2));
+        assert_eq!(turns[1].state, TurnState::Incomplete);
+        assert_eq!(turns[1].completion_seq, None);
+    }
+
+    #[test]
+    fn later_v8_turn_does_not_retroactively_apply_v3_recovery_binding() {
+        // Frozen v2 accepted a provider-labelled context limit without the
+        // later response-attempt binding.  Keep that old turn readable when a
+        // subsequent v8 turn raises the current structural reducer.
+        let events = vec![
+            user_with_boundary_version(1, "legacy-v2", 2),
+            event(
+                2,
+                "legacy-v2",
+                "context.limit_reached",
+                json!({"source": "provider"}),
+            ),
+            user_with_boundary_version(3, "current-v8", 8),
+            inline_response(4, "current-v8", 3),
+        ];
+
+        let turns = segment_turns(&events).expect("mixed frozen recovery languages remain valid");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].state, TurnState::LimitReached);
+        assert!(matches!(turns[1].state, TurnState::Complete(_)));
+    }
+
+    #[test]
+    fn v2_pre_user_context_limit_remains_representable_in_a_later_v8_journal() {
+        let events = vec![
+            event(1, "legacy-v2", "context.limit_reached", json!({})),
+            user_with_boundary_version(2, "legacy-v2", 2),
+            event(
+                3,
+                "legacy-v2",
+                "turn.abandoned",
+                json!({"user_message_seq": 2, "reason": "historical v2 fixture"}),
+            ),
+            user_with_boundary_version(4, "current-v8", 8),
+            inline_response(5, "current-v8", 4),
+        ];
+
+        let turns = segment_turns(&events).expect("legacy v2 prefix must not be rejected by v8");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].state, TurnState::LimitReached);
+        assert!(matches!(turns[1].state, TurnState::Complete(_)));
+        assert_eq!(
+            segment_turns_for_version(8, &events)
+                .expect("the persisted v8 reducer owns the same mixed-language semantics"),
+            turns
+        );
+    }
+
+    #[test]
+    fn later_terminal_tag_does_not_upgrade_the_owning_users_recovery_language() {
+        let events = vec![
+            user_with_boundary_version(1, "legacy-v2", 2),
+            event(
+                2,
+                "legacy-v2",
+                "response.failed",
+                json!({"turn_boundary_version": 8}),
+            ),
+            event(
+                3,
+                "legacy-v2",
+                "context.limit_reached",
+                json!({"source": "provider"}),
+            ),
+        ];
+
+        let turns = segment_turns(&events)
+            .expect("a later terminal cannot retroactively select recovery v3");
+        assert_eq!(turns[0].state, TurnState::Failed);
+    }
+
+    #[test]
+    fn unknown_boundary_claim_fails_closed_before_reducer_dispatch() {
+        let events = vec![user_with_boundary_version(1, "future", 9)];
+
+        let error = segment_turns(&events).expect_err("future boundary must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported turn boundary version 9")
+        );
     }
 
     #[test]
@@ -2921,6 +3648,45 @@ mod tests {
             .expect("in-flight slot"),
             ProviderRequestSlotState::ResponseInFlight
         );
+    }
+
+    #[test]
+    fn provider_slot_does_not_reinterpret_an_unrelated_v2_retry_with_v3() {
+        let events = vec![
+            user_with_boundary_version(1, "legacy-v2", 2),
+            event(
+                2,
+                "legacy-v2",
+                "context.limit_reached",
+                json!({"source":"provider"}),
+            ),
+            event(
+                3,
+                "legacy-v2",
+                "turn.retry_started",
+                json!({
+                    "retry_version":1,
+                    "retry_id":"legacy-retry",
+                    "user_message_seq":1,
+                    "context_limit_seq":2,
+                }),
+            ),
+            mcp_v4_activation(4),
+            user_with_boundary_version(5, "modern-mcp", 8),
+        ];
+
+        validate_turn_recovery_v2(&events[..3]).expect("the legacy retry is valid recovery v2");
+        assert!(
+            validate_turn_recovery_v3(&events).is_err(),
+            "a whole-journal recovery-v3 pass would retroactively reject the v2 prefix"
+        );
+        assert_eq!(
+            provider_request_slot_state_for_version(5, &events, "modern-mcp")
+                .expect("the modern MCP slot only validates its owning turn with recovery v3"),
+            ProviderRequestSlotState::Ready
+        );
+        validate_provider_request_slots_v2(&events, &["modern-mcp".to_owned()])
+            .expect("the batch slot validator must apply the same target-turn scope");
     }
 
     #[test]

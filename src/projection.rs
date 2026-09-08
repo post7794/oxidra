@@ -9,25 +9,53 @@ use serde_json::{Value, json};
 
 use crate::compaction::{
     COMPACTION_CHECKPOINT_KIND, CheckpointChain, CompactionBoundaryChain, compacted_history_item,
-    validate_compaction_boundary_chain,
+    validate_checkpoint_chain, validate_compaction_boundary_chain,
 };
 use crate::error::{OxidraError, Result};
 use crate::mcp::{
     MCP_CALL_CHAIN_VALIDATOR_VERSION_V1, MCP_CALL_CHAIN_VALIDATOR_VERSION_V2,
-    validate_mcp_call_chain_for_version, validate_mcp_call_chain_through_version,
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V4, validate_mcp_call_chain_for_version,
+    validate_mcp_call_chain_through_version,
 };
 use crate::session::JournalEvent;
 use crate::turn::{
-    ValidatedTurnRecovery, complete_prefix_candidates, validate_turn_recovery_v2,
-    validate_turn_recovery_v3,
+    ValidatedTurnRecovery, complete_prefix_candidates, validate_turn_recovery_dynamic,
+    validate_turn_recovery_v2, validate_turn_recovery_v3,
 };
 
 /// Current immutable event-to-item format used when building compaction input.
-pub const SOURCE_PROJECTION_VERSION: u32 = 6;
+pub const SOURCE_PROJECTION_VERSION: u32 = 8;
 const SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V5: u32 =
     MCP_CALL_CHAIN_VALIDATOR_VERSION_V1;
 const SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6: u32 =
     MCP_CALL_CHAIN_VALIDATOR_VERSION_V2;
+const SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V7: u32 =
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V4;
+const SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8: u32 =
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V4;
+
+/// Public projection helpers accept caller-constructed `JournalEvent`
+/// fixtures in addition to events materialized by `SessionStore`.  A safe
+/// caller can therefore put a JSON tree far deeper than serde_json's
+/// recursive Clone/Serialize/Drop implementations tolerate into a projected
+/// user, assistant, or tool item.  Historical on-disk schema-1 journals were
+/// already constrained by serde_json's default 128-level reader, so rejecting
+/// deeper in-memory projection payloads does not narrow the durable language.
+const MAX_PROJECTION_VALUE_DEPTH_V1: usize = 128;
+
+pub(crate) fn validate_projection_value_depth_v1(value: &Value, label: &str) -> Result<()> {
+    crate::session::validate_borrowed_json_depth_v1(
+        value,
+        MAX_PROJECTION_VALUE_DEPTH_V1,
+        "projection",
+        label,
+    )
+}
+
+fn clone_projection_value_v1(value: &Value, label: &str) -> Result<Value> {
+    validate_projection_value_depth_v1(value, label)?;
+    Ok(crate::session::clone_json_value_iteratively_v1(value))
+}
 
 /// Whether a persisted source projection version can prove that a validated
 /// compaction-boundary abandon was excluded from the opaque summary source.
@@ -38,7 +66,7 @@ const SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6: u32 =
 pub(crate) fn source_projection_supports_boundary_exclusions(version: u32) -> Result<bool> {
     match version {
         1..=3 => Ok(false),
-        4..=6 => Ok(true),
+        4..=8 => Ok(true),
         _ => Err(OxidraError::Session(format!(
             "unsupported compaction source projection version {version}"
         ))),
@@ -57,11 +85,32 @@ pub(crate) fn project_events_with_boundary_chain(
     boundary_chain: &CompactionBoundaryChain,
 ) -> Result<Vec<Value>> {
     validate_mcp_call_chain_through_version(
-        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6,
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8,
         events,
     )?;
     let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
     project_events_current(events, &excluded_turn_ids)
+}
+
+/// Rebuild the normal Provider input after the caller has already validated
+/// the MCP call-chain for this exact prefix.
+///
+/// The v4 MCP reader uses this to bind a prepared request to its canonical
+/// journal projection without recursively re-entering itself through the
+/// ordinary projection-level MCP gate. Keep this crate-private: skipping that
+/// gate is sound only while the caller owns the same validation pass.
+pub(crate) fn project_provider_request_after_mcp_validation(
+    events: &[JournalEvent],
+) -> Result<Vec<Value>> {
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    let checkpoint_chain = validate_checkpoint_chain(events)?;
+    let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+    project_checkpoint_and_tail_with_exclusions(
+        events,
+        &checkpoint_chain,
+        &boundary_chain,
+        &excluded_turn_ids,
+    )
 }
 
 /// Rebuild the current input shape while a validated recovery boundary is
@@ -76,7 +125,7 @@ pub(crate) fn project_events_for_recovery_planning(
     boundary_chain: &CompactionBoundaryChain,
 ) -> Result<Vec<Value>> {
     validate_mcp_call_chain_through_version(
-        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6,
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8,
         events,
     )?;
     project_events_current(events, &boundary_chain.abandoned_turn_ids())
@@ -92,6 +141,8 @@ pub fn project_events_for_compaction(version: u32, events: &[JournalEvent]) -> R
         4 => project_events_v4(events),
         5 => project_events_v5(events),
         6 => project_events_v6(events),
+        7 => project_events_v7(events),
+        8 => project_events_v8(events),
         _ => Err(OxidraError::Session(format!(
             "unsupported compaction source projection version {version}"
         ))),
@@ -146,6 +197,31 @@ fn project_events_v6(events: &[JournalEvent]) -> Result<Vec<Value>> {
     project_events_impl(events, Some(&recovery), true, Some(&excluded_turn_ids))
 }
 
+fn project_events_v7(events: &[JournalEvent]) -> Result<Vec<Value>> {
+    validate_mcp_call_chain_through_version(
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V7,
+        events,
+    )?;
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+    let recovery = validate_turn_recovery_v3(events)?;
+    project_events_impl(events, Some(&recovery), true, Some(&excluded_turn_ids))
+}
+
+fn project_events_v8(events: &[JournalEvent]) -> Result<Vec<Value>> {
+    validate_mcp_call_chain_through_version(
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8,
+        events,
+    )?;
+    let boundary_chain = validate_compaction_boundary_chain(events)?;
+    let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
+    // v8 is the first source projection whose recovery language is selected
+    // by each owning user.message. Keep v1-v7 literal: changing their global
+    // v2/v3 reducers would change already persisted compaction source bytes.
+    let recovery = validate_turn_recovery_dynamic(events)?;
+    project_events_impl(events, Some(&recovery), true, Some(&excluded_turn_ids))
+}
+
 /// Build the current runtime projection after applying the separately
 /// versioned compaction-boundary state machine. Historical source projection
 /// versions intentionally bypass this wrapper and remain byte-frozen.
@@ -153,7 +229,7 @@ fn project_events_current(
     events: &[JournalEvent],
     excluded_turn_ids: &HashSet<String>,
 ) -> Result<Vec<Value>> {
-    let recovery = validate_turn_recovery_v3(events)?;
+    let recovery = validate_turn_recovery_dynamic(events)?;
     project_events_impl(events, Some(&recovery), true, Some(excluded_turn_ids))
 }
 
@@ -222,7 +298,10 @@ fn project_events_impl(
                         || explicitly_abandoned_turns.contains(turn_id)
                 });
                 if !abandoned {
-                    projected.push(item.clone());
+                    projected.push(clone_projection_value_v1(
+                        item,
+                        "projected user.message item",
+                    )?);
                 }
             }
             "response.completed" => {
@@ -235,7 +314,12 @@ fn project_events_impl(
                 }
                 let items = response_output_items(event)?;
                 validate_response_output_items(items)?;
-                projected.extend(items.iter().cloned());
+                for item in items {
+                    projected.push(clone_projection_value_v1(
+                        item,
+                        "projected response output item",
+                    )?);
+                }
             }
             kind if is_tool_terminal_v1(kind) => {
                 if event
@@ -245,7 +329,7 @@ fn project_events_impl(
                 {
                     continue;
                 }
-                if let Some(item) = tool_output_item_v1(&event.data) {
+                if let Some(item) = tool_output_item_v1(&event.data)? {
                     projected.push(item);
                 }
             }
@@ -332,7 +416,7 @@ fn validate_user_input_item(item: &Value, seq: u64) -> Result<()> {
 /// Project only events after a verified complete-turn prefix boundary.
 pub fn project_tail(events: &[JournalEvent], covers_through_seq: u64) -> Result<Vec<Value>> {
     validate_mcp_call_chain_through_version(
-        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6,
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8,
         events,
     )?;
     let boundary_is_valid = complete_prefix_candidates(events)?
@@ -369,7 +453,7 @@ pub(crate) fn project_checkpoint_and_tail_with_boundary_chain(
     boundary_chain: &CompactionBoundaryChain,
 ) -> Result<Vec<Value>> {
     validate_mcp_call_chain_through_version(
-        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6,
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8,
         events,
     )?;
     let excluded_turn_ids = boundary_chain.projection_excluded_turn_ids()?;
@@ -420,7 +504,7 @@ pub(crate) fn project_checkpoint_and_tail_for_recovery_planning(
     boundary_chain: &CompactionBoundaryChain,
 ) -> Result<Vec<Value>> {
     validate_mcp_call_chain_through_version(
-        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6,
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8,
         events,
     )?;
     let excluded_turn_ids = boundary_chain.abandoned_turn_ids();
@@ -443,7 +527,7 @@ pub(crate) fn project_compaction_summary_and_tail(
     boundary_chain: &CompactionBoundaryChain,
 ) -> Result<Vec<Value>> {
     validate_mcp_call_chain_through_version(
-        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6,
+        SOURCE_PROJECTION_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8,
         events,
     )?;
     let excluded_turn_ids = boundary_chain.abandoned_turn_ids();
@@ -483,26 +567,33 @@ fn is_tool_terminal_v1(kind: &str) -> bool {
     )
 }
 
-fn tool_output_item_v1(data: &Value) -> Option<Value> {
-    let call_id = data.get("call_id")?.as_str()?;
-    let output = data.get("output").cloned().unwrap_or_else(|| {
-        json!({
+fn tool_output_item_v1(data: &Value) -> Result<Option<Value>> {
+    let Some(call_id) = data.get("call_id").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let fallback;
+    let output = if let Some(output) = data.get("output") {
+        output
+    } else {
+        fallback = json!({
             "error": {
                 "code": data.get("error_code").and_then(Value::as_str).unwrap_or("cancelled"),
                 "message": "tool did not complete normally",
             }
-        })
-    });
+        });
+        &fallback
+    };
+    validate_projection_value_depth_v1(output, "projected tool output")?;
     let output = match output {
-        Value::String(output) => output,
-        output => serde_json::to_string(&output)
+        Value::String(output) => output.clone(),
+        output => serde_json::to_string(output)
             .unwrap_or_else(|_| "{\"error\":{\"code\":\"serialization_error\"}}".to_owned()),
     };
-    Some(json!({
+    Ok(Some(json!({
         "type": "function_call_output",
         "call_id": call_id,
         "output": output,
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -527,6 +618,51 @@ mod tests {
             turn_id: turn_id.map(str::to_owned),
             data,
         }
+    }
+
+    #[test]
+    fn public_projection_rejects_deep_tool_output_without_stack_overflow() {
+        let mut output = Value::Null;
+        for _ in 0..20_000 {
+            output = Value::Array(vec![output]);
+        }
+        let mut terminal = event(
+            1,
+            Some("turn"),
+            "tool.completed",
+            json!({
+                "call_id": "call",
+                "output": null,
+                "is_error": false,
+            }),
+        );
+        terminal.data["output"] = output;
+
+        let error = project_events_for_compaction(1, &[terminal])
+            .expect_err("deep caller-constructed projection values must be rejected");
+        assert!(error.to_string().contains("projection depth"), "{error}");
+    }
+
+    fn mcp_v4_activation(seq: u64) -> JournalEvent {
+        event(
+            seq,
+            None,
+            "mcp.registry.activated",
+            json!({
+                "bindings":[],
+                "config_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "call_chain_validator_version":4,
+                "coordinator_id":"0190f5e6-7b00-7abc-8000-000000000001",
+                "coordinator_version":4,
+                "execution_plan_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "registry_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "registry_epoch_id":"0190f5e6-7b00-7abc-8000-000000000002",
+                "registry_version":1,
+                "schema_profile_version":1,
+                "stdio_kernel_version":1,
+                "surface_claim_version":1,
+            }),
+        )
     }
 
     fn frozen_retry_events() -> Vec<JournalEvent> {
@@ -736,6 +872,78 @@ mod tests {
         );
         assert!(project_tail(&events, 2).is_err());
         assert!(project_tail(&events, 5).is_err());
+    }
+
+    #[test]
+    fn source_projection_v7_remains_the_first_v4_compatible_projection() {
+        assert_eq!(SOURCE_PROJECTION_VERSION, 8);
+        assert!(source_projection_supports_boundary_exclusions(7).unwrap());
+        assert!(source_projection_supports_boundary_exclusions(8).unwrap());
+        let events = vec![mcp_v4_activation(1)];
+
+        let error = project_events_for_compaction(6, &events)
+            .expect_err("source projection v6 keeps its call-chain v2 ceiling")
+            .to_string();
+        assert!(error.contains("compatibility ceiling 2"), "{error}");
+        assert_eq!(
+            project_events_for_compaction(7, &events)
+                .expect("source projection v7 accepts call-chain v4"),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            project_events_for_compaction(8, &events)
+                .expect("source projection v8 retains the call-chain v4 ceiling"),
+            Vec::<Value>::new()
+        );
+        assert!(project_events_for_compaction(9, &events).is_err());
+    }
+
+    #[test]
+    fn source_projection_v8_selects_recovery_by_the_owning_user_turn() {
+        // Recovery v2 accepted a context-limit row before its user.message;
+        // recovery v3 deliberately rejects that order. A later v8 turn must
+        // not make source projection reinterpret the historical v2 turn.
+        let events = vec![
+            event(1, Some("legacy-v2"), "context.limit_reached", json!({})),
+            event(
+                2,
+                Some("legacy-v2"),
+                "user.message",
+                json!({
+                    "turn_boundary_version":2,
+                    "item":{"role":"user","content":"obsolete legacy prompt"},
+                }),
+            ),
+            event(
+                3,
+                Some("legacy-v2"),
+                "turn.abandoned",
+                json!({
+                    "user_message_seq":2,
+                    "reason":"historical v2 recovery",
+                }),
+            ),
+            user(4, "current-v8"),
+            response(5, "current-v8"),
+        ];
+
+        assert!(
+            project_events_for_compaction(7, &events).is_err(),
+            "frozen source projection v7 must retain its global recovery-v3 reader"
+        );
+        let projected = project_events_for_compaction(8, &events)
+            .expect("source projection v8 must preserve mixed recovery languages");
+        assert_eq!(
+            projected,
+            vec![
+                json!({"role":"user","content":"current-v8"}),
+                json!({"type":"message","role":"assistant","id":"m-current-v8"}),
+            ]
+        );
+        assert_eq!(
+            project_events(&events).expect("runtime projection uses the same dynamic reader"),
+            projected
+        );
     }
 
     #[test]

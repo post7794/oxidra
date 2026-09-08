@@ -8,22 +8,16 @@ action.
 
 ## Run
 
-The command uses normal Oxidra Provider configuration and credentials. It
-requires an explicit acknowledgement because the default run makes ten live
-Provider requests:
+Live generation is currently fail-closed. The old example called the raw
+Provider transport and received a complete response before any durable writer
+owned it. Provider outcomes are now opaque until a typed durable path commits
+their terminal, so the benchmark must not regain a raw unwrap merely to keep a
+developer utility working. A future live generator needs its own versioned
+durable sink and crash-prefix protocol first.
 
-```powershell
-cargo run --example compaction_drift --release -- `
-  --confirm-live-calls `
-  --output target/compaction-drift/model-baseline.json
-```
-
-Optional `--model` and `--api-base-url` overrides follow the same validation as
-the main CLI. API keys are never accepted as command-line arguments and are not
-written to the artifact. Existing output files are not overwritten.
-
-Metrics can evolve without repeating paid Provider calls when the frozen input
-item chain, prompt hash and envelope hash are unchanged:
+The production-validated rescorer remains available. Metrics can evolve without
+repeating paid Provider calls when the frozen input item chain, prompt hash and
+envelope hash are unchanged:
 
 ```powershell
 cargo run --example compaction_drift --release -- `
@@ -101,15 +95,17 @@ ending and a terminal backslash before a line ending. Other backslashes remain
 semantic. This is an explicit finite lexical contract, not a claim that the
 metric is a general Markdown renderer. V3 through v10 are immutable.
 
-Round 1 sends the frozen input with the registered compaction prompt, no tools,
-`store: false`, and the production 8192-token output cap. Every later round
-wraps only the previous summary with the production low-privilege summary
-envelope. The benchmark does not add a special reminder between rounds.
+The recorded live artifact was produced with round 1 sending the frozen input
+under the registered compaction prompt, no tools, `store: false`, and the
+production 8192-token output cap. Every later recorded round wrapped only the
+previous summary with the production low-privilege summary envelope. The
+rescorer verifies that exact request chain; it does not make a new Provider
+call.
 
 ## Artifact
 
-The JSON artifact is rewritten after every completed round so a partial run is
-auditable. It records:
+Historical source artifacts were rewritten after every completed live round so
+a partial run was auditable. Current rescore artifacts record:
 
 - model, Provider protocol and secret-free Provider usage-domain hash;
 - fixture, prompt and summary-envelope hashes;

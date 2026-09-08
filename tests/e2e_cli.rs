@@ -22,10 +22,34 @@ use oxidra::compaction::{
     validate_checkpoint_chain,
 };
 use oxidra::error::OxidraError;
-use oxidra::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
+use oxidra::provider::{
+    ResponseProvider, ResponseRequest, SilentStreamObserverV1, StreamObserver,
+    UncommittedProviderOutcomeV1,
+};
 use oxidra::session::{SessionHeader, SessionJournal, SessionStore};
 use oxidra::turn::TURN_BOUNDARY_VERSION;
-use oxidra::types::AssistantTurn;
+
+trait SessionJournalFixtureExt {
+    fn append_fixture_event_v1(
+        &mut self,
+        kind: impl Into<String>,
+        turn_id: Option<&str>,
+        data: Value,
+    ) -> oxidra::Result<oxidra::session::JournalEvent>;
+}
+
+impl SessionJournalFixtureExt for SessionJournal {
+    fn append_fixture_event_v1(
+        &mut self,
+        kind: impl Into<String>,
+        turn_id: Option<&str>,
+        data: Value,
+    ) -> oxidra::Result<oxidra::session::JournalEvent> {
+        // SAFETY: each fixture below constructs a prefix exercised by the
+        // corresponding reducer/recovery integration test.
+        unsafe { self.append_protocol_event_and_sync_unchecked_v1(kind, turn_id, data) }
+    }
+}
 
 const INITIAL_CALC: &str = "def add(a, b):\n    return a - b\n\nprint(add(3, 5))\n";
 const FIXED_CALC: &str = "def add(a, b):\n    return a + b\n\nprint(add(3, 5))\n";
@@ -44,8 +68,6 @@ struct CapturedRequest {
 
 struct FailingCompactionProvider;
 
-struct NoopCompactionObserver;
-
 #[async_trait]
 impl ResponseProvider for FailingCompactionProvider {
     async fn respond(
@@ -53,16 +75,10 @@ impl ResponseProvider for FailingCompactionProvider {
         _request: ResponseRequest,
         _observer: &mut dyn StreamObserver,
         _cancellation: CancellationToken,
-    ) -> oxidra::Result<AssistantTurn> {
-        Err(OxidraError::Provider(
+    ) -> UncommittedProviderOutcomeV1 {
+        UncommittedProviderOutcomeV1::failure(OxidraError::Provider(
             "injected pre-resume compaction failure".to_owned(),
         ))
-    }
-}
-
-impl StreamObserver for NoopCompactionObserver {
-    fn on_event(&mut self, _event: ProviderEvent) -> oxidra::Result<()> {
-        Ok(())
     }
 }
 
@@ -147,8 +163,12 @@ fn cli_runs_read_edit_shell_and_replays_tool_outputs() {
         );
     }
     assert!(
-        stderr.contains("[tool] receiving arguments for call"),
-        "streamed tool-call progress was not visible:\n{stderr}"
+        stderr.contains("(arguments hidden from observer)"),
+        "tool start status did not preserve the display-only boundary:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("[tool] receiving arguments for call"),
+        "pre-commit function-call identity escaped through the CLI observer:\n{stderr}"
     );
     assert!(stderr.contains("[turn]"), "missing turn metrics:\n{stderr}");
     assert!(
@@ -553,7 +573,7 @@ fn compaction_boundary_abandon_and_retry_survive_process_resume() {
         "obsolete cross-process prompt",
     );
     abandoned_journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             COMPACTION_BOUNDARY_FAILED_KIND,
             None,
             serde_json::to_value(CompactionBoundaryFailed {
@@ -635,7 +655,7 @@ fn compaction_boundary_abandon_and_retry_survive_process_resume() {
         failed_boundary.user_message_seq,
     );
     retry_journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
             None,
             serde_json::to_value(CompactionBoundaryRetryStarted {
@@ -766,7 +786,7 @@ fn retry_pending_reports_shell_approval_as_exit_three() {
         )
         .expect("create pending session");
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "user.message",
             Some("limited-turn"),
             json!({
@@ -776,7 +796,7 @@ fn retry_pending_reports_shell_approval_as_exit_three() {
         )
         .expect("append pending prompt");
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "context.limit_reached",
             Some("limited-turn"),
             json!({"error":"context window limit reached"}),
@@ -1055,8 +1075,8 @@ fn doctor_rejects_secret_bearing_base_urls_without_echoing_them() {
 }
 
 #[test]
-fn interactive_text_delta_is_visible_before_response_completed() {
-    const STREAMED: &str = "streamed before completion";
+fn interactive_text_delta_is_hidden_until_response_completed() {
+    const COMMITTED_TEXT: &str = "visible only after durable completion";
 
     let project = tempfile::tempdir().expect("create temporary project");
     let user_home = tempfile::tempdir().expect("create isolated user data directory");
@@ -1077,7 +1097,7 @@ fn interactive_text_delta_is_visible_before_response_completed() {
     let server = thread::spawn(move || -> Result<(), String> {
         let (mut stream, _) = listener.accept().map_err(|error| error.to_string())?;
         let _request = read_http_request(&mut stream)?;
-        let (first, rest) = split_text_sse("resp_stream", STREAMED);
+        let (first, rest) = split_text_sse("resp_stream", COMMITTED_TEXT);
         let content_length = first.len() + rest.len();
         write!(
             stream,
@@ -1134,7 +1154,7 @@ fn interactive_text_delta_is_visible_before_response_completed() {
                 break;
             }
             output.extend_from_slice(&buffer[..read]);
-            if !announced && find_bytes(&output, STREAMED.as_bytes()).is_some() {
+            if !announced && find_bytes(&output, COMMITTED_TEXT.as_bytes()).is_some() {
                 observed.send(()).expect("announce streamed delta");
                 announced = true;
             }
@@ -1149,10 +1169,16 @@ fn interactive_text_delta_is_visible_before_response_completed() {
     delta_ready
         .recv_timeout(Duration::from_secs(5))
         .expect("server did not send delta");
-    observed_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("text delta was not visible before response.completed");
+    assert!(
+        observed_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_err(),
+        "Provider-controlled text escaped before response.completed"
+    );
     finish_response.send(()).expect("allow response completion");
+    observed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("committed response text was not rendered after completion");
     stdin.write_all(b"exit\n").expect("write REPL exit");
     drop(stdin);
 
@@ -1160,8 +1186,8 @@ fn interactive_text_delta_is_visible_before_response_completed() {
     assert!(status.success(), "interactive Oxidra exited with {status}");
     let output = stdout_reader.join().expect("stdout reader panicked");
     assert!(
-        find_bytes(&output, STREAMED.as_bytes()).is_some(),
-        "streamed text was absent from stdout: {}",
+        find_bytes(&output, COMMITTED_TEXT.as_bytes()).is_some(),
+        "committed response text was absent from stdout: {}",
         String::from_utf8_lossy(&output)
     );
     server
@@ -1526,7 +1552,7 @@ fn append_completed_turn(
     answer: &str,
 ) -> u64 {
     let user = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "user.message",
             Some(turn_id),
             json!({
@@ -1542,7 +1568,7 @@ fn append_completed_turn(
         "content":[{"type":"output_text","text":answer}],
     })];
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "response.completed",
             Some(turn_id),
             json!({
@@ -1565,7 +1591,7 @@ fn append_completed_turn(
         .expect("append completed-turn response");
     let marker_seq = journal.next_seq();
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "turn.completed",
             Some(turn_id),
             json!({
@@ -1586,7 +1612,7 @@ fn append_open_boundary(
     prompt: &str,
 ) -> CompactionBoundary {
     let user = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "user.message",
             Some(turn_id),
             json!({
@@ -1597,7 +1623,7 @@ fn append_open_boundary(
         .expect("append boundary owner");
     let boundary = CompactionBoundary::new(boundary_id, turn_id, user.seq);
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             COMPACTION_BOUNDARY_STARTED_KIND,
             None,
             serde_json::to_value(CompactionBoundaryStarted {
@@ -1655,9 +1681,8 @@ fn seed_failed_compaction_boundary(
             &boundary,
             &candidate,
             "gpt-5.6-sol",
-            &mut NoopCompactionObserver,
+            &mut SilentStreamObserverV1,
             CancellationToken::new(),
-            |_| Ok(()),
         ))
         .expect_err("seed compaction must fail");
     assert!(matches!(error, OxidraError::Provider(_)));

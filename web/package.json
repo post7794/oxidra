@@ -1,0 +1,16 @@
+{
+  "name": "oxidra-website",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A dependency-free introduction to the Oxidra coding agent.",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -6,6 +6,9 @@ pub mod config;
 pub mod context;
 pub mod error;
 mod event_kind;
+#[doc(hidden)]
+pub mod execution_guardian;
+pub(crate) mod fs_security;
 pub mod history;
 mod history_artifact;
 pub mod mcp;
@@ -13,6 +16,7 @@ mod memory;
 mod process;
 pub mod projection;
 pub mod provider;
+mod provider_sse;
 mod render;
 pub mod session;
 pub mod tools;

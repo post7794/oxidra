@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,7 +10,10 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::{Agent, AgentObserver, ApprovalHandler, TurnOutcome, load_project_instructions};
+use crate::agent::{
+    Agent, AgentObserver, ApprovalHandler, ProviderDisplayEventV1, ToolCompletedDisplayV1,
+    ToolStartedDisplayV1, TurnOutcome, load_project_instructions,
+};
 use crate::auth::{CredentialStatus, CredentialStore};
 use crate::config::{
     ContextLimits, ProjectContext, ProviderConfig, display_safe_url, load_provider_settings,
@@ -19,13 +21,12 @@ use crate::config::{
 use crate::context::ContextRuntime;
 use crate::error::{OxidraError, Result};
 use crate::memory::{MemoryProvenance, MemoryStore};
-use crate::provider::{OpenAiResponsesProvider, ProviderEvent};
+use crate::provider::OpenAiResponsesProvider;
 use crate::render::{
-    RenderOptions, display_value, escape_terminal, format_turn_metrics, render_edit_diff,
+    RenderOptions, display_value, escape_terminal, escape_terminal_multiline, format_turn_metrics,
 };
 use crate::session::{InDoubtTool, SessionHeader, SessionJournal, SessionStore};
 use crate::tools::BuiltinTools;
-use crate::types::{ToolCall, ToolResult};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -127,6 +128,12 @@ enum SessionCommand {
     List,
     /// Print the canonical journal for a session.
     Show { session_id: String },
+    /// Export a versioned, non-resumable archive without reopening the session.
+    Export {
+        session_id: String,
+        /// Destination path ending in `.oxidra-session-export`.
+        destination: PathBuf,
+    },
     /// Permanently delete a session and its artifacts.
     Delete { session_id: String },
 }
@@ -364,6 +371,17 @@ fn run_session_command(command: SessionCommand) -> Result<()> {
         SessionCommand::Show { session_id } => {
             let events = store.inspect(&session_id)?;
             println!("{}", serde_json::to_string_pretty(&events)?);
+            Ok(())
+        }
+        SessionCommand::Export {
+            session_id,
+            destination,
+        } => {
+            let bytes = store.export_read_only_snapshot(&session_id, &destination)?;
+            println!(
+                "Exported session {session_id} to {} ({bytes} bytes).",
+                escape_terminal(&destination.display().to_string())
+            );
             Ok(())
         }
         SessionCommand::Delete { session_id } => {
@@ -773,9 +791,7 @@ async fn run_batch_turn(
         render_options,
     )
     .await?;
-    write_completed_text(&outcome.text)?;
-    print_turn_metrics(&outcome, observer.started_at, model);
-    Ok(())
+    finish_batch_turn(&outcome, observer.started_at, model)
 }
 
 async fn run_batch_retry_pending(
@@ -793,8 +809,22 @@ async fn run_batch_retry_pending(
         render_options,
     )
     .await?;
-    write_completed_text(&outcome.text)?;
-    print_turn_metrics(&outcome, observer.started_at, model);
+    finish_batch_turn(&outcome, observer.started_at, model)
+}
+
+fn finish_batch_turn(outcome: &TurnOutcome, started_at: Instant, model: &str) -> Result<()> {
+    // A stalled turn is recoverable in the REPL, but is not a successful batch
+    // result. Share this boundary with --retry-pending and emit no success text.
+    if !outcome.stalled {
+        write_completed_text(&outcome.text)?;
+    }
+    print_turn_metrics(outcome, started_at, model);
+    if outcome.stalled {
+        return Err(OxidraError::tool(
+            "stalled",
+            "turn stalled after three consecutive identical tool failures",
+        ));
+    }
     Ok(())
 }
 
@@ -919,18 +949,9 @@ async fn run_one_turn(
             }
         }
     };
-    observer.finish_text()?;
-
     if let Ok(outcome) = &result {
-        if stream_text
-            && !outcome.text.is_empty()
-            && !observer.response_streamed_text.ends_with(&outcome.text)
-        {
-            print!("{}", outcome.text);
-            if !outcome.text.ends_with('\n') {
-                println!();
-            }
-            io::stdout().flush()?;
+        if stream_text && !outcome.text.is_empty() {
+            write_completed_text(&outcome.text)?;
         }
     }
 
@@ -948,6 +969,11 @@ struct CliApproval<'a> {
     interactive: bool,
     input: Option<&'a mut StdinLines>,
 }
+
+// This is the sole approval implementation allowed to see replayable
+// command/content in production. It only renders the prompt and returns the
+// user's decision; actual dispatch remains inside Agent.
+impl crate::agent::approval_handler_sealed::Sealed for CliApproval<'_> {}
 
 #[async_trait]
 impl ApprovalHandler for CliApproval<'_> {
@@ -993,12 +1019,20 @@ impl ApprovalHandler for CliApproval<'_> {
         if !self.interactive {
             return Ok(false);
         }
-        eprintln!(
-            "\nMemory to persist:\n{}",
-            display_value(&json!({ "content": content }))
-        );
-        eprint!("Remember this for future sessions? [y/N] ");
-        io::stderr().flush()?;
+        // Approval is for the exact full content, not the bounded diagnostic
+        // preview. Quoting first distinguishes literal backslashes from escaped
+        // controls; terminal escaping also makes Unicode presentation controls
+        // visible. Never truncate this representation before asking for consent.
+        let preview = escape_terminal(&serde_json::to_string(content)?);
+        {
+            let mut stderr = io::stderr().lock();
+            writeln!(
+                stderr,
+                "\nMemory to persist (complete escaped content):\n{preview}"
+            )?;
+            write!(stderr, "Remember this for future sessions? [y/N] ")?;
+            stderr.flush()?;
+        }
         let input = self.input.as_deref_mut().ok_or_else(|| {
             OxidraError::Config("interactive memory approval has no stdin reader".to_owned())
         })?;
@@ -1019,10 +1053,6 @@ impl ApprovalHandler for CliApproval<'_> {
 
 struct CliObserver {
     stream_text: bool,
-    response_streamed_text: String,
-    wrote_text: bool,
-    text_ended_with_newline: bool,
-    announced_argument_streams: HashSet<String>,
     cancellation: CancellationToken,
     approval_required: Option<String>,
     started_at: Instant,
@@ -1037,110 +1067,60 @@ impl CliObserver {
     ) -> Self {
         Self {
             stream_text,
-            response_streamed_text: String::new(),
-            wrote_text: false,
-            text_ended_with_newline: true,
-            announced_argument_streams: HashSet::new(),
             cancellation,
             approval_required: None,
             started_at: Instant::now(),
             render_options,
         }
     }
-
-    fn finish_text(&mut self) -> Result<()> {
-        let mut stdout = io::stdout().lock();
-        if self.stream_text && self.wrote_text && !self.text_ended_with_newline {
-            stdout.write_all(b"\n")?;
-        }
-        stdout.flush()?;
-        self.wrote_text = false;
-        self.text_ended_with_newline = true;
-        Ok(())
-    }
 }
 
-impl AgentObserver for CliObserver {
-    fn on_response_started(&mut self) -> Result<()> {
-        self.response_streamed_text.clear();
-        Ok(())
-    }
+impl crate::agent::agent_observer_sealed::Sealed for CliObserver {}
 
-    fn on_provider_event(&mut self, event: ProviderEvent) -> Result<()> {
+impl AgentObserver for CliObserver {
+    fn on_provider_event(&mut self, event: ProviderDisplayEventV1) -> Result<()> {
         match event {
-            ProviderEvent::TextDelta(delta) => {
-                if self.stream_text {
-                    let mut stdout = io::stdout().lock();
-                    stdout.write_all(delta.as_bytes())?;
-                    stdout.flush()?;
-                    self.wrote_text = true;
-                    self.response_streamed_text.push_str(&delta);
-                    self.text_ended_with_newline = delta.ends_with('\n');
-                }
-            }
-            ProviderEvent::FunctionArgumentsDelta {
-                item_id,
-                call_id,
-                delta: _,
-            } => {
-                let id = call_id.or(item_id).unwrap_or_else(|| "unknown".to_owned());
-                if self.announced_argument_streams.insert(id.clone()) {
-                    writeln!(
-                        io::stderr().lock(),
-                        "[tool] receiving arguments for call {}",
-                        escape_terminal(&id)
-                    )?;
-                }
-            }
-            ProviderEvent::Retry {
+            ProviderDisplayEventV1::Retry {
                 attempt,
-                delay,
-                reason,
+                classification,
             } => {
                 writeln!(
                     io::stderr().lock(),
-                    "[provider] retry {attempt} in {:.1}s: {}",
-                    delay.as_secs_f64(),
-                    escape_terminal(&reason)
-                )?;
-            }
-            ProviderEvent::Unknown {
-                event_type,
-                payload: _,
-            } => {
-                writeln!(
-                    io::stderr().lock(),
-                    "[provider] ignored unknown event {}",
-                    escape_terminal(&event_type)
+                    "[provider] retry after attempt {attempt}: {}",
+                    classification.display_text()
                 )?;
             }
         }
         Ok(())
     }
 
-    fn on_tool_started(&mut self, call: &ToolCall) -> Result<()> {
+    fn on_tool_started(&mut self, event: &ToolStartedDisplayV1<'_>) -> Result<()> {
         writeln!(
             io::stderr().lock(),
-            "[tool:start] {} {}",
-            escape_terminal(&call.name),
-            display_value(&call.arguments)
+            "[tool:start] {} (arguments hidden from observer)",
+            escape_terminal(event.tool_name()),
         )?;
-        if let Some(diff) = render_edit_diff(call, self.render_options) {
-            writeln!(io::stderr().lock(), "[edit:diff]\n{diff}")?;
-        }
         Ok(())
     }
 
-    fn on_tool_completed(&mut self, call: &ToolCall, result: &ToolResult) -> Result<()> {
-        let status = if result.is_error { "error" } else { "ok" };
+    fn on_tool_completed(&mut self, event: &ToolCompletedDisplayV1<'_>) -> Result<()> {
+        let status = if event.is_error() { "error" } else { "ok" };
         writeln!(
             io::stderr().lock(),
             "[tool:{status}] {} {}",
-            escape_terminal(&call.name),
-            display_value(&result.output)
+            escape_terminal(event.tool_name()),
+            display_value(event.output())
         )?;
-        if !self.stream_text && result.error_code.as_deref() == Some("approval_required") {
-            self.approval_required = Some(if call.name == "remember" {
+        if let Some(diff) = event.edit_diff() {
+            let rendered = diff.render(self.render_options);
+            let mut stderr = io::stderr().lock();
+            stderr.write_all(rendered.as_bytes())?;
+            if !rendered.ends_with('\n') {
+                stderr.write_all(b"\n")?;
+            }
+        }
+        if !self.stream_text && event.error_code() == Some("approval_required") {
+            self.approval_required = Some(if event.tool_name() == "remember" {
                 "remember requires interactive user confirmation".to_owned()
             } else {
                 "shell command requires --full-auto in non-interactive mode".to_owned()
@@ -1162,9 +1142,12 @@ impl AgentObserver for CliObserver {
 }
 
 fn write_completed_text(text: &str) -> Result<()> {
+    // stdout is a display surface even when piped to another terminal command.
+    // Keep the canonical text unchanged in the journal and Provider replay.
+    let rendered = escape_terminal_multiline(text);
     let mut stdout = io::stdout().lock();
-    stdout.write_all(text.as_bytes())?;
-    if !text.ends_with('\n') {
+    stdout.write_all(rendered.as_bytes())?;
+    if !rendered.ends_with('\n') {
         stdout.write_all(b"\n")?;
     }
     stdout.flush()?;
@@ -1324,6 +1307,25 @@ mod tests {
             Some(Command::Session {
                 command: SessionCommand::Delete { session_id }
             }) if session_id == "session-1"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "oxidra",
+            "session",
+            "export",
+            "session-1",
+            "snapshot.oxidra-session-export",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session {
+                command: SessionCommand::Export {
+                    session_id,
+                    destination,
+                }
+            }) if session_id == "session-1"
+                && destination == PathBuf::from("snapshot.oxidra-session-export")
         ));
 
         let cli = Cli::try_parse_from(["oxidra", "memory", "forget", "memory-1"]).unwrap();

@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::config::{ContextLimits, ProviderConfig};
 use crate::error::{OxidraError, Result};
-use crate::provider::{ResponseRequest, prepared_request_body};
+use crate::provider::{PreparedResponseRequest, ResponseRequest, prepared_request_body};
 use crate::session::JournalEvent;
 use crate::types::ToolDefinition;
 
@@ -485,12 +485,28 @@ pub fn measure_prepared_request(
 ) -> Result<PreparedRequestMeasurement> {
     let body = prepared_request_body(request, &runtime.model);
     let bytes = serde_json::to_vec(&body)?;
+    measure_exact_prepared_request(&body, &bytes)
+}
+
+/// Measure the exact serialized Provider body that a prepared dispatch token
+/// owns. Unlike [`measure_prepared_request`], this cannot drift from a
+/// Provider-specific effective model or request-shape transformation.
+pub fn measure_provider_prepared_request(
+    request: &PreparedResponseRequest,
+) -> Result<PreparedRequestMeasurement> {
+    measure_exact_prepared_request(request.body(), request.body_bytes())
+}
+
+pub(crate) fn measure_exact_prepared_request(
+    body: &Value,
+    bytes: &[u8],
+) -> Result<PreparedRequestMeasurement> {
     Ok(PreparedRequestMeasurement {
         measurement_version: CONTEXT_MEASUREMENT_VERSION,
         estimator_version: CONTEXT_ESTIMATOR_VERSION,
         request_shape_version: REQUEST_SHAPE_VERSION,
-        request_digest: digest_bytes(b"oxidra.prepared-request.v1\0", &bytes),
-        estimated_input_tokens: estimate_json_tokens(&body)?,
+        request_digest: digest_bytes(b"oxidra.prepared-request.v1\0", bytes),
+        estimated_input_tokens: estimate_json_tokens(body)?,
         serialized_request_bytes: bytes.len() as u64,
     })
 }
@@ -672,7 +688,7 @@ fn latest_comparable_anchor(
     Ok(None)
 }
 
-fn provider_usage_domain(provider: &ProviderConfig) -> Result<String> {
+pub(crate) fn provider_usage_domain(provider: &ProviderConfig) -> Result<String> {
     let mut endpoint = provider.api_base_url.clone();
     endpoint
         .set_username("")

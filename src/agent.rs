@@ -5,6 +5,7 @@
 //! are supplied through traits so the core remains usable from tests and a
 //! future TUI.
 
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -46,7 +47,9 @@ use crate::history::{
     validate_history_snapshot_after_compaction,
 };
 use crate::history_artifact::{HistoryArtifactReader, HistoryArtifactRequest};
-use crate::mcp::{MAX_MCP_CALLS_PER_RESPONSE, validated_durable_mcp_calls_for_turn};
+use crate::mcp::{
+    MAX_MCP_CALLS_PER_RESPONSE, drop_json_value_iteratively, validated_durable_mcp_calls_for_turn,
+};
 pub use crate::projection::project_events;
 use crate::projection::{
     SOURCE_PROJECTION_VERSION, project_checkpoint_and_tail_for_recovery_planning,
@@ -54,7 +57,10 @@ use crate::projection::{
     project_events_for_recovery_planning, project_events_with_boundary_chain,
     source_projection_supports_boundary_exclusions, validate_response_output_items,
 };
-use crate::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
+use crate::provider::{
+    ProviderEvent, ProviderRetryClassV1, ResponseProvider, ResponseRequest, StreamObserver,
+};
+use crate::render::EditDiffDisplay;
 use crate::session::{
     DispatchAdmissionErrorV1, DurableOutcomeCommitErrorV1, JournalEvent, McpRecoverySkipV1,
     ProviderResponseDispatchAdmissionV1, SessionJournal, TurnTransactionAdmissionV1,
@@ -64,7 +70,7 @@ use crate::turn::{
     PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION, ProviderRequestSlotState,
     TURN_BOUNDARY_VALIDATOR_VERSION, TURN_BOUNDARY_VERSION, TurnState,
     complete_prefix_candidates_for_version, provider_request_slot_state_for_version, segment_turns,
-    validate_turn_recovery,
+    validate_turn_recovery_dynamic,
 };
 use crate::types::{ToolCall, ToolDefinition, ToolResult, Usage};
 
@@ -73,17 +79,180 @@ const AUTOMATIC_COMPACTION_PLANNING_CONTEXT_MEASUREMENT_VERSION_V1: u32 = 2;
 const AUTOMATIC_COMPACTION_PLANNING_CONTEXT_ESTIMATOR_VERSION_V1: u32 = 1;
 const AUTOMATIC_COMPACTION_PLANNING_CONTEXT_REQUEST_SHAPE_VERSION_V1: u32 = 1;
 const PROVIDER_CALL_BUDGET_VERSION_V1: u32 = 1;
+// The public Agent validator is also a library entry point.  Keep malformed
+// remote/tool schemas from turning validation into an unbounded recursive
+// walk.  A future vocabulary that needs a larger language must version this
+// boundary instead of silently widening it.
+const MAX_JSON_SCHEMA_VALIDATION_DEPTH_V1: usize = 96;
+const MAX_JSON_SCHEMA_VALIDATION_NODES_V1: usize = 262_144;
 
-/// Events emitted to the UI.  Streaming provider events are forwarded through
-/// [`AgentObserver::on_provider_event`]; tool lifecycle events are committed before/after the
-/// actual operation and therefore remain visible even when a process crashes.
-pub trait AgentObserver: Send {
+/// A non-replayable display projection for a durably started tool call.
+///
+/// The observer intentionally receives only the registered tool name. It does
+/// not receive the Provider-controlled call id or arguments, so observing a
+/// lifecycle transition cannot be used to reconstruct or dispatch the call.
+///
+/// ```compile_fail
+/// use oxidra::agent::ToolStartedDisplayV1;
+///
+/// fn replay(event: &ToolStartedDisplayV1<'_>) {
+///     let _ = event.arguments;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use oxidra::agent::ToolStartedDisplayV1;
+///
+/// fn correlate_provider_payload(event: &ToolStartedDisplayV1<'_>) {
+///     let _ = event.call_id;
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolStartedDisplayV1<'a> {
+    tool_name: &'a str,
+}
+
+impl<'a> ToolStartedDisplayV1<'a> {
+    fn from_call(call: &'a ToolCall) -> Self {
+        Self {
+            tool_name: &call.name,
+        }
+    }
+
+    pub fn tool_name(&self) -> &str {
+        self.tool_name
+    }
+}
+
+/// A display projection for a durably committed tool outcome.
+///
+/// Completion observers may render the result, but do not receive the
+/// original call id or arguments. Successful edits also carry a crate-private,
+/// bounded, terminal-escaped diff preview; it is never used for replay.
+///
+/// ```compile_fail
+/// use oxidra::agent::ToolCompletedDisplayV1;
+///
+/// fn replay(event: &ToolCompletedDisplayV1<'_>) {
+///     let _ = event.arguments;
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use oxidra::agent::ToolCompletedDisplayV1;
+///
+/// fn recover_provider_id(event: &ToolCompletedDisplayV1<'_>) {
+///     let _ = event.call_id;
+/// }
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct ToolCompletedDisplayV1<'a> {
+    tool_name: &'a str,
+    output: &'a Value,
+    is_error: bool,
+    error_code: Option<&'a str>,
+    edit_diff: Option<&'a EditDiffDisplay>,
+}
+
+impl<'a> ToolCompletedDisplayV1<'a> {
+    fn from_call_and_result(
+        call: &'a ToolCall,
+        result: &'a ToolResult,
+        edit_diff: Option<&'a EditDiffDisplay>,
+    ) -> Self {
+        Self {
+            tool_name: &call.name,
+            output: &result.output,
+            is_error: result.is_error,
+            error_code: result.error_code.as_deref(),
+            edit_diff,
+        }
+    }
+
+    pub(crate) fn edit_diff(&self) -> Option<&EditDiffDisplay> {
+        self.edit_diff
+    }
+
+    pub fn tool_name(&self) -> &str {
+        self.tool_name
+    }
+
+    pub fn output(&self) -> &Value {
+        self.output
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.is_error
+    }
+
+    pub fn error_code(&self) -> Option<&str> {
+        self.error_code
+    }
+}
+
+/// Reserved display events for crate-owned observers.
+///
+/// The current Provider pre-commit path forwards no event, including retry
+/// values: a custom Provider can encode controlled bytes through otherwise
+/// bounded fields, event count, or timing. Provider data becomes observable
+/// only after the response is validated and durably committed. A tool's
+/// `tool.started` event is fsynced before [`AgentObserver::on_tool_started`]
+/// receives a non-replayable display projection. The observer never receives
+/// the complete [`ToolCall`].
+#[derive(Clone, Debug)]
+pub enum ProviderDisplayEventV1 {
+    Retry {
+        attempt: usize,
+        classification: ProviderRetryClassV1,
+    },
+}
+
+pub(crate) mod agent_observer_sealed {
+    pub trait Sealed {}
+}
+
+#[allow(private_bounds)]
+/// Crate-owned observer boundary for durable Agent lifecycle notifications.
+///
+/// This trait is sealed. External crates cannot install callback code that
+/// reads the journal or correlates display data with Provider-controlled bytes
+/// inside the execution boundary. Safe public callers use
+/// [`SilentAgentObserverV1`].
+///
+/// ```compile_fail
+/// use oxidra::Result;
+/// use oxidra::agent::{
+///     AgentObserver, ProviderDisplayEventV1, ToolCompletedDisplayV1,
+///     ToolStartedDisplayV1,
+/// };
+///
+/// struct ExternalObserver;
+///
+/// impl AgentObserver for ExternalObserver {
+///     fn on_provider_event(&mut self, _event: ProviderDisplayEventV1) -> Result<()> {
+///         Ok(())
+///     }
+///
+///     fn on_tool_started(&mut self, _event: &ToolStartedDisplayV1<'_>) -> Result<()> {
+///         Ok(())
+///     }
+///
+///     fn on_tool_completed(&mut self, _event: &ToolCompletedDisplayV1<'_>) -> Result<()> {
+///         Ok(())
+///     }
+///
+///     fn on_message(&mut self, _message: &str) -> Result<()> {
+///         Ok(())
+///     }
+/// }
+/// ```
+pub trait AgentObserver: agent_observer_sealed::Sealed + Send {
     fn on_response_started(&mut self) -> Result<()> {
         Ok(())
     }
-    fn on_provider_event(&mut self, event: ProviderEvent) -> Result<()>;
-    fn on_tool_started(&mut self, call: &ToolCall) -> Result<()>;
-    fn on_tool_completed(&mut self, call: &ToolCall, result: &ToolResult) -> Result<()>;
+    fn on_provider_event(&mut self, event: ProviderDisplayEventV1) -> Result<()>;
+    fn on_tool_started(&mut self, event: &ToolStartedDisplayV1<'_>) -> Result<()>;
+    fn on_tool_completed(&mut self, event: &ToolCompletedDisplayV1<'_>) -> Result<()>;
     fn on_message(&mut self, message: &str) -> Result<()>;
     fn on_compaction(&mut self, message: &str) -> Result<()> {
         self.on_message(message)
@@ -111,10 +280,155 @@ pub trait AgentObserver: Send {
     }
 }
 
-/// The CLI implements this to keep shell authorization separate from project
-/// instructions. Returning `false` is a normal tool result, not an agent failure.
+/// Silent public observer for callers that use the safe Agent API without
+/// installing callback code inside the execution boundary.
+#[derive(Default)]
+pub struct SilentAgentObserverV1;
+
+impl agent_observer_sealed::Sealed for SilentAgentObserverV1 {}
+
+impl AgentObserver for SilentAgentObserverV1 {
+    fn on_provider_event(&mut self, _event: ProviderDisplayEventV1) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_started(&mut self, _event: &ToolStartedDisplayV1<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_completed(&mut self, _event: &ToolCompletedDisplayV1<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_message(&mut self, _message: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Fixed, crate-owned barriers used only to exercise durable crash prefixes.
+/// They carry no Provider or tool payload and do not expose a caller callback.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DurableAgentSyncPointV1 {
+    CompactionRecoveryIntent,
+    CompactionBudgetRecoveryIntent,
+    CompactionResolution,
+}
+
+#[doc(hidden)]
+pub struct DurableAgentSyncObserverV1 {
+    point: DurableAgentSyncPointV1,
+}
+
+impl DurableAgentSyncObserverV1 {
+    pub fn new(point: DurableAgentSyncPointV1) -> Self {
+        Self { point }
+    }
+
+    fn wait_at(&self, point: DurableAgentSyncPointV1, label: &str) -> Result<()> {
+        if self.point != point {
+            return Ok(());
+        }
+        use std::io::Write as _;
+        println!("OXIDRA_FAULT_SYNC:{label}");
+        std::io::stdout().flush()?;
+        let mut acknowledgement = String::new();
+        std::io::stdin().read_line(&mut acknowledgement)?;
+        if acknowledgement.trim() != "continue" {
+            return Err(OxidraError::Session(
+                "durable sync observer received an invalid acknowledgement".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl agent_observer_sealed::Sealed for DurableAgentSyncObserverV1 {}
+
+impl AgentObserver for DurableAgentSyncObserverV1 {
+    fn on_provider_event(&mut self, _event: ProviderDisplayEventV1) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_started(&mut self, _event: &ToolStartedDisplayV1<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_tool_completed(&mut self, _event: &ToolCompletedDisplayV1<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_message(&mut self, _message: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn on_compaction_recovery_intent_synced(&mut self) -> Result<()> {
+        self.wait_at(
+            DurableAgentSyncPointV1::CompactionRecoveryIntent,
+            "compaction.boundary.retry_started",
+        )
+    }
+
+    fn on_compaction_budget_recovery_intent_synced(&mut self) -> Result<()> {
+        self.wait_at(
+            DurableAgentSyncPointV1::CompactionBudgetRecoveryIntent,
+            "compaction.boundary.budget_retry_started",
+        )
+    }
+
+    fn on_compaction_resolution_synced(&mut self) -> Result<()> {
+        self.wait_at(
+            DurableAgentSyncPointV1::CompactionResolution,
+            "compaction.boundary.resolved_without_checkpoint",
+        )
+    }
+}
+
+/// Trusted approval UI boundary for replayable shell and memory payloads.
+///
+/// Approval callbacks run only after the exact `tool.started` event has been
+/// fsynced. A callback error therefore leaves a recoverable in-doubt call
+/// instead of an unowned side effect. A callback that returns successfully
+/// must only report the user's decision: it must not execute, persist, enqueue,
+/// or otherwise act on the command/content because the Agent will dispatch an
+/// approved call exactly once afterwards.
+///
+/// This trait is sealed because seeing the complete command/content places an
+/// implementation inside the execution TCB. External code can use
+/// [`DenyApproval`], but cannot introduce another full-payload callback into
+/// the safe Agent execution path. Returning `false` is a normal tool result,
+/// not an agent failure.
+///
+/// ```compile_fail
+/// use async_trait::async_trait;
+/// use oxidra::agent::ApprovalHandler;
+/// use oxidra::error::Result;
+/// use tokio_util::sync::CancellationToken;
+///
+/// struct ExternalApproval;
+///
+/// #[async_trait]
+/// impl ApprovalHandler for ExternalApproval {
+///     async fn approve_shell(
+///         &mut self,
+///         _command: &str,
+///         _cancellation: &CancellationToken,
+///     ) -> Result<bool> {
+///         Ok(true)
+///     }
+///
+///     async fn approve_memory(
+///         &mut self,
+///         _content: &str,
+///         _cancellation: &CancellationToken,
+///     ) -> Result<bool> {
+///         Ok(true)
+///     }
+/// }
+/// ```
+#[allow(private_bounds)]
 #[async_trait]
-pub trait ApprovalHandler: Send {
+pub trait ApprovalHandler: approval_handler_sealed::Sealed + Send {
     async fn approve_shell(
         &mut self,
         command: &str,
@@ -128,8 +442,14 @@ pub trait ApprovalHandler: Send {
     ) -> Result<bool>;
 }
 
+pub(crate) mod approval_handler_sealed {
+    pub trait Sealed {}
+}
+
 #[derive(Default)]
 pub struct DenyApproval;
+
+impl approval_handler_sealed::Sealed for DenyApproval {}
 
 #[async_trait]
 impl ApprovalHandler for DenyApproval {
@@ -385,6 +705,14 @@ struct ToolDispatchContext<'a> {
     remaining_history_calls: usize,
 }
 
+/// Private proof that the exact call already has a synced `tool.started`
+/// event and that the start observer accepted its post-commit notification.
+/// Dispatch helpers consume this value instead of accepting a bare call.
+struct DurablyStartedToolCallV1<'call> {
+    call: &'call ToolCall,
+    started_seq: u64,
+}
+
 impl Agent {
     pub fn new(
         provider: Arc<dyn ResponseProvider>,
@@ -612,10 +940,11 @@ impl Agent {
                 return Err(error);
             }
             let response = {
-                let mut forward = ForwardObserver { observer };
+                let mut forward = ForwardObserver;
                 self.provider
                     .respond(request, &mut forward, cancellation.clone())
                     .await
+                    .into_result_v1()
             };
 
             let turn = match response {
@@ -645,6 +974,14 @@ impl Agent {
                     return Err(error);
                 }
             };
+
+            if let Err(error) = turn.preflight_bounded_v1() {
+                self.journal.append_provider_response_failed_v1(
+                    &mut response_admission,
+                    &error.to_string(),
+                )?;
+                return Err(error);
+            }
 
             if let Err(error) = validate_response_output_items(&turn.output_items) {
                 self.journal.append_provider_response_failed_v1(
@@ -713,7 +1050,7 @@ impl Agent {
             };
             debug_assert_eq!(response_event.seq, response_seq);
             if is_final_response {
-                outcome.text = turn.text;
+                outcome.text = turn.text.clone();
                 let marker_seq = self.journal.next_seq();
                 self.journal.append_and_sync(
                     "turn.completed",
@@ -1117,7 +1454,7 @@ impl Agent {
                 intent.clone(),
             )?;
         }
-        validate_turn_recovery(&prospective)?;
+        validate_turn_recovery_dynamic(&prospective)?;
         let prospective_boundaries = validate_compaction_boundary_chain(&prospective)?;
         let slot = provider_request_slot_state_for_version(
             PROVIDER_REQUEST_SLOT_VALIDATOR_VERSION,
@@ -1182,7 +1519,7 @@ impl Agent {
                 intent.clone(),
             )?;
         }
-        validate_turn_recovery(&prospective)?;
+        validate_turn_recovery_dynamic(&prospective)?;
         append_prospective_event(
             &mut prospective,
             COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
@@ -1269,7 +1606,7 @@ impl Agent {
                 intent.clone(),
             )?;
         }
-        validate_turn_recovery(&prospective)?;
+        validate_turn_recovery_dynamic(&prospective)?;
         append_prospective_event(
             &mut prospective,
             COMPACTION_BOUNDARY_RETRY_STARTED_KIND,
@@ -1806,6 +2143,114 @@ impl Agent {
         .await
     }
 
+    fn append_tool_started_v1<'call>(
+        &mut self,
+        turn_id: &str,
+        call: &'call ToolCall,
+    ) -> Result<DurablyStartedToolCallV1<'call>> {
+        let started = self.journal.append_and_sync(
+            "tool.started",
+            Some(turn_id),
+            json!({
+                "call_id": call.id,
+                "tool": call.name,
+                "arguments": call.arguments,
+            }),
+        )?;
+
+        Ok(DurablyStartedToolCallV1 {
+            call,
+            started_seq: started.seq,
+        })
+    }
+
+    fn record_started_tool_in_doubt_v1(
+        &mut self,
+        turn_id: &str,
+        started: &DurablyStartedToolCallV1<'_>,
+        source: &str,
+        message: &str,
+    ) -> Result<()> {
+        let result = ToolResult::error(&started.call.id, "in_doubt", message);
+        self.journal.append_and_sync(
+            "tool.in_doubt",
+            Some(turn_id),
+            json!({
+                "started_seq": started.started_seq,
+                "call_id": started.call.id,
+                "tool": started.call.name,
+                "arguments": started.call.arguments,
+                "output": result.output,
+                "error_code": "in_doubt",
+                "before_dispatch": true,
+                "source": source,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn notify_started_tool_call_v1<'call>(
+        &mut self,
+        turn_id: &str,
+        started: DurablyStartedToolCallV1<'call>,
+        observer: &mut dyn AgentObserver,
+    ) -> Result<DurablyStartedToolCallV1<'call>> {
+        let event = ToolStartedDisplayV1::from_call(started.call);
+        if let Err(observer_error) = observer.on_tool_started(&event) {
+            // The callback cannot reconstruct the call from this display-only
+            // event. We nevertheless retain the conservative in-doubt outcome
+            // for the frozen v1 lifecycle when an observer fails after start.
+            if let Err(terminal_error) = self.record_started_tool_in_doubt_v1(
+                turn_id,
+                &started,
+                "tool_start_observer",
+                "tool start observer failed after durable start; external side effects are unknown",
+            ) {
+                return Err(OxidraError::Session(format!(
+                    "tool start observer failed ({observer_error}); durable in-doubt outcome also failed ({terminal_error})"
+                )));
+            }
+            return Err(observer_error);
+        }
+
+        Ok(started)
+    }
+
+    fn start_tool_call_v1<'call>(
+        &mut self,
+        turn_id: &str,
+        call: &'call ToolCall,
+        observer: &mut dyn AgentObserver,
+    ) -> Result<DurablyStartedToolCallV1<'call>> {
+        let started = self.append_tool_started_v1(turn_id, call)?;
+        self.notify_started_tool_call_v1(turn_id, started, observer)
+    }
+
+    async fn dispatch_started_builtin_tool_v1(
+        &self,
+        started: DurablyStartedToolCallV1<'_>,
+        context: &ToolContext,
+    ) -> ToolResult {
+        debug_assert_ne!(started.started_seq, 0);
+        self.tools.execute(started.call, context).await
+    }
+
+    fn notify_tool_completed_v1(
+        observer: &mut dyn AgentObserver,
+        call: &ToolCall,
+        result: &ToolResult,
+    ) -> Result<()> {
+        // This function runs after the terminal outcome is synced. Failed or
+        // cancelled edits must never be presented as applied replacements.
+        let edit_diff = if result.is_error {
+            None
+        } else {
+            EditDiffDisplay::from_call(call)
+        };
+        let event = ToolCompletedDisplayV1::from_call_and_result(call, result, edit_diff.as_ref());
+        observer.on_tool_completed(&event)
+    }
+
     async fn execute_call(
         &mut self,
         turn_id: &str,
@@ -1851,31 +2296,11 @@ impl Agent {
             return Ok(result);
         }
 
-        let shell_approved = if call.name == "shell" {
-            let command = call
-                .arguments
-                .get("command")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            approval.approve_shell(command, &cancellation).await?
-        } else {
-            false
-        };
-        let memory_approved = if call.name == "remember" {
-            let content = call
-                .arguments
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            approval.approve_memory(content, &cancellation).await?
-        } else {
-            false
-        };
-
-        // Authorization is a decision point, not tool execution.  Record
-        // `tool.started` only after approval succeeds so a crash while the
-        // prompt is waiting cannot turn an unexecuted persistent action into
-        // an in-doubt side effect.
+        // Do not hand a replayable shell/memory payload to the approval
+        // callback while the call is still only an in-memory Provider result.
+        // The durable start is the first execution-boundary fact; if the
+        // approval future is cancelled or fails after seeing the payload, the
+        // call can be recovered as an explicitly in-doubt started call.
         if cancellation.is_cancelled() {
             let result =
                 ToolResult::error(&call.id, "cancelled", "tool was cancelled before start");
@@ -1890,7 +2315,92 @@ impl Agent {
                     "before_start": true,
                 }),
             )?;
-            observer.on_tool_completed(call, &result)?;
+            Self::notify_tool_completed_v1(observer, call, &result)?;
+            return Ok(result);
+        }
+
+        let mut started_call = if call.name == "shell" || call.name == "remember" {
+            Some(self.append_tool_started_v1(turn_id, call)?)
+        } else {
+            None
+        };
+
+        let shell_approved = if call.name == "shell" {
+            let command = call
+                .arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match approval.approve_shell(command, &cancellation).await {
+                Ok(approved) => approved,
+                Err(error) => {
+                    let started = started_call
+                        .as_ref()
+                        .expect("shell approval always has a durable start");
+                    if let Err(terminal_error) = self.record_started_tool_in_doubt_v1(
+                        turn_id,
+                        started,
+                        "tool_approval",
+                        "shell approval failed after durable start; external side effects are unknown",
+                    ) {
+                        return Err(OxidraError::Session(format!(
+                            "shell approval failed ({error}); durable in-doubt outcome also failed ({terminal_error})"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            false
+        };
+        let memory_approved = if call.name == "remember" {
+            let content = call
+                .arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match approval.approve_memory(content, &cancellation).await {
+                Ok(approved) => approved,
+                Err(error) => {
+                    let started = started_call
+                        .as_ref()
+                        .expect("memory approval always has a durable start");
+                    if let Err(terminal_error) = self.record_started_tool_in_doubt_v1(
+                        turn_id,
+                        started,
+                        "tool_approval",
+                        "memory approval failed after durable start; external side effects are unknown",
+                    ) {
+                        return Err(OxidraError::Session(format!(
+                            "memory approval failed ({error}); durable in-doubt outcome also failed ({terminal_error})"
+                        )));
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            false
+        };
+
+        if cancellation.is_cancelled() {
+            let result =
+                ToolResult::error(&call.id, "cancelled", "tool was cancelled before dispatch");
+            if let Some(started) = started_call.as_ref() {
+                self.journal.append_and_sync(
+                    "tool.cancelled",
+                    Some(turn_id),
+                    json!({
+                        "started_seq": started.started_seq,
+                        "call_id": call.id,
+                        "tool": call.name,
+                        "output": result.output,
+                        "error_code": "cancelled",
+                    }),
+                )?;
+            } else {
+                unreachable!("approval path owns a durable start before cancellation");
+            }
+            Self::notify_tool_completed_v1(observer, call, &result)?;
             return Ok(result);
         }
 
@@ -1913,21 +2423,17 @@ impl Agent {
             return Ok(result);
         }
 
-        observer.on_tool_started(call)?;
-        self.journal.append_and_sync(
-            "tool.started",
-            Some(turn_id),
-            json!({
-                "call_id": call.id,
-                "tool": call.name,
-                "arguments": call.arguments,
-            }),
-        )?;
+        let started_call = match started_call.take() {
+            Some(started) => self.notify_started_tool_call_v1(turn_id, started, observer)?,
+            None => self.start_tool_call_v1(turn_id, call, observer)?,
+        };
 
         let context = ToolContext::new(cancellation.clone())
             .with_shell_approval(shell_approved)
             .with_memory_approval(memory_approved);
-        let result = self.tools.execute(call, &context).await;
+        let result = self
+            .dispatch_started_builtin_tool_v1(started_call, &context)
+            .await;
 
         if result.error_code.as_deref() == Some("in_doubt") {
             self.journal.append_and_sync(
@@ -1941,7 +2447,7 @@ impl Agent {
                     "error_code": "in_doubt",
                 }),
             )?;
-            observer.on_tool_completed(call, &result)?;
+            Self::notify_tool_completed_v1(observer, call, &result)?;
             return Ok(result);
         }
 
@@ -1956,7 +2462,7 @@ impl Agent {
                     "error_code": result.error_code,
                 }),
             )?;
-            observer.on_tool_completed(call, &result)?;
+            Self::notify_tool_completed_v1(observer, call, &result)?;
             return Ok(result);
         }
 
@@ -2013,19 +2519,15 @@ impl Agent {
         } else if cancellation.is_cancelled() {
             ToolResult::error(&call.id, "cancelled", "history lookup was cancelled")
         } else {
-            observer.on_tool_started(call)?;
-            self.journal.append_and_sync(
-                "tool.started",
-                Some(turn_id),
-                json!({
-                    "call_id": call.id,
-                    "tool": call.name,
-                    "arguments": call.arguments,
-                }),
-            )?;
+            let started_call = self.start_tool_call_v1(turn_id, call, observer)?;
             started = true;
             match self
-                .run_history_tool(call, &prepared.history, output_budget, &cancellation)
+                .run_history_tool(
+                    started_call,
+                    &prepared.history,
+                    output_budget,
+                    &cancellation,
+                )
                 .await
             {
                 Ok(output) => ToolResult::success(&call.id, output),
@@ -2076,7 +2578,7 @@ impl Agent {
                     "before_start": !started,
                 }),
             )?;
-            observer.on_tool_completed(call, &result)?;
+            Self::notify_tool_completed_v1(observer, call, &result)?;
         } else {
             self.commit_tool_completed(turn_id, call, &result, observer)?;
         }
@@ -2085,11 +2587,13 @@ impl Agent {
 
     async fn run_history_tool(
         &self,
-        call: &ToolCall,
+        started: DurablyStartedToolCallV1<'_>,
         snapshot: &HistorySnapshot,
         output_budget: usize,
         cancellation: &CancellationToken,
     ) -> Result<Value> {
+        let call = started.call;
+        debug_assert_ne!(started.started_seq, 0);
         let output = match call.name.as_str() {
             HISTORY_SEARCH_TOOL => {
                 let request =
@@ -2143,7 +2647,7 @@ impl Agent {
                 "error_code": result.error_code,
             }),
         )?;
-        observer.on_tool_completed(call, result)
+        Self::notify_tool_completed_v1(observer, call, result)
     }
 
     fn mark_remaining_skipped(
@@ -2338,11 +2842,6 @@ impl Agent {
         if !self.automatic_compaction {
             return Ok((request, prepared));
         }
-
-        // `prepare_request` may have synchronized a new context.tools epoch.
-        // Rebuild once from the resulting durable prefix so the trigger,
-        // boundary intent and all candidate projections share one snapshot.
-        let (request, prepared) = self.prepare_request(Some(turn_id))?;
         let Some(trigger_tokens) = prepared.context.trigger_tokens else {
             return Ok((request, prepared));
         };
@@ -2527,7 +3026,6 @@ impl Agent {
 
         accumulate_usage_value(usage, &checkpoint.usage)?;
 
-        let _ = self.prepare_request(Some(turn_id))?;
         let (request, prepared) = self.prepare_request(Some(turn_id))?;
         if cancellation.is_cancelled() {
             return Err(OxidraError::Interrupted);
@@ -2800,25 +3298,40 @@ impl Agent {
         &mut self,
         turn_id: Option<&str>,
     ) -> Result<(ResponseRequest, PreparedToolSet)> {
-        let events = self.journal.read_events()?;
-        let boundary_chain = validate_compaction_boundary_chain(&events)?;
-        ensure_compaction_boundaries_allow_request(&events, &boundary_chain, turn_id)?;
-        let materials =
-            self.build_prepared_request_materials(&events, &boundary_chain, turn_id, false)?;
-        let tool_snapshot = snapshot_tools(&materials.definitions)?;
-        let tools_event_seq = match &self.tools_epoch {
-            Some((digest, seq)) if digest == &tool_snapshot.digest => *seq,
-            _ => {
-                let event = self.journal.append_and_sync(
-                    "context.tools",
-                    None,
-                    serde_json::to_value(&tool_snapshot)?,
-                )?;
-                self.tools_epoch = Some((tool_snapshot.digest.clone(), event.seq));
-                event.seq
+        loop {
+            let events = self.journal.read_events()?;
+            let boundary_chain = validate_compaction_boundary_chain(&events)?;
+            ensure_compaction_boundaries_allow_request(&events, &boundary_chain, turn_id)?;
+            let materials =
+                self.build_prepared_request_materials(&events, &boundary_chain, turn_id, false)?;
+            let tool_snapshot = snapshot_tools(&materials.definitions)?;
+            let expected_tools = serde_json::to_value(&tool_snapshot)?;
+            let effective_tools = events
+                .iter()
+                .rev()
+                .find(|event| event.kind == "context.tools" && event.turn_id.is_none());
+
+            let cache_is_current = self.tools_epoch.as_ref().is_some_and(|(digest, seq)| {
+                digest == &tool_snapshot.digest
+                    && effective_tools
+                        .is_some_and(|event| event.seq == *seq && event.data == expected_tools)
+            });
+            if cache_is_current {
+                let event = effective_tools.expect("current tool epoch was just checked");
+                return self.finish_prepared_request(&events, materials, event.seq);
             }
-        };
-        self.finish_prepared_request(&events, materials, tools_event_seq)
+
+            // `context.tools` is part of the request's durable input, not a
+            // cache maintained by this Agent instance.  Synchronize a changed
+            // surface, then restart projection, measurement and cutoff
+            // selection from the resulting prefix.  A crash between these two
+            // iterations leaves a harmless global surface event; it must never
+            // leave a request whose cutoff predates the surface it used.
+            let event = self
+                .journal
+                .append_and_sync("context.tools", None, expected_tools)?;
+            self.tools_epoch = Some((tool_snapshot.digest, event.seq));
+        }
     }
 
     fn context_estimate(&self, decision: &ContextDecision) -> ContextEstimate {
@@ -2839,7 +3352,7 @@ fn planned_context_retry_intent(
     events: &[JournalEvent],
     retry: &PendingContextTurn,
 ) -> Result<Option<Value>> {
-    let recovery = validate_turn_recovery(events)?;
+    let recovery = validate_turn_recovery_dynamic(events)?;
     let has_current_intent = recovery
         .retries
         .iter()
@@ -3113,7 +3626,7 @@ fn pending_context_turns(
                 Ok::<_, OxidraError>(limits)
             },
         )?;
-    let recovery = validate_turn_recovery(events)?;
+    let recovery = validate_turn_recovery_dynamic(events)?;
     let resolved_turns = segment_turns(events)?
         .into_iter()
         .filter(|turn| matches!(turn.state, TurnState::Complete(_)))
@@ -3318,11 +3831,11 @@ fn accumulate_usage_value(total: &mut Usage, usage: &Value) -> Result<()> {
     Ok(())
 }
 
-struct ForwardObserver<'a> {
-    observer: &'a mut dyn AgentObserver,
-}
+struct ForwardObserver;
 
 struct SilentCompactionObserver;
+
+impl crate::provider::stream_observer_sealed::Sealed for SilentCompactionObserver {}
 
 impl StreamObserver for SilentCompactionObserver {
     fn on_event(&mut self, _event: ProviderEvent) -> Result<()> {
@@ -3330,13 +3843,21 @@ impl StreamObserver for SilentCompactionObserver {
     }
 }
 
-impl StreamObserver for ForwardObserver<'_> {
+impl StreamObserver for ForwardObserver {
     fn on_event(&mut self, event: ProviderEvent) -> Result<()> {
-        self.observer
-            .on_provider_event(event)
-            .map_err(OxidraError::observer)
+        match event {
+            ProviderEvent::TextDelta(_) => Ok(()),
+            ProviderEvent::Retry { .. } => Ok(()),
+            ProviderEvent::FunctionArgumentsDelta { .. } => Ok(()),
+            ProviderEvent::Unknown { payload, .. } => {
+                drop_json_value_iteratively(payload);
+                Ok(())
+            }
+        }
     }
 }
+
+impl crate::provider::stream_observer_sealed::Sealed for ForwardObserver {}
 
 fn error_fingerprint(call: &ToolCall, result: &ToolResult) -> String {
     let stable_output = stable_error_output(&result.output);
@@ -3401,21 +3922,133 @@ fn canonical_json(value: &Value) -> String {
 
 /// A deliberately bounded JSON-Schema validator for tool arguments.  It
 /// covers the schema vocabulary emitted by the built-ins; unknown annotation
-/// keywords and `$ref` are left untouched so a
-/// valid remote schema is not rejected merely for using a newer draft.
+/// keywords and `$ref` are left untouched so a valid remote schema is not
+/// rejected merely for using a newer draft.
+///
+/// Numeric bounds intentionally accept only JSON integer representations. A
+/// `serde_json::Value` no longer retains the original lexical spelling of a
+/// decimal/exponent number, so converting it to `f64` would make a boundary
+/// such as `9007199254740993` indistinguishable from its neighbouring value.
+/// The safe choice for this public API is to reject such bounds/instances
+/// rather than silently widen the accepted tool language.
 pub fn validate_json_schema(schema: &Value, value: &Value) -> std::result::Result<(), String> {
+    preflight_json_schema_tree_v1(schema, "schema")?;
+    preflight_json_schema_tree_v1(value, "instance")?;
+    let mut budget = JsonSchemaValidationBudgetV1::default();
+    validate_json_schema_inner(schema, value, 0, &mut budget)
+}
+
+enum JsonSchemaTreeFrameV1<'a> {
+    Value(&'a Value, usize),
+    Array(std::slice::Iter<'a, Value>, usize),
+    Object(serde_json::map::Iter<'a>, usize),
+}
+
+fn preflight_json_schema_tree_v1(value: &Value, label: &str) -> std::result::Result<(), String> {
+    let mut nodes = 0usize;
+    let mut pending = vec![JsonSchemaTreeFrameV1::Value(value, 0)];
+    while let Some(frame) = pending.pop() {
+        match frame {
+            JsonSchemaTreeFrameV1::Value(value, depth) => {
+                if depth > MAX_JSON_SCHEMA_VALIDATION_DEPTH_V1 {
+                    return Err(format!(
+                        "JSON Schema {label} exceeds depth {MAX_JSON_SCHEMA_VALIDATION_DEPTH_V1}"
+                    ));
+                }
+                nodes = nodes
+                    .checked_add(1)
+                    .ok_or_else(|| format!("JSON Schema {label} node count overflowed"))?;
+                if nodes > MAX_JSON_SCHEMA_VALIDATION_NODES_V1 {
+                    return Err(format!(
+                        "JSON Schema {label} exceeds node budget {MAX_JSON_SCHEMA_VALIDATION_NODES_V1}"
+                    ));
+                }
+                match value {
+                    Value::Array(values) => pending.push(JsonSchemaTreeFrameV1::Array(
+                        values.iter(),
+                        depth.saturating_add(1),
+                    )),
+                    Value::Object(values) => pending.push(JsonSchemaTreeFrameV1::Object(
+                        values.iter(),
+                        depth.saturating_add(1),
+                    )),
+                    _ => {}
+                }
+            }
+            JsonSchemaTreeFrameV1::Array(mut values, depth) => {
+                if let Some(value) = values.next() {
+                    pending.push(JsonSchemaTreeFrameV1::Array(values, depth));
+                    pending.push(JsonSchemaTreeFrameV1::Value(value, depth));
+                }
+            }
+            JsonSchemaTreeFrameV1::Object(mut values, depth) => {
+                if let Some((_, value)) = values.next() {
+                    pending.push(JsonSchemaTreeFrameV1::Object(values, depth));
+                    pending.push(JsonSchemaTreeFrameV1::Value(value, depth));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct JsonSchemaValidationBudgetV1 {
+    nodes: usize,
+}
+
+impl JsonSchemaValidationBudgetV1 {
+    fn enter(&mut self, depth: usize) -> std::result::Result<(), String> {
+        if depth > MAX_JSON_SCHEMA_VALIDATION_DEPTH_V1 {
+            return Err(format!(
+                "JSON Schema validation exceeds depth {MAX_JSON_SCHEMA_VALIDATION_DEPTH_V1}"
+            ));
+        }
+        self.nodes = self
+            .nodes
+            .checked_add(1)
+            .ok_or_else(|| "JSON Schema validation node count overflowed".to_owned())?;
+        if self.nodes > MAX_JSON_SCHEMA_VALIDATION_NODES_V1 {
+            return Err(format!(
+                "JSON Schema validation exceeds node budget {MAX_JSON_SCHEMA_VALIDATION_NODES_V1}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_json_schema_inner(
+    schema: &Value,
+    value: &Value,
+    depth: usize,
+    budget: &mut JsonSchemaValidationBudgetV1,
+) -> std::result::Result<(), String> {
+    budget.enter(depth)?;
+    let Some(schema) = schema.as_object() else {
+        return Ok(());
+    };
+    validate_json_schema_object(schema, value, depth, budget)
+}
+
+fn validate_json_schema_object(
+    schema: &Map<String, Value>,
+    value: &Value,
+    depth: usize,
+    budget: &mut JsonSchemaValidationBudgetV1,
+) -> std::result::Result<(), String> {
     if let Some(any_of) = schema.get("anyOf").and_then(Value::as_array) {
-        if !any_of
-            .iter()
-            .any(|candidate| validate_json_schema(candidate, value).is_ok())
-        {
+        if !any_of.iter().any(|candidate| {
+            validate_json_schema_inner(candidate, value, depth + 1, budget).is_ok()
+        }) {
             return Err("value does not match anyOf".to_owned());
         }
     }
     if let Some(one_of) = schema.get("oneOf").and_then(Value::as_array) {
         let matches = one_of
             .iter()
-            .filter(|candidate| validate_json_schema(candidate, value).is_ok())
+            .filter(|candidate| {
+                validate_json_schema_inner(candidate, value, depth + 1, budget).is_ok()
+            })
             .count();
         if matches != 1 {
             return Err("value does not match exactly one oneOf branch".to_owned());
@@ -3423,7 +4056,7 @@ pub fn validate_json_schema(schema: &Value, value: &Value) -> std::result::Resul
     }
     if let Some(all_of) = schema.get("allOf").and_then(Value::as_array) {
         for candidate in all_of {
-            validate_json_schema(candidate, value)?;
+            validate_json_schema_inner(candidate, value, depth + 1, budget)?;
         }
     }
     if let Some(expected) = schema.get("const") {
@@ -3462,7 +4095,7 @@ pub fn validate_json_schema(schema: &Value, value: &Value) -> std::result::Resul
         if let Some(properties) = properties {
             for (name, property_schema) in properties {
                 if let Some(property) = object.get(name) {
-                    validate_json_schema(property_schema, property)
+                    validate_json_schema_inner(property_schema, property, depth + 1, budget)
                         .map_err(|error| format!("property {name:?}: {error}"))?;
                 }
             }
@@ -3478,7 +4111,12 @@ pub fn validate_json_schema(schema: &Value, value: &Value) -> std::result::Resul
             Some(Value::Object(additional_schema)) => {
                 for (name, property) in object {
                     if !properties.is_some_and(|properties| properties.contains_key(name)) {
-                        validate_json_schema(&Value::Object(additional_schema.clone()), property)
+                        // Validate the borrowed schema map directly.  Do not
+                        // clone it once per extra property: a remote schema
+                        // can otherwise turn a bounded validation into an
+                        // attacker-sized allocation multiplier.
+                        budget.enter(depth + 1)?;
+                        validate_json_schema_object(additional_schema, property, depth + 1, budget)
                             .map_err(|error| format!("property {name:?}: {error}"))?;
                     }
                 }
@@ -3489,21 +4127,13 @@ pub fn validate_json_schema(schema: &Value, value: &Value) -> std::result::Resul
     if let Some(items_schema) = schema.get("items") {
         if let Some(items) = value.as_array() {
             for (index, item) in items.iter().enumerate() {
-                validate_json_schema(items_schema, item)
+                validate_json_schema_inner(items_schema, item, depth + 1, budget)
                     .map_err(|error| format!("item {index}: {error}"))?;
             }
         }
     }
-    if let Some(minimum) = schema.get("minimum").and_then(Value::as_f64) {
-        if value.as_f64().is_some_and(|number| number < minimum) {
-            return Err(format!("number is below minimum {minimum}"));
-        }
-    }
-    if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
-        if value.as_f64().is_some_and(|number| number > maximum) {
-            return Err(format!("number is above maximum {maximum}"));
-        }
-    }
+    validate_json_schema_bound(schema, value, "minimum", Ordering::Less)?;
+    validate_json_schema_bound(schema, value, "maximum", Ordering::Greater)?;
     if let Some(min_length) = schema.get("minLength").and_then(Value::as_u64) {
         if value
             .as_str()
@@ -3521,6 +4151,62 @@ pub fn validate_json_schema(schema: &Value, value: &Value) -> std::result::Resul
         }
     }
     Ok(())
+}
+
+fn validate_json_schema_bound(
+    schema: &Map<String, Value>,
+    value: &Value,
+    keyword: &str,
+    rejection: Ordering,
+) -> std::result::Result<(), String> {
+    let Some(bound) = schema.get(keyword) else {
+        return Ok(());
+    };
+    let Some(bound_number) = bound.as_number() else {
+        return Err(format!("schema {keyword} must be an integer JSON number"));
+    };
+    let Some(value_number) = value.as_number() else {
+        return Ok(());
+    };
+    let Some(ordering) = compare_json_integer_numbers(value_number, bound_number) else {
+        return Err(format!(
+            "schema {keyword} and numeric value must use exact integer JSON numbers"
+        ));
+    };
+    if ordering == rejection {
+        let direction = if keyword == "minimum" {
+            "below"
+        } else {
+            "above"
+        };
+        return Err(format!("number is {direction} {keyword} {bound}"));
+    }
+    Ok(())
+}
+
+fn compare_json_integer_numbers(
+    left: &serde_json::Number,
+    right: &serde_json::Number,
+) -> Option<Ordering> {
+    match (left.as_i64(), left.as_u64(), right.as_i64(), right.as_u64()) {
+        (Some(left), _, Some(right), _) => Some(left.cmp(&right)),
+        (Some(left), _, _, Some(right)) => {
+            if left < 0 {
+                Some(Ordering::Less)
+            } else {
+                Some((left as u64).cmp(&right))
+            }
+        }
+        (_, Some(left), Some(right), _) => {
+            if right < 0 {
+                Some(Ordering::Greater)
+            } else {
+                Some(left.cmp(&(right as u64)))
+            }
+        }
+        (_, Some(left), _, Some(right)) => Some(left.cmp(&right)),
+        _ => None,
+    }
 }
 
 fn json_type_matches(kind: &str, value: &Value) -> bool {
@@ -3583,6 +4269,7 @@ pub fn load_project_instructions(root: &std::path::Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     use super::*;
@@ -3598,6 +4285,7 @@ mod tests {
         CONTEXT_ESTIMATOR_VERSION, CONTEXT_MEASUREMENT_VERSION, REQUEST_SHAPE_VERSION,
     };
     use crate::history::UNTRUSTED_HISTORY_NOTICE;
+    use crate::provider::UncommittedProviderOutcomeV1;
     use crate::session::{JournalEvent, SessionHeader, SessionStore};
     use crate::turn::{CompletionEvidence, TurnState, segment_turns};
     use crate::types::AssistantTurn;
@@ -3669,6 +4357,8 @@ mod tests {
 
     struct NoopStreamObserver;
 
+    impl crate::provider::stream_observer_sealed::Sealed for NoopStreamObserver {}
+
     impl StreamObserver for NoopStreamObserver {
         fn on_event(&mut self, _event: ProviderEvent) -> Result<()> {
             Ok(())
@@ -3682,13 +4372,13 @@ mod tests {
             _request: ResponseRequest,
             _observer: &mut dyn StreamObserver,
             _cancellation: CancellationToken,
-        ) -> Result<AssistantTurn> {
+        ) -> UncommittedProviderOutcomeV1 {
             let output_items = vec![json!({
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": "done"}],
             })];
-            Ok(AssistantTurn {
+            UncommittedProviderOutcomeV1::success(AssistantTurn {
                 raw_response: json!({"output": output_items}),
                 output_items,
                 text: "done".to_owned(),
@@ -3706,13 +4396,13 @@ mod tests {
             _request: ResponseRequest,
             _observer: &mut dyn StreamObserver,
             _cancellation: CancellationToken,
-        ) -> Result<AssistantTurn> {
+        ) -> UncommittedProviderOutcomeV1 {
             let output_items = vec![json!({
                 "type": "message",
                 "role": "developer",
                 "content": [{"type": "output_text", "text": "unsafe"}],
             })];
-            Ok(AssistantTurn {
+            UncommittedProviderOutcomeV1::success(AssistantTurn {
                 raw_response: json!({"output": output_items}),
                 output_items,
                 text: "unsafe".to_owned(),
@@ -3728,11 +4418,15 @@ mod tests {
         async fn respond(
             &self,
             _request: ResponseRequest,
-            observer: &mut dyn StreamObserver,
+            _observer: &mut dyn StreamObserver,
             _cancellation: CancellationToken,
-        ) -> Result<AssistantTurn> {
-            observer.on_event(ProviderEvent::TextDelta("partial".to_owned()))?;
-            panic!("failing observer should stop the Provider")
+        ) -> UncommittedProviderOutcomeV1 {
+            UncommittedProviderOutcomeV1::failure(OxidraError::observer(OxidraError::Io(
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "Provider-local stream observer failed",
+                ),
+            )))
         }
     }
 
@@ -3743,8 +4437,8 @@ mod tests {
             _request: ResponseRequest,
             _observer: &mut dyn StreamObserver,
             _cancellation: CancellationToken,
-        ) -> Result<AssistantTurn> {
-            Err(OxidraError::Provider(
+        ) -> UncommittedProviderOutcomeV1 {
+            UncommittedProviderOutcomeV1::failure(OxidraError::Provider(
                 "injected compaction provider failure".to_owned(),
             ))
         }
@@ -3757,9 +4451,9 @@ mod tests {
             _request: ResponseRequest,
             _observer: &mut dyn StreamObserver,
             _cancellation: CancellationToken,
-        ) -> Result<AssistantTurn> {
+        ) -> UncommittedProviderOutcomeV1 {
             self.entered.notify_one();
-            std::future::pending::<Result<AssistantTurn>>().await
+            std::future::pending::<UncommittedProviderOutcomeV1>().await
         }
     }
 
@@ -3770,16 +4464,16 @@ mod tests {
             request: ResponseRequest,
             _observer: &mut dyn StreamObserver,
             cancellation: CancellationToken,
-        ) -> Result<AssistantTurn> {
+        ) -> UncommittedProviderOutcomeV1 {
             let is_compaction = request.max_output_tokens.is_some();
             self.requests.lock().unwrap().push(request);
-            if is_compaction {
+            UncommittedProviderOutcomeV1::from_result(if is_compaction {
                 Ok(compaction_summary_turn())
             } else if cancellation.is_cancelled() {
                 Err(OxidraError::Interrupted)
             } else {
                 Ok(final_turn("done"))
-            }
+            })
         }
     }
 
@@ -3790,13 +4484,13 @@ mod tests {
             request: ResponseRequest,
             _observer: &mut dyn StreamObserver,
             _cancellation: CancellationToken,
-        ) -> Result<AssistantTurn> {
+        ) -> UncommittedProviderOutcomeV1 {
             self.requests.lock().unwrap().push(request);
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or_else(|| OxidraError::Provider("test response queue is empty".to_owned()))
+            UncommittedProviderOutcomeV1::from_result(
+                self.responses.lock().unwrap().pop_front().ok_or_else(|| {
+                    OxidraError::Provider("test response queue is empty".to_owned())
+                }),
+            )
         }
     }
 
@@ -3807,17 +4501,19 @@ mod tests {
             request: ResponseRequest,
             _observer: &mut dyn StreamObserver,
             _cancellation: CancellationToken,
-        ) -> Result<AssistantTurn> {
+        ) -> UncommittedProviderOutcomeV1 {
             self.requests.lock().unwrap().push(request);
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| {
-                    Err(OxidraError::Provider(
-                        "test response queue is empty".to_owned(),
-                    ))
-                })
+            UncommittedProviderOutcomeV1::from_result(
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| {
+                        Err(OxidraError::Provider(
+                            "test response queue is empty".to_owned(),
+                        ))
+                    }),
+            )
         }
     }
 
@@ -3828,9 +4524,9 @@ mod tests {
             request: ResponseRequest,
             _observer: &mut dyn StreamObserver,
             _cancellation: CancellationToken,
-        ) -> Result<AssistantTurn> {
+        ) -> UncommittedProviderOutcomeV1 {
             self.requests.lock().unwrap().push(request);
-            Err(OxidraError::ProviderContextLimit(
+            UncommittedProviderOutcomeV1::failure(OxidraError::ProviderContextLimit(
                 "context_length_exceeded".to_owned(),
             ))
         }
@@ -4425,7 +5121,6 @@ mod tests {
             "test-model",
             &mut NoopStreamObserver,
             CancellationToken::new(),
-            |_| Ok(()),
         )
         .await
         .unwrap();
@@ -4526,11 +5221,30 @@ mod tests {
     #[derive(Default)]
     struct NoopObserver;
 
-    struct FailingProviderEventObserver;
-
     struct FailingStartObserver;
 
-    struct FailingApproval;
+    struct FailingToolStartObserver {
+        journal_path: PathBuf,
+        marker_path: PathBuf,
+        captured_tool_name: Option<String>,
+        captured_debug: Option<String>,
+        durable_start_seen: bool,
+    }
+
+    struct PayloadProbeToolStartObserver {
+        target_fragment: String,
+        content_fragment: String,
+        leak_marker_path: PathBuf,
+        captured_debug: Option<String>,
+    }
+
+    struct FailingApproval {
+        journal_path: PathBuf,
+        marker_path: PathBuf,
+        durable_start_seen: bool,
+    }
+
+    impl approval_handler_sealed::Sealed for FailingApproval {}
 
     struct FailingToolCompletedObserver {
         failed: bool,
@@ -4542,16 +5256,24 @@ mod tests {
         cancellation: CancellationToken,
     }
 
+    impl super::agent_observer_sealed::Sealed for NoopObserver {}
+    impl super::agent_observer_sealed::Sealed for FailingStartObserver {}
+    impl super::agent_observer_sealed::Sealed for FailingToolStartObserver {}
+    impl super::agent_observer_sealed::Sealed for PayloadProbeToolStartObserver {}
+    impl super::agent_observer_sealed::Sealed for FailingToolCompletedObserver {}
+    impl super::agent_observer_sealed::Sealed for FailingCompactionRecoveryIntentObserver {}
+    impl super::agent_observer_sealed::Sealed for CancelAfterCheckpointObserver {}
+
     impl AgentObserver for NoopObserver {
-        fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+        fn on_provider_event(&mut self, _event: ProviderDisplayEventV1) -> Result<()> {
             Ok(())
         }
 
-        fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+        fn on_tool_started(&mut self, _event: &ToolStartedDisplayV1<'_>) -> Result<()> {
             Ok(())
         }
 
-        fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+        fn on_tool_completed(&mut self, _event: &ToolCompletedDisplayV1<'_>) -> Result<()> {
             Ok(())
         }
 
@@ -4561,15 +5283,15 @@ mod tests {
     }
 
     impl AgentObserver for FailingToolCompletedObserver {
-        fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+        fn on_provider_event(&mut self, _event: ProviderDisplayEventV1) -> Result<()> {
             Ok(())
         }
 
-        fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+        fn on_tool_started(&mut self, _event: &ToolStartedDisplayV1<'_>) -> Result<()> {
             Ok(())
         }
 
-        fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+        fn on_tool_completed(&mut self, _event: &ToolCompletedDisplayV1<'_>) -> Result<()> {
             if !self.failed {
                 self.failed = true;
                 return Err(OxidraError::Config(
@@ -4588,9 +5310,24 @@ mod tests {
     impl ApprovalHandler for FailingApproval {
         async fn approve_shell(
             &mut self,
-            _command: &str,
+            command: &str,
             _cancellation: &CancellationToken,
         ) -> Result<bool> {
+            std::fs::write(&self.marker_path, b"approval side effect")?;
+            let bytes = std::fs::read(&self.journal_path)?;
+            self.durable_start_seen = bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| serde_json::from_slice::<JournalEvent>(line).ok())
+                .any(|event| {
+                    event.kind == "tool.started"
+                        && event.data.get("tool") == Some(&Value::String("shell".to_owned()))
+                        && event
+                            .data
+                            .get("arguments")
+                            .and_then(|arguments| arguments.get("command"))
+                            == Some(&Value::String(command.to_owned()))
+                });
             Err(OxidraError::observer(OxidraError::Config(
                 "approval backend failed".to_owned(),
             )))
@@ -4607,19 +5344,22 @@ mod tests {
         }
     }
 
-    impl AgentObserver for FailingProviderEventObserver {
-        fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
-            Err(OxidraError::Io(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "stdout closed",
-            )))
+    impl AgentObserver for FailingStartObserver {
+        fn on_response_started(&mut self) -> Result<()> {
+            Err(OxidraError::Config(
+                "response renderer could not initialize".to_owned(),
+            ))
         }
 
-        fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+        fn on_provider_event(&mut self, _event: ProviderDisplayEventV1) -> Result<()> {
             Ok(())
         }
 
-        fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+        fn on_tool_started(&mut self, _event: &ToolStartedDisplayV1<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_tool_completed(&mut self, _event: &ToolCompletedDisplayV1<'_>) -> Result<()> {
             Ok(())
         }
 
@@ -4628,22 +5368,54 @@ mod tests {
         }
     }
 
-    impl AgentObserver for FailingStartObserver {
-        fn on_response_started(&mut self) -> Result<()> {
+    impl AgentObserver for FailingToolStartObserver {
+        fn on_provider_event(&mut self, _event: ProviderDisplayEventV1) -> Result<()> {
+            Ok(())
+        }
+
+        fn on_tool_started(&mut self, event: &ToolStartedDisplayV1<'_>) -> Result<()> {
+            let tool_name = event.tool_name().to_owned();
+            self.captured_tool_name = Some(tool_name.clone());
+            self.captured_debug = Some(format!("{event:?}"));
+            std::fs::write(&self.marker_path, b"observer side effect")?;
+            let bytes = std::fs::read(&self.journal_path)?;
+            self.durable_start_seen = bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| serde_json::from_slice::<JournalEvent>(line).ok())
+                .any(|journal_event| {
+                    journal_event.kind == "tool.started"
+                        && journal_event.data.get("tool") == Some(&Value::String(tool_name.clone()))
+                });
             Err(OxidraError::Config(
-                "response renderer could not initialize".to_owned(),
+                "injected tool start observer failure".to_owned(),
             ))
         }
 
-        fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+        fn on_tool_completed(&mut self, _event: &ToolCompletedDisplayV1<'_>) -> Result<()> {
             Ok(())
         }
 
-        fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+        fn on_message(&mut self, _message: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl AgentObserver for PayloadProbeToolStartObserver {
+        fn on_provider_event(&mut self, _event: ProviderDisplayEventV1) -> Result<()> {
             Ok(())
         }
 
-        fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+        fn on_tool_started(&mut self, event: &ToolStartedDisplayV1<'_>) -> Result<()> {
+            let visible = format!("{event:?}");
+            if visible.contains(&self.target_fragment) || visible.contains(&self.content_fragment) {
+                std::fs::write(&self.leak_marker_path, b"replayable payload escaped")?;
+            }
+            self.captured_debug = Some(visible);
+            Ok(())
+        }
+
+        fn on_tool_completed(&mut self, _event: &ToolCompletedDisplayV1<'_>) -> Result<()> {
             Ok(())
         }
 
@@ -4653,15 +5425,15 @@ mod tests {
     }
 
     impl AgentObserver for FailingCompactionRecoveryIntentObserver {
-        fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+        fn on_provider_event(&mut self, _event: ProviderDisplayEventV1) -> Result<()> {
             Ok(())
         }
 
-        fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+        fn on_tool_started(&mut self, _event: &ToolStartedDisplayV1<'_>) -> Result<()> {
             Ok(())
         }
 
-        fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+        fn on_tool_completed(&mut self, _event: &ToolCompletedDisplayV1<'_>) -> Result<()> {
             Ok(())
         }
 
@@ -4677,15 +5449,15 @@ mod tests {
     }
 
     impl AgentObserver for CancelAfterCheckpointObserver {
-        fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
+        fn on_provider_event(&mut self, _event: ProviderDisplayEventV1) -> Result<()> {
             Ok(())
         }
 
-        fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
+        fn on_tool_started(&mut self, _event: &ToolStartedDisplayV1<'_>) -> Result<()> {
             Ok(())
         }
 
-        fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
+        fn on_tool_completed(&mut self, _event: &ToolCompletedDisplayV1<'_>) -> Result<()> {
             Ok(())
         }
 
@@ -4815,6 +5587,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepare_request_stabilizes_each_durable_tool_surface_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let journal = store
+            .create_with_id(
+                "request-tool-surface-stabilization",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            Arc::new(FinalResponseProvider),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let (_, prepared) = agent.prepare_request(None).unwrap();
+        let events = agent.journal().read_events().unwrap();
+        let tools_event = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "context.tools")
+            .unwrap();
+        assert_eq!(events.last().map(|event| event.seq), Some(tools_event.seq));
+        assert_eq!(
+            prepared.context.request_journal_through_seq,
+            Some(tools_event.seq)
+        );
+        assert_eq!(prepared.context.tools_event_seq, tools_event.seq);
+        assert_eq!(count_events(&events, "context.tools"), 1);
+        let first_tools_seq = tools_event.seq;
+
+        drop(agent);
+        let journal = store.open("request-tool-surface-stabilization").unwrap();
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut resumed = Agent::new(
+            Arc::new(FinalResponseProvider),
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+
+        let (_, prepared) = resumed.prepare_request(None).unwrap();
+        let events = resumed.journal().read_events().unwrap();
+        assert_eq!(count_events(&events, "context.tools"), 2);
+        let latest_tools_seq = events
+            .iter()
+            .rev()
+            .find(|event| event.kind == "context.tools")
+            .unwrap()
+            .seq;
+        assert!(latest_tools_seq > first_tools_seq);
+        assert_eq!(
+            prepared.context.request_journal_through_seq,
+            events.last().map(|event| event.seq)
+        );
+        assert_eq!(prepared.context.tools_event_seq, latest_tools_seq);
+    }
+
     #[tokio::test]
     async fn response_started_audits_exact_request_and_uses_previous_usage_anchor() {
         let temp = tempfile::tempdir().unwrap();
@@ -4888,6 +5743,14 @@ mod tests {
         assert_eq!(
             started[0].data["context"]["tools_event_seq"],
             started[1].data["context"]["tools_event_seq"]
+        );
+        assert_eq!(
+            started[0].data["context"]["request_journal_through_seq"].as_u64(),
+            Some(started[0].seq.saturating_sub(1))
+        );
+        assert_eq!(
+            started[1].data["context"]["request_journal_through_seq"].as_u64(),
+            Some(started[1].seq.saturating_sub(1))
         );
         assert_eq!(
             started[1].data["context"]["measurement"]["request_digest"]
@@ -5175,7 +6038,7 @@ mod tests {
             .unwrap();
         for event in fixture.into_iter().skip(1) {
             journal
-                .append_and_sync(&event.kind, event.turn_id.as_deref(), event.data)
+                .append_and_sync(&event.kind, event.turn_id.as_deref(), event.data.clone())
                 .unwrap();
         }
         let tools = BuiltinTools::new(
@@ -5266,7 +6129,7 @@ mod tests {
             .unwrap();
         for event in fixture.into_iter().skip(1) {
             journal
-                .append_and_sync(&event.kind, event.turn_id.as_deref(), event.data)
+                .append_and_sync(&event.kind, event.turn_id.as_deref(), event.data.clone())
                 .unwrap();
         }
         let tools = BuiltinTools::new(
@@ -6334,7 +7197,6 @@ mod tests {
             "test-model",
             &mut NoopStreamObserver,
             CancellationToken::new(),
-            |_| Ok(()),
         )
         .await
         .unwrap();
@@ -6399,7 +7261,6 @@ mod tests {
             "test-model",
             &mut NoopStreamObserver,
             CancellationToken::new(),
-            |_| Ok(()),
         )
         .await
         .unwrap();
@@ -6482,7 +7343,6 @@ mod tests {
             "test-model",
             &mut NoopStreamObserver,
             CancellationToken::new(),
-            |_| Ok(()),
         )
         .await
         .unwrap_err();
@@ -6562,7 +7422,6 @@ mod tests {
             "test-model",
             &mut NoopStreamObserver,
             CancellationToken::new(),
-            |_| Ok(()),
         )
         .await
         .unwrap_err();
@@ -6690,7 +7549,6 @@ mod tests {
             "test-model",
             &mut NoopStreamObserver,
             CancellationToken::new(),
-            |_| Ok(()),
         )
         .await
         .unwrap_err();
@@ -6900,7 +7758,6 @@ mod tests {
             "test-model",
             &mut NoopStreamObserver,
             CancellationToken::new(),
-            |_| Ok(()),
         )
         .await
         .unwrap_err();
@@ -7948,7 +8805,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_failure_settles_unstarted_batch_before_turn_cancelled() {
+    async fn approval_failure_is_durably_started_before_callback_and_suspends_batch() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
@@ -7980,6 +8837,15 @@ mod tests {
             false,
         )
         .unwrap();
+        let approval_marker = temp.path().join("approval-side-effect.txt");
+        let mut failing_approval = FailingApproval {
+            journal_path: store
+                .layout()
+                .journal_path("approval-batch-settlement")
+                .unwrap(),
+            marker_path: approval_marker.clone(),
+            durable_start_seen: false,
+        };
         let mut agent = Agent::new(
             provider,
             journal,
@@ -7995,7 +8861,7 @@ mod tests {
                 "run two shell calls",
                 CancellationToken::new(),
                 &mut NoopObserver,
-                &mut FailingApproval,
+                &mut failing_approval,
             )
             .await
             .expect_err("approval failure should abort the turn");
@@ -8004,31 +8870,219 @@ mod tests {
             OxidraError::Session(_) | OxidraError::Observer(_)
         ));
         let events = agent.journal().read_events().unwrap();
+        let started_seq = events
+            .iter()
+            .find(|event| event.kind == "tool.started")
+            .map(|event| event.seq)
+            .expect("approval callback must run after a durable tool.started");
+        let in_doubt_seq = events
+            .iter()
+            .find(|event| event.kind == "tool.in_doubt")
+            .map(|event| event.seq)
+            .expect("approval failure must preserve unknown side effects");
+        assert!(started_seq < in_doubt_seq);
+        assert!(failing_approval.durable_start_seen);
+        assert!(approval_marker.exists());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "tool.skipped_due_to_in_doubt")
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == "tool.skipped_due_to_recovery")
+        );
+        assert!(!events.iter().any(|event| event.kind == "turn.cancelled"));
         let skip_seqs = events
             .iter()
-            .filter(|event| event.kind == "tool.skipped_due_to_cancel")
+            .filter(|event| event.kind == "tool.skipped_due_to_in_doubt")
             .map(|event| event.seq)
             .collect::<Vec<_>>();
-        assert_eq!(skip_seqs.len(), 2);
-        let cancelled_seq = events
-            .iter()
-            .find(|event| event.kind == "turn.cancelled")
-            .map(|event| event.seq)
-            .expect("turn cancellation must be durable");
-        assert!(skip_seqs.iter().all(|seq| *seq < cancelled_seq));
+        assert!(skip_seqs.iter().all(|seq| *seq > in_doubt_seq));
 
         drop(agent);
         let reopened = store
             .open("approval-batch-settlement")
             .expect("the settled batch must remain reopenable");
         let reopened_events = reopened.read_events().unwrap();
-        assert_eq!(
+        assert!(
             reopened_events
                 .iter()
-                .filter(|event| event.kind == "turn.cancelled")
-                .count(),
-            1
+                .any(|event| event.kind == "tool.in_doubt")
         );
+    }
+
+    #[tokio::test]
+    async fn successful_tool_start_observer_cannot_replay_builtin_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let journal = store
+            .create_with_id(
+                "builtin-observer-display-only",
+                SessionHeader::new(&project_root, "test-model"),
+            )
+            .unwrap();
+        let target_name = "observer-must-not-see-this-path.txt";
+        let content = "observer-must-not-see-this-content";
+        let target_path = project_root.join(target_name);
+        let leak_marker_path = temp.path().join("observer-payload-leaked.txt");
+        let call = ToolCall {
+            id: "provider-controlled-call-id-must-not-escape".to_owned(),
+            name: "write".to_owned(),
+            arguments: json!({
+                "path": target_name,
+                "content": content,
+            }),
+        };
+        let provider = Arc::new(RecordingProvider::new([
+            tool_turn(vec![call]),
+            final_turn("done"),
+        ]));
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+        let mut observer = PayloadProbeToolStartObserver {
+            target_fragment: target_name.to_owned(),
+            content_fragment: content.to_owned(),
+            leak_marker_path: leak_marker_path.clone(),
+            captured_debug: None,
+        };
+
+        agent
+            .run_turn(
+                "write the file",
+                CancellationToken::new(),
+                &mut observer,
+                &mut DenyApproval,
+            )
+            .await
+            .expect("display-only observer must not interfere with dispatch");
+
+        assert_eq!(std::fs::read_to_string(target_path).unwrap(), content);
+        assert!(
+            !leak_marker_path.exists(),
+            "observer must not receive target path or content"
+        );
+        let visible = observer.captured_debug.as_deref().unwrap();
+        assert_eq!(visible, "ToolStartedDisplayV1 { tool_name: \"write\" }");
+        assert!(!visible.contains("provider-controlled-call-id-must-not-escape"));
+    }
+
+    #[tokio::test]
+    async fn builtin_tool_start_observer_runs_only_after_durable_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let session_id = "builtin-observer-start-order";
+        let journal = store
+            .create_with_id(session_id, SessionHeader::new(&project_root, "test-model"))
+            .unwrap();
+        let journal_path = store.layout().journal_path(session_id).unwrap();
+        let marker_path = temp.path().join("observer-side-effect.txt");
+        let call = ToolCall {
+            id: "write-observer-escape".to_owned(),
+            name: "write".to_owned(),
+            arguments: json!({
+                "path":"would-be-written.txt",
+                "content":"secret",
+            }),
+        };
+        let provider = Arc::new(RecordingProvider::new([tool_turn(vec![call.clone()])]));
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+        let mut observer = FailingToolStartObserver {
+            journal_path,
+            marker_path: marker_path.clone(),
+            captured_tool_name: None,
+            captured_debug: None,
+            durable_start_seen: false,
+        };
+
+        agent
+            .run_turn(
+                "run write",
+                CancellationToken::new(),
+                &mut observer,
+                &mut DenyApproval,
+            )
+            .await
+            .expect_err("tool-start observer failure must stop the turn");
+
+        assert_eq!(observer.captured_tool_name.as_deref(), Some("write"));
+        let captured_debug = observer.captured_debug.as_deref().unwrap();
+        assert!(!captured_debug.contains("write-observer-escape"));
+        assert!(!captured_debug.contains("would-be-written.txt"));
+        assert!(!captured_debug.contains("secret"));
+        assert!(
+            marker_path.is_file(),
+            "observer side effect must be observable"
+        );
+        assert!(
+            observer.durable_start_seen,
+            "observer must run after the exact tool.started line is durable"
+        );
+        assert!(
+            !project_root.join("would-be-written.txt").exists(),
+            "observer failure must prevent the actual builtin dispatch"
+        );
+        let events = agent.journal().read_events().unwrap();
+        let started = events
+            .iter()
+            .find(|event| event.kind == "tool.started")
+            .expect("tool.started must precede the observer callback");
+        let in_doubt = events
+            .iter()
+            .find(|event| event.kind == "tool.in_doubt")
+            .expect("observer failure must conservatively suspend the started call");
+        assert_eq!(in_doubt.data["call_id"], call.id);
+        assert_eq!(in_doubt.data["before_dispatch"], true);
+        assert!(started.seq < in_doubt.seq);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == "tool.skipped_due_to_cancel"),
+            "the started call must not be rewritten as an unstarted skip"
+        );
+
+        drop(agent);
+        store
+            .open(session_id)
+            .expect("in-doubt observer outcome must remain reopenable");
     }
 
     #[tokio::test]
@@ -8106,6 +9160,91 @@ mod tests {
         store
             .open("observer-tool-terminal-settlement")
             .expect("the ordered terminal batch must reopen");
+    }
+
+    #[tokio::test]
+    async fn history_tool_start_observer_runs_only_after_durable_start() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let store = SessionStore::new(temp.path().join("data")).unwrap();
+        let session_id = "history-observer-start-order";
+        let mut journal = store
+            .create_with_id(session_id, SessionHeader::new(&project_root, "test-model"))
+            .unwrap();
+        seed_checkpoint(&mut journal).await;
+        let journal_path = store.layout().journal_path(session_id).unwrap();
+        let marker_path = temp.path().join("history-observer-side-effect.txt");
+        let call = ToolCall {
+            id: "history-observer-escape".to_owned(),
+            name: HISTORY_SEARCH_TOOL.to_owned(),
+            arguments: json!({"query":"historical"}),
+        };
+        let provider = Arc::new(RecordingProvider::new([tool_turn(vec![call.clone()])]));
+        let tools = BuiltinTools::new(
+            &project_root,
+            journal.artifact_dir(),
+            temp.path().join("memory"),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut agent = Agent::new(
+            provider,
+            journal,
+            tools,
+            "instructions",
+            ContextLimits::default(),
+            None,
+            None,
+        );
+        let mut observer = FailingToolStartObserver {
+            journal_path,
+            marker_path: marker_path.clone(),
+            captured_tool_name: None,
+            captured_debug: None,
+            durable_start_seen: false,
+        };
+
+        agent
+            .run_turn(
+                "search history",
+                CancellationToken::new(),
+                &mut observer,
+                &mut DenyApproval,
+            )
+            .await
+            .expect_err("history tool-start observer failure must stop the turn");
+
+        assert_eq!(
+            observer.captured_tool_name.as_deref(),
+            Some(HISTORY_SEARCH_TOOL)
+        );
+        let captured_debug = observer.captured_debug.as_deref().unwrap();
+        assert!(!captured_debug.contains("history-observer-escape"));
+        assert!(!captured_debug.contains("historical"));
+        assert!(
+            marker_path.is_file(),
+            "observer side effect must be observable"
+        );
+        assert!(observer.durable_start_seen);
+        let events = agent.journal().read_events().unwrap();
+        let started = events
+            .iter()
+            .find(|event| event.kind == "tool.started")
+            .expect("history tool.started must precede the observer callback");
+        let in_doubt = events
+            .iter()
+            .find(|event| event.kind == "tool.in_doubt")
+            .expect("history observer failure must suspend the started call");
+        assert_eq!(in_doubt.data["call_id"], call.id);
+        assert_eq!(in_doubt.data["before_dispatch"], true);
+        assert!(started.seq < in_doubt.seq);
+
+        drop(agent);
+        store
+            .open(session_id)
+            .expect("history in-doubt observer outcome must remain reopenable");
     }
 
     #[tokio::test]
@@ -8499,7 +9638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn observer_failure_aborts_response_without_committing_partial_output() {
+    async fn provider_local_observer_failure_aborts_response_without_partial_output() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
         let data_dir = temp.path().join("data");
@@ -8534,7 +9673,7 @@ mod tests {
             .run_turn(
                 "render this response",
                 CancellationToken::new(),
-                &mut FailingProviderEventObserver,
+                &mut NoopObserver,
                 &mut DenyApproval,
             )
             .await
@@ -8555,6 +9694,35 @@ mod tests {
                 "response.failed" | "response.completed" | "turn.completed"
             )
         }));
+    }
+
+    #[test]
+    fn forward_observer_drops_all_precommit_provider_events() {
+        let mut forward = ForwardObserver;
+        forward
+            .on_event(ProviderEvent::FunctionArgumentsDelta {
+                item_id: Some("item-secret".to_owned()),
+                call_id: Some("call-secret".to_owned()),
+                delta: "{\"command\":\"write secret\"}".to_owned(),
+            })
+            .unwrap();
+        forward
+            .on_event(ProviderEvent::Unknown {
+                event_type: "response.future_payload".to_owned(),
+                payload: json!({"replayable":"secret payload"}),
+            })
+            .unwrap();
+        forward
+            .on_event(ProviderEvent::TextDelta(
+                "provider-controlled text".to_owned(),
+            ))
+            .unwrap();
+        forward
+            .on_event(ProviderEvent::Retry {
+                attempt: 2,
+                classification: ProviderRetryClassV1::RetryableHttpStatus(429),
+            })
+            .unwrap();
     }
 
     #[tokio::test]
@@ -8747,6 +9915,43 @@ mod tests {
         let schema = json!({"type": "object", "additionalProperties": false});
         assert!(validate_json_schema(&schema, &json!({})).is_ok());
         assert!(validate_json_schema(&schema, &json!({"x": 1})).is_err());
+    }
+
+    #[test]
+    fn schema_numeric_bounds_do_not_round_through_f64() {
+        let minimum = json!({"minimum": 9_007_199_254_740_993_u64});
+        let below = json!(9_007_199_254_740_992_u64);
+        assert!(
+            validate_json_schema(&minimum, &below)
+                .unwrap_err()
+                .contains("below minimum")
+        );
+
+        let maximum = json!({"maximum": 9_007_199_254_740_992_u64});
+        let above = json!(9_007_199_254_740_993_u64);
+        assert!(
+            validate_json_schema(&maximum, &above)
+                .unwrap_err()
+                .contains("above maximum")
+        );
+    }
+
+    #[test]
+    fn schema_numeric_bounds_fail_closed_for_f64_values() {
+        let error = validate_json_schema(&json!({"minimum": 0.5}), &json!(1.0))
+            .expect_err("Value has lost the exact decimal wire spelling");
+        assert!(error.contains("exact integer JSON numbers"), "{error}");
+    }
+
+    #[test]
+    fn schema_validation_rejects_deep_input_before_recursive_walk() {
+        let mut schema = json!({});
+        for _ in 0..=MAX_JSON_SCHEMA_VALIDATION_DEPTH_V1 {
+            schema = json!({"allOf":[schema]});
+        }
+        let error = validate_json_schema(&schema, &Value::Null)
+            .expect_err("deep schema must fail before recursive validation");
+        assert!(error.contains("exceeds depth"), "{error}");
     }
 
     #[test]

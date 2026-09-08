@@ -4,3 +4,5 @@
 .vscode/
 *.log
 *.rmeta
+/target-turn-audit/
+/codex-install.ps1.inspect

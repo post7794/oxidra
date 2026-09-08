@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use oxidra::agent::{Agent, AgentObserver, DenyApproval};
+use oxidra::agent::{
+    Agent, DenyApproval, DurableAgentSyncObserverV1, DurableAgentSyncPointV1, SilentAgentObserverV1,
+};
 use oxidra::compaction::{
     COMPACTION_ABORTED_KIND, COMPACTION_BOUNDARY_BUDGET_RETRY_STARTED_KIND,
     COMPACTION_BOUNDARY_FAILED_KIND, COMPACTION_BOUNDARY_RESOLVED_WITHOUT_CHECKPOINT_KIND,
@@ -25,16 +27,15 @@ use oxidra::compaction::{
 };
 use oxidra::config::{ContextLimits, ContextValueSource};
 use oxidra::context::AUTOMATIC_COMPACTION_PLANNING_VERSION;
-use oxidra::error::Result;
 use oxidra::projection::SOURCE_PROJECTION_VERSION;
-use oxidra::provider::{ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver};
+use oxidra::provider::{ResponseProvider, ResponseRequest, SilentStreamObserverV1, StreamObserver};
 use oxidra::session::{JOURNAL_SCHEMA, JournalEvent, SessionHeader, SessionJournal, SessionStore};
 use oxidra::tools::BuiltinTools;
 use oxidra::turn::{
     CompletePrefix, CompletionEvidence, TURN_BOUNDARY_VALIDATOR_VERSION, TURN_BOUNDARY_VERSION,
     TurnState, complete_prefix_candidates, segment_turns,
 };
-use oxidra::types::{AssistantTurn, ToolCall, ToolResult, Usage};
+use oxidra::types::{AssistantTurn, Usage};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -54,6 +55,28 @@ const TURN_ID: &str = "turn-1";
 const RESPONSE_ATTEMPT_ID: &str = "attempt-1";
 const SYNC_PREFIX: &str = "OXIDRA_FAULT_SYNC:";
 const SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+
+trait SessionJournalFixtureExt {
+    fn append_fixture_event_v1(
+        &mut self,
+        kind: impl Into<String>,
+        turn_id: Option<&str>,
+        data: Value,
+    ) -> oxidra::Result<JournalEvent>;
+}
+
+impl SessionJournalFixtureExt for SessionJournal {
+    fn append_fixture_event_v1(
+        &mut self,
+        kind: impl Into<String>,
+        turn_id: Option<&str>,
+        data: Value,
+    ) -> oxidra::Result<JournalEvent> {
+        // SAFETY: fault-injection needs exact crash prefixes; every fixture is
+        // reduced after process termination by the test that created it.
+        unsafe { self.append_protocol_event_and_sync_unchecked_v1(kind, turn_id, data) }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SyncPoint {
@@ -424,7 +447,7 @@ fn force_kill_after_compaction_recovery_intent_can_retry_after_reopen() {
     let outcome = runtime
         .block_on(agent.retry_pending_turn(
             CancellationToken::new(),
-            &mut NoopAgentObserver,
+            &mut SilentAgentObserverV1,
             &mut DenyApproval,
         ))
         .expect("retry recovered compaction boundary");
@@ -708,7 +731,7 @@ fn fault_injection_child() {
     sync_barrier(SyncPoint::SessionStarted);
 
     let user = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "user.message",
             Some(TURN_ID),
             json!({
@@ -720,7 +743,7 @@ fn fault_injection_child() {
     sync_barrier(SyncPoint::UserMessage);
 
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "response.started",
             Some(TURN_ID),
             json!({
@@ -733,7 +756,7 @@ fn fault_injection_child() {
 
     let response_seq = journal.next_seq();
     let response = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "response.completed",
             Some(TURN_ID),
             json!({
@@ -755,7 +778,7 @@ fn fault_injection_child() {
 
     let marker_seq = journal.next_seq();
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "turn.completed",
             Some(TURN_ID),
             json!({
@@ -785,7 +808,7 @@ fn retry_fault_injection_child() {
         )
         .expect("create retry child journal");
     let user = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "user.message",
             Some(TURN_ID),
             json!({
@@ -795,7 +818,7 @@ fn retry_fault_injection_child() {
         )
         .expect("append retry user message");
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "response.failed",
             Some(TURN_ID),
             json!({
@@ -805,14 +828,14 @@ fn retry_fault_injection_child() {
         )
         .expect("append initial context failure");
     let limit = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "context.limit_reached",
             Some(TURN_ID),
             json!({"error":"context_length_exceeded"}),
         )
         .expect("append initial context limit");
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "turn.retry_started",
             Some(TURN_ID),
             json!({
@@ -826,7 +849,7 @@ fn retry_fault_injection_child() {
     sync_barrier_label(RetrySyncPoint::IntentSynced.label());
 
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "response.started",
             Some(TURN_ID),
             json!({
@@ -839,7 +862,7 @@ fn retry_fault_injection_child() {
 
     let response_seq = journal.next_seq();
     let response = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "response.completed",
             Some(TURN_ID),
             json!({
@@ -858,7 +881,7 @@ fn retry_fault_injection_child() {
         .expect("append retry response completion");
     let marker_seq = journal.next_seq();
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "turn.completed",
             Some(TURN_ID),
             json!({
@@ -899,7 +922,7 @@ fn budget_migration_fault_injection_child() {
         .expect("create budget migration child journal");
     for event in fixture.into_iter().skip(1) {
         journal
-            .append_and_sync(&event.kind, event.turn_id.as_deref(), event.data)
+            .append_fixture_event_v1(&event.kind, event.turn_id.as_deref(), event.data.clone())
             .expect("append literal legacy budget event");
     }
     let tools = BuiltinTools::new(
@@ -926,7 +949,9 @@ fn budget_migration_fault_injection_child() {
     let error = runtime
         .block_on(agent.retry_pending_turn(
             CancellationToken::new(),
-            &mut BudgetMigrationSyncObserver,
+            &mut DurableAgentSyncObserverV1::new(
+                DurableAgentSyncPointV1::CompactionBudgetRecoveryIntent,
+            ),
             &mut DenyApproval,
         ))
         .expect_err("parent should kill the child after migration fsync");
@@ -953,7 +978,7 @@ fn compaction_replan_fault_injection_child() {
         append_large_replan_turn(&mut journal, index);
     }
     let user = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "user.message",
             Some(TURN_ID),
             json!({
@@ -971,7 +996,7 @@ fn compaction_replan_fault_injection_child() {
     .expect("planning extra is an object")
     .clone();
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             COMPACTION_BOUNDARY_STARTED_KIND,
             None,
             serde_json::to_value(CompactionBoundaryStarted {
@@ -983,7 +1008,7 @@ fn compaction_replan_fault_injection_child() {
         )
         .expect("append initial compaction boundary");
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             COMPACTION_BOUNDARY_FAILED_KIND,
             None,
             serde_json::to_value(CompactionBoundaryFailed {
@@ -1021,7 +1046,7 @@ fn compaction_replan_fault_injection_child() {
     let error = runtime
         .block_on(agent.retry_pending_turn(
             CancellationToken::new(),
-            &mut CompactionRecoverySyncObserver,
+            &mut DurableAgentSyncObserverV1::new(DurableAgentSyncPointV1::CompactionRecoveryIntent),
             &mut DenyApproval,
         ))
         .expect_err("parent should kill the child at the durable retry intent");
@@ -1052,7 +1077,7 @@ fn compaction_resolution_fault_injection_child() {
         append_large_replan_turn(&mut journal, index);
     }
     let user = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "user.message",
             Some(TURN_ID),
             json!({
@@ -1070,7 +1095,7 @@ fn compaction_resolution_fault_injection_child() {
     .expect("planning extra is an object")
     .clone();
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             COMPACTION_BOUNDARY_STARTED_KIND,
             None,
             serde_json::to_value(CompactionBoundaryStarted {
@@ -1082,7 +1107,7 @@ fn compaction_resolution_fault_injection_child() {
         )
         .expect("append initial compaction resolution boundary");
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             COMPACTION_BOUNDARY_FAILED_KIND,
             None,
             serde_json::to_value(CompactionBoundaryFailed {
@@ -1125,106 +1150,11 @@ fn compaction_resolution_fault_injection_child() {
     let error = runtime
         .block_on(agent.retry_pending_turn(
             CancellationToken::new(),
-            &mut CompactionResolutionSyncObserver,
+            &mut DurableAgentSyncObserverV1::new(DurableAgentSyncPointV1::CompactionResolution),
             &mut DenyApproval,
         ))
         .expect_err("parent should kill the child after resolution fsync");
     panic!("compaction resolution child unexpectedly resumed: {error}");
-}
-
-struct CompactionRecoverySyncObserver;
-
-struct CompactionResolutionSyncObserver;
-
-struct BudgetMigrationSyncObserver;
-
-impl AgentObserver for BudgetMigrationSyncObserver {
-    fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_message(&mut self, _message: &str) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_compaction_budget_recovery_intent_synced(&mut self) -> Result<()> {
-        sync_barrier_label(BUDGET_MIGRATION_SYNC_LABEL);
-        Ok(())
-    }
-}
-
-impl AgentObserver for CompactionRecoverySyncObserver {
-    fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_message(&mut self, _message: &str) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_compaction_recovery_intent_synced(&mut self) -> Result<()> {
-        sync_barrier_label(COMPACTION_REPLAN_SYNC_LABEL);
-        Ok(())
-    }
-}
-
-impl AgentObserver for CompactionResolutionSyncObserver {
-    fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_message(&mut self, _message: &str) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_compaction_resolution_synced(&mut self) -> Result<()> {
-        sync_barrier_label(COMPACTION_RESOLUTION_SYNC_LABEL);
-        Ok(())
-    }
-}
-
-struct NoopAgentObserver;
-
-impl AgentObserver for NoopAgentObserver {
-    fn on_provider_event(&mut self, _event: ProviderEvent) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_tool_started(&mut self, _call: &ToolCall) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_tool_completed(&mut self, _call: &ToolCall, _result: &ToolResult) -> Result<()> {
-        Ok(())
-    }
-
-    fn on_message(&mut self, _message: &str) -> Result<()> {
-        Ok(())
-    }
 }
 
 struct UnexpectedRecoveryProvider;
@@ -1236,7 +1166,7 @@ impl ResponseProvider for UnexpectedRecoveryProvider {
         _request: ResponseRequest,
         _observer: &mut dyn StreamObserver,
         _cancellation: CancellationToken,
-    ) -> Result<AssistantTurn> {
+    ) -> oxidra::provider::UncommittedProviderOutcomeV1 {
         panic!("Provider dispatch occurred before the recovery intent sync hook")
     }
 }
@@ -1269,17 +1199,18 @@ impl ResponseProvider for RecoveryProvider {
         request: ResponseRequest,
         _observer: &mut dyn StreamObserver,
         _cancellation: CancellationToken,
-    ) -> Result<AssistantTurn> {
+    ) -> oxidra::provider::UncommittedProviderOutcomeV1 {
         self.requests
             .lock()
             .expect("lock recovery requests")
             .push(request);
-        Ok(self
-            .responses
-            .lock()
-            .expect("lock recovery responses")
-            .pop_front()
-            .expect("scripted recovery response"))
+        oxidra::provider::UncommittedProviderOutcomeV1::success(
+            self.responses
+                .lock()
+                .expect("lock recovery responses")
+                .pop_front()
+                .expect("scripted recovery response"),
+        )
     }
 }
 
@@ -1294,7 +1225,7 @@ impl ResponseProvider for FaultCompactionProvider {
         request: ResponseRequest,
         _observer: &mut dyn StreamObserver,
         _cancellation: CancellationToken,
-    ) -> Result<AssistantTurn> {
+    ) -> oxidra::provider::UncommittedProviderOutcomeV1 {
         assert!(request.tools.is_empty());
         assert_eq!(
             request.max_output_tokens,
@@ -1308,7 +1239,7 @@ impl ResponseProvider for FaultCompactionProvider {
             "role": "assistant",
             "content": [{"type": "output_text", "text": "fault-injection summary"}],
         })];
-        Ok(AssistantTurn {
+        let turn = AssistantTurn {
             raw_response: json!({
                 "id": "fault-injection-compaction-response",
                 "status": "completed",
@@ -1329,15 +1260,11 @@ impl ResponseProvider for FaultCompactionProvider {
                 ..Usage::default()
             },
             unknown_stream_events: Vec::new(),
-        })
-    }
-}
-
-struct NoopStreamObserver;
-
-impl StreamObserver for NoopStreamObserver {
-    fn on_event(&mut self, _event: ProviderEvent) -> Result<()> {
-        Ok(())
+        };
+        if self.scenario == CompactionSyncPoint::ProviderCompleted {
+            sync_barrier_label(self.scenario.label());
+        }
+        oxidra::provider::UncommittedProviderOutcomeV1::success(turn)
     }
 }
 
@@ -1405,18 +1332,12 @@ fn compaction_fault_injection_child() {
                 &mut journal,
                 &candidate,
                 "fault-injection-model",
-                &mut NoopStreamObserver,
+                &mut SilentStreamObserverV1,
                 CancellationToken::new(),
-                |summary| {
-                    assert_eq!(summary, "fault-injection summary");
-                    if scenario == CompactionSyncPoint::ProviderCompleted {
-                        sync_barrier_label(scenario.label());
-                    }
-                    Ok(())
-                },
             ))
             .expect("complete production compaction attempt");
         assert_eq!(checkpoint.covers_through_seq, marker.seq);
+        assert_eq!(checkpoint.summary, "fault-injection summary");
         if scenario == CompactionSyncPoint::CheckpointSynced {
             sync_barrier_label(scenario.label());
         }
@@ -1424,7 +1345,7 @@ fn compaction_fault_injection_child() {
     }
 
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             COMPACTION_STARTED_KIND,
             None,
             serde_json::to_value(CompactionStarted {
@@ -1482,7 +1403,7 @@ fn append_completed_compaction_turn(
     index: usize,
 ) -> JournalEvent {
     let user = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "user.message",
             Some(turn_id),
             json!({
@@ -1493,7 +1414,7 @@ fn append_completed_compaction_turn(
         .expect("append compaction fixture user message");
     let response_seq = journal.next_seq();
     let response = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "response.completed",
             Some(turn_id),
             json!({
@@ -1523,7 +1444,7 @@ fn append_completed_compaction_turn(
         .expect("append compaction fixture response");
     let marker_seq = journal.next_seq();
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "turn.completed",
             Some(turn_id),
             json!({
@@ -1539,7 +1460,7 @@ fn append_completed_compaction_turn(
 fn append_large_replan_turn(journal: &mut SessionJournal, index: usize) {
     let turn_id = format!("large-replan-turn-{index}");
     let user = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "user.message",
             Some(&turn_id),
             json!({
@@ -1559,7 +1480,7 @@ fn append_large_replan_turn(journal: &mut SessionJournal, index: usize) {
         "content": [{"type":"output_text","text":text}],
     });
     let response = journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "response.completed",
             Some(&turn_id),
             json!({
@@ -1581,7 +1502,7 @@ fn append_large_replan_turn(journal: &mut SessionJournal, index: usize) {
         .expect("append large replan response");
     let marker_seq = journal.next_seq();
     journal
-        .append_and_sync(
+        .append_fixture_event_v1(
             "turn.completed",
             Some(&turn_id),
             json!({

@@ -4,6 +4,7 @@
 //! registry only receives tool lifecycle semantics after this reducer proves
 //! the activation, durable Provider call and every started/terminal edge.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -13,21 +14,37 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{McpModelOutputV1, schema};
-use crate::context::{MCP_SURFACE_CLAIM_VERSION_V1, ToolSurfaceSnapshotV1};
+use crate::context::{
+    MCP_SURFACE_CLAIM_VERSION_V1, PROVIDER_PROTOCOL_OPENAI_RESPONSES, ToolSurfaceSnapshotV1,
+    measure_exact_prepared_request,
+};
 use crate::error::{OxidraError, Result};
 use crate::event_kind::{is_response_terminal, is_tool_lifecycle, is_tool_terminal};
+use crate::projection::project_provider_request_after_mcp_validation;
 use crate::session::JournalEvent;
 
 pub(crate) const MCP_CALL_CHAIN_VALIDATOR_VERSION_V1: u32 = 1;
 pub(crate) const MCP_CALL_CHAIN_VALIDATOR_VERSION_V2: u32 = 2;
 pub(crate) const MCP_CALL_CHAIN_VALIDATOR_VERSION_V3: u32 = 3;
-pub const MCP_CALL_CHAIN_VALIDATOR_VERSION: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V2;
+pub(crate) const MCP_CALL_CHAIN_VALIDATOR_VERSION_V4: u32 = 4;
+pub const MCP_CALL_CHAIN_VALIDATOR_VERSION: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V4;
 const MAX_MCP_CALLS_PER_RESPONSE_V1: usize = 4_096;
 pub const MAX_MCP_CALLS_PER_RESPONSE: usize = MAX_MCP_CALLS_PER_RESPONSE_V1;
 const MCP_EXECUTION_COORDINATOR_VERSION_V1: u64 = 1;
 const MCP_EXECUTION_COORDINATOR_VERSION_V2: u64 = 2;
 const MCP_EXECUTION_COORDINATOR_VERSION_V3: u64 = 3;
+const MCP_EXECUTION_COORDINATOR_VERSION_V4: u64 = 4;
 const MCP_RESPONSE_SURFACE_REFERENCE_VERSION_V1: u64 = 1;
+const MCP_PREPARED_REQUEST_REFERENCE_VERSION_V1: u64 = 1;
+const MAX_MCP_PREPARED_REQUEST_BODY_BYTES_V1: usize = 8 * 1024 * 1024;
+/// v4 replays a historical projection for every owned Provider start. Until a
+/// streaming projection reader replaces that algorithm, freeze cumulative
+/// work so a valid journal cannot make reopen perform unbounded quadratic
+/// scans. Production admission runs the same prospective validator before the
+/// next `response.started` is fsynced.
+const MAX_MCP_V4_PROJECTION_PREFIX_EVENT_VISITS: usize = 8 * 1024 * 1024;
+const MAX_MCP_V4_PROJECTION_PREFIX_BYTES: usize = 1024 * 1024 * 1024;
+const MAX_MCP_V4_OWNED_RESPONSE_STARTS: usize = 4_096;
 const MCP_DISPATCH_PERMIT_VERSION_V1: u64 = 1;
 const MCP_ARGUMENT_DIGEST_VERSION_V1: u64 = 1;
 const MCP_TOOL_REGISTRY_VERSION_V1: u64 = 1;
@@ -37,6 +54,70 @@ const MCP_REGISTRY_ACTIVATED_KIND: &str = "mcp.registry.activated";
 const MAX_MCP_RAWLESS_ERROR_MESSAGE_BYTES_V3: usize = 16 * 1024;
 const MCP_RAWLESS_COMPLETION_CODES_V3: &[&str] =
     &["dispatch_permit_invalid", "not_found", "transport_closed"];
+
+thread_local! {
+    /// Projection v4 depends on the compaction/turn reducers, whose frozen
+    /// policies in turn re-check the MCP prefix. Nested checks validate the
+    /// complete v4 core but must not recursively rebuild the same prepared
+    /// request projection. This scope is thread-local and panic-safe; callers
+    /// cannot construct it outside this module.
+    static MCP_V4_PROJECTION_SCOPE: Cell<bool> = const { Cell::new(false) };
+}
+
+struct McpV4ProjectionScope;
+
+#[derive(Default)]
+struct McpV4ProjectionBudget {
+    response_starts: usize,
+    prefix_event_visits: usize,
+    prefix_bytes: usize,
+}
+
+impl McpV4ProjectionBudget {
+    fn charge(&mut self, prefix_event_visits: usize, prefix_bytes: usize) -> Result<()> {
+        self.response_starts = self.response_starts.checked_add(1).ok_or_else(|| {
+            OxidraError::Session("MCP v4 prepared-request projection budget overflow".to_owned())
+        })?;
+        self.prefix_event_visits = self
+            .prefix_event_visits
+            .checked_add(prefix_event_visits)
+            .ok_or_else(|| {
+                OxidraError::Session(
+                    "MCP v4 prepared-request event-visit budget overflow".to_owned(),
+                )
+            })?;
+        self.prefix_bytes = self.prefix_bytes.checked_add(prefix_bytes).ok_or_else(|| {
+            OxidraError::Session("MCP v4 prepared-request prefix-byte budget overflow".to_owned())
+        })?;
+        if self.response_starts > MAX_MCP_V4_OWNED_RESPONSE_STARTS
+            || self.prefix_event_visits > MAX_MCP_V4_PROJECTION_PREFIX_EVENT_VISITS
+            || self.prefix_bytes > MAX_MCP_V4_PROJECTION_PREFIX_BYTES
+        {
+            return session_error(
+                "MCP v4 prepared-request projection exceeds its frozen validation-work budget",
+            );
+        }
+        Ok(())
+    }
+}
+
+impl McpV4ProjectionScope {
+    fn enter() -> Option<Self> {
+        MCP_V4_PROJECTION_SCOPE.with(|scope| {
+            if scope.replace(true) {
+                None
+            } else {
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for McpV4ProjectionScope {
+    fn drop(&mut self) {
+        MCP_V4_PROJECTION_SCOPE.with(|scope| scope.set(false));
+    }
+}
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct McpCallKey {
@@ -217,6 +298,31 @@ pub(crate) fn validate_mcp_call_chain_v3(events: &[JournalEvent]) -> Result<()> 
     validate_mcp_call_chain_with_activation(events, &activation)
 }
 
+/// Validate the first MCP protocol that binds the exact prepared Provider
+/// request digest as well as the v3 Provider-visible tool surface.  v1-v3
+/// remain frozen compatibility readers; v4 is registered as an offline
+/// reader before it becomes the current writer protocol.
+pub(crate) fn validate_mcp_call_chain_v4(events: &[JournalEvent]) -> Result<()> {
+    let activation = activation_v4(events)?;
+    let Some(activation) = activation else {
+        reject_orphan_mcp_markers(events)?;
+        return Ok(());
+    };
+    if activation.call_chain_validator_version != MCP_CALL_CHAIN_VALIDATOR_VERSION_V4 {
+        return session_error("unsupported MCP call-chain validator version");
+    }
+
+    validate_mcp_call_chain_with_activation(events, &activation)?;
+    let Some(_scope) = McpV4ProjectionScope::enter() else {
+        // A projection-level dependency is validating a prefix of the exact
+        // chain already being proved. The core activation/response/lifecycle
+        // state above remains mandatory; only the cyclic projection edge is
+        // suppressed for this nested call.
+        return Ok(());
+    };
+    validate_prepared_request_projection_v4(events, &activation)
+}
+
 fn validate_mcp_call_chain_with_activation(
     events: &[JournalEvent],
     activation: &Activation,
@@ -293,7 +399,7 @@ fn validate_mcp_call_chain_with_activation(
             MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 | MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => {
                 validate_lifecycle_event_v1(event, call, activation, state, &recovery_authorities)?;
             }
-            MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 => {
+            MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 | MCP_CALL_CHAIN_VALIDATOR_VERSION_V4 => {
                 validate_lifecycle_event_v3(event, call, activation, state, &recovery_authorities)?;
             }
             version => {
@@ -328,6 +434,7 @@ struct OwnedResponseSurfaceV3 {
     registry_epoch_id: String,
     registry_digest: String,
     bindings: Vec<SurfaceBindingIdentity>,
+    provider_tools: Value,
 }
 
 /// Establish v3 response ownership from the exact tool surface referenced by
@@ -430,12 +537,28 @@ fn owned_response_start_seqs_v3(
                 output_schema_digest: binding.output_schema_digest().map(ToOwned::to_owned),
             })
             .collect::<Vec<_>>();
+        let provider_tools = Value::Array(
+            snapshot
+                .tools()
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type":"function",
+                        "name":tool.name,
+                        "description":tool.description,
+                        "parameters":tool.input_schema,
+                        "strict":false,
+                    })
+                })
+                .collect(),
+        );
         let surface = Arc::new(OwnedResponseSurfaceV3 {
             surface_event_seq: tools_event_seq,
             surface_digest: snapshot.digest().to_owned(),
             registry_epoch_id: claim.registry_epoch_id().to_owned(),
             registry_digest: claim.registry_digest().to_owned(),
             bindings,
+            provider_tools,
         });
         surfaces.insert(tools_event_seq, surface);
     }
@@ -571,6 +694,394 @@ fn owned_response_start_seqs_v3(
     Ok(owned)
 }
 
+/// Extend the frozen v3 surface relation with one exact prepared-request
+/// identity. The request reference is a separate closed profile so later
+/// request hashing rules need not change the v3 surface snapshot contract.
+fn owned_response_start_seqs_v4(
+    events: &[JournalEvent],
+    activation: &Activation,
+) -> Result<HashMap<u64, Arc<OwnedResponseSurfaceV3>>> {
+    let owned = owned_response_start_seqs_v3(events, activation)?;
+    let starts_by_seq = events
+        .iter()
+        .filter(|event| event.kind == "response.started")
+        .map(|event| (event.seq, event))
+        .collect::<HashMap<_, _>>();
+    for start_seq in owned.keys() {
+        let start = starts_by_seq
+            .get(start_seq)
+            .copied()
+            .expect("owned response start was indexed from the same journal");
+        let reference = start
+            .data
+            .get("mcp_prepared_request")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                session_message(start, "mcp_prepared_request must be an object for v4")
+            })?;
+        require_exact_keys(reference, &["body", "digest", "version"], start)?;
+        require_version(
+            reference,
+            "version",
+            MCP_PREPARED_REQUEST_REFERENCE_VERSION_V1,
+            start,
+        )?;
+        let reference_digest = required_sha256(reference, "digest", start)?;
+        let body = reference.get("body").ok_or_else(|| {
+            session_message(start, "mcp_prepared_request has no canonical body for v4")
+        })?;
+        super::preflight_mcp_provider_event_tree_v1(
+            body,
+            MAX_MCP_PREPARED_REQUEST_BODY_BYTES_V1,
+        )
+        .map_err(|error| {
+            OxidraError::Session(format!(
+                "response.started at seq {} prepared Provider request exceeds the bounded v1 JSON profile: {error}",
+                start.seq
+            ))
+        })?;
+        let canonical_body_bytes = serde_json::to_vec(body)?;
+        let recomputed_measurement = measure_exact_prepared_request(body, &canonical_body_bytes)?;
+        let recomputed_digest = recomputed_measurement.request_digest.as_str();
+        if reference_digest != recomputed_digest {
+            return Err(session_message(
+                start,
+                "mcp_prepared_request.digest does not match its canonical body",
+            ));
+        }
+        let surface = owned
+            .get(start_seq)
+            .expect("v4 request start has the v3 surface indexed above");
+        validate_prepared_request_body_v1(body, start, surface)?;
+        let measurement = start
+            .data
+            .get("context")
+            .and_then(Value::as_object)
+            .and_then(|context| context.get("measurement"))
+            .ok_or_else(|| {
+                session_message(
+                    start,
+                    "has no context.measurement for prepared-request validation v4",
+                )
+            })?;
+        let expected_measurement = serde_json::to_value(&recomputed_measurement)?;
+        if measurement != &expected_measurement {
+            return Err(session_message(
+                start,
+                "context.measurement does not match the canonical prepared Provider request",
+            ));
+        }
+    }
+    Ok(owned)
+}
+
+/// Bind every v4 prepared body to the journal state that existed before its
+/// exact `response.started`. Digest and measurement fields live in the same
+/// mutable journal record as the body, so they are integrity checks, not an
+/// independent provenance anchor. The canonical input/instructions/runtime
+/// events are the authority that prevents a self-consistent forged request
+/// from becoming valid history.
+fn validate_prepared_request_projection_v4(
+    events: &[JournalEvent],
+    activation: &Activation,
+) -> Result<()> {
+    let owned = owned_response_start_seqs_v4(events, activation)?;
+    let events_by_seq = events
+        .iter()
+        .map(|event| (event.seq, event))
+        .collect::<HashMap<_, _>>();
+    let event_indexes = events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| (event.seq, index))
+        .collect::<HashMap<_, _>>();
+    let mut cumulative_encoded_bytes = Vec::with_capacity(events.len());
+    let mut encoded_bytes = 0usize;
+    for event in events {
+        let event_bytes = crate::session::encode_journal_event_v2(event)?
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| OxidraError::Session("MCP v4 journal event size overflow".to_owned()))?;
+        encoded_bytes = encoded_bytes.checked_add(event_bytes).ok_or_else(|| {
+            OxidraError::Session("MCP v4 journal prefix size overflow".to_owned())
+        })?;
+        cumulative_encoded_bytes.push(encoded_bytes);
+    }
+    let mut budget = McpV4ProjectionBudget::default();
+    let mut start_seqs = owned.keys().copied().collect::<Vec<_>>();
+    start_seqs.sort_unstable();
+
+    for start_seq in start_seqs {
+        let start = events_by_seq
+            .get(&start_seq)
+            .copied()
+            .expect("owned v4 response start was indexed from the same journal");
+        let start_index = *event_indexes
+            .get(&start_seq)
+            .expect("owned v4 response start index");
+        let context = start
+            .data
+            .get("context")
+            .and_then(Value::as_object)
+            .ok_or_else(|| session_message(start, "has no request context object for v4"))?;
+        let through_seq = context
+            .get("request_journal_through_seq")
+            .and_then(Value::as_u64)
+            .filter(|seq| *seq != 0 && *seq < start.seq)
+            .ok_or_else(|| {
+                session_message(
+                    start,
+                    "has no valid request_journal_through_seq for prepared-request validation v4",
+                )
+            })?;
+        let Some(&through_index) = event_indexes.get(&through_seq) else {
+            return Err(session_message(
+                start,
+                "references a missing request_journal_through_seq event",
+            ));
+        };
+        if start_index == 0 || through_index + 1 != start_index {
+            return Err(session_message(
+                start,
+                "request_journal_through_seq is not the exact durable predecessor of response.started",
+            ));
+        }
+        budget.charge(through_index + 1, cumulative_encoded_bytes[through_index])?;
+        let prefix = &events[..=through_index];
+        let tools_event_seq = context
+            .get("tools_event_seq")
+            .and_then(Value::as_u64)
+            .filter(|seq| *seq != 0 && *seq <= through_seq)
+            .ok_or_else(|| {
+                session_message(
+                    start,
+                    "has no valid tools_event_seq for prepared-request validation v4",
+                )
+            })?;
+        if latest_global_context_event_seq_v4(prefix, "context.tools") != Some(tools_event_seq) {
+            return Err(session_message(
+                start,
+                "tools_event_seq is not the effective context.tools at the request cutoff",
+            ));
+        }
+        let projected = project_provider_request_after_mcp_validation(prefix)?;
+        let body = start
+            .data
+            .get("mcp_prepared_request")
+            .and_then(Value::as_object)
+            .and_then(|reference| reference.get("body"))
+            .and_then(Value::as_object)
+            .expect("owned v4 request body was validated above");
+        if body.get("input") != Some(&Value::Array(projected)) {
+            return Err(session_message(
+                start,
+                "mcp_prepared_request.body.input does not match the canonical journal projection",
+            ));
+        }
+
+        let configured_seq = context
+            .get("configured_event_seq")
+            .and_then(Value::as_u64)
+            .filter(|seq| *seq != 0 && *seq <= through_seq)
+            .ok_or_else(|| {
+                session_message(
+                    start,
+                    "has no valid configured_event_seq for prepared-request validation v4",
+                )
+            })?;
+        if latest_global_context_event_seq_v4(prefix, "context.configured") != Some(configured_seq)
+        {
+            return Err(session_message(
+                start,
+                "configured_event_seq is not the effective context.configured at the request cutoff",
+            ));
+        }
+        let configured = exact_global_context_event_v4(
+            &events_by_seq,
+            configured_seq,
+            "context.configured",
+            start,
+        )?;
+        let configured_model = configured
+            .data
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| session_message(configured, "has no non-empty model"))?;
+        if body.get("model").and_then(Value::as_str) != Some(configured_model) {
+            return Err(session_message(
+                start,
+                "mcp_prepared_request.body.model does not match context.configured",
+            ));
+        }
+        if configured
+            .data
+            .get("provider_protocol")
+            .and_then(Value::as_str)
+            != Some(PROVIDER_PROTOCOL_OPENAI_RESPONSES)
+        {
+            return Err(session_message(
+                configured,
+                "does not select the frozen OpenAI Responses Provider protocol",
+            ));
+        }
+        let configured_domain = configured
+            .data
+            .get("provider_usage_domain")
+            .and_then(Value::as_str)
+            .filter(|value| valid_sha256(value))
+            .ok_or_else(|| {
+                session_message(configured, "has no valid Provider usage-domain digest")
+            })?;
+        if context.get("provider_usage_domain").and_then(Value::as_str) != Some(configured_domain) {
+            return Err(session_message(
+                start,
+                "request context Provider usage domain does not match context.configured",
+            ));
+        }
+
+        let instructions_seq = match context.get("instructions_event_seq") {
+            Some(Value::Null) | None => None,
+            Some(value) => {
+                let instructions_seq = value
+                    .as_u64()
+                    .filter(|seq| *seq != 0 && *seq <= through_seq)
+                    .ok_or_else(|| {
+                        session_message(
+                            start,
+                            "has an invalid instructions_event_seq for prepared-request validation v4",
+                        )
+                    })?;
+                Some(instructions_seq)
+            }
+        };
+        if latest_global_context_event_seq_v4(prefix, "context.instructions") != instructions_seq {
+            return Err(session_message(
+                start,
+                "instructions_event_seq is not the effective context.instructions at the request cutoff",
+            ));
+        }
+        let expected_instructions = match instructions_seq {
+            Some(instructions_seq) => {
+                let instructions = exact_global_context_event_v4(
+                    &events_by_seq,
+                    instructions_seq,
+                    "context.instructions",
+                    start,
+                )?
+                .data
+                .get("instructions")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    session_message(start, "referenced context.instructions is not a string")
+                })?;
+                (!instructions.is_empty()).then_some(instructions)
+            }
+            None => None,
+        };
+        if body.get("instructions").and_then(Value::as_str) != expected_instructions {
+            return Err(session_message(
+                start,
+                "mcp_prepared_request.body.instructions does not match context.instructions",
+            ));
+        }
+        // v4 has no independent durable policy field for a per-request output
+        // override. Accepting one would make the body its own authority.
+        if body.contains_key("max_output_tokens") {
+            return Err(session_message(
+                start,
+                "mcp_prepared_request.body.max_output_tokens has no durable v4 policy anchor",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn latest_global_context_event_seq_v4(events: &[JournalEvent], kind: &str) -> Option<u64> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.kind == kind && event.turn_id.is_none())
+        .map(|event| event.seq)
+}
+
+fn exact_global_context_event_v4<'a>(
+    events_by_seq: &'a HashMap<u64, &'a JournalEvent>,
+    seq: u64,
+    expected_kind: &str,
+    start: &JournalEvent,
+) -> Result<&'a JournalEvent> {
+    let event = events_by_seq.get(&seq).copied().ok_or_else(|| {
+        session_message(
+            start,
+            format!("references missing {expected_kind} seq {seq}"),
+        )
+    })?;
+    if event.kind != expected_kind || event.turn_id.is_some() || event.seq >= start.seq {
+        return Err(session_message(
+            start,
+            format!("does not reference one earlier global {expected_kind} event"),
+        ));
+    }
+    Ok(event)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn validate_prepared_request_body_v1(
+    body: &Value,
+    start: &JournalEvent,
+    surface: &OwnedResponseSurfaceV3,
+) -> Result<()> {
+    let object = body.as_object().ok_or_else(|| {
+        session_message(
+            start,
+            "mcp_prepared_request.body must be a canonical Provider request object",
+        )
+    })?;
+    let mut expected = BTreeSet::from(["include", "input", "model", "store", "stream", "tools"]);
+    if object.contains_key("instructions") {
+        expected.insert("instructions");
+    }
+    if object.contains_key("max_output_tokens") {
+        expected.insert("max_output_tokens");
+    }
+    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(session_message(
+            start,
+            "mcp_prepared_request.body is not in the frozen Provider request v1 shape",
+        ));
+    }
+    if object
+        .get("model")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+        || !object.get("input").is_some_and(Value::is_array)
+        || object.get("tools") != Some(&surface.provider_tools)
+        || object.get("stream").and_then(Value::as_bool) != Some(true)
+        || object.get("store").and_then(Value::as_bool) != Some(false)
+        || object.get("include") != Some(&json!(["reasoning.encrypted_content"]))
+        || object
+            .get("instructions")
+            .is_some_and(|value| !value.is_string())
+        || object
+            .get("max_output_tokens")
+            .is_some_and(|value| value.as_u64().is_none())
+    {
+        return Err(session_message(
+            start,
+            "mcp_prepared_request.body does not match its exact Provider surface/profile",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the complete v2 response transaction before projecting any MCP
 /// calls.  The response start, not a discovered function call, owns the
 /// lifecycle.  Generic and MCP-claimed attempts share one per-turn active
@@ -579,9 +1090,15 @@ fn response_attempts_v2<'a>(
     events: &'a [JournalEvent],
     activation: &Activation,
 ) -> Result<BTreeMap<(String, String), OwnedResponseAttemptV2<'a>>> {
-    let owned_v3 = (activation.call_chain_validator_version == MCP_CALL_CHAIN_VALIDATOR_VERSION_V3)
-        .then(|| owned_response_start_seqs_v3(events, activation))
-        .transpose()?;
+    let owned_surface = match activation.call_chain_validator_version {
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 => {
+            Some(owned_response_start_seqs_v3(events, activation)?)
+        }
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V4 => {
+            Some(owned_response_start_seqs_v4(events, activation)?)
+        }
+        _ => None,
+    };
     let mut starts = HashMap::<(String, String), Vec<u64>>::new();
     let mut active = HashMap::<String, (String, u64)>::new();
     let mut terminal_counts = HashMap::<(String, String), u8>::new();
@@ -632,7 +1149,7 @@ fn response_attempts_v2<'a>(
                         ));
                     }
                     active.insert(turn_id.to_owned(), (attempt_id.to_owned(), event.seq));
-                    let claims_mcp = owned_v3.as_ref().map_or_else(
+                    let claims_mcp = owned_surface.as_ref().map_or_else(
                         || {
                             event.data.get("mcp_registry_epoch_id").is_some()
                                 || event.data.get("mcp_registry_digest").is_some()
@@ -641,7 +1158,7 @@ fn response_attempts_v2<'a>(
                     );
                     if claims_mcp {
                         validate_response_registry(event, activation)?;
-                        let surface = owned_v3
+                        let surface = owned_surface
                             .as_ref()
                             .and_then(|owned| owned.get(&event.seq))
                             .cloned();
@@ -937,10 +1454,23 @@ pub(crate) fn validate_mcp_call_chain_for_version(
     version: u32,
     events: &[JournalEvent],
 ) -> Result<()> {
+    // Public turn/projection reducers can reach this dispatcher with events
+    // constructed directly in safe Rust. A historical wire reader could not
+    // materialize trees beyond serde_json's depth ceiling; reject those
+    // fixtures before activation/call/result readers clone or serialize them.
+    for event in events {
+        crate::session::validate_borrowed_json_depth_v1(
+            &event.data,
+            128,
+            "MCP reducer",
+            "journal event data",
+        )?;
+    }
     match version {
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => validate_mcp_call_chain_v1(events),
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => validate_mcp_call_chain_v2(events),
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 => validate_mcp_call_chain_v3(events),
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V4 => validate_mcp_call_chain_v4(events),
         _ => session_error(format!(
             "unsupported MCP call-chain validator version {version}"
         )),
@@ -1023,6 +1553,7 @@ pub(crate) fn validated_durable_mcp_call_if_present(
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => activation_v1(events)?,
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => activation_v2(events)?,
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 => activation_v3(events)?,
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V4 => activation_v4(events)?,
         version => {
             return session_error(format!(
                 "unsupported MCP call-chain validator version {version}"
@@ -1058,6 +1589,21 @@ pub(crate) fn validated_durable_mcp_calls_for_turn(
     events: &[JournalEvent],
     turn_id: &str,
 ) -> Result<HashMap<String, ValidatedDurableMcpCall>> {
+    Ok(validated_durable_mcp_calls_index(events)?
+        .into_iter()
+        .filter(|((call_turn_id, _), _)| call_turn_id == turn_id)
+        .map(|((_, call_id), call)| (call_id, call))
+        .collect())
+}
+
+/// Validate the selected durable MCP language once and return an exact
+/// `(turn_id, call_id)` index for every owned Provider call.  Recovery uses
+/// this whole-journal form so classifying unstarted calls across many turns is
+/// O(events + calls), rather than re-running the complete MCP reducer once per
+/// turn.
+pub(crate) fn validated_durable_mcp_calls_index(
+    events: &[JournalEvent],
+) -> Result<HashMap<(String, String), ValidatedDurableMcpCall>> {
     let Some(version) = call_chain_validator_version(events)? else {
         return Ok(HashMap::new());
     };
@@ -1065,6 +1611,7 @@ pub(crate) fn validated_durable_mcp_calls_for_turn(
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => activation_v1(events)?,
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => activation_v2(events)?,
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 => activation_v3(events)?,
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V4 => activation_v4(events)?,
         version => {
             return session_error(format!(
                 "unsupported MCP call-chain validator version {version}"
@@ -1075,10 +1622,9 @@ pub(crate) fn validated_durable_mcp_calls_for_turn(
     validate_mcp_call_chain_with_activation(events, &activation)?;
     Ok(durable_mcp_calls(events, &activation)?
         .into_iter()
-        .filter(|(key, _)| key.turn_id == turn_id)
         .map(|(key, call)| {
             (
-                key.call_id,
+                (key.turn_id, key.call_id),
                 ValidatedDurableMcpCall {
                     provider_name: call.provider_name,
                     arguments: call.arguments,
@@ -1101,6 +1647,7 @@ pub(crate) fn mcp_turn_ids(events: &[JournalEvent]) -> Result<Vec<String>> {
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V1) => activation_v1(events)?,
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) => activation_v2(events)?,
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V3) => activation_v3(events)?,
+        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V4) => activation_v4(events)?,
         Some(version) => {
             return session_error(format!(
                 "unsupported MCP call-chain validator version {version}"
@@ -1152,11 +1699,20 @@ pub(crate) fn ensure_no_unstarted_mcp_calls_v3(events: &[JournalEvent]) -> Resul
     ensure_no_unstarted_mcp_calls_with_activation(events, &activation)
 }
 
+pub(crate) fn ensure_no_unstarted_mcp_calls_v4(events: &[JournalEvent]) -> Result<()> {
+    validate_mcp_call_chain_v4(events)?;
+    let Some(activation) = activation_v4(events)? else {
+        return Ok(());
+    };
+    ensure_no_unstarted_mcp_calls_with_activation(events, &activation)
+}
+
 pub(crate) fn ensure_no_unstarted_mcp_calls(events: &[JournalEvent]) -> Result<()> {
     match call_chain_validator_version(events)? {
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V1) => ensure_no_unstarted_mcp_calls_v1(events),
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V2) => ensure_no_unstarted_mcp_calls_v2(events),
         Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V3) => ensure_no_unstarted_mcp_calls_v3(events),
+        Some(MCP_CALL_CHAIN_VALIDATOR_VERSION_V4) => ensure_no_unstarted_mcp_calls_v4(events),
         Some(version) => session_error(format!(
             "unsupported MCP call-chain validator version {version}"
         )),
@@ -1464,6 +2020,26 @@ fn activation_v2(events: &[JournalEvent]) -> Result<Option<Activation>> {
 }
 
 fn activation_v3(events: &[JournalEvent]) -> Result<Option<Activation>> {
+    activation_surface_v3_or_v4(
+        events,
+        MCP_EXECUTION_COORDINATOR_VERSION_V3,
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V3,
+    )
+}
+
+fn activation_v4(events: &[JournalEvent]) -> Result<Option<Activation>> {
+    activation_surface_v3_or_v4(
+        events,
+        MCP_EXECUTION_COORDINATOR_VERSION_V4,
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V4,
+    )
+}
+
+fn activation_surface_v3_or_v4(
+    events: &[JournalEvent],
+    coordinator_version: u64,
+    call_chain_validator_version: u32,
+) -> Result<Option<Activation>> {
     let activations = events
         .iter()
         .filter(|event| event.kind == MCP_REGISTRY_ACTIVATED_KIND)
@@ -1472,9 +2048,9 @@ fn activation_v3(events: &[JournalEvent]) -> Result<Option<Activation>> {
         return Ok(None);
     }
     if activations.len() != 1 {
-        return session_error(
-            "MCP call-chain validator v3 requires exactly one registry activation",
-        );
+        return session_error(format!(
+            "MCP call-chain validator v{call_chain_validator_version} requires exactly one registry activation"
+        ));
     }
     let event = activations[0];
     if event.turn_id.is_some() {
@@ -1502,16 +2078,11 @@ fn activation_v3(events: &[JournalEvent]) -> Result<Option<Activation>> {
         ],
         event,
     )?;
-    require_version(
-        data,
-        "coordinator_version",
-        MCP_EXECUTION_COORDINATOR_VERSION_V3,
-        event,
-    )?;
+    require_version(data, "coordinator_version", coordinator_version, event)?;
     require_version(
         data,
         "call_chain_validator_version",
-        u64::from(MCP_CALL_CHAIN_VALIDATOR_VERSION_V3),
+        u64::from(call_chain_validator_version),
         event,
     )?;
     require_version(
@@ -1633,8 +2204,8 @@ fn activation_v3(events: &[JournalEvent]) -> Result<Option<Activation>> {
 
     Ok(Some(Activation {
         seq: event.seq,
-        coordinator_version: MCP_EXECUTION_COORDINATOR_VERSION_V3 as u32,
-        call_chain_validator_version: MCP_CALL_CHAIN_VALIDATOR_VERSION_V3,
+        coordinator_version: coordinator_version as u32,
+        call_chain_validator_version,
         schema_profile_version: MCP_SCHEMA_PROFILE_VERSION_V1 as u32,
         registry_epoch_id,
         registry_digest,
@@ -1654,6 +2225,7 @@ fn durable_mcp_calls(
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V1 => durable_mcp_calls_v1(events, activation),
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V2 => durable_mcp_calls_v2(events, activation),
         MCP_CALL_CHAIN_VALIDATOR_VERSION_V3 => durable_mcp_calls_v2(events, activation),
+        MCP_CALL_CHAIN_VALIDATOR_VERSION_V4 => durable_mcp_calls_v2(events, activation),
         version => session_error(format!(
             "unsupported MCP call-chain validator version {version}"
         )),
@@ -2591,7 +3163,7 @@ fn validate_surface_bound_provenance_v3(
     require_version_map(
         data,
         "execution_coordinator_version",
-        MCP_EXECUTION_COORDINATOR_VERSION_V3,
+        u64::from(activation.coordinator_version),
         event,
     )?;
     require_version_map(
@@ -2814,7 +3386,7 @@ fn validate_pre_start_terminal_v3(
         .data
         .get("mcp_execution_coordinator_version")
         .and_then(Value::as_u64)
-        != Some(MCP_EXECUTION_COORDINATOR_VERSION_V3)
+        != Some(u64::from(activation.coordinator_version))
         || event.data.get("registry_epoch_id").and_then(Value::as_str)
             != Some(activation.registry_epoch_id.as_str())
         || event.data.get("registry_digest").and_then(Value::as_str)
@@ -3217,7 +3789,8 @@ fn reject_orphan_mcp_markers(events: &[JournalEvent]) -> Result<()> {
         let orphan_response = event.kind == "response.started"
             && (event.data.get("mcp_registry_epoch_id").is_some()
                 || event.data.get("mcp_registry_digest").is_some()
-                || event.data.get("mcp_surface").is_some());
+                || event.data.get("mcp_surface").is_some()
+                || event.data.get("mcp_prepared_request").is_some());
         let orphan_context_surface = event.kind == "context.tools"
             && event
                 .data
@@ -3369,6 +3942,9 @@ mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
 
+    use crate::compaction::{
+        COMPACTION_BOUNDARY_STARTED_KIND, CompactionBoundary, CompactionBoundaryStarted,
+    };
     use crate::context::{McpSurfaceBindingV1, McpSurfaceClaimV1, snapshot_tool_surface_v1};
     use crate::types::ToolDefinition;
 
@@ -3605,6 +4181,95 @@ mod tests {
         events
     }
 
+    fn mcp_events_v4() -> Vec<JournalEvent> {
+        let mut events = mcp_events_v3();
+        events[0].data["coordinator_version"] = Value::from(4);
+        events[0].data["call_chain_validator_version"] = Value::from(4);
+        for event in &mut events[2..] {
+            event.seq += 1;
+        }
+        events.insert(
+            2,
+            event(
+                3,
+                None,
+                "context.configured",
+                json!({
+                    "measurement_version":crate::context::CONTEXT_MEASUREMENT_VERSION,
+                    "estimator_version":crate::context::CONTEXT_ESTIMATOR_VERSION,
+                    "request_shape_version":crate::context::REQUEST_SHAPE_VERSION,
+                    "model":"fixture-model",
+                    "provider_protocol":PROVIDER_PROTOCOL_OPENAI_RESPONSES,
+                    "provider_usage_domain":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "context_window":Value::Null,
+                    "reserve_tokens":0,
+                    "usable_tokens":Value::Null,
+                    "trigger_tokens":Value::Null,
+                    "target_tokens":Value::Null,
+                    "context_window_source":"fixture",
+                    "reserve_tokens_source":"fixture",
+                }),
+            ),
+        );
+        events[3].data["item"] = json!({"role":"user","content":"fixture"});
+        for event in &mut events[1..] {
+            if is_tool_lifecycle(&event.kind) {
+                if let Some(provenance) = event.data.get_mut("mcp") {
+                    provenance["execution_coordinator_version"] = Value::from(4);
+                    provenance["response_started_seq"] = Value::from(5);
+                    provenance["response_completed_seq"] = Value::from(6);
+                }
+            }
+        }
+        events[7].data["started_seq"] = Value::from(7);
+        let surface = ToolSurfaceSnapshotV1::from_exact_journal_value(&events[1].data)
+            .expect("parse v4 fixture surface");
+        let provider_tools = surface
+            .tools()
+            .iter()
+            .map(|tool| {
+                json!({
+                    "type":"function",
+                    "name":tool.name,
+                    "description":tool.description,
+                    "parameters":tool.input_schema,
+                    "strict":false,
+                })
+            })
+            .collect::<Vec<_>>();
+        let request_body = json!({
+            "model":"fixture-model",
+            "input":[{"role":"user","content":"fixture"}],
+            "tools":provider_tools,
+            "stream":true,
+            "store":false,
+            "include":["reasoning.encrypted_content"],
+        });
+        let request_body_bytes =
+            serde_json::to_vec(&request_body).expect("encode v4 fixture request");
+        let measurement = measure_exact_prepared_request(&request_body, &request_body_bytes)
+            .expect("measure v4 fixture request");
+        let request_digest = measurement.request_digest.clone();
+        let start = events
+            .iter_mut()
+            .find(|event| event.kind == "response.started")
+            .expect("v4 fixture response start");
+        start.data["context"]["request_journal_through_seq"] = Value::from(4);
+        start.data["context"]["configured_event_seq"] = Value::from(3);
+        start.data["context"]["instructions_event_seq"] = Value::Null;
+        start.data["context"]["provider_usage_domain"] = Value::String(
+            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+        );
+        start.data["context"]["measurement"] =
+            serde_json::to_value(measurement).expect("encode v4 fixture measurement");
+        start.data["mcp_prepared_request"] = json!({
+            "version":MCP_PREPARED_REQUEST_REFERENCE_VERSION_V1,
+            "digest":request_digest,
+            "body":request_body,
+        });
+        events
+    }
+
     #[test]
     fn valid_mcp_call_chain_v1_is_accepted() {
         validate_mcp_call_chain_v1(&mcp_events()).expect("valid MCP chain");
@@ -3641,6 +4306,282 @@ mod tests {
             .expect_err("v2 compatibility ceiling must reject v3")
             .to_string();
         assert!(error.contains("exceeds compatibility ceiling 2"), "{error}");
+    }
+
+    #[test]
+    fn valid_mcp_call_chain_v4_binds_prepared_request_digest() {
+        let events = mcp_events_v4();
+        validate_mcp_call_chain_v4(&events).expect("valid MCP v4 chain");
+        validate_mcp_call_chain_through_version(4, &events)
+            .expect("v4 ceiling accepts prepared-request reader");
+        let error = validate_mcp_call_chain_through_version(3, &events)
+            .expect_err("v3 compatibility ceiling must reject v4")
+            .to_string();
+        assert!(error.contains("exceeds compatibility ceiling 3"), "{error}");
+
+        let call = validated_durable_mcp_call(&events, "turn-1", "call-1")
+            .expect("validated v4 durable call");
+        assert_eq!(call.response_attempt_id.as_deref(), Some("attempt-1"));
+        let surface = call.surface.expect("validated v4 surface provenance");
+        assert_eq!(surface.surface_event_seq, 2);
+        assert_eq!(
+            surface.surface_digest,
+            events[1].data["digest"].as_str().expect("surface digest")
+        );
+    }
+
+    #[test]
+    fn v4_projection_reentry_through_current_compaction_boundary_is_bounded() {
+        let mut events = mcp_events_v4();
+        for event in events.iter_mut().filter(|event| event.seq >= 5) {
+            event.seq += 1;
+            if let Some(provenance) = event.data.get_mut("mcp") {
+                provenance["response_started_seq"] = Value::from(6);
+                provenance["response_completed_seq"] = Value::from(7);
+            }
+        }
+        let terminal = events
+            .iter_mut()
+            .find(|event| event.kind == "tool.completed")
+            .expect("fixture terminal");
+        terminal.data["started_seq"] = Value::from(8);
+        let start = events
+            .iter_mut()
+            .find(|event| event.kind == "response.started")
+            .expect("fixture start");
+        start.data["context"]["request_journal_through_seq"] = Value::from(5);
+        events.insert(
+            4,
+            event(
+                5,
+                None,
+                COMPACTION_BOUNDARY_STARTED_KIND,
+                serde_json::to_value(CompactionBoundaryStarted {
+                    boundary: CompactionBoundary::new("boundary-v4", "turn-1", 4),
+                    trigger: "context_trigger".to_owned(),
+                    extra: Map::new(),
+                })
+                .expect("encode v4 compaction boundary"),
+            ),
+        );
+
+        let error = validate_mcp_call_chain_v4(&events)
+            .expect_err("pending compaction boundary must reject ordinary Provider dispatch");
+        assert!(
+            error.to_string().contains("compaction") || error.to_string().contains("boundary"),
+            "projection recursion must terminate at the deterministic boundary error: {error}"
+        );
+    }
+
+    #[test]
+    fn nested_v4_projection_scope_still_validates_core_provenance() {
+        let _scope = McpV4ProjectionScope::enter().expect("enter outer projection scope");
+        let mut events = mcp_events_v4();
+        let lifecycle = events
+            .iter_mut()
+            .find(|event| event.kind == "tool.started")
+            .expect("fixture lifecycle");
+        lifecycle.data["mcp"]["registry_digest"] = Value::String("f".repeat(64));
+        validate_mcp_call_chain_v4(&events)
+            .expect_err("nested projection scope may not suppress MCP core validation");
+    }
+
+    #[test]
+    fn v4_projection_budget_fails_before_counter_overflow_or_unbounded_work() {
+        let mut budget = McpV4ProjectionBudget::default();
+        budget
+            .charge(
+                MAX_MCP_V4_PROJECTION_PREFIX_EVENT_VISITS,
+                MAX_MCP_V4_PROJECTION_PREFIX_BYTES,
+            )
+            .expect("exact frozen projection budget");
+        budget
+            .charge(1, 0)
+            .expect_err("projection event work above the frozen budget must fail closed");
+    }
+
+    #[test]
+    fn v4_activation_profile_is_exact_and_does_not_change_the_current_writer() {
+        assert_eq!(MCP_CALL_CHAIN_VALIDATOR_VERSION, 4);
+
+        let mut wrong_coordinator = mcp_events_v4();
+        wrong_coordinator[0].data["coordinator_version"] = Value::from(3);
+        validate_mcp_call_chain_v4(&wrong_coordinator)
+            .expect_err("v4 activation requires coordinator v4");
+
+        let mut wrong_call_chain = mcp_events_v4();
+        wrong_call_chain[0].data["call_chain_validator_version"] = Value::from(3);
+        validate_mcp_call_chain_v4(&wrong_call_chain)
+            .expect_err("v4 activation requires call-chain v4");
+
+        let mut missing_surface_profile = mcp_events_v4();
+        missing_surface_profile[0]
+            .data
+            .as_object_mut()
+            .expect("activation data")
+            .remove("surface_claim_version");
+        validate_mcp_call_chain_v4(&missing_surface_profile)
+            .expect_err("v4 activation requires the surface claim profile");
+
+        let mut unknown_activation_field = mcp_events_v4();
+        unknown_activation_field[0].data["unexpected"] = Value::Bool(true);
+        validate_mcp_call_chain_v4(&unknown_activation_field)
+            .expect_err("v4 activation rejects unknown fields");
+    }
+
+    #[test]
+    fn v4_prepared_request_reference_mutations_fail_closed() {
+        let assert_rejected = |name: &str, events: Vec<JournalEvent>| {
+            assert!(
+                validate_mcp_call_chain_v4(&events).is_err(),
+                "{name} must fail closed"
+            );
+        };
+        let start_index = |events: &[JournalEvent]| {
+            events
+                .iter()
+                .position(|event| event.kind == "response.started")
+                .expect("fixture response start")
+        };
+
+        let mut missing = mcp_events_v4();
+        let index = start_index(&missing);
+        missing[index]
+            .data
+            .as_object_mut()
+            .expect("start data")
+            .remove("mcp_prepared_request");
+        assert_rejected("missing prepared request reference", missing);
+
+        let mut wrong_version = mcp_events_v4();
+        let index = start_index(&wrong_version);
+        wrong_version[index].data["mcp_prepared_request"]["version"] = Value::from(2);
+        assert_rejected("wrong prepared request reference version", wrong_version);
+
+        let mut unknown_field = mcp_events_v4();
+        let index = start_index(&unknown_field);
+        unknown_field[index].data["mcp_prepared_request"]["unexpected"] = Value::Bool(true);
+        assert_rejected("unknown prepared request reference field", unknown_field);
+
+        let mut invalid_digest = mcp_events_v4();
+        let index = start_index(&invalid_digest);
+        invalid_digest[index].data["mcp_prepared_request"]["digest"] =
+            Value::String("not-a-sha256".to_owned());
+        assert_rejected("invalid prepared request reference digest", invalid_digest);
+
+        let mut missing_body = mcp_events_v4();
+        let index = start_index(&missing_body);
+        missing_body[index].data["mcp_prepared_request"]
+            .as_object_mut()
+            .expect("prepared request reference")
+            .remove("body");
+        assert_rejected("missing canonical prepared request body", missing_body);
+
+        let mut mutated_body = mcp_events_v4();
+        let index = start_index(&mutated_body);
+        mutated_body[index].data["mcp_prepared_request"]["body"]["model"] =
+            Value::String("mutated-model".to_owned());
+        assert_rejected("prepared request body mutation", mutated_body);
+
+        let mut self_certifying_digests = mcp_events_v4();
+        let index = start_index(&self_certifying_digests);
+        self_certifying_digests[index].data["mcp_prepared_request"]["body"]["model"] =
+            Value::String("mutated-model".to_owned());
+        self_certifying_digests[index].data["mcp_prepared_request"]["digest"] =
+            Value::String("b".repeat(64));
+        self_certifying_digests[index].data["context"]["measurement"]["request_digest"] =
+            Value::String("b".repeat(64));
+        assert_rejected(
+            "matching attacker-controlled digests without the canonical body hash",
+            self_certifying_digests,
+        );
+
+        let mut self_consistent_forgery = mcp_events_v4();
+        let index = start_index(&self_consistent_forgery);
+        self_consistent_forgery[index].data["mcp_prepared_request"]["body"]["input"] =
+            json!([{"role":"user","content":"forged input"}]);
+        let forged_body =
+            self_consistent_forgery[index].data["mcp_prepared_request"]["body"].clone();
+        let forged_bytes = serde_json::to_vec(&forged_body).expect("encode forged request body");
+        let forged_measurement = measure_exact_prepared_request(&forged_body, &forged_bytes)
+            .expect("measure forged request body");
+        self_consistent_forgery[index].data["mcp_prepared_request"]["digest"] =
+            Value::String(forged_measurement.request_digest.clone());
+        self_consistent_forgery[index].data["context"]["measurement"] =
+            serde_json::to_value(forged_measurement).expect("encode forged measurement");
+        assert_rejected(
+            "self-consistent request body not anchored in the journal projection",
+            self_consistent_forgery,
+        );
+
+        let mut stale_cutoff = mcp_events_v4();
+        let index = start_index(&stale_cutoff);
+        stale_cutoff[index].data["context"]["request_journal_through_seq"] = Value::from(3);
+        stale_cutoff[index].data["mcp_prepared_request"]["body"]["input"] = json!([]);
+        let stale_body = stale_cutoff[index].data["mcp_prepared_request"]["body"].clone();
+        let stale_bytes = serde_json::to_vec(&stale_body).expect("encode stale-cutoff body");
+        let stale_measurement = measure_exact_prepared_request(&stale_body, &stale_bytes)
+            .expect("measure stale-cutoff body");
+        stale_cutoff[index].data["mcp_prepared_request"]["digest"] =
+            Value::String(stale_measurement.request_digest.clone());
+        stale_cutoff[index].data["context"]["measurement"] =
+            serde_json::to_value(stale_measurement).expect("encode stale-cutoff measurement");
+        assert_rejected(
+            "self-consistent request may not omit durable events before response.started",
+            stale_cutoff,
+        );
+
+        let mut mismatched_digest = mcp_events_v4();
+        let index = start_index(&mismatched_digest);
+        mismatched_digest[index].data["mcp_prepared_request"]["digest"] =
+            Value::String("b".repeat(64));
+        assert_rejected("mismatched prepared request digest", mismatched_digest);
+
+        let mut missing_measurement = mcp_events_v4();
+        let index = start_index(&missing_measurement);
+        missing_measurement[index].data["context"]
+            .as_object_mut()
+            .expect("context")
+            .remove("measurement");
+        assert_rejected("missing context measurement", missing_measurement);
+
+        let mut invalid_measurement_digest = mcp_events_v4();
+        let index = start_index(&invalid_measurement_digest);
+        invalid_measurement_digest[index].data["context"]["measurement"]["request_digest"] =
+            Value::String("invalid".to_owned());
+        assert_rejected(
+            "invalid context measurement request digest",
+            invalid_measurement_digest,
+        );
+
+        for field in [
+            "measurement_version",
+            "estimator_version",
+            "request_shape_version",
+            "estimated_input_tokens",
+            "serialized_request_bytes",
+        ] {
+            let mut mismatched_measurement = mcp_events_v4();
+            let index = start_index(&mismatched_measurement);
+            let value = mismatched_measurement[index].data["context"]["measurement"][field]
+                .as_u64()
+                .expect("numeric prepared-request measurement field");
+            mismatched_measurement[index].data["context"]["measurement"][field] =
+                Value::from(value + 1);
+            assert_rejected(
+                &format!("mismatched context measurement field {field}"),
+                mismatched_measurement,
+            );
+        }
+
+        let mut unknown_measurement_field = mcp_events_v4();
+        let index = start_index(&unknown_measurement_field);
+        unknown_measurement_field[index].data["context"]["measurement"]["unexpected"] =
+            Value::Bool(true);
+        assert_rejected(
+            "unknown context measurement field",
+            unknown_measurement_field,
+        );
     }
 
     #[test]

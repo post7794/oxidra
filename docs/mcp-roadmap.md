@@ -2,10 +2,12 @@
 
 状态：MCP stdio transport/session kernel v1、显式 project-config reader v1、
 execution-plan digest v1、JSON Schema profile v1、session-scoped tool registry v1、
-durable execution coordinator core v2 和当前 MCP call-chain validator v2 已实现；v1 reader
-保持冻结兼容；MCP-capable tool-surface snapshot 的 writer-side v1 原语和显式的
-activation/call-chain v3 offline reader 已建立，但 v3 尚未成为当前 writer protocol epoch，
-也尚未接入 Agent 或 CLI 参数。
+durable execution coordinator core v4 和当前 MCP call-chain validator v4 已实现；v1-v3 reader
+保持冻结兼容。v3 首次冻结 activation、Provider-visible tool surface 与 model-facing result
+profile；v4 在同一 surface 关系上增加 versioned prepared-request envelope（canonical Provider
+body、digest 和完整 measurement）以及发送 sealed body bytes 的 typed Provider request
+admission。turn v8、Provider slot v5、source projection v8、history extractor v8 与 compaction
+boundary v8 已同步升级到同一 compatibility epoch。Agent 与 CLI 参数仍未接入。
 当前代码只能由 Rust 调用方显式加载绝对 config path、批准 execution plan 与 registry
 surface，并把 coordinator 绑定到 session journal；它不是已经对用户开放的插件入口。
 
@@ -66,8 +68,9 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
   值，避免把短 token 或低熵密码变成离线猜测 oracle。
 - 子进程先 `env_clear()`，只继承显式 allowlist 和显式配置值；环境变量名按
   ASCII 不区分大小写去重，避免同一配置在 Windows 与 Unix 上产生不同含义。
-- `ProcessTree` 在 Windows 使用 `CREATE_SUSPENDED` 启动 MCP 进程，先关联带
-  `KILL_ON_JOB_CLOSE` 的 Job Object，再恢复主线程。Linux stdio kernel v1 在 `exec`
+- Windows execution guardian 使用 `CREATE_SUSPENDED` 启动 MCP 进程，并通过
+  `PROC_THREAD_ATTRIBUTE_JOB_LIST` 让进程从 birth 起属于带 `KILL_ON_JOB_CLOSE` 的
+  Job Object，再恢复主线程。Linux stdio kernel v1 在 `exec`
   已批准的 server 代码前安装 seccomp：允许同一 thread group 内的线程，但拒绝独立
   `fork`/`vfork`/`clone`/`clone3`、namespace/session/process-group escape，并禁止清除
   `PDEATHSIG` 或通过 credential mutation 触发内核清除；Oxidra 同时用 pidfd 固定唯一
@@ -75,13 +78,54 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
   唯一 server process 由 `PDEATHSIG` 终止；受控清理使用 pidfd，不再扫描 `/proc`、
   推断 adopted lineage 或按可复用的数值 PID 杀进程。Linux x86_64/aarch64 缺少
   seccomp/pidfd 时，以及其他 Unix（包括当前 macOS）缺少等价边界时，都会 fail closed。
-  受支持平台上的连接失败、取消、协议错误、in-doubt、shutdown 或宿主强杀不会留下
-  MCP 后代进程。
+  受支持平台上的连接失败、取消、协议错误、in-doubt 和受控 shutdown 不会留下 MCP
+  后代进程。被动宿主强杀时，process-external guardian 继续持有 gate 直到 containment exact
+  empty；guardian 自身先被强杀时，已 fsync 的 active-generation record 会让后续 reopen 永久
+  fail closed。v1 不提供原地恢复：durable record 不包含足以机器验证旧 containment 已清空的
+  平台身份，删除 gate 或强写 clean 都会重新打开 generation overlap。正式出口仅为
+  `oxidra session export <ID> <ARCHIVE>.oxidra-session-export` 的只读 archive；它持有普通 session lock，但跳过
+  execution gate、不会 repair/修改源 journal、不会清除 quarantine，也不能用于 resume/dispatch。
+  API 强制专用 `.oxidra-session-export` 后缀，因此即使目标位于另一份 Store 的 `sessions`、
+  `locks` 或 `artifacts` 树中，也不能占用其 `.jsonl`/lock/合法 session-id namespace。
+  archive 首行是版本化的 non-journal manifest，后接 exact 原始 JSONL bytes 和 digest；因此把
+  archive 放入另一个 `SessionStore` 也不会被误识别为可 resume journal。若 crash prefix 的末行
+  不完整，manifest 还记录 complete-prefix offset、tail 长度和 tail SHA-256；export 不会替源
+  journal 截断或补换行。destination 父目录必须由 operator 控制，不能允许不可信并发 writer；
+  v1 pathname publisher 不防御同用户 namespace race。这里的 exact 只表示普通 session lock
+  持有期间实际读取到的 bytes；v1
+  不声称抵抗仍以同一 OS principal 运行的旧 MCP 对 source、destination 或 archive 的主动篡改，
+  需要该保证时仍必须使用独立权限的 exporter/guardian 或外部签名边界。
+  该方案选择 safety 而不是 guardian-crash 后的 availability，且仍假设同一 OS principal 没有
+  主动篡改 gate state。
 - stdio transport 把 `Child`、`ProcessTree` 和最后一份 execution lease 交给独立的原生 reaper
   thread；kill 只是请求，只有 direct child 的同步 `try_wait` 已完成 reap，且 Windows Job 的
   `ActiveProcesses` 已降为零，才会释放 lease 并发布完成。session、runtime 或已 started 调用的
   future 在 `Drop` 中通过复制的 Linux pidfd / Windows Job handle 同步请求终止；即使
   current-thread runtime 不再驱动或已整体销毁，reap 与锁释放也不依赖 Tokio 再次 poll。
+- session-bound MCP 还会启动独立 execution guardian 持有第二个 generation gate。Linux MCP
+  child 在 `exec` 前向 guardian 注册 exact pidfd。Windows 则由单线程 guardian 创建 per-server
+  Job 与 stdio pipes，并使用 `STARTUPINFOEXW` 的 `PROC_THREAD_ATTRIBUTE_JOB_LIST` 和
+  `HANDLE_LIST` 原子创建 suspended child；只有 guardian 内的三个 child pipe ends 会在该次
+  `CreateProcessW` 临界区短暂设为 inheritable，不与 host 中 std/tokio/第三方 spawn 的私有锁
+  竞争。guardian 把 Job、process 与 host-side stdio handles 复制给 exact host，收到 host 已成功
+  接管这些 handles 的一次性 resume 决定后才恢复 exact primary thread。因此既不存在
+  CreateProcess→Assign/guardian-register 窗口，也不存在 host-wide inheritable-handle 窗口。
+  host control pipe 关闭后，
+  guardian 在 READY 前先追加并 fsync durable active-generation record；随后终止全部已注册
+  containment，并在 Linux pidfd 全部退出、Windows Job `ActiveProcesses == 0` 后追加并 fsync
+  matching clean record，最后才释放 gate。OS lock 只负责 live guardian 的互斥；durable state
+  负责 guardian-first crash 后的 fail-closed safety。active、残缺、未知或状态机不匹配的 gate
+  state 都会在 journal repair/恢复写入前拒绝 reopen，不会自动猜测旧 containment 已退出。
+  Windows guardian 使用 `CREATE_BREAKAWAY_FROM_JOB`，并在
+  READY 前用 `IsProcessInJob(..., NULL)` 证明已离开所有 supervisor Jobs；无法完全 breakaway 时
+  MCP startup 在任何 server birth 前 fail closed，部署方必须显式允许 guardian breakaway。
+  该 v1 guardian 在 host-first crash 时自动恢复，在 guardian-first crash 时选择 durable poison；
+  poison 是永久 quarantine，不存在 `--recover` 或原地 clean 转换；只能在无 live session writer
+  时导出带 non-journal manifest 的只读 archive，保留源 journal 与 gate 作为审计证据。
+  它不是对同一 security principal 的权限隔离：当前用户权限的已批准 server 仍可能主动终止 guardian、unlink/替换
+  普通 lock path，或攻击其他用户态状态。若威胁模型包含这种主动攻击，发布前必须把 guardian
+  放入更高 integrity/独立账户/系统服务，或把 MCP 放入更低权限 token/AppContainer；不能把
+  当前 helper 进程描述成不可绕过的恶意插件 sandbox。
 - Linux kernel v1 的 lifecycle 保证来自“禁止 server 创建独立子进程”，不是启动后补扫后代。
   因此当前不支持需要 subprocess 的 MCP server，也不支持依赖 `npx`、shell wrapper
   等二次 spawn 的启动链；应直接配置最终 interpreter/executable。若未来需要允许
@@ -123,6 +167,14 @@ version error 会阻止降级；普通 method error、无响应、EOF 或 transp
   `validation_error`、`in_doubt=false` 且 server 收不到请求。声明 output schema 时，
   complete result 必须包含满足 schema 的 `structuredContent`；失败按已写出协议错误
   返回 `in_doubt=true` 并关闭 transport。它是有限 profile，不声称实现完整 JSON Schema。
+- 磁盘 JSON profile 不为调用方直接构造的内存 `JournalEvent` / `Value` 背书。
+  公共 projection、compaction、history 输出计费及 turn→MCP reducer 路径，在递归
+  Clone/Serialize 之前使用同一迭代式深度检查；这里保留历史 reader 的 128 层上界，
+  不把新增节点或 decoded-byte 预算追溯施加到 legacy journal。`JournalEvent` 与
+  `CompactionSource` 的 Clone/Drop 采用迭代实现。结果展示的 JSON 编码缓冲至多
+  64 KiB，再产生至多 16 KiB 的清理后文本；不能先编码完整结果再截断。
+  这些保证覆盖库内消费路径，不意味着任意外部 Rust 代码可以安全地递归打印、序列化或
+  析构自己保存的裸 `Value`，也不构成整个 Provider 路径的单副本峰值内存保证。
 - tool name 只接受 MCP 登记的 ASCII `[A-Za-z0-9_.-]` 子集，Agent 层仍需映射为
   独立、稳定、无碰撞的 Provider tool name。
 - server 若声明 `tools.listChanged=true`，或会话中发送
@@ -177,7 +229,7 @@ execution-plan digest 与 registry digest 是单向的两层证据：前者在�
 看到哪些工具”。工具表 digest 不能反向充当 executable 的执行许可；path trust 也不能
 被表述成具体代码内容已经得到认证。
 
-### 3.3 durable execution coordinator core v1/v2
+### 3.3 durable execution coordinator core v1/v2/v4
 
 `McpExecutionCoordinator` 是正常 registry dispatch 的唯一 capability owner。Rust 可见性
 和私有类型建立以下边界，而不是依赖调用约定：
@@ -191,12 +243,13 @@ McpRegistry::connect_for_activation(session journal, ...)
 → pub(super) registry dispatch
 ```
 
-- 当前 writer 使用 coordinator v2；v1 activation reader 保持原有 `provider_names` 语义。
+- 当前 writer 使用 coordinator v4；v1/v2 activation reader 保持各自原有语义。
   activation 同步写入 `mcp.registry.activated`，绑定 session、coordinator ID、registry
   epoch、config SHA、execution-plan digest、registry digest，以及 kernel/schema/registry/
-  coordinator 的具体版本；v2 还持久化排序后的
-  `provider alias → server/raw tool/protocol` binding snapshot，供离线 reducer 查表证明
-  provenance。live coordinator 只能写入同一 session journal。
+  coordinator 的具体版本；v2 持久化排序后的
+  `provider alias → server/raw tool/protocol` identity，v4 持久化完整的 definition/output-schema
+  digest binding snapshot 与 surface claim version，供离线 reducer 查表证明 provenance。live
+  coordinator 只能写入同一 session journal。
 - 首次 activation 由 coordinator 私有构造、按值消费的一次性 bootstrap token 提交；之后
   MCP-reserved journal event 必须携带同一 live coordinator 为 exact session/activation/epoch
   **以及 exact runtime journal handle** 生成的 opaque writer capability。handle identity 不写入
@@ -223,10 +276,15 @@ McpRegistry::connect_for_activation(session journal, ...)
   digest 的 Provider call；对应的 `response.started` 还必须显式记录当前
   `mcp_registry_epoch_id` 与 `mcp_registry_digest`，并且该 response 必须在 activation 之后。
   schema preparation 失败也不能借另一个真实 call ID 写 terminal。
-- per-call approval 前和通过后都从 journal snapshot 重建 candidate，并用冻结的 Provider
-  request-slot reducer v2 验证假想 `tool.started`。approval handler 不持有 journal，不能在
-  approval await 期间另行写入同一 writer；请求同时提供完整、有界的 `arguments_json`，
-  `arguments_display` 只是终端安全的展示摘要，不能作为审批策略的唯一输入。
+- per-call approval 前和通过后都从 journal snapshot 重建 candidate，并用当前 Provider
+  slot v5 policy（内部复用已冻结的 slot state-machine core）验证假想 `tool.started`。当前 trait
+  已 sealed，公开入口只能选择 crate-owned 的固定 allow/deny policy，不能安装会读取 journal、
+  捕获状态或产生副作用的 pre-start callback。coordinator 内部仍为该次审批生成随机 opaque
+  subject；Provider 控制的 call/tool/binding identity 以及可对低熵参数执行字典枚举的确定性
+  digest 全部留在私有 exact-call context。未来若需要 interactive 或 argument-aware approval，
+  必须先定义并 fsync 独立的
+  `approval_requested -> granted | in_doubt` 生命周期及 recovery，而不能重新把
+  `arguments_json` 加回这个单阶段 callback。
 - approval 通过后先 fsync `tool.started`，再生成不可构造、不可 clone、按值消费的 permit。
   permit 绑定 turn/call、provider/raw tool identity、registry epoch/digest、协议版本、server
   attempt、参数 digest、coordinator ID 和 durable started seq；registry 与 session 在发送前
@@ -248,7 +306,7 @@ McpRegistry::connect_for_activation(session journal, ...)
   每个 session 只允许一个 registry activation。已有 `tool.started`/`tool.in_doubt` 未
   解决时，新的 MCP dispatch 统一 fail closed，禁止把 remaining calls 交给调用方约定跳过。
 - activation 不允许跨越 pending compaction boundary；已经结束的旧 boundary 使用其
-  activation 前兼容视图，后来的 v2 registry epoch 不会追溯改变冻结的 boundary v6 语义。
+  activation 前兼容视图，后来的 registry epoch 不会追溯改变冻结的旧 boundary 语义。
 
 coordinator core 当前仍不是 Agent 集成完成的声明。`McpExecutionCoordinator::resume()` 已能在
 session reopen/recovery 后，用重新取得 execution trust 与 surface trust 的 live registry 复用
@@ -268,17 +326,40 @@ generation。coordinator shutdown/Drop 发起 transport 终止，native reaper �
 随后才可能发生下一次 reopen；旧 capability 不能复用。
 未解决的 `tool.in_doubt` 同样会在 eligibility 签发前阻止 MCP 启动；discovery 后、coordinator
 重新绑定 registry 前还会再次检查当前 journal，避免启动期间的状态漂移绕过恢复门槛。
-但 Agent 尚未消费该 reader，也尚未调用现有的 typed `context.tools` / MCP Provider response
-writer。后者会在 `response.started` 注入当前 registry epoch/digest；Agent 仍必须从同一
-prepared request snapshot
-写入这些字段，证明 Provider request 所使用的 `context.tools`、返回 call、approval、started
-和 permit 属于同一个 epoch；完成这条绑定前不能把 MCP definitions 放进 Agent 请求。
+但 Agent 尚未消费该 reader。coordinator v4 已提供 typed prepared-request admission：Provider
+先把 logical `ResponseRequest` 封装成 `PreparedResponseRequest`，同时冻结 canonical body、同一份
+serialized body bytes、Provider protocol 与 usage domain；capability 在 dispatch 前持有该 exact
+prepared request、parent turn/outcome admission 与 live coordinator proof，重新测量 body/bytes，
+并要求 request tools 等于 exact durable `context.tools` snapshot。随后 `response.started` 写入
+registry epoch/digest、`mcp_surface` event/digest，以及包含 `{version, digest, body}` 的
+`mcp_prepared_request` envelope；只有 crate 内 sealed、受信的 MCP exact-wire transport 才能消费该
+capability，并发送其持有的同一份 sealed bytes。公开可实现的 `PreparedResponseProvider` 仍是
+legacy/custom transport TCB，不能进入 MCP exact-wire admission；因此该保证不声称由 Rust 类型
+强制任意外部 Provider 的网络行为。内建 transport 禁止 HTTP redirect 和环境/system proxy
+自动发现；需要代理时必须把代理显式配置为 API base URL，使实际接收方进入 usage-domain
+provenance，而不是在 durable admission 之后静默改变网络接收方。
+Provider 返回后先由不可观察的 outcome owner 持有完整 `AssistantTurn`；该类型没有 pre-commit
+result accessor。`commit_v1()` 会先验证 bounded JSON、canonical `output_items`、tool-call projection
+和批次上限，再 fsync 唯一 terminal，只有成功后才返回 `McpCommittedProviderResponseV1`。exact MCP
+stream 在此之前完全沉默：text、function-argument delta、unknown payload 和 retry 的值、次数、
+时序都不会越过 observer 边界，因为 custom Provider 可以用任何这些维度编码受控字节。已提交的 `tool_calls` 仍只是后续 durable call/batch reducer 的输入，不是可复制
+的 execution permit；Agent 接入必须继续从 exact lifecycle state 获取一次性执行 authority。
+generic Agent 的 pre-commit sink 同样丢弃全部 Provider events；`AgentObserver` 已 sealed，外部调用方
+只能使用无 callback 的 silent observer。crate-owned CLI observer 只接收 durable lifecycle 之后的
+display projection，完整 `ToolCall`、Provider call ID 与 arguments 不跨越该接口。未来若增加 renderer、
+queue 或 hook，也必须先证明它接收数据时已经存在对应 durable owner，不能仅靠 DTO 字段改名宣称安全。
+  generic Agent preparation 现在会把 `context.tools` 当作 durable input：surface 变化或新的
+  Agent epoch 需要写入时先 fsync，然后重新读取 journal、重建 projection/materials/measurement，
+  只有稳定 snapshot 才返回，因此首个 tools epoch 的 request cutoff 不再落后于 surface；进程内
+  cache 只用于确认本次 preparation 已接管最新 event，不能替代 journal 事实源。Agent 仍必须把
+  这一步与 exact seal/admission 收敛到一个无 await 的 typed 构造点，不能先调用 generic Provider
+  writer，或从同一 logical request 重建第二份 body。
 
 当前 `ToolSurfaceSnapshotV1` / `McpProviderSurfaceV1` 已把 live registry 的 alias、
 definition digest、output-schema digest、registry epoch/digest 与 Provider-visible 工具顺序
 合并为 writer-side snapshot，并在写入前拒绝 builtin/history/MCP 名称碰撞。公开 serde 类型可以
 被解析或构造出内部自洽的值，因此真正的 authority 边界是 coordinator 写入时对 exact live registry
-binding snapshot 的逐项比较，而不是“类型不可构造”。旧 `ToolSnapshot` v1 保持字节兼容。显式 validator v3 已登记严格、可离线的关系：
+binding snapshot 的逐项比较，而不是“类型不可构造”。旧 `ToolSnapshot` v1 保持字节兼容。validator v3 登记了严格、可离线的关系：
 activation 保存 full binding digest，`response.started` 引用 activation 之后、start 之前的唯一
 global `context.tools`，并要求 `mcp_surface.event_seq == context.tools_event_seq`；snapshot、claim、
 activation 的 epoch/digest/full bindings 必须一致。删除 response claim 不能把实际使用 MCP
@@ -286,37 +367,36 @@ surface 或返回 activated alias 的 response 降级为 generic。Serde 会忽�
 额外字段也由 parsed-JSON canonical reader 拒绝；该保证针对 journal 已解析后的语义形状，不声称
 保留重复 key、对象原始顺序或数字词法。绑定到 MCP alias 的 input schema 会重新通过冻结的
 schema profile v1；v3 lifecycle 的 outer data 与 nested provenance 都是 closed profile，并把 exact
-response/surface/definition identity 传递到 terminal。当前 coordinator writer 仍冻结在 v2；在 turn、slot、
-projection、history 与 compaction 全部新增同一 v3 compatibility epoch 前，不能把 v3 设为默认值，
-因此 Agent 仍不得把该 snapshot 当成当前 durable dispatch authority。
+response/surface/definition identity 传递到 terminal。v4 保留该冻结关系，并额外对 versioned
+`mcp_prepared_request` body 做 bounded preflight，重算 canonical body bytes、body digest 与完整
+`context.measurement`，校验冻结的 Responses body shape，并要求 body tools 等于 durable surface。
+writer-side typed capability 再把这些 durable 事实绑定到自己实际持有并 dispatch 的 sealed bytes。
 
 该 v3 reader 还不把 `output_schema_digest` 误当 runtime validation-schema identity：surface 中的
 digest 仍来自展示 schema，structured output 验证必须继续由 stdio kernel 的冻结 schema profile
-完成。已登记一个**仅供未来 v3 typed writer 使用**的 model-result profile v1：在该 profile
+完成。v4 current writer 使用 model-result profile v1：在该 profile
 中，`mcp_raw_result` 只作有界的 parsed-JSON 审计值，`output` 必须是严格 text-only、带
 `trust = untrusted_mcp_tool_output` 的模型 envelope；offline reader 会从 raw 重新派生并 exact
 compare，禁止 `_meta`、annotations、structuredContent、image/resource/audio 或未知 content
-item 进入模型。当前 v2 coordinator writer 仍返回并持久化 bounded raw result，不能把这项 v3
-reader 约束倒灌成 v2 的接受集合。v3 typed writer 的 projection/profile/大小失败才统一写
-`tool.in_doubt` 并关闭旧 transport；Agent/source projection 尚未切换到 v3 protocol epoch，不能
-把当前 v2 activation 误报为 Agent 已接入。
+item 进入模型。旧 v1/v2 writer 仍按其冻结契约解释 bounded raw result，不能把 v3/v4 reader
+约束倒灌进历史接受集合。v4 writer 的 projection/profile/大小失败统一写 `tool.in_doubt` 并
+关闭旧 transport；这仍不等于 Agent 已接入。
 
-### 3.4 MCP call-chain validator v1/v2 与已登记的 v3 reader
+### 3.4 MCP call-chain validator v1-v4
 
 MCP terminal 的语义权限现由单一、冻结的 call-chain validator 授予，不再要求 turn、slot、
 projection 和 history 各自“碰巧做出相同判断”：
 
 - v1 仍由 coordinator v1、turn v6、Provider slot v3、source projection v5、history
-  extractor v5 和 compaction boundary v6 按字面量解释。当前 writer 持久化
-  `call_chain_validator_version = 2`；turn v7、Provider slot v4、source projection v6、
-  history extractor v6 和 compaction boundary v7 冻结兼容集合 `{v1, v2}`，按 activation
-  声明选择 exact reducer，并拒绝未来版本，而不是读取可变默认值。
-- validator v3 已作为显式 offline reader 登记，但 `MCP_CALL_CHAIN_VALIDATOR_VERSION` 和
-  coordinator current writer 仍保持 v2。`validate_mcp_call_chain_through_version(2, ...)` 对 v3
-  journal 必须继续 fail closed；只有显式 ceiling 3 才能读取 v3 fixture。下一 protocol epoch
-  必须同时新增 turn v8、Provider slot v5、source projection v7、history extractor v7 与
-  compaction boundary v8，并保持所有旧 match arm 不变；不能只推进 MCP 常量，让其他 reducer
-  在 session reopen 或 projection 时拒绝刚写出的 journal。
+  extractor v5 和 compaction boundary v6 按字面量解释；v2 由 turn v7、Provider slot v4、
+  source projection v6、history extractor v6 和 compaction boundary v7 解释。旧 match arm
+  保持冻结，不读取可变默认值。
+- v3 是完整 surface/result offline epoch；v4 是当前 writer，在 v3 之上增加 prepared-request
+  body envelope、完整 measurement 与 exact serialized-byte binding。turn v8、Provider slot v5、source projection v8、history extractor v8 与
+  compaction boundary v8 的 compatibility ceiling 均为 call-chain v4。任何较旧 ceiling 对
+  v4 journal 必须 fail closed，不能只推进 MCP 常量而让 session reopen/projection 拒绝刚写出的
+  journal。turn/source/history v8 同时把 recovery grammar 绑定到 owning `user.message` 的版本，
+  禁止后写 terminal、compaction metadata 或 journal 最大版本追溯升级旧 turn；v1-v7 reader 保持字面量冻结。
 - validator v2 先由 activation 之后、显式带同一 registry epoch/digest 的
   `response.started` 确定整个 response transaction 的 MCP 所有权；unfinished、failed、aborted
   以及只含内置工具的 response 仍属于该 epoch。typed response envelope 保存 exact start、
@@ -393,17 +473,16 @@ projection 和 history 各自“碰巧做出相同判断”：
   writer/reader 接受集合，不授予 dispatch 权限；未来 Agent 正常路径仍必须由 coordinator
   capability 独占，不能把“格式合法”解释成“已获批准”。
 - 当前 generic Provider response admission 只拥有容量与普通 Provider lifecycle 权限，不能与
-  registry 字符串拼接出 MCP authority：完整/部分 v2 claim、v3 surface relation，以及
+  registry 字符串拼接出 MCP authority：完整/部分旧 claim、v3/v4 surface/request relation，以及
   `response.completed` 中的 activated alias 都必须在首笔相关 fsync 前 fail closed。专用 typed
-  MCP response writer 已校验并绑定 parent turn reserve、创建一次性 outcome reservation，并绑定
-  live coordinator capability；同一 guard 提交 exact terminal，并用 typed commit error 证明是否仍
-  允许 bounded fallback。未来 Agent 接入必须直接消费该 writer，不能先用 generic admission 写
-  start，再另行“补”MCP provenance。
+  MCP request writer 已校验并绑定 parent turn reserve、创建一次性 outcome reservation，绑定
+  live coordinator capability、exact surface 和 exact request；同一 guard 提交 exact terminal，
+  并用 typed commit error 证明是否仍允许 bounded fallback。未来 Agent 接入必须直接消费该
+  writer，不能先用 generic admission 写 start，再另行“补”MCP provenance。
 
-call-chain validator 解决的是 durable 事实解释，不会自动恢复 live server。下一阶段仍需在 session
-reopen 后按已批准 execution plan 重建或替换 live registry epoch，并把实际 request 的
-`context.tools` snapshot 与 `response.started` epoch 一次性绑定；完成前不能向 Agent 暴露
-MCP definitions。
+call-chain validator 解决的是 durable 事实解释，不会自动恢复 live server。resume 与 typed
+request binding 的内核路径已建立；下一阶段是让 Agent/CLI 只消费这些 capability，并接通 execution
+trust、surface approval 与 per-call approval，不能向 Agent 暴露绕过该路径的 MCP definitions。
 
 ## 4. 尚未实现：Agent 与 CLI policy
 
@@ -452,17 +531,17 @@ config reader 已实现，但 CLI 还不能选择它。用户入口必须：
 
 ### 4.2 Agent tool registry
 
-底层 registry 已能建立 snapshot；Agent 仍需：
+底层 registry 与 `ToolSurfaceSnapshotV1` 已能建立稳定 alias、完整 binding snapshot、schema
+profile 结果和 builtin/history/MCP 的全局 collision proof。Agent glue 仍需只消费这些既有原语，
+不得重新实现或旁路它们，并且必须：
 
-- raw identity 为 `(server_name, raw_tool_name)`；
-- 生成满足 Provider 约束的稳定 namespace，长度超限或 alias collision 时 fail closed；
-- 保存原始 MCP schema、Provider 投影 schema、server protocol、kernel version、
-  config digest、schema-profile version 和全表 digest；
-- 直接消费已登记的 MCP JSON Schema profile v1 验证结果，不能改用会忽略未知关键词
-  的内置 `validate_json_schema()`；
-- 合并内置/history/MCP 工具前做全局 collision 检查；
-- registry snapshot 进入 `context.tools`，同一 prepared request 与后续调用必须使用
-  同一 epoch，不能在中途重新 list。
+- 从 canonical journal projection、当前 instructions 和 exact surface 构造 logical
+  `ResponseRequest`；任意调用方自建 input/history 后再绑定一个正确 digest，不构成完整 request authority；
+- 保持 raw identity `(server_name, raw_tool_name)` 与既有稳定 Provider alias 的一一关系；
+- 直接消费既有 registry/schema/binding snapshot，不能改用会忽略未知关键词的内置
+  `validate_json_schema()`，也不能自行重新 list 或重算另一份工具表；
+- 把 exact snapshot 写入 `context.tools`，并让同一 sealed prepared request、Provider response
+  和后续调用使用同一 epoch。
 
 ### 4.3 journal 与恢复
 

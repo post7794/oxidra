@@ -15,11 +15,11 @@ pub use config::{
     MCP_PROJECT_CONFIG_VERSION_V1, McpProjectConfig,
 };
 pub use coordinator::{
-    DenyMcpCallApproval, MCP_ARGUMENT_DIGEST_VERSION, MCP_DISPATCH_PERMIT_VERSION,
-    MCP_EXECUTION_COORDINATOR_VERSION, McpCallApprovalHandler, McpCallApprovalRequest,
-    McpCallIdentity, McpExecutionCoordinator, McpProviderResponseAdmissionErrorV1,
-    McpProviderResponseCommitErrorV1, McpProviderResponseDispatchAdmissionV1, McpProviderSurfaceV1,
-    McpResumeEligibility,
+    AllowMcpCallApproval, DenyMcpCallApproval, MCP_ARGUMENT_DIGEST_VERSION,
+    MCP_DISPATCH_PERMIT_VERSION, MCP_EXECUTION_COORDINATOR_VERSION, McpCallApprovalHandler,
+    McpCallApprovalRequest, McpCallIdentity, McpCommittedProviderResponseV1,
+    McpExecutionCoordinator, McpPreparedProviderRequestV1, McpProviderDispatchOutcomeV1,
+    McpProviderResponseAdmissionErrorV1, McpProviderSurfaceV1, McpResumeEligibility,
 };
 pub(crate) use coordinator::{
     LiveMcpJournalWriteProofV1, McpJournalWriteCapabilityV1, McpRegistryActivationAdmissionV1,
@@ -28,10 +28,11 @@ pub use journal::{MAX_MCP_CALLS_PER_RESPONSE, MCP_CALL_CHAIN_VALIDATOR_VERSION};
 pub(crate) const MCP_REGISTRY_ACTIVATED_KIND: &str = "mcp.registry.activated";
 pub(crate) use journal::{
     MAX_RESPONSE_STATUS_TEXT_BYTES_V2, MCP_CALL_CHAIN_VALIDATOR_VERSION_V1,
-    MCP_CALL_CHAIN_VALIDATOR_VERSION_V2, argument_digest_v1, call_chain_validator_version,
-    mcp_turn_ids, response_status_text_for_journal, validate_mcp_call_chain,
-    validate_mcp_call_chain_for_version, validate_mcp_call_chain_through_version,
-    validated_durable_mcp_call_if_present, validated_durable_mcp_calls_for_turn,
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V2, MCP_CALL_CHAIN_VALIDATOR_VERSION_V4, argument_digest_v1,
+    call_chain_validator_version, mcp_turn_ids, response_status_text_for_journal,
+    validate_mcp_call_chain, validate_mcp_call_chain_for_version,
+    validate_mcp_call_chain_through_version, validated_durable_mcp_call_if_present,
+    validated_durable_mcp_calls_for_turn, validated_durable_mcp_calls_index,
 };
 pub use registry::{
     ApprovedMcpRegistry, ApprovedMcpResumeRegistry, MCP_TOOL_REGISTRY_VERSION, McpRegistry,
@@ -39,10 +40,12 @@ pub use registry::{
 };
 pub use schema::MCP_SCHEMA_PROFILE_VERSION;
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
 use std::process::Stdio;
 use std::sync::{
     Arc, Mutex,
@@ -50,10 +53,12 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+#[cfg(not(windows))]
+use tokio::process::{ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
@@ -63,7 +68,11 @@ use uuid::Uuid;
 use crate::session::SessionExecutionLeaseV1;
 
 use crate::error::{OxidraError, Result};
-use crate::process::{ProcessTree, ProcessTreeAbortHandle};
+#[cfg(windows)]
+use crate::execution_guardian::ExecutionGuardianLeaseV1;
+#[cfg(windows)]
+use crate::process::WindowsContainedChildV1;
+use crate::process::{ManagedChildV1, ProcessTree, ProcessTreeAbortHandle};
 use crate::types::ToolDefinition;
 use crate::untrusted_display;
 
@@ -92,6 +101,30 @@ const MAX_TOOL_PAGES: usize = 64;
 const MAX_TOOLS: usize = 512;
 const MAX_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
 const MAX_SERVER_INFO_FIELD_BYTES: usize = 256;
+pub(crate) const MAX_STDIO_ARGS_V1: usize = 64;
+pub(crate) const MAX_STDIO_ARG_BYTES_V1: usize = 4096;
+pub(crate) const MAX_STDIO_INHERITED_ENV_V1: usize = 32;
+pub(crate) const MAX_STDIO_EXPLICIT_ENV_V1: usize = 64;
+pub(crate) const MAX_STDIO_ENV_NAME_BYTES_V1: usize = 256;
+pub(crate) const MAX_STDIO_ENV_VALUE_BYTES_V1: usize = 64 * 1024;
+pub(crate) const MAX_STDIO_ENV_TOTAL_BYTES_V1: usize = 256 * 1024;
+
+#[cfg(not(windows))]
+type McpChild = tokio::process::Child;
+#[cfg(windows)]
+type McpChild = WindowsContainedChildV1;
+#[cfg(not(windows))]
+type McpChildStdin = ChildStdin;
+#[cfg(windows)]
+type McpChildStdin = tokio::fs::File;
+#[cfg(not(windows))]
+type McpChildStdout = ChildStdout;
+#[cfg(windows)]
+type McpChildStdout = tokio::fs::File;
+#[cfg(not(windows))]
+type McpChildStderr = ChildStderr;
+#[cfg(windows)]
+type McpChildStderr = tokio::fs::File;
 
 /// Render a raw MCP tool result for a terminal, approval UI or model-facing
 /// diagnostic without mutating the protocol value retained by the caller.
@@ -105,7 +138,7 @@ pub enum McpProtocolEra {
     Legacy,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct McpStdioConfig {
     pub name: String,
     pub command: PathBuf,
@@ -113,6 +146,33 @@ pub struct McpStdioConfig {
     pub cwd: Option<PathBuf>,
     pub inherit_env: Vec<String>,
     pub env: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for McpStdioConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // This config is often logged before it has been converted into the
+        // prepared, redacted execution plan.  Never recurse into caller-
+        // supplied args or environment values: both are allowed to contain
+        // credentials and provider prompts.  Shape metadata is sufficient for
+        // diagnostics and keeps Debug from becoming a secret exfiltration
+        // channel.
+        formatter
+            .debug_struct("McpStdioConfig")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("cwd", &self.cwd)
+            .field("args_count", &self.args.len())
+            .field(
+                "args_bytes",
+                &self
+                    .args
+                    .iter()
+                    .fold(0usize, |total, arg| total.saturating_add(arg.len())),
+            )
+            .field("inherit_env_names", &self.inherit_env)
+            .field("explicit_env_names", &self.env.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl McpStdioConfig {
@@ -145,6 +205,42 @@ impl McpStdioConfig {
                 "MCP server {} command must be an absolute path",
                 self.name
             )));
+        }
+        if self.args.len() > MAX_STDIO_ARGS_V1
+            || self
+                .args
+                .iter()
+                .any(|argument| argument.is_empty() || argument.len() > MAX_STDIO_ARG_BYTES_V1)
+        {
+            return Err(OxidraError::Config(format!(
+                "MCP server {} args must contain at most {MAX_STDIO_ARGS_V1} non-empty values of at most {MAX_STDIO_ARG_BYTES_V1} bytes",
+                self.name
+            )));
+        }
+        if self.inherit_env.len() > MAX_STDIO_INHERITED_ENV_V1 {
+            return Err(OxidraError::Config(format!(
+                "MCP server {} inherits more than {MAX_STDIO_INHERITED_ENV_V1} environment variables",
+                self.name
+            )));
+        }
+        if self.env.len() > MAX_STDIO_EXPLICIT_ENV_V1 {
+            return Err(OxidraError::Config(format!(
+                "MCP server {} has more than {MAX_STDIO_EXPLICIT_ENV_V1} explicit environment variables",
+                self.name
+            )));
+        }
+        for (name, value) in &self.env {
+            if name.len() > MAX_STDIO_ENV_NAME_BYTES_V1 {
+                return Err(OxidraError::Config(format!(
+                    "MCP environment variable name exceeds {MAX_STDIO_ENV_NAME_BYTES_V1} bytes"
+                )));
+            }
+            if value.len() > MAX_STDIO_ENV_VALUE_BYTES_V1 {
+                return Err(OxidraError::Config(format!(
+                    "MCP environment variable {} exceeds {MAX_STDIO_ENV_VALUE_BYTES_V1} bytes",
+                    untrusted_display::quoted_single_line(name)
+                )));
+            }
         }
         let command = std::fs::canonicalize(&self.command).map_err(|error| {
             OxidraError::Config(format!(
@@ -184,11 +280,29 @@ impl McpStdioConfig {
                 )));
             }
         }
-        let inherited_env = self
+        let inherited_env: BTreeMap<String, OsString> = self
             .inherit_env
             .iter()
             .filter_map(|name| std::env::var_os(name).map(|value| (name.clone(), value)))
             .collect();
+        let inherited_env_bytes = inherited_env.values().try_fold(0usize, |total, value| {
+            total
+                .checked_add(value.as_os_str().as_encoded_bytes().len())
+                .ok_or_else(|| OxidraError::Config("MCP environment size overflowed".to_owned()))
+        })?;
+        let explicit_env_bytes = self.env.values().try_fold(0usize, |total, value| {
+            total
+                .checked_add(value.len())
+                .ok_or_else(|| OxidraError::Config("MCP environment size overflowed".to_owned()))
+        })?;
+        if inherited_env_bytes
+            .checked_add(explicit_env_bytes)
+            .is_none_or(|bytes| bytes > MAX_STDIO_ENV_TOTAL_BYTES_V1)
+        {
+            return Err(OxidraError::Config(format!(
+                "MCP environment exceeds {MAX_STDIO_ENV_TOTAL_BYTES_V1} bytes"
+            )));
+        }
         Ok(PreparedMcpStdioConfig {
             name: self.name.clone(),
             command,
@@ -283,8 +397,17 @@ pub struct McpCallError {
 /// result. Top-level structured content and metadata remain audit-only;
 /// annotations, images, resources and every unknown content variant make the
 /// projection fail rather than being silently stringified into this envelope.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct McpModelOutputV1 {
+    profile_version: u32,
+    trust: String,
+    is_error: bool,
+    content: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpModelOutputWireV1 {
     profile_version: u32,
     trust: String,
     is_error: bool,
@@ -299,8 +422,14 @@ impl McpModelOutputV1 {
     pub(crate) fn from_value_v1(value: &Value) -> std::result::Result<Self, String> {
         preflight_mcp_result_tree_v1(value)?;
         ensure_json_within_limit(value, MAX_MCP_MODEL_OUTPUT_BYTES_V1)?;
-        let output: Self = serde_json::from_value(value.clone())
+        let wire: McpModelOutputWireV1 = serde_json::from_value(value.clone())
             .map_err(|error| format!("invalid MCP model output envelope: {error}"))?;
+        let output = Self {
+            profile_version: wire.profile_version,
+            trust: wire.trust,
+            is_error: wire.is_error,
+            content: wire.content,
+        };
         output.validate()?;
         if serde_json::to_value(&output)
             .map_err(|error| format!("cannot encode MCP model output: {error}"))?
@@ -614,11 +743,24 @@ pub(super) fn preflight_mcp_result_tree_v1(value: &Value) -> std::result::Result
     preflight_mcp_result_tree(value, MAX_MCP_RESULT_DEPTH_V1, MAX_MCP_RESULT_NODES_V1)
 }
 
-pub(super) fn preflight_mcp_provider_event_tree_v1(
+pub(crate) fn preflight_mcp_provider_event_tree_v1(
     value: &Value,
     maximum_bytes: usize,
 ) -> std::result::Result<(), String> {
-    preflight_mcp_json_tree(
+    measure_mcp_provider_event_tree_v1(value, maximum_bytes).map(|_| ())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct McpJsonTreeMetricsV1 {
+    pub nodes: usize,
+    pub encoded_bytes: usize,
+}
+
+pub(crate) fn measure_mcp_provider_event_tree_v1(
+    value: &Value,
+    maximum_bytes: usize,
+) -> std::result::Result<McpJsonTreeMetricsV1, String> {
+    measure_mcp_json_tree(
         value,
         MAX_MCP_PROVIDER_EVENT_DEPTH_V1,
         MAX_MCP_PROVIDER_EVENT_NODES_V1,
@@ -626,20 +768,204 @@ pub(super) fn preflight_mcp_provider_event_tree_v1(
     )
 }
 
+/// Validates an untrusted Provider JSON text before `serde_json` is allowed to
+/// allocate the corresponding [`Value`] tree.
+///
+/// A wire-byte ceiling alone does not bound the allocation amplification of a
+/// wide JSON array/object: a compact input can cause `serde_json::from_str` to
+/// allocate hundreds of thousands of `Value` slots before the post-parse tree
+/// preflight gets a chance to run. This first pass uses serde's streaming
+/// visitor interface, retains no strings or collection entries, and charges
+/// the same depth/node profile used for parsed Provider events.
+pub(crate) fn preflight_mcp_provider_json_text_v1(
+    input: &str,
+    maximum_bytes: usize,
+) -> std::result::Result<(), String> {
+    count_mcp_provider_json_text_nodes_v1(input, maximum_bytes).map(|_| ())
+}
+
+/// Count the parsed JSON nodes in untrusted Provider text without building a
+/// `serde_json::Value` tree. Callers that aggregate several argument strings
+/// use this before parsing each one, so individually valid argument payloads
+/// cannot multiply into an attacker-sized response graph.
+pub(crate) fn count_mcp_provider_json_text_nodes_v1(
+    input: &str,
+    maximum_bytes: usize,
+) -> std::result::Result<usize, String> {
+    if input.len() > maximum_bytes {
+        return Err(format!(
+            "MCP Provider JSON exceeds the {maximum_bytes}-byte input limit"
+        ));
+    }
+
+    let budget = McpJsonTextBudgetV1 {
+        nodes: Cell::new(0),
+        max_depth: MAX_MCP_PROVIDER_EVENT_DEPTH_V1,
+        max_nodes: MAX_MCP_PROVIDER_EVENT_NODES_V1,
+    };
+    let mut deserializer = serde_json::Deserializer::from_str(input);
+    McpJsonTextSeedV1 {
+        budget: &budget,
+        depth: 0,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| format!("invalid bounded MCP Provider JSON: {error}"))?;
+    deserializer
+        .end()
+        .map_err(|error| format!("invalid bounded MCP Provider JSON: {error}"))?;
+
+    Ok(budget.nodes.get())
+}
+
+/// Parses Provider JSON only after the allocation-free streaming preflight has
+/// proved that constructing the `Value` cannot exceed the frozen tree profile.
+pub(crate) fn parse_mcp_provider_json_text_v1(
+    input: &str,
+    maximum_bytes: usize,
+) -> std::result::Result<Value, String> {
+    preflight_mcp_provider_json_text_v1(input, maximum_bytes)?;
+    serde_json::from_str(input).map_err(|error| format!("invalid MCP Provider JSON: {error}"))
+}
+
+struct McpJsonTextBudgetV1 {
+    nodes: Cell<usize>,
+    max_depth: usize,
+    max_nodes: usize,
+}
+
+impl McpJsonTextBudgetV1 {
+    fn enter<E>(&self, depth: usize) -> std::result::Result<(), E>
+    where
+        E: serde::de::Error,
+    {
+        if depth > self.max_depth {
+            return Err(E::custom(format_args!(
+                "MCP Provider JSON exceeds validation depth {}",
+                self.max_depth
+            )));
+        }
+        let nodes = self.nodes.get().saturating_add(1);
+        if nodes > self.max_nodes {
+            return Err(E::custom(format_args!(
+                "MCP Provider JSON exceeds validation node budget {}",
+                self.max_nodes
+            )));
+        }
+        self.nodes.set(nodes);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct McpJsonTextSeedV1<'a> {
+    budget: &'a McpJsonTextBudgetV1,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for McpJsonTextSeedV1<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        self.budget.enter::<D::Error>(self.depth)?;
+        deserializer.deserialize_any(McpJsonTextVisitorV1 {
+            budget: self.budget,
+            depth: self.depth,
+        })
+    }
+}
+
+struct McpJsonTextVisitorV1<'a> {
+    budget: &'a McpJsonTextBudgetV1,
+    depth: usize,
+}
+
+impl<'de> Visitor<'de> for McpJsonTextVisitorV1<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_borrowed_str<E>(self, _value: &'de str) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_string<E>(self, _value: String) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let child = McpJsonTextSeedV1 {
+            budget: self.budget,
+            depth: self.depth.saturating_add(1),
+        };
+        while sequence.next_element_seed(child)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let child = McpJsonTextSeedV1 {
+            budget: self.budget,
+            depth: self.depth.saturating_add(1),
+        };
+        while map.next_key::<IgnoredAny>()?.is_some() {
+            map.next_value_seed(child)?;
+        }
+        Ok(())
+    }
+}
+
 fn preflight_mcp_result_tree(
     value: &Value,
     max_depth: usize,
     max_nodes: usize,
 ) -> std::result::Result<(), String> {
-    preflight_mcp_json_tree(value, max_depth, max_nodes, usize::MAX)
+    measure_mcp_json_tree(value, max_depth, max_nodes, usize::MAX).map(|_| ())
 }
 
-fn preflight_mcp_json_tree(
+fn measure_mcp_json_tree(
     value: &Value,
     max_depth: usize,
     max_nodes: usize,
     maximum_bytes: usize,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<McpJsonTreeMetricsV1, String> {
     let mut nodes = 0usize;
     let mut encoded_bytes = 0usize;
     let mut pending = vec![McpResultFrame::Value(value, 0)];
@@ -722,7 +1048,10 @@ fn preflight_mcp_json_tree(
             }
         }
     }
-    Ok(())
+    Ok(McpJsonTreeMetricsV1 {
+        nodes,
+        encoded_bytes,
+    })
 }
 
 fn add_json_encoded_bytes(
@@ -1470,8 +1799,8 @@ fn valid_environment_name(name: &str) -> bool {
 
 struct Transport {
     process: TransportProcess,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdin: McpChildStdin,
+    stdout: BufReader<McpChildStdout>,
     stderr_task: Option<JoinHandle<()>>,
     next_id: u64,
 }
@@ -1596,6 +1925,8 @@ struct TransportOwnerCompletion {
     /// The final runtime-only session-lock reference lives in the independent
     /// native owner, not in a Tokio task or the coordinator Drop path.
     execution_lease: Option<SessionExecutionLeaseV1>,
+    #[cfg(windows)]
+    standalone_guardian: Option<ExecutionGuardianLeaseV1>,
 }
 
 impl Drop for TransportOwnerCompletion {
@@ -1605,13 +1936,15 @@ impl Drop for TransportOwnerCompletion {
         // waking async waiters so a completed shutdown can immediately open a
         // new session generation without racing the final Arc<File> drop.
         self.execution_lease.take();
+        #[cfg(windows)]
+        self.standalone_guardian.take();
         self.state.exited.store(true, Ordering::Release);
         self.state.finished.notify_waiters();
     }
 }
 
 struct TransportProcessOwner {
-    child: Child,
+    child: McpChild,
     process_tree: ProcessTree,
     completion: TransportOwnerCompletion,
     reaped: bool,
@@ -1629,7 +1962,7 @@ impl TransportProcessOwner {
                 self.abort_and_reap();
                 return;
             }
-            match self.child.try_wait() {
+            match self.child.try_wait_v1() {
                 Ok(Some(_)) => {
                     self.finish_after_direct_exit();
                     return;
@@ -1678,13 +2011,14 @@ impl Drop for TransportProcessOwner {
     }
 }
 
-fn terminate_direct_child_and_reap_blocking(child: &mut Child) {
-    let _ = child.start_kill();
+#[cfg(not(windows))]
+fn terminate_direct_child_and_reap_blocking(child: &mut McpChild) {
+    let _ = child.start_kill_v1();
     loop {
-        match child.try_wait() {
+        match child.try_wait_v1() {
             Ok(Some(_)) => return,
             Ok(None) | Err(_) => {
-                let _ = child.start_kill();
+                let _ = child.start_kill_v1();
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -1697,7 +2031,9 @@ impl Transport {
         stderr_capture: Arc<Mutex<StderrCapture>>,
         execution_lease: Option<SessionExecutionLeaseV1>,
     ) -> Result<Self> {
+        #[cfg(not(windows))]
         let mut command = Command::new(&config.command);
+        #[cfg(not(windows))]
         command
             .args(&config.args)
             .stdin(Stdio::piped())
@@ -1705,65 +2041,148 @@ impl Transport {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .env_clear();
+        #[cfg(not(windows))]
         if let Some(cwd) = &config.cwd {
             command.current_dir(cwd);
         }
+        #[cfg(not(windows))]
         command.envs(&config.inherited_env);
+        #[cfg(not(windows))]
         command.envs(&config.env);
+        #[cfg(target_os = "linux")]
+        let guardian_registration = execution_lease
+            .as_ref()
+            .map(SessionExecutionLeaseV1::prepare_linux_guardian_registration_v1)
+            .transpose()
+            .map_err(|error| {
+                OxidraError::Mcp(format!(
+                    "MCP server {} cannot register with its execution guardian: {error}",
+                    config.name
+                ))
+            })?;
+        #[cfg(target_os = "linux")]
+        if let Some(registration) = &guardian_registration {
+            // `CommandExt::pre_exec` callbacks run in registration order.
+            // Register the exact child pidfd with the process-external
+            // guardian before the containment callback arms PDEATHSIG. If the
+            // host dies at either side of that transition, the child is owned
+            // by at least one exact kernel identity; the guardian never has
+            // to reopen a numeric PID after parent death.
+            registration.configure(&mut command).map_err(|error| {
+                OxidraError::Mcp(format!(
+                    "MCP server {} cannot configure execution-guardian registration: {error}",
+                    config.name
+                ))
+            })?;
+        }
+        #[cfg(not(windows))]
         ProcessTree::configure_suspended(&mut command).map_err(|error| {
             OxidraError::Mcp(format!(
                 "MCP server {} cannot be started safely on this platform: {error}",
                 config.name
             ))
         })?;
-        let mut child = command.spawn().map_err(|error| {
-            OxidraError::Mcp(format!(
-                "failed to start MCP server {} at {}: {error}",
-                config.name,
-                config.command.display()
-            ))
-        })?;
-        let mut process_tree = match ProcessTree::attach_contained(&child) {
-            Ok(tree) => tree,
-            Err(error) => {
-                // No untrusted code may outlive the startup lease even when
-                // this async constructor is cancelled on an error path.
-                terminate_direct_child_and_reap_blocking(&mut child);
-                return Err(OxidraError::Mcp(format!(
-                    "failed to own MCP server {} process tree: {error}",
-                    config.name
-                )));
-            }
+
+        #[cfg(not(windows))]
+        let (mut child, mut process_tree, stdin, stdout, stderr) = {
+            let mut child = command.spawn().map_err(|error| {
+                OxidraError::Mcp(format!(
+                    "failed to start MCP server {} at {}: {error}",
+                    config.name,
+                    config.command.display()
+                ))
+            })?;
+            #[cfg(target_os = "linux")]
+            drop(guardian_registration);
+            let mut process_tree = match ProcessTree::attach_contained(&child) {
+                Ok(tree) => tree,
+                Err(error) => {
+                    // No untrusted code may outlive the startup lease even when
+                    // this async constructor is cancelled on an error path.
+                    terminate_direct_child_and_reap_blocking(&mut child);
+                    return Err(OxidraError::Mcp(format!(
+                        "failed to own MCP server {} process tree: {error}",
+                        config.name
+                    )));
+                }
+            };
+            let stdin = match child.stdin.take() {
+                Some(stdin) => stdin,
+                None => {
+                    process_tree.terminate_and_reap_blocking(&mut child);
+                    return Err(OxidraError::Mcp(format!(
+                        "MCP server {} has no stdin",
+                        config.name
+                    )));
+                }
+            };
+            let stdout = match child.stdout.take() {
+                Some(stdout) => stdout,
+                None => {
+                    process_tree.terminate_and_reap_blocking(&mut child);
+                    return Err(OxidraError::Mcp(format!(
+                        "MCP server {} has no stdout",
+                        config.name
+                    )));
+                }
+            };
+            let stderr = match child.stderr.take() {
+                Some(stderr) => stderr,
+                None => {
+                    process_tree.terminate_and_reap_blocking(&mut child);
+                    return Err(OxidraError::Mcp(format!(
+                        "MCP server {} has no stderr",
+                        config.name
+                    )));
+                }
+            };
+            (child, process_tree, stdin, stdout, stderr)
         };
-        let stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                process_tree.terminate_and_reap_blocking(&mut child);
-                return Err(OxidraError::Mcp(format!(
-                    "MCP server {} has no stdin",
-                    config.name
-                )));
+
+        #[cfg(windows)]
+        let (mut child, mut process_tree, stdin, stdout, stderr, standalone_guardian) = {
+            let mut standalone_guardian = None;
+            let spawned = match execution_lease.as_ref() {
+                Some(lease) => lease.spawn_windows_guardian_process_v1(
+                    &config.command,
+                    &config.args,
+                    config.cwd.as_deref(),
+                    &config.inherited_env,
+                    &config.env,
+                ),
+                None => {
+                    let guardian = ExecutionGuardianLeaseV1::start_ephemeral().map_err(|error| {
+                        OxidraError::Mcp(format!(
+                            "MCP server {} cannot start its standalone execution guardian: {error}",
+                            config.name
+                        ))
+                    })?;
+                    let spawned = guardian.spawn_windows_process(
+                        &config.command,
+                        &config.args,
+                        config.cwd.as_deref(),
+                        &config.inherited_env,
+                        &config.env,
+                    );
+                    standalone_guardian = Some(guardian);
+                    spawned
+                }
             }
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                process_tree.terminate_and_reap_blocking(&mut child);
-                return Err(OxidraError::Mcp(format!(
-                    "MCP server {} has no stdout",
-                    config.name
-                )));
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                process_tree.terminate_and_reap_blocking(&mut child);
-                return Err(OxidraError::Mcp(format!(
-                    "MCP server {} has no stderr",
-                    config.name
-                )));
-            }
+            .map_err(|error| {
+                OxidraError::Mcp(format!(
+                    "failed to atomically start MCP server {} at {} through its Windows guardian: {error}",
+                    config.name,
+                    config.command.display()
+                ))
+            })?;
+            (
+                spawned.child,
+                spawned.process_tree,
+                spawned.stdin,
+                spawned.stdout,
+                spawned.stderr,
+                standalone_guardian,
+            )
         };
         let stderr_task = tokio::spawn(drain_stderr(stderr, Arc::clone(&stderr_capture)));
         let native_abort = match process_tree.abort_handle() {
@@ -1778,6 +2197,7 @@ impl Transport {
                 )));
             }
         };
+        #[cfg(not(windows))]
         if let Err(error) = process_tree.resume_suspended() {
             process_tree.terminate_and_reap_blocking(&mut child);
             stderr_task.abort();
@@ -1799,6 +2219,8 @@ impl Transport {
             completion: TransportOwnerCompletion {
                 state: Arc::clone(&process_state),
                 execution_lease,
+                #[cfg(windows)]
+                standalone_guardian,
             },
             reaped: false,
         };
@@ -2030,7 +2452,7 @@ impl StderrCapture {
     }
 }
 
-async fn drain_stderr(mut stderr: ChildStderr, capture: Arc<Mutex<StderrCapture>>) {
+async fn drain_stderr(mut stderr: McpChildStderr, capture: Arc<Mutex<StderrCapture>>) {
     let mut buffer = [0u8; 4096];
     loop {
         let count = match stderr.read(&mut buffer).await {
@@ -2106,7 +2528,7 @@ fn prefixed_stderr_tail<'a>(
 }
 
 async fn read_bounded_line(
-    reader: &mut BufReader<ChildStdout>,
+    reader: &mut BufReader<McpChildStdout>,
 ) -> std::io::Result<Option<Vec<u8>>> {
     let mut line = Vec::new();
     loop {
@@ -2142,7 +2564,7 @@ fn trim_ascii_end(mut line: &[u8]) -> &[u8] {
 }
 
 async fn write_json_line(
-    stdin: &mut ChildStdin,
+    stdin: &mut McpChildStdin,
     value: &Value,
 ) -> std::result::Result<(), ClientError> {
     let mut bytes = serde_json::to_vec(value).map_err(|error| ClientError::Protocol {
@@ -2169,7 +2591,7 @@ async fn write_json_line(
     })
 }
 
-pub(super) fn drop_json_value_iteratively(value: Value) {
+pub(crate) fn drop_json_value_iteratively(value: Value) {
     let mut pending = vec![JsonDropFrame::Value(value)];
     while let Some(frame) = pending.pop() {
         match frame {
@@ -2204,7 +2626,7 @@ fn ensure_json_within_limit(
     value: &Value,
     maximum_bytes: usize,
 ) -> std::result::Result<(), String> {
-    preflight_mcp_json_tree(value, usize::MAX, usize::MAX, maximum_bytes)
+    measure_mcp_json_tree(value, usize::MAX, usize::MAX, maximum_bytes).map(|_| ())
 }
 
 #[derive(Debug)]
@@ -2351,6 +2773,23 @@ mod tests {
         let debug = format!("{prepared:?}");
         assert!(debug.contains("TOKEN"));
         assert!(!debug.contains("must-not-appear-in-debug"));
+    }
+
+    #[test]
+    fn stdio_config_debug_never_echoes_args_or_environment_values() {
+        let mut config = McpStdioConfig::new(
+            "fixture",
+            std::env::current_exe().expect("resolve test executable"),
+        );
+        config.args.push("secret-argument".to_owned());
+        config
+            .env
+            .insert("TOKEN".to_owned(), "secret-environment-value".to_owned());
+        let debug = format!("{config:?}");
+        assert!(debug.contains("args_count"));
+        assert!(debug.contains("explicit_env_names"));
+        assert!(!debug.contains("secret-argument"));
+        assert!(!debug.contains("secret-environment-value"));
     }
 
     #[test]
@@ -2503,19 +2942,24 @@ mod tests {
     #[test]
     fn iterative_json_size_matches_serde_encoding() {
         let fixtures = [
-            Value::Null,
-            json!(true),
-            json!(false),
-            json!(12345),
-            json!("quote\" slash\\ controls\u{0000}\u{0008}\t\n\u{000c}\r 界"),
-            json!([]),
-            json!({}),
-            json!([null, true, "x", {"key\n界":"value\\\""}]),
+            (Value::Null, 1),
+            (json!(true), 1),
+            (json!(false), 1),
+            (json!(12345), 1),
+            (
+                json!("quote\" slash\\ controls\u{0000}\u{0008}\t\n\u{000c}\r 界"),
+                1,
+            ),
+            (json!([]), 1),
+            (json!({}), 1),
+            (json!([null, true, "x", {"key\n界":"value\\\""}]), 6),
         ];
-        for value in fixtures {
+        for (value, expected_nodes) in fixtures {
             let encoded = serde_json::to_vec(&value).expect("encode JSON size fixture");
-            preflight_mcp_provider_event_tree_v1(&value, encoded.len())
+            let metrics = measure_mcp_provider_event_tree_v1(&value, encoded.len())
                 .expect("exact encoded-byte boundary must be accepted");
+            assert_eq!(metrics.encoded_bytes, encoded.len());
+            assert_eq!(metrics.nodes, expected_nodes);
             if !encoded.is_empty() {
                 let error =
                     preflight_mcp_provider_event_tree_v1(&value, encoded.len().saturating_sub(1))

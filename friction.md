@@ -4,6 +4,21 @@
 
 ## Session 管理
 
+### 磁盘 reader 的预算不能替代内存 API 的前置校验
+
+公开 helper 和 reducer 可以接收调用方直接构造的 `JournalEvent` / `Value`，并不必然经过
+`SessionStore`。已用子进程回归复现并修复 history 输出计费、compaction boundary 解析、
+MCP 结果展示及 turn→MCP 参数读取的深层 JSON 栈溢出。递归操作前复用迭代式深度检查，
+展示采用固定容量 writer；测试同时保留历史 reader 可接受的深度上界。后续新增公共 JSON
+入口必须说明它消费的是已验证的 owner 还是裸 fixture，不能仅以“journal 已有预算”作为依据。
+这不等于任意外部 DTO 操作有界，也未消除 Provider 多份 canonical/projection 副本的峰值开销。
+
+### 文件系统边界仍依赖 pathname
+
+- Unix data/session/artifact/memory 状态已收紧到目录 mode `0700`、文件 mode `0600`，但没有移除额外 POSIX/extended ACL 或证明远程文件系统按本地 mode 语义执行；Windows 继续依赖 data-root ACL。builtin/history 的 bounded read 会 no-follow 打开最终组件、验证 exact handle 为 regular file，并限制真实读取字节数。
+- 但 session `open/list/inspect/export/delete`、history artifact 目录解析和 builtin 的 parent canonicalization 尚未改为 `openat`/NT handle-relative traversal。同一 OS principal 的并发进程仍可在验证后替换父目录、junction/reparse point 或 pathname；当前模式位和 canonicalization 只覆盖非对抗性 namespace。若产品要把同用户插件也视为攻击者，必须引入独立 principal/sandbox 或可信的 handle-relative filesystem broker，不能继续在每个调用点追加 pathname recheck。
+- `edit` 的 full-file SHA-256 和发布前复查能发现复查之前的普通并发写入，但 portable rename 不是 compare-and-swap；复查后到原子替换前仍有窄窗口可覆盖同用户 writer 的新内容。要关闭这一点，需要平台 inode/file-ID 绑定的交换/回滚协议或 broker，而不是再加一次 pathname read。
+
 ### `session` 命令需要删除能力
 
 - 需要提供 `oxidra session delete <SESSION_ID>`。
@@ -185,7 +200,7 @@ execution trust 明确是授予当前 OS 用户权限的 path/command capability
 lifecycle containment，不限制文件或网络权限；未来 per-tool approval 只是请求意图确认
 与审计，不是进程 sandbox。固定 JSON Schema profile v1 已在 dispatch 前验证参数、在
 complete result 后验证 structured output，并由 registry digest 绑定。durable execution
-coordinator core、registry epoch activation、call-chain validator v2 与 crash recovery 已接入
+coordinator core、registry epoch activation、call-chain validator v4 与 crash recovery 已接入
 journal。新的 writer-side tool-surface snapshot 已能把 live registry alias、definition/
 output-schema digest 与 builtin/history 工具表合并并在写入前拒绝名称碰撞；generic journal
 writer 也会在 MCP-sensitive event fsync 前运行冻结 reducer。live coordinator 和公开的 typed
@@ -193,24 +208,40 @@ Provider/context writer 绑定当前 runtime journal handle；首次 activation 
 generation 的 one-shot startup slot。coordinator 与独立 native transport reaper 共同持有 session
 lock execution lease；kill 只是请求，只有 direct child 已 reap 且 Windows Job 的 active process
 归零才释放最后一份 lease，所以 journal/coordinator 或 Tokio runtime 单独 drop 后不能在旧 MCP
-transport 完成退出前 reopen。旧 authority
+  transport 完成退出前 reopen。session-bound execution guardian 还持有独立 generation gate：
+  READY 前先 fsync active-generation record，正常 host death 时先终止并等待已注册 Linux pidfd
+  target 退出 / Windows per-server Job 归零，再 fsync matching clean record 并允许 reopen；若
+  guardian 自身先被强杀，OS lock 虽会释放，但 durable active state 使 session 永久 fail closed，
+  且 v1 不支持原地恢复。正式出口只有 `oxidra session export <ID> <ARCHIVE>.oxidra-session-export`：在普通 session lock
+  下写入 non-journal manifest 后附未经 repair 的 exact 原始 JSONL bytes，使 archive 不能被误作
+  新 session resume，同时不清除 gate、不重新授权 dispatch。destination 父目录必须由 operator
+  控制且不能允许不可信并发 writer；v1 pathname publisher 不防御同用户 namespace race。
+  Windows 由单线程 guardian 创建 Job、stdio pipes 和 suspended child，通过
+`PROC_THREAD_ATTRIBUTE_JOB_LIST`/`HANDLE_LIST` 从 process birth 起原子完成 containment，
+再把 host-side handles 复制给 exact host 并等待一次性 resume 决定；这也避免了 host 内并发
+std/tokio/第三方 spawn 继承临时 pipe handles。guardian 还会在 READY 前证明自己不属于任何 supervisor Job，无法
+  完全 breakaway 时 fail closed。该 guardian 与
+  MCP server 仍属于同一 OS 用户，普通 lock path 和 durable state 也不是权限隔离；主动终止 guardian
+  会牺牲 session 可用性，而替换 gate 或篡改其他同用户状态仍在保证之外。若把
+server 视为主动对抗代码，仍需低权限 token/AppContainer、独立账户或可信系统服务。旧 authority
 即使 session/registry digest 未变也不能继续写入或 dispatch；generic Provider admission 会拒绝
-MCP-owned start 与 activated-alias completion。显式 activation/call-chain v3
-offline reader 已能严格证明 activation、global `context.tools`、request context 与
+MCP-owned start 与 activated-alias completion。activation/call-chain v3
+reader 已能严格证明 activation、global `context.tools`、request context 与
 `response.started.mcp_surface` 的 exact relation，并阻止删除 claim 后把 activated alias 降级成
 generic response；绑定的 input schema 和 lifecycle outer/nested provenance 也会按冻结 profile
-重验。展示用 output-schema digest 仍不能证明 runtime structured validation；MCP kernel 已登记、但尚未
-接入当前 writer 的 v3 model-facing result envelope v1：raw MCP result 只作有界 parsed-JSON
-审计值，model-facing projection 只允许严格 text-only 且由 offline reader 从 raw 重派生。current writer 仍冻结在 v2，CLI
-参数、Agent approval 和实际 request binding 也未接通，因此用户现在仍然只能使用固定内置工具，
+重验。展示用 output-schema digest 仍不能证明 runtime structured validation；current v4 writer
+已接入 model-facing result envelope v1：raw MCP result 只作有界 parsed-JSON 审计值，
+model-facing projection 只允许严格 text-only 且由 offline reader 从 raw 重派生。v4 typed
+Provider request admission 还会把 exact durable `context.tools`、`PreparedResponseRequest` 的
+canonical body/sealed body bytes（仅由 crate-sealed MCP transport 消费）、digest/full measurement、protocol/usage domain 与 outcome
+reserve 一次性绑定。CLI 参数、Agent approval 和 Agent glue 尚未接通，因此用户现在仍然只能使用固定内置工具，
 不能把上述 MCP server 暴露给模型。
 
-下一步先完成统一 MCP protocol epoch 升级，而不是直接写 Agent glue：turn、Provider slot、
-source projection、history extractor 和 compaction boundary 必须各新增只接受 call-chain v3 的
-冻结版本；现有 v2 typed `context.tools`/response writer 必须由 Agent 直接消费，并在 v3 epoch
-升级时同步收窄其 surface/result profile，不能退回 public generic Value writer。随后把
-session-open resume capability、CLI execution trust、Agent approval 与 coordinator 的一次性
-dispatch permit 接成唯一事实源。现有 CLI 的 durable `in_doubt` resolution transaction 必须复用，
+统一 protocol epoch 已升级为 call-chain v4、turn v8、Provider slot v5、source/history v8 与
+compaction boundary v8；turn/source/history v8 按 owning `user.message` 选择 recovery grammar，
+不再按 journal 最大版本追溯解释旧 turn。下一步让 Agent/CLI 消费已有的 session-open resume capability，并把 CLI
+execution trust、Agent approval、typed Provider request admission 与 coordinator 的一次性 dispatch permit 接成唯一事实源，
+不能退回 public generic Value writer。现有 CLI 的 durable `in_doubt` resolution transaction 必须复用，
 不能再实现一套 MCP 专用终态 writer。
 完整顺序与 release gate 见 `docs/mcp-roadmap.md`；不能把 kernel 的存在误报为已完成
 用户入口。

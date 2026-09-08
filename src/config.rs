@@ -228,7 +228,7 @@ fn resolve_settings(
     })
 }
 
-fn normalize_base_url(base_url: &str) -> Result<Url> {
+pub(crate) fn normalize_base_url(base_url: &str) -> Result<Url> {
     let mut api_base_url = Url::parse(base_url)?;
     validate_public_base_url(&api_base_url)?;
     if !api_base_url.path().ends_with('/') {
@@ -238,7 +238,12 @@ fn normalize_base_url(base_url: &str) -> Result<Url> {
     Ok(api_base_url)
 }
 
-fn validate_public_base_url(url: &Url) -> Result<()> {
+pub(crate) fn validate_public_base_url(url: &Url) -> Result<()> {
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(OxidraError::Config(
+            "API base URL must use http/https and include a host".to_owned(),
+        ));
+    }
     // Provider URL 会出现在诊断与审计域中，配置边界直接禁止携带秘密。
     if !url.username().is_empty() || url.password().is_some() {
         return Err(OxidraError::Config(

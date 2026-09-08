@@ -16,18 +16,23 @@ use crate::compaction::{
 };
 use crate::error::{OxidraError, Result};
 use crate::event_kind::is_tool_terminal;
-use crate::mcp::{MCP_CALL_CHAIN_VALIDATOR_VERSION_V2, validate_mcp_call_chain_through_version};
+use crate::mcp::{
+    MCP_CALL_CHAIN_VALIDATOR_VERSION_V2, MCP_CALL_CHAIN_VALIDATOR_VERSION_V4,
+    validate_mcp_call_chain_through_version,
+};
 use crate::projection::{
     source_projection_supports_boundary_exclusions, validate_response_output_items,
 };
 use crate::session::{JOURNAL_SCHEMA, JournalEvent};
-use crate::turn::validate_turn_recovery;
+use crate::turn::validate_turn_recovery_dynamic;
 use crate::types::ToolDefinition;
 
 pub const HISTORY_SCHEMA_VERSION: u32 = 1;
 /// Increment when the recovery/provenance semantics change; old cursors fail closed.
-pub const HISTORY_EXTRACTOR_VERSION: u32 = 6;
+pub const HISTORY_EXTRACTOR_VERSION: u32 = 8;
 const HISTORY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V2;
+const HISTORY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V7: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V4;
+const HISTORY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8: u32 = MCP_CALL_CHAIN_VALIDATOR_VERSION_V4;
 pub const HISTORY_CURSOR_VERSION: u32 = 1;
 pub const MAX_HISTORY_QUERY_BYTES: usize = 512;
 pub const MAX_HISTORY_CURSOR_BYTES: usize = 2_048;
@@ -212,10 +217,7 @@ impl HistorySnapshot {
         boundary_chain: &CompactionBoundaryChain,
         excluded_turn_ids: &HashSet<String>,
     ) -> Result<Self> {
-        validate_mcp_call_chain_through_version(
-            HISTORY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6,
-            events,
-        )?;
+        validate_history_mcp_compatibility_for_version(HISTORY_EXTRACTOR_VERSION, events)?;
         chain.ensure_matches(events)?;
         boundary_chain.ensure_checkpoint_projection_safe(chain)?;
         let session_id = validate_journal_envelopes(events)?;
@@ -544,6 +546,23 @@ impl HistorySnapshot {
     }
 }
 
+fn validate_history_mcp_compatibility_for_version(
+    extractor_version: u32,
+    events: &[JournalEvent],
+) -> Result<()> {
+    let ceiling = match extractor_version {
+        6 => HISTORY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V6,
+        7 => HISTORY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V7,
+        8 => HISTORY_MCP_CALL_CHAIN_VALIDATOR_VERSION_V8,
+        _ => {
+            return Err(OxidraError::Session(format!(
+                "unsupported history extractor MCP compatibility version {extractor_version}"
+            )));
+        }
+    };
+    validate_mcp_call_chain_through_version(ceiling, events)
+}
+
 /// Prove that the history view required by the normal request will remain
 /// constructible if a checkpoint is committed at `covers_through_seq`.
 ///
@@ -560,6 +579,12 @@ pub(crate) fn validate_history_snapshot_after_compaction(
     covers_through_seq: u64,
     source_projection_version: u32,
 ) -> Result<HistorySnapshot> {
+    // This preview promises that the post-checkpoint normal history view can
+    // be rebuilt. It must therefore execute the same MCP compatibility gate
+    // as `HistorySnapshot::build_with_boundary_chain`; calling the lower-level
+    // `build_from_views` directly must not become a bypass for malformed or
+    // future call-chain epochs.
+    validate_history_mcp_compatibility_for_version(HISTORY_EXTRACTOR_VERSION, events)?;
     chain.ensure_matches(events)?;
     boundary_chain.ensure_checkpoint_projection_safe(chain)?;
     let parent_cutoff = chain
@@ -696,7 +721,7 @@ fn extract_records_with_exclusions(
         .count();
     let scoped = &events[..scoped_len];
     // 已放弃回合仍保留在 journal 中，但不应通过 history 工具重新灌回模型。
-    let mut abandoned_turns = validate_turn_recovery(scoped)?
+    let mut abandoned_turns = validate_turn_recovery_dynamic(scoped)?
         .abandons
         .into_keys()
         .collect::<HashSet<_>>();
@@ -1454,6 +1479,7 @@ pub fn serialized_history_tool_output_bytes(call_id: &str, output: &Value) -> Re
             "history tool output has an empty call_id".to_owned(),
         ));
     }
+    crate::projection::validate_projection_value_depth_v1(output, "history tool output")?;
     let output = match output {
         Value::String(output) => output.clone(),
         output => serde_json::to_string(output)?,
@@ -1620,6 +1646,28 @@ mod tests {
         }
     }
 
+    fn mcp_v4_activation(seq: u64) -> JournalEvent {
+        event(
+            seq,
+            None,
+            "mcp.registry.activated",
+            json!({
+                "bindings":[],
+                "config_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "call_chain_validator_version":4,
+                "coordinator_id":"0190f5e6-7b00-7abc-8000-000000000001",
+                "coordinator_version":4,
+                "execution_plan_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "registry_digest":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                "registry_epoch_id":"0190f5e6-7b00-7abc-8000-000000000002",
+                "registry_version":1,
+                "schema_profile_version":1,
+                "stdio_kernel_version":1,
+                "surface_claim_version":1,
+            }),
+        )
+    }
+
     fn fixture_events() -> Vec<JournalEvent> {
         include_str!("../tests/fixtures/compaction_v1.jsonl")
             .lines()
@@ -1691,6 +1739,80 @@ mod tests {
         let second = HistorySnapshot::build(&with_irrelevant_tail, &second_chain).unwrap();
         assert_eq!(snapshot.latest_digest(), second.latest_digest());
         assert_eq!(snapshot.records(), second.records());
+    }
+
+    #[test]
+    fn history_extractor_v7_remains_the_first_v4_compatible_reader() {
+        assert_eq!(HISTORY_EXTRACTOR_VERSION, 8);
+        let events = vec![mcp_v4_activation(1)];
+
+        let error = validate_history_mcp_compatibility_for_version(6, &events)
+            .expect_err("history extractor v6 keeps its call-chain v2 ceiling")
+            .to_string();
+        assert!(error.contains("compatibility ceiling 2"), "{error}");
+        validate_history_mcp_compatibility_for_version(7, &events)
+            .expect("history extractor v7 accepts call-chain v4");
+        validate_history_mcp_compatibility_for_version(8, &events)
+            .expect("history extractor v8 retains the call-chain v4 ceiling");
+        assert!(validate_history_mcp_compatibility_for_version(9, &events).is_err());
+    }
+
+    #[test]
+    fn history_extractor_v8_preserves_mixed_recovery_languages() {
+        let events = vec![
+            event(1, Some("legacy-v2"), "context.limit_reached", json!({})),
+            event(
+                2,
+                Some("legacy-v2"),
+                "user.message",
+                json!({
+                    "turn_boundary_version":2,
+                    "item":{"role":"user","content":"obsolete legacy prompt"},
+                }),
+            ),
+            event(
+                3,
+                Some("legacy-v2"),
+                "turn.abandoned",
+                json!({
+                    "user_message_seq":2,
+                    "reason":"historical v2 recovery",
+                }),
+            ),
+            event(
+                4,
+                Some("current-v8"),
+                "user.message",
+                json!({
+                    "turn_boundary_version":8,
+                    "item":{"role":"user","content":"current prompt"},
+                }),
+            ),
+            event(
+                5,
+                Some("current-v8"),
+                "response.completed",
+                json!({"output_items":[{
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"current answer"}],
+                }]}),
+            ),
+        ];
+
+        let records = extract_records(&events, 5)
+            .expect("history v8 must select recovery by each owning user turn");
+        assert!(
+            records.iter().all(|record| record.turn_id == "current-v8"),
+            "the abandoned legacy turn must not be searchable"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["current prompt", "current answer"]
+        );
     }
 
     #[test]
@@ -2177,6 +2299,15 @@ mod tests {
             event(
                 1,
                 Some("turn"),
+                "user.message",
+                json!({
+                    "turn_boundary_version":8,
+                    "item":{"role":"user","content":"run the calls"},
+                }),
+            ),
+            event(
+                2,
+                Some("turn"),
                 "response.completed",
                 json!({"output_items":[
                     {"type":"function_call","call_id":"reused","name":"read","arguments":"{\"path\":\"a\"}"},
@@ -2185,26 +2316,26 @@ mod tests {
                 ]}),
             ),
             event(
-                2,
+                3,
                 Some("turn"),
                 "tool.completed",
                 json!({"call_id":"reused","tool":"read","output":{"path":"a"}}),
             ),
             event(
-                3,
+                4,
                 Some("turn"),
                 "tool.completed",
                 json!({"call_id":"reused","tool":"history_search","output":{"results":[]}}),
             ),
             event(
-                4,
+                5,
                 Some("turn"),
                 "tool.completed",
                 json!({"call_id":"reused","tool":"read","output":{"path":"b"}}),
             ),
         ];
 
-        let records = extract_records(&events, 4).unwrap();
+        let records = extract_records(&events, 5).unwrap();
         assert_eq!(
             records
                 .iter()

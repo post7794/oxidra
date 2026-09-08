@@ -5,25 +5,13 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use oxidra::compaction::{
-    COMPACTION_BOUNDARY_VERSION, COMPACTION_PROMPT_VERSION, MAX_COMPACTION_OUTPUT_TOKENS,
-    SOURCE_DIGEST_VERSION, SUMMARY_ENVELOPE_VERSION, USAGE_CONTRACT_VERSION,
-    compacted_history_item, compaction_instructions, validate_recorded_compaction_response,
+    COMPACTION_PROMPT_VERSION, SUMMARY_ENVELOPE_VERSION, compacted_history_item,
+    compaction_instructions, validate_recorded_compaction_response,
 };
-use oxidra::config::{ContextLimits, ProviderConfig};
-use oxidra::context::{
-    AUTOMATIC_COMPACTION_PLANNING_VERSION, CONTEXT_ESTIMATOR_VERSION, CONTEXT_MEASUREMENT_VERSION,
-    ContextRuntime, REQUEST_SHAPE_VERSION,
-};
-use oxidra::projection::SOURCE_PROJECTION_VERSION;
-use oxidra::provider::{
-    OpenAiResponsesProvider, ProviderEvent, ResponseProvider, ResponseRequest, StreamObserver,
-};
-use oxidra::turn::TURN_BOUNDARY_VALIDATOR_VERSION;
 use oxidra::{OxidraError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio_util::sync::CancellationToken;
 
 const FIXTURE_BYTES: &[u8] = include_bytes!("../tests/fixtures/compaction_drift_v10.json");
 #[cfg(test)]
@@ -245,14 +233,6 @@ struct RecordedRound {
     usage: oxidra::types::Usage,
 }
 
-struct SilentObserver;
-
-impl StreamObserver for SilentObserver {
-    fn on_event(&mut self, _event: ProviderEvent) -> Result<()> {
-        Ok(())
-    }
-}
-
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -268,136 +248,10 @@ async fn run() -> Result<()> {
     if let Some(source) = args.rescore.as_deref() {
         return rescore_artifact(&args, &fixture, source);
     }
-    if !args.confirm_live_calls {
-        return Err(OxidraError::ApprovalRequired(format!(
-            "pass --confirm-live-calls to acknowledge {} live Provider calls",
-            args.rounds
-        )));
-    }
-    if args.rounds < *REQUIRED_SNAPSHOTS.last().expect("snapshots are non-empty") {
-        return Err(OxidraError::Config(format!(
-            "--rounds must be at least {}",
-            REQUIRED_SNAPSHOTS.last().expect("snapshots are non-empty")
-        )));
-    }
-
-    let config = ProviderConfig::resolve(None, args.api_base_url, args.model)?;
-    let context_runtime = ContextRuntime::from_provider(&config, ContextLimits::default())?;
-    let provider = OpenAiResponsesProvider::new(config.clone())?;
-    let output = args
-        .output
-        .unwrap_or_else(|| default_output_path(&config.model));
-    if output.exists() {
-        return Err(OxidraError::Config(format!(
-            "refusing to overwrite existing drift artifact {}",
-            output.display()
-        )));
-    }
-
-    let mut artifact = DriftArtifact {
-        artifact_version: 10,
-        metric_version: METRIC_VERSION,
-        status: "running".to_owned(),
-        started_at: Utc::now(),
-        completed_at: None,
-        model: config.model.clone(),
-        provider_protocol: context_runtime.provider_protocol,
-        provider_usage_domain: context_runtime.provider_usage_domain,
-        fixture_version: fixture.fixture_version,
-        fixture_sha256: sha256_hex(FIXTURE_BYTES),
-        prompt_sha256: sha256_hex(
-            compaction_instructions(COMPACTION_PROMPT_VERSION)
-                .expect("current prompt is registered")
-                .as_bytes(),
-        ),
-        summary_envelope_template_sha256: sha256_hex(&serde_json::to_vec(
-            &compacted_history_item(SUMMARY_ENVELOPE_VERSION, "")?,
-        )?),
-        requested_rounds: args.rounds,
-        protocol_versions: ProtocolVersions {
-            prompt: COMPACTION_PROMPT_VERSION,
-            summary_envelope: SUMMARY_ENVELOPE_VERSION,
-            source_projection: SOURCE_PROJECTION_VERSION,
-            turn_validator: TURN_BOUNDARY_VALIDATOR_VERSION,
-            source_digest: SOURCE_DIGEST_VERSION,
-            usage_contract: USAGE_CONTRACT_VERSION,
-            compaction_boundary: COMPACTION_BOUNDARY_VERSION,
-            context_measurement: CONTEXT_MEASUREMENT_VERSION,
-            context_estimator: CONTEXT_ESTIMATOR_VERSION,
-            request_shape: REQUEST_SHAPE_VERSION,
-            automatic_compaction_planning: AUTOMATIC_COMPACTION_PLANNING_VERSION,
-        },
-        live_provider_calls: true,
-        source_artifact_sha256: None,
-        rounds: Vec::with_capacity(args.rounds as usize),
-        error: None,
-    };
-    write_artifact(&output, &artifact)?;
-
-    let prompt = compaction_instructions(COMPACTION_PROMPT_VERSION).ok_or_else(|| {
-        OxidraError::Session(format!(
-            "unsupported compaction prompt version {COMPACTION_PROMPT_VERSION}"
-        ))
-    })?;
-    let mut input = fixture.input.clone();
-    for round in 1..=args.rounds {
-        let input_bytes = serde_json::to_vec(&input)?;
-        let request = ResponseRequest {
-            instructions: Some(prompt.to_owned()),
-            input,
-            tools: Vec::new(),
-            model: Some(config.model.clone()),
-            max_output_tokens: Some(MAX_COMPACTION_OUTPUT_TOKENS),
-        };
-        let response = match provider
-            .respond(request, &mut SilentObserver, CancellationToken::new())
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                artifact.status = "failed".to_owned();
-                artifact.completed_at = Some(Utc::now());
-                artifact.error = Some(error.to_string());
-                write_artifact(&output, &artifact)?;
-                return Err(error);
-            }
-        };
-        if response.text.trim().is_empty() {
-            return finish_failed(
-                &output,
-                &mut artifact,
-                "Provider returned an empty compaction summary",
-            );
-        }
-        if !response.tool_calls.is_empty() {
-            return finish_failed(
-                &output,
-                &mut artifact,
-                "compaction drift response unexpectedly contained tool calls",
-            );
-        }
-
-        let summary = response.text;
-        let metrics = measure_summary(&fixture, &summary);
-        artifact.rounds.push(RoundArtifact {
-            round,
-            registered_snapshot: REQUIRED_SNAPSHOTS.contains(&round),
-            input_sha256: sha256_hex(&input_bytes),
-            summary_sha256: sha256_hex(summary.as_bytes()),
-            summary: summary.clone(),
-            raw_response: response.raw_response,
-            usage: response.usage,
-            metrics,
-        });
-        write_artifact(&output, &artifact)?;
-        input = vec![compacted_history_item(SUMMARY_ENVELOPE_VERSION, &summary)?];
-    }
-
-    artifact.status = "completed".to_owned();
-    artifact.completed_at = Some(Utc::now());
-    write_artifact(&output, &artifact)?;
-    print_snapshots(&output, &artifact);
-    Ok(())
+    Err(OxidraError::ApprovalRequired(
+        "live drift generation is temporarily disabled: Provider outcomes are opaque until a durable writer commits them; use --rescore with an existing artifact until the benchmark has its own typed durable sink"
+            .to_owned(),
+    ))
 }
 
 fn rescore_artifact(args: &Args, fixture: &DriftFixture, source_path: &Path) -> Result<()> {
@@ -1542,31 +1396,6 @@ fn range_distance(first: (usize, usize), second: (usize, usize)) -> usize {
 
 fn ranges_overlap(first: (usize, usize), second: (usize, usize)) -> bool {
     first.0 < second.1 && second.0 < first.1
-}
-
-fn finish_failed<T>(output: &Path, artifact: &mut DriftArtifact, message: &str) -> Result<T> {
-    artifact.status = "failed".to_owned();
-    artifact.completed_at = Some(Utc::now());
-    artifact.error = Some(message.to_owned());
-    write_artifact(output, artifact)?;
-    Err(OxidraError::Provider(message.to_owned()))
-}
-
-fn default_output_path(model: &str) -> PathBuf {
-    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
-    let model = model
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    PathBuf::from("target")
-        .join("compaction-drift")
-        .join(format!("{timestamp}-{model}.json"))
 }
 
 fn write_artifact(path: &Path, artifact: &DriftArtifact) -> Result<()> {

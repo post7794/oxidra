@@ -13,10 +13,10 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 async-trait = "=0.1.88"
 base64 = "=0.22.1"
+bytes = "=1.10.0"
 chrono = { version = "=0.4.39", features = ["serde"] }
 clap = { version = "=4.5.31", features = ["derive"] }
 directories = "=6.0.0"
-eventsource-stream = "=0.2.3"
 fastrand = "=2.3.0"
 fs2 = "=0.4.3"
 futures-util = "=0.3.31"
@@ -31,7 +31,7 @@ tokio = { version = "=1.43.0", features = ["fs", "io-util", "macros", "process",
 tokio-util = { version = "=0.7.13", features = ["rt"] }
 toml = "=0.8.23"
 url = "=2.5.4"
-uuid = { version = "=1.13.1", features = ["serde", "v7"] }
+uuid = { version = "=1.13.1", features = ["serde", "v4", "v7"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "=0.29.0", features = ["process", "signal"] }

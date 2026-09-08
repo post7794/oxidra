@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Oxidra — 轻量级个人 CLI 编码 Agent</title>
+  <meta name="description" content="Oxidra: A lightweight personal CLI coding agent written in Rust. 具备 5 大原生 Rust 工具、Append-Only 本地可审计日志、系统级进程沙箱与自适应上下文压缩。">
+  <!-- Stylesheets -->
+  <link rel="stylesheet" href="styles/main.css">
+  <link rel="stylesheet" href="styles/components.css">
+  <link rel="stylesheet" href="styles/animations.css">
+  <!-- Favicon placeholder SVG -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2300f2fe'><path d='M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5'/></svg>">
+</head>
+<body>
+
+  <!-- Ambient Grid Background -->
+  <div class="bg-ambient-grid" aria-hidden="true"></div>
+
+  <!-- Site Navigation Header -->
+  <header class="site-header">
+    <div class="container nav-container">
+      <a href="#" class="brand-logo" aria-label="Oxidra 主页">
+        <svg viewBox="0 0 24 24">
+          <polygon points="12 2 2 7 12 12 22 7 12 2"></polygon>
+          <polyline points="2 17 12 22 22 17"></polyline>
+          <polyline points="2 12 12 17 22 12"></polyline>
+        </svg>
+        <span>Oxidra</span>
+        <span class="brand-badge">Rust 2024</span>
+      </a>
+
+      <nav aria-label="主导航">
+        <ul class="nav-links">
+          <li><a href="#hero" class="nav-link">概览</a></li>
+          <li><a href="#roadmap" class="nav-link">进度矩阵</a></li>
+          <li><a href="#architecture" class="nav-link">架构契约</a></li>
+          <li><a href="#tools" class="nav-link">内置工具</a></li>
+          <li><a href="#compaction" class="nav-link">压缩引擎</a></li>
+          <li><a href="#terminal" class="nav-link">终端模拟</a></li>
+          <li><a href="#install" class="nav-link">安装运行</a></li>
+        </ul>
+      </nav>
+
+      <div class="nav-actions">
+        <a href="https://github.com/post7794/oxidra" target="_blank" rel="noopener noreferrer" class="btn btn-secondary btn-sm" aria-label="GitHub 仓库">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+          <span>GitHub</span>
+        </a>
+        <a href="#install" class="btn btn-primary btn-sm">快速开始</a>
+        <button class="mobile-menu-btn" id="mobile-menu-btn" aria-label="打开导航菜单">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- Hero Section -->
+    <section id="hero" class="hero-section">
+      <div class="container hero-content">
+        <div class="hero-pill">
+          <span class="pulse-dot"></span>
+          <span>Rust 1.85 Edition 2024 · 纯原生零运行依赖</span>
+        </div>
+        <h1 class="hero-title">
+          轻量 · 确定 · 本地可审计<br>
+          <span class="gradient-text">个人 CLI 编码 Agent</span>
+        </h1>
+        <p class="hero-subtitle">
+          Oxidra 专为严谨的工程师打造。基于 OpenAI Responses API，集成 5 大原生 Rust 核心工具，
+          恪守 Append-Only 本地审计真相源与进程级沙箱治理，拒绝流式污染与不可控副作用。
+        </p>
+
+        <!-- Quick Install Box -->
+        <div class="hero-actions">
+          <div class="hero-install-box">
+            <span class="prompt-sym">&gt;</span>
+            <span id="quick-install-cmd">irm https://raw.githubusercontent.com/post7794/oxidra/main/install.ps1 | iex</span>
+            <button class="copy-btn" data-copy-target="quick-install-cmd" aria-label="复制 Windows 安装指令" title="复制指令">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            </button>
+          </div>
+          <a href="#roadmap" class="btn btn-secondary">查看研发展望</a>
+        </div>
+
+        <!-- Hero Stats Counter Grid -->
+        <div class="hero-stats-grid" id="hero-stats-container">
+          <!-- Dynamic stats loaded from data.js -->
+        </div>
+      </div>
+    </section>
+
+    <!-- Roadmap & Milestone Matrix Section -->
+    <section id="roadmap" class="section">
+      <div class="container">
+        <div class="section-header">
+          <span class="section-tag">Development Milestones</span>
+          <h2 class="section-title">工程演进与进度全景矩阵</h2>
+          <p class="section-desc">
+            从 M1 核心循环到 M5 上下文压缩与 MCP 协议底座，Oxidra 按照工业级安全规范稳步推进，
+            确保每一项能力都有完备的代码实现与契约测试支撑。
+          </p>
+        </div>
+
+        <!-- Filter Pills -->
+        <div class="roadmap-filters">
+          <button class="filter-btn active" data-filter="all">全部阶段 (All)</button>
+          <button class="filter-btn" data-filter="completed">已完成 · 稳定 (M1-M3)</button>
+          <button class="filter-btn" data-filter="experimental">主线已就绪 · 实验性 (M5)</button>
+          <button class="filter-btn" data-filter="kernel_ready">底座就绪 (MCP)</button>
+          <button class="filter-btn" data-filter="postponed">已规划 · 暂缓 (M4)</button>
+        </div>
+
+        <!-- Milestone Cards Grid -->
+        <div class="milestones-grid" id="milestones-grid">
+          <!-- Dynamic cards rendered by roadmap.js -->
+        </div>
+      </div>
+    </section>
+
+    <!-- Core Architecture & Principles Section -->
+    <section id="architecture" class="section" style="background: rgba(10, 14, 22, 0.5);">
+      <div class="container">
+        <div class="section-header">
+          <span class="section-tag">Architecture & Design</span>
+          <h2 class="section-title">不可妥协的安全哲学与架构契约</h2>
+          <p class="section-desc">
+            真正的工业级 Agent 不是盲目追求自主执行，而是把不可恢复的风险锁进确定性的安全边界。
+          </p>
+        </div>
+
+        <!-- 4 Architecture Pillars -->
+        <div class="pillars-grid" id="pillars-container">
+          <!-- Dynamic pillars rendered by app.js -->
+        </div>
+
+        <!-- Interactive Architecture Flow Diagram -->
+        <div class="arch-diagram-box">
+          <h3 style="margin-bottom: 24px; text-align: center; font-size: 1.15rem;">
+            ⚡ 核心交互与数据流拓扑图 (Dataflow Topology)
+          </h3>
+          <div class="flow-steps">
+            <div class="flow-node">
+              <div class="flow-node-title">CLI / REPL</div>
+              <div class="flow-node-desc">用户输入与终端交互</div>
+            </div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-node">
+              <div class="flow-node-title">Agent Loop</div>
+              <div class="flow-node-desc">意图调度与会话状态机</div>
+            </div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-node">
+              <div class="flow-node-title">Responses Provider</div>
+              <div class="flow-node-desc">SSE 流式 · Silent Pre-commit</div>
+            </div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-node">
+              <div class="flow-node-title">Builtin Tools / MCP</div>
+              <div class="flow-node-desc">受限工具箱 &amp; 强权限沙箱</div>
+            </div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-node">
+              <div class="flow-node-title">OS Guardian</div>
+              <div class="flow-node-desc">Windows Job / Linux seccomp</div>
+            </div>
+            <div class="flow-arrow">→</div>
+            <div class="flow-node" style="border-color: var(--accent-cyan); background: var(--bg-glass);">
+              <div class="flow-node-title" style="color: var(--accent-cyan);">Session Journal</div>
+              <div class="flow-node-desc">Append-Only 物理原子落盘</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 5 Built-in Tools Showcase -->
+    <section id="tools" class="section">
+      <div class="container">
+        <div class="section-header">
+          <span class="section-tag">Builtin Capabilities</span>
+          <h2 class="section-title">5 大原生 Rust 内置工具箱</h2>
+          <p class="section-desc">
+            无第三方复杂运行时，没有不可预料的外部依赖，全部由严谨的 Rust 原生模块精细实现。
+          </p>
+        </div>
+
+        <!-- Tools Tab Switcher -->
+        <div class="tools-tabs" id="tools-tabs">
+          <!-- Populated by app.js -->
+        </div>
+
+        <!-- Tool Details Card -->
+        <div class="tool-details-card" id="tool-details-container">
+          <!-- Populated by app.js -->
+        </div>
+      </div>
+    </section>
+
+    <!-- M5 Compaction Engine Deep Dive -->
+    <section id="compaction" class="section" style="background: rgba(10, 14, 22, 0.6);">
+      <div class="container">
+        <div class="section-header">
+          <span class="section-tag">Context Management (M5)</span>
+          <h2 class="section-title">自适应长上下文压缩引擎 (Auto-Compaction)</h2>
+          <p class="section-desc">
+            下一次请求装不下历史怎么办？Oxidra 采用确定性 Anchor 差分测算与 Checkpoint Envelope 机制，
+            在保留原始 Journal 的同时，使模型安全拥有无限续航能力。
+          </p>
+        </div>
+
+        <div class="compaction-box">
+          <!-- Metrics Row -->
+          <div class="compaction-metrics-row">
+            <div class="compaction-metric">
+              <div class="val">80% Usable</div>
+              <div class="desc">自动触发水线 (Trigger Threshold)</div>
+            </div>
+            <div class="compaction-metric">
+              <div class="val">50% Usable</div>
+              <div class="desc">压缩收敛目标 (Target Compression)</div>
+            </div>
+            <div class="compaction-metric">
+              <div class="val">8,192 Tokens</div>
+              <div class="desc">摘要输出保护硬上限 (Max Summary Budget)</div>
+            </div>
+          </div>
+
+          <div style="margin-bottom: 32px;">
+            <h3 style="font-size: 1.15rem; margin-bottom: 12px;">🎯 Usage-Anchor 差分预测算法</h3>
+            <p style="color: var(--text-secondary); line-height: 1.7; font-size: 0.94rem;">
+              Oxidra 拒绝使用粗暴的字符长度猜测，而是以前序请求的真实 Provider Usage 为绝对锚点：
+              <code style="color: var(--accent-cyan); background: rgba(0,242,254,0.08); padding: 2px 6px; border-radius: 4px;">
+                next_input ~= anchor.input_tokens + E(current_request) - E(anchor_request)
+              </code>。
+              只有当压缩后真实重建请求低于 50% 目标且保留最新 2 个完整 Turn 时，才提交 Checkpoint。
+            </p>
+          </div>
+
+          <!-- Benchmark Badge -->
+          <div style="background: var(--bg-surface); border: 1px solid rgba(16, 185, 129, 0.3); border-radius: var(--radius-md); padding: 20px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+            <div style="font-size: 2rem; color: var(--accent-emerald);">🏆</div>
+            <div style="flex: 1;">
+              <h4 style="color: var(--accent-emerald); margin-bottom: 4px;">Kimi-K2.7-Code 真实基准 10 轮验证闭环</h4>
+              <p style="font-size: 0.88rem; color: #cbd5e1;">
+                在长达 10 轮严苛连续压缩漂移测试中，Prompt v3 完整保留全部 <strong>17/17 项固定事实</strong>，
+                并且针对嵌在历史上下文中的提示词注入指令保持 <strong>0 执行</strong>，验证记录沉淀于 <code>docs/compaction-drift.md</code>。
+              </p>
+            </div>
+          </div>
+
+          <!-- 3 History Tools -->
+          <div style="margin-top: 36px;">
+            <h4 style="font-size: 1.05rem; margin-bottom: 8px;">🔍 3 个压缩历史受控回溯工具 (History Tools)</h4>
+            <p style="font-size: 0.86rem; color: var(--text-muted); margin-bottom: 16px;">
+              压缩不是遗忘。模型在压缩后依然可以通过专用工具以“不可信历史证据”的形式精准调取被压缩轮次的内容：
+            </p>
+            <div class="history-tools-grid" id="history-tools-container">
+              <!-- Rendered by app.js -->
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Interactive Terminal Sandbox -->
+    <section id="terminal" class="section">
+      <div class="container">
+        <div class="section-header">
+          <span class="section-tag">Interactive Playground</span>
+          <h2 class="section-title">交互式 CLI 终端沙盒模拟器</h2>
+          <p class="section-desc">
+            点击下方不同场景按钮，直观体验 Oxidra 真实运行时的命令响应、彩色差异高亮、工具调用及 Token 指标反馈。
+          </p>
+        </div>
+
+        <!-- Scenario Selector Buttons -->
+        <div class="scenario-selector">
+          <button class="scenario-btn active" data-scenario="test-fix">🧪 修复测试并验证 (read → edit → shell)</button>
+          <button class="scenario-btn" data-scenario="auth-status">🔐 凭据与模型状态 (oxidra auth status)</button>
+          <button class="scenario-btn" data-scenario="session-list">📋 本地会话列表 (oxidra session list)</button>
+          <button class="scenario-btn" data-scenario="compact-demo">⚡ 80% 触发自适应压缩 (--experimental-auto-compact)</button>
+        </div>
+
+        <!-- Sandbox Terminal Window -->
+        <div class="terminal-window">
+          <div class="terminal-header">
+            <div class="terminal-dots">
+              <span class="terminal-dot red"></span>
+              <span class="terminal-dot yellow"></span>
+              <span class="terminal-dot green"></span>
+            </div>
+            <div class="terminal-title" id="sandbox-term-title">oxidra-session — 修复项目测试</div>
+            <button class="btn btn-secondary btn-sm" id="sandbox-rerun-btn" style="padding: 2px 8px; font-size: 0.72rem;">
+              <span>↻ 重新播放</span>
+            </button>
+          </div>
+          <div class="terminal-body" id="sandbox-term-body">
+            <!-- Simulated output stream generated by terminal.js -->
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Installation & Getting Started Section -->
+    <section id="install" class="section" style="background: rgba(10, 14, 22, 0.7);">
+      <div class="container">
+        <div class="section-header">
+          <span class="section-tag">Quick Start</span>
+          <h2 class="section-title">快速安装与配置</h2>
+          <p class="section-desc">
+            支持 Windows 一键脚本部署或使用 Cargo 源码编译安装。
+          </p>
+        </div>
+
+        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 32px;" class="install-grid">
+          <!-- Windows PowerShell Box -->
+          <div class="glass-card" style="padding: 32px;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+              <h3 style="font-size: 1.25rem;">Windows 一键安装</h3>
+              <span class="status-badge completed">MSVC Verified</span>
+            </div>
+            <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 16px;">
+              自动下载最新 Windows MSVC 二进制包，校验 SHA-256 哈希完整性，并可自动添加到用户 PATH：
+            </p>
+            <div class="code-preview-box" style="margin-bottom: 16px;">
+              <pre class="code-preview-body"><code id="win-install-script">irm https://raw.githubusercontent.com/post7794/oxidra/main/install.ps1 -OutFile $env:TEMP\oxidra-install.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File $env:TEMP\oxidra-install.ps1 -AddToPath</code></pre>
+            </div>
+            <button class="btn btn-secondary btn-sm" data-copy-target="win-install-script">📋 复制 Windows 安装指令</button>
+          </div>
+
+          <!-- Cargo Source Build Box -->
+          <div class="glass-card" style="padding: 32px;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+              <h3 style="font-size: 1.25rem;">Cargo 源码编译</h3>
+              <span class="status-badge experimental">Rust 1.85+</span>
+            </div>
+            <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 16px;">
+              克隆仓库并在本地以 Release 模式编译安装（支持 Linux、macOS 与 Windows）：
+            </p>
+            <div class="code-preview-box" style="margin-bottom: 16px;">
+              <pre class="code-preview-body"><code id="cargo-install-script">git clone https://github.com/post7794/oxidra.git
+cd oxidra
+cargo install --path .</code></pre>
+            </div>
+            <button class="btn btn-secondary btn-sm" data-copy-target="cargo-install-script">📋 复制 Cargo 编译指令</button>
+          </div>
+        </div>
+
+        <!-- Configuration Guide Box -->
+        <div class="glass-card" style="padding: 32px; margin-top: 32px;">
+          <h3 style="font-size: 1.25rem; margin-bottom: 12px;">⚙ 初始配置与凭据设置</h3>
+          <p style="font-size: 0.9rem; color: var(--text-secondary); margin-bottom: 20px;">
+            Oxidra 采用非对称安全设计：API 密钥存入系统原生 Keyring，通用配置存放于 <code>config.toml</code>：
+          </p>
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px;">
+            <div>
+              <div class="tool-prop-label">1. 配置 API 凭据（保存至系统安全凭据库）</div>
+              <div class="code-preview-box" style="margin-top: 8px;">
+                <pre class="code-preview-body"><code># 交互式无回显存入系统 Keyring
+oxidra auth login
+
+# 检查凭据健康状态
+oxidra auth status</code></pre>
+              </div>
+            </div>
+            <div>
+              <div class="tool-prop-label">2. 首次运行体验 (支持批处理或单次指令)</div>
+              <div class="code-preview-box" style="margin-top: 8px;">
+                <pre class="code-preview-body"><code># 单次执行模式
+oxidra -p "运行单元测试并总结结果" --full-auto
+
+# 启动交互式 REPL 会话
+oxidra</code></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Site Footer -->
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <h4>Oxidra CLI Coding Agent</h4>
+          <p>A lightweight personal CLI coding agent written in Rust. 极简 · 本地可审计 · 确定性与安全优先。</p>
+          <div style="font-size: 0.78rem; color: var(--text-muted);">
+            Rust 1.85 Edition 2024 · Licensed under MIT
+          </div>
+        </div>
+
+        <div class="footer-col">
+          <h5>核心能力</h5>
+          <ul class="footer-links">
+            <li><a href="#tools" class="footer-link">5 大内置工具</a></li>
+            <li><a href="#compaction" class="footer-link">M5 自动压缩</a></li>
+            <li><a href="#architecture" class="footer-link">系统级沙箱</a></li>
+            <li><a href="#architecture" class="footer-link">Append-Only 日志</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h5>研发展望</h5>
+          <ul class="footer-links">
+            <li><a href="#roadmap" class="footer-link">M1 核心循环</a></li>
+            <li><a href="#roadmap" class="footer-link">M2 密钥与记忆</a></li>
+            <li><a href="#roadmap" class="footer-link">M3 会话管理</a></li>
+            <li><a href="#roadmap" class="footer-link">MCP 协议沙箱</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h5>资源链接</h5>
+          <ul class="footer-links">
+            <li><a href="https://github.com/post7794/oxidra" target="_blank" rel="noopener noreferrer" class="footer-link">GitHub 仓库</a></li>
+            <li><a href="#install" class="footer-link">Windows 安装器</a></li>
+            <li><a href="#terminal" class="footer-link">终端模拟沙盒</a></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="footer-bottom">
+        <div>© 2026 Oxidra Project. All rights reserved.</div>
+        <div style="display: flex; gap: 16px;">
+          <span>Zero External Dependencies</span>
+          <span>•</span>
+          <span>Local Privacy First</span>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <!-- Scripts: ES Modules -->
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

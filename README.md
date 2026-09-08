@@ -111,8 +111,13 @@ The legacy `[provider].api_key` field is intentionally rejected. Remove it from
 an existing config file, then run `oxidra auth login` to migrate the credential
 into the selected store.
 
-Interactive mode shows streamed assistant text on stdout and tool/provider
-diagnostics on stderr:
+Interactive mode renders assistant text on stdout only after the Provider
+response has been validated and durably committed. Its text is derived only
+from the canonical output items, including an explicitly empty final text;
+pre-commit text deltas cannot fill it back in. Tool/provider diagnostics use
+stderr. Both interactive and batch stdout escape terminal/Unicode presentation
+controls, preserve tabs and line breaks, and render CRLF as LF. This is a
+display-only transformation: journals and Provider replay retain the raw text.
 
 ```powershell
 cargo run
@@ -121,6 +126,11 @@ cargo run
 Press `Ctrl+C` to cancel the active Responses request or tool process. A
 single shell command requires confirmation unless `--full-auto` is explicitly
 provided for the current process.
+
+Three consecutive identical tool failures pause the turn. In batch mode
+(`-p` or `--retry-pending`), this exits with code 1 and no success text on stdout;
+metrics and the failure reason remain on stderr. Interactive mode keeps the
+REPL open so another prompt can be entered.
 
 At the end of each completed turn, stderr prints the model, accumulated token
 usage, and the approximate context size for the next request. The estimate is
@@ -207,6 +217,7 @@ oxidra memory list
 oxidra memory show <ID>
 oxidra memory forget <ID>
 oxidra session delete <SESSION_ID>
+oxidra session export <SESSION_ID> <ARCHIVE>.oxidra-session-export
 ```
 
 Session journals and shell artifacts are stored in the platform user-data
@@ -215,7 +226,25 @@ Persistent memories are stored as plain Markdown under the same user-data
 directory and are injected only after deterministic size packing. Memories
 created by the tool record their source project and creation time in two-field
 frontmatter; this provenance is visible to management commands but is stripped
-before model injection.
+before model injection. Before saving a `remember` result, interactive approval
+shows the complete escaped content, not the truncated diagnostic preview;
+`--full-auto` never substitutes for this confirmation.
+
+On Unix, Oxidra tightens its data root and state directories to mode `0700`
+and durable files to `0600`; on Windows it relies on the ACL inherited by the
+selected data root. The Unix helper does not remove additional POSIX/extended
+ACL entries or attest remote-filesystem permission semantics, so the operator
+must also control those. These are privacy defaults, not a sandbox against
+another process running as the same OS user. Session management,
+history artifacts, memories, and built-in project tools still resolve parent
+components through pathname-based filesystem APIs. After canonical resolution,
+bounded file reads use a no-follow open where the platform exposes it, so that
+exact final component cannot silently change into a link before the handle is
+checked; an in-root symlink already resolved to an in-root target is still
+allowed. A concurrent same-user writer can also replace a parent directory
+after validation. Deployments requiring an adversarial namespace boundary need
+a separate principal/sandbox or handle-relative broker rather than relying on
+canonicalization and mode bits.
 
 ## Verification
 
@@ -230,11 +259,17 @@ cargo clippy --all-targets --offline -- -D warnings
 
 The canonical acceptance flow is `read -> edit -> shell`, with a real file
 change and command result verified by the test in `tests/e2e_cli.rs`.
+`tests/cli_output_contract.rs` additionally exercises full-content memory
+approval, terminal-safe display with unchanged journal/replay bytes, canonical
+empty-text handling, and stalled batch/retry exit codes across real CLI processes.
 
-The integration suite also verifies that interactive text deltas arrive before
-`response.completed`, `--resume` replays complete raw output items, shell
-cancellation returns promptly, and project-root boundaries hold across file
-tools. CI runs Rust 1.85 on Windows, Linux, and macOS via
+The integration suite also verifies that the entire Provider pre-commit stream
+is silent: text, function-argument and unknown payloads, plus retry values,
+counts and timing, cannot reach a caller callback before `response.completed`.
+The committed text is rendered afterward. It also verifies that `--resume`
+replays complete raw output items,
+shell cancellation returns promptly, and project-root boundaries hold across
+file tools. CI runs Rust 1.85 on Windows, Linux, and macOS via
 `.github/workflows/ci.yml`.
 
 The main branch contains an MCP stdio kernel, explicit project-config reader,
@@ -242,7 +277,43 @@ execution-plan approval capability, fixed JSON Schema profile, a
 session-scoped registry, and the durable coordinator/journal policy core. These
 are still Rust foundations: MCP is not yet wired into the CLI, Agent tool
 surface, or user approval flow, so users still have only the built-in tools.
+The MCP exact-wire claim is limited to the crate-sealed built-in OpenAI
+transport; public custom prepared transports remain a trusted TCB and are
+not admitted by the MCP coordinator. The built-in exact path also disables
+HTTP redirects and implicit environment/system proxies; a required proxy must
+be configured as the explicit API base URL so it is part of durable endpoint
+provenance.
 Approving an MCP execution plan grants that
 local program the authority of the current OS user; future per-tool approval is
-request audit/intent confirmation, not a filesystem or network sandbox. See
+request audit/intent confirmation, not a filesystem or network sandbox. A
+sealed approval boundary currently exposes only crate-owned fixed allow/deny
+policies; interactive or argument-aware approval requires a separate durable
+approval-attempt protocol before it can be added safely. A
+process-external guardian now keeps a session execution gate across passive
+host death until all registered Linux pidfd targets have exited or Windows Jobs
+report no active processes. Before publishing READY it also fsyncs a durable
+active-generation record; only an exact containment-empty proof can fsync the
+matching clean record. If the guardian itself is killed first, the OS lock may
+disappear but the session remains permanently quarantined rather than risking
+overlapping generations. There is no in-place recovery because the durable v1
+record cannot prove that the old containment is empty; `oxidra session export
+<ID> <ARCHIVE>.oxidra-session-export` writes a versioned, non-resumable archive manifest followed by the
+exact unchanged journal bytes, without clearing the gate or authorizing
+resume. “Exact” means the bytes observed while holding the ordinary session
+lock; it is not an authenticity guarantee against a still-running process with
+the same OS-user authority. The destination parent directory must be controlled
+by the operator and must not permit untrusted concurrent writers; the v1
+pathname-based publisher does not defend against same-user namespace races.
+Publication fsyncs a complete sibling first; Unix then hard-links without
+replacement, removes the sibling, and fsyncs the parent directory, while
+Windows uses no-replace `MoveFileExW` with `WRITE_THROUGH`. A failure after the
+publish point is reported as durability-uncertain because the complete
+destination may already exist and must not be blindly retried at the same path.
+Windows children enter a
+guardian-owned Job atomically at process birth, before their suspended primary
+thread can run. This is a safety-over-availability crash ordering guarantee,
+not a privilege boundary:
+an approved same-user process can still attack the guardian, its lock path, or
+other user-owned state. Adversarial plugin isolation still requires a lower
+privilege principal/AppContainer/service or an equivalent OS boundary. See
 `docs/mcp-roadmap.md` for the remaining integration and recovery gates.

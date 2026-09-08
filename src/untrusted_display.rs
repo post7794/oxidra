@@ -27,29 +27,86 @@ pub(crate) fn sanitize_single_line(input: &str) -> String {
 }
 
 pub(crate) fn text_for_display(input: &str) -> String {
-    truncate_utf8(
-        &sanitize_single_line(input),
-        MAX_UNTRUSTED_JSON_DISPLAY_BYTES,
-    )
+    let mut output = String::with_capacity(input.len().min(MAX_UNTRUSTED_JSON_DISPLAY_BYTES));
+    for character in input.chars() {
+        let character = if is_presentation_control(character) {
+            '�'
+        } else {
+            character
+        };
+        if output.len() + character.len_utf8() > MAX_UNTRUSTED_JSON_DISPLAY_BYTES {
+            return truncated_utf8_prefix(&output, MAX_UNTRUSTED_JSON_DISPLAY_BYTES);
+        }
+        output.push(character);
+    }
+    output
 }
 
 pub(crate) fn quoted_single_line(input: &str) -> String {
     format!("{:?}", sanitize_single_line(input))
 }
 
+// A sanitized Unicode scalar occupies at least one byte and its source at
+// most four. This prefix is therefore enough to reproduce the original
+// sanitize-then-truncate result without serializing the entire JSON tree.
+const MAX_RAW_JSON_DISPLAY_BYTES: usize = MAX_UNTRUSTED_JSON_DISPLAY_BYTES * 4;
+const MAX_JSON_DISPLAY_DEPTH: usize = 128;
+
+#[derive(Default)]
+struct JsonDisplayWriter {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl std::io::Write for JsonDisplayWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let available = MAX_RAW_JSON_DISPLAY_BYTES.saturating_sub(self.bytes.len());
+        let written = available.min(bytes.len());
+        if written < bytes.len() {
+            self.truncated = true;
+            if written == 0 {
+                return Err(std::io::Error::other("JSON display prefix is full"));
+            }
+        }
+        self.bytes.extend_from_slice(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 pub(crate) fn json_for_display(value: &Value) -> String {
-    let serialized = serde_json::to_string(value)
-        .unwrap_or_else(|_| "<unserializable external JSON>".to_owned());
-    truncate_utf8(
-        &sanitize_single_line(&serialized),
-        MAX_UNTRUSTED_JSON_DISPLAY_BYTES,
+    // Public rendering helpers accept borrowed Values, not only wire-parsed
+    // MCP results. Bound recursion before entering serde's serializer.
+    if crate::session::validate_borrowed_json_depth_v1(
+        value,
+        MAX_JSON_DISPLAY_DEPTH,
+        "display",
+        "external JSON",
     )
+    .is_err()
+    {
+        return "<external JSON exceeds display depth limit>".to_owned();
+    }
+    let mut writer = JsonDisplayWriter::default();
+    if serde_json::to_writer(&mut writer, value).is_err() && !writer.truncated {
+        return "<unserializable external JSON>".to_owned();
+    }
+    // Only a capped prefix may end partway through UTF-8. That replacement is
+    // beyond the final display cutoff and cannot change the visible prefix.
+    text_for_display(&String::from_utf8_lossy(&writer.bytes))
 }
 
 pub(crate) fn truncate_utf8(text: &str, maximum_bytes: usize) -> String {
     if text.len() <= maximum_bytes {
         return text.to_owned();
     }
+    truncated_utf8_prefix(text, maximum_bytes)
+}
+
+fn truncated_utf8_prefix(text: &str, maximum_bytes: usize) -> String {
     let suffix = "<truncated>";
     let mut end = maximum_bytes.saturating_sub(suffix.len()).min(text.len());
     while !text.is_char_boundary(end) {
@@ -62,7 +119,7 @@ pub(crate) fn truncate_utf8(text: &str, maximum_bytes: usize) -> String {
 
 /// Unicode code points that can alter visual ordering, line structure or
 /// glyph boundaries without appearing as ordinary printable text.
-fn is_presentation_control(character: char) -> bool {
+pub(crate) fn is_presentation_control(character: char) -> bool {
     character.is_control()
         || matches!(
             character,
@@ -109,6 +166,47 @@ mod tests {
         assert!(!rendered.contains('\u{202e}'));
         assert!(rendered.ends_with("<truncated>"));
         assert!(rendered.len() <= MAX_UNTRUSTED_JSON_DISPLAY_BYTES);
+    }
+
+    #[test]
+    fn bounded_display_preserves_sanitize_then_truncate_semantics() {
+        for text in [
+            "plain".repeat(20_000),
+            "中🙂\u{202e}\u{e0001}\n\t\0\\\"".repeat(20_000),
+            "x".repeat(MAX_UNTRUSTED_JSON_DISPLAY_BYTES),
+            format!("{}🙂", "x".repeat(MAX_UNTRUSTED_JSON_DISPLAY_BYTES - 1)),
+        ] {
+            assert_eq!(
+                text_for_display(&text),
+                truncate_utf8(
+                    &sanitize_single_line(&text),
+                    MAX_UNTRUSTED_JSON_DISPLAY_BYTES
+                ),
+            );
+            let value = serde_json::json!({"text": text});
+            let previous = truncate_utf8(
+                &sanitize_single_line(&serde_json::to_string(&value).unwrap()),
+                MAX_UNTRUSTED_JSON_DISPLAY_BYTES,
+            );
+            assert_eq!(json_for_display(&value), previous);
+        }
+        let wide = Value::Array(vec![Value::Null; 40_000]);
+        assert_eq!(
+            json_for_display(&wide),
+            truncate_utf8(
+                &serde_json::to_string(&wide).unwrap(),
+                MAX_UNTRUSTED_JSON_DISPLAY_BYTES
+            ),
+        );
+    }
+
+    #[test]
+    fn json_display_writer_stops_at_fixed_prefix_capacity() {
+        let value = Value::String("x".repeat(MAX_RAW_JSON_DISPLAY_BYTES * 2));
+        let mut writer = JsonDisplayWriter::default();
+        assert!(serde_json::to_writer(&mut writer, &value).is_err());
+        assert!(writer.truncated);
+        assert_eq!(writer.bytes.len(), MAX_RAW_JSON_DISPLAY_BYTES);
     }
 
     #[test]

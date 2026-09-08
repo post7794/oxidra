@@ -4,13 +4,16 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{OxidraError, Result};
+use crate::fs_security::open_read_only_no_follow;
 use crate::history::{
     HistorySnapshot, MAX_HISTORY_ARTIFACT_SOURCE_BYTES, UNTRUSTED_HISTORY_NOTICE,
     serialized_history_tool_output_bytes,
 };
+use crate::tools::MAX_ARTIFACT_BYTES;
 
 const MAX_ARTIFACT_METADATA_BYTES: u64 = 64 * 1_024;
 
@@ -88,11 +91,23 @@ impl HistoryArtifactReader {
         let grant = snapshot.artifact_grant(&request.artifact_id)?;
         let directory = verified_child_directory(&self.root, &grant.artifact_id).await?;
         let metadata_path = verified_child_file(&directory, "metadata.json").await?;
-        let metadata_len = tokio::fs::metadata(&metadata_path).await?.len();
-        if metadata_len > MAX_ARTIFACT_METADATA_BYTES {
-            return integrity_error("artifact metadata exceeds the 64 KiB limit");
-        }
-        let metadata_bytes = tokio::fs::read(&metadata_path).await?;
+        let metadata_bytes = match read_regular_file_bounded(
+            &metadata_path,
+            MAX_ARTIFACT_METADATA_BYTES,
+            cancellation,
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(ArtifactFileReadError::Cancelled) => return Err(OxidraError::Interrupted),
+            Err(ArtifactFileReadError::NotRegular) => {
+                return integrity_error("artifact metadata is not a regular file");
+            }
+            Err(ArtifactFileReadError::TooLarge) => {
+                return integrity_error("artifact metadata exceeds the 64 KiB limit");
+            }
+            Err(ArtifactFileReadError::Io(error)) => return Err(error.into()),
+        };
         if sha256_hex(&metadata_bytes) != grant.metadata_sha256 {
             return integrity_error("artifact metadata digest does not match the journal grant");
         }
@@ -116,6 +131,11 @@ impl HistoryArtifactReader {
             return integrity_error("artifact stream uses an unexpected file name");
         }
         let stored_bytes = required_u64(stream.get("stored_bytes"), "stored_bytes")?;
+        if stored_bytes > MAX_ARTIFACT_BYTES {
+            return integrity_error(format!(
+                "artifact stored stream exceeds the {MAX_ARTIFACT_BYTES}-byte limit"
+            ));
+        }
         let original_bytes = required_u64(stream.get("bytes"), "bytes")?;
         let artifact_truncated = stream
             .get("artifact_truncated")
@@ -140,13 +160,20 @@ impl HistoryArtifactReader {
         }
 
         let stream_path = verified_child_file(&directory, request.stream.file_name()).await?;
-        let actual_len = tokio::fs::metadata(&stream_path).await?.len();
-        if actual_len != stored_bytes {
+        let bytes = match read_regular_file_bounded(&stream_path, stored_bytes, cancellation).await
+        {
+            Ok(bytes) => bytes,
+            Err(ArtifactFileReadError::Cancelled) => return Err(OxidraError::Interrupted),
+            Err(ArtifactFileReadError::NotRegular) => {
+                return integrity_error("artifact stream is not a regular file");
+            }
+            Err(ArtifactFileReadError::TooLarge) => {
+                return integrity_error("artifact stream length does not match metadata");
+            }
+            Err(ArtifactFileReadError::Io(error)) => return Err(error.into()),
+        };
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != stored_bytes {
             return integrity_error("artifact stream length does not match metadata");
-        }
-        let bytes = tokio::fs::read(&stream_path).await?;
-        if cancellation.is_cancelled() {
-            return Err(OxidraError::Interrupted);
         }
         if sha256_hex(&bytes) != stored_sha256 {
             return integrity_error("artifact stream digest does not match metadata");
@@ -238,6 +265,49 @@ async fn verified_child_file(directory: &Path, name: &str) -> Result<PathBuf> {
         return integrity_error("artifact file resolves outside its artifact directory");
     }
     Ok(canonical)
+}
+
+#[derive(Debug)]
+enum ArtifactFileReadError {
+    Cancelled,
+    NotRegular,
+    TooLarge,
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for ArtifactFileReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+async fn read_regular_file_bounded(
+    path: &Path,
+    max_bytes: u64,
+    cancellation: &CancellationToken,
+) -> std::result::Result<Vec<u8>, ArtifactFileReadError> {
+    let file = tokio::select! {
+        _ = cancellation.cancelled() => return Err(ArtifactFileReadError::Cancelled),
+        result = open_read_only_no_follow(path) => result?,
+    };
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(ArtifactFileReadError::NotRegular);
+    }
+    if metadata.len() > max_bytes {
+        return Err(ArtifactFileReadError::TooLarge);
+    }
+    let capacity = usize::try_from(metadata.len().min(max_bytes)).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut limited = tokio::fs::File::from_std(file).take(max_bytes.saturating_add(1));
+    tokio::select! {
+        _ = cancellation.cancelled() => return Err(ArtifactFileReadError::Cancelled),
+        result = limited.read_to_end(&mut bytes) => result?,
+    };
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(ArtifactFileReadError::TooLarge);
+    }
+    Ok(bytes)
 }
 
 fn required_u64(value: Option<&Value>, field: &str) -> Result<u64> {
@@ -521,6 +591,43 @@ mod tests {
                 matches!(error, OxidraError::Tool { code, .. } if code == "artifact_integrity_error")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_stream_size_claim_above_artifact_limit_before_reading() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("artifact-1");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("stdout.bin"), b"").unwrap();
+        std::fs::write(directory.join("stderr.bin"), b"").unwrap();
+        let oversized = MAX_ARTIFACT_BYTES + 1;
+        let metadata = json!({
+            "schema":2,"kind":"shell_output",
+            "stdout":{"file":"stdout.bin","bytes":oversized,"stored_bytes":oversized,"artifact_truncated":false,"sha256":sha256_hex(b""),"stored_sha256":sha256_hex(b"")},
+            "stderr":{"file":"stderr.bin","bytes":0,"stored_bytes":0,"artifact_truncated":false,"sha256":sha256_hex(b""),"stored_sha256":sha256_hex(b"")}
+        });
+        let metadata_bytes = serde_json::to_vec_pretty(&metadata).unwrap();
+        std::fs::write(directory.join("metadata.json"), &metadata_bytes).unwrap();
+
+        let error = HistoryArtifactReader::new(temp.path())
+            .unwrap()
+            .read(
+                &snapshot_with_artifact(&sha256_hex(&metadata_bytes)),
+                &HistoryArtifactRequest {
+                    artifact_id: "artifact-1".to_owned(),
+                    stream: HistoryArtifactStream::Stdout,
+                    byte_offset: 0,
+                    max_bytes: 8,
+                },
+                "call",
+                MAX_HISTORY_TOOL_OUTPUT_BYTES,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, OxidraError::Tool { code, .. } if code == "artifact_integrity_error")
+        );
     }
 
     #[tokio::test]

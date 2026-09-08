@@ -16,9 +16,9 @@ pub const MCP_EXECUTION_PLAN_VERSION: u32 = 1;
 
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const MAX_SERVERS: usize = 16;
-const MAX_ARGS: usize = 64;
-const MAX_ARG_BYTES: usize = 4096;
-const MAX_INHERITED_ENV: usize = 32;
+const MAX_ARGS: usize = super::MAX_STDIO_ARGS_V1;
+const MAX_ARG_BYTES: usize = super::MAX_STDIO_ARG_BYTES_V1;
+const MAX_INHERITED_ENV: usize = super::MAX_STDIO_INHERITED_ENV_V1;
 
 #[derive(Clone, Debug)]
 pub struct McpProjectConfig {

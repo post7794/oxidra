@@ -1,0 +1,13 @@
+{
+  "name": "oxidra-showcase",
+  "version": "0.1.0",
+  "description": "Oxidra CLI Coding Agent Showcase Frontend",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs"
+  },
+  "keywords": ["oxidra", "agent", "rust", "cli", "showcase"],
+  "author": "",
+  "license": "MIT"
+}
